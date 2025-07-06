@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ORIAnnotations &#8212; ORIAnnotations 0.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="../_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="../_static/alabaster.css?v=27fed22d" />
+    <script src="../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="https://unpkg.com/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({"startOnLoad": true})</script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+   
+  <link rel="stylesheet" href="../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for ORIAnnotations</h1><div class="highlight"><pre>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">opentimelineio</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">otio</span>
+<span class="n">SyncEvent</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">schemadef</span><span class="o">.</span><span class="n">module_from_name</span><span class="p">(</span><span class="s1">&#39;SyncEvent&#39;</span><span class="p">)</span>
+
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span>
+
+
+<div class="viewcode-block" id="Media">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.Media">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Media</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    The media class is the container for the media being reviewed.</span>
+<span class="sd">    It will end up on its own track.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">        name (str): Name of the media, typically the file basename.</span>
+<span class="sd">        media_path (str): Full path to the location of the media.</span>
+<span class="sd">        frame_rate (float): The frame rate of the media</span>
+<span class="sd">        duration (int): Duration of the media</span>
+<span class="sd">        start_frame (int): Start frame.</span>
+<span class="sd">        vendor_name (str): The name of the vendor</span>
+<span class="sd">        artist_name (str): The artist name</span>
+<span class="sd">        vendor_id (str): The unique vendor id</span>
+<span class="sd">        client_id (str): The unique client id</span>
+<span class="sd">        clip_uuid (str): The UUID of the clip</span>
+<span class="sd">        </span>
+
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">media_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">frame_rate</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">duration</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">start_frame</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="n">vendor_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">artist_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">vendor_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">client_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">clip_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># otio_clip: otio.schema.Clip = field(default_factory=otio.schema.Clip)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_otio_clip_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">clip</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Read an OTIO clip and populate the fields from its metadata.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">clip</span><span class="o">.</span><span class="n">name</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;artist_name&#39;</span><span class="p">,</span> <span class="s1">&#39;vendor_id&#39;</span><span class="p">,</span> <span class="s1">&#39;client_id&#39;</span><span class="p">,</span> <span class="s1">&#39;clip_uuid&#39;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">clip</span><span class="o">.</span><span class="n">metadata</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">clip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">])</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_create_otio_clip</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">media_ref</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">ExternalReference</span><span class="p">(</span>
+                    <span class="n">target_url</span><span class="o">=</span><span class="s2">&quot;file://&quot;</span><span class="o">+</span><span class="bp">self</span><span class="o">.</span><span class="n">media_path</span><span class="p">,</span>
+                    <span class="n">available_range</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span>
+                        <span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">calc_otio_start_frame</span><span class="p">(),</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">)),</span>
+                        <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">duration</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">))</span>
+                    <span class="p">)</span>
+                <span class="p">)</span>
+        <span class="n">metadata</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;artist_name&#39;</span><span class="p">,</span> <span class="s1">&#39;vendor_id&#39;</span><span class="p">,</span> <span class="s1">&#39;client_id&#39;</span><span class="p">,</span> <span class="s1">&#39;clip_uuid&#39;</span><span class="p">]:</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">):</span>
+                    <span class="n">newclip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span>
+
+        <span class="n">clip</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Clip</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+            <span class="n">media_reference</span><span class="o">=</span><span class="n">media_ref</span><span class="p">,</span>
+            <span class="n">source_range</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span>
+                <span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">calc_otio_start_frame</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">),</span>
+                <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">duration</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">)</span>
+            <span class="p">),</span>
+            <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="n">clip</span>
+<div class="viewcode-block" id="Media.calc_otio_start_frame">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.Media.calc_otio_start_frame">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">calc_otio_start_frame</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="mi">0</span> <span class="c1"># for now.</span></div>
+
+
+<div class="viewcode-block" id="Media.calc_otio_end_frame">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.Media.calc_otio_end_frame">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">calc_otio_end_frame</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">duration</span> <span class="c1"># for now.</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="find_overlapping_clips">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.find_overlapping_clips">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">find_overlapping_clips</span><span class="p">(</span><span class="n">source_clip</span><span class="p">,</span> <span class="n">target_track</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Find clips on target_track that overlap with source_clip on source_track.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        source_clip (Clip): A OTIO clip that we want to find the associated clips in the target_track</span>
+<span class="sd">        target_track (track): The track we are looking for the associated clips in.</span>
+
+<span class="sd">    Return:</span>
+<span class="sd">        [Clip]: The clip(s) that are in range.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    
+    <span class="c1"># Get the time range of the source clip in the timeline&#39;s coordinate system</span>
+    <span class="n">source_range_in_timeline</span> <span class="o">=</span> <span class="n">source_clip</span><span class="o">.</span><span class="n">range_in_parent</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Found </span><span class="si">{</span><span class="n">source_range_in_timeline</span><span class="si">}</span><span class="s2"> for clip </span><span class="si">{</span><span class="n">source_clip</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    
+    <span class="c1"># Find overlapping clips on the target track</span>
+    <span class="n">overlapping_clips</span> <span class="o">=</span> <span class="p">[]</span>
+    
+    <span class="k">return</span> <span class="n">target_track</span><span class="o">.</span><span class="n">children_in_range</span><span class="p">(</span><span class="n">source_range_in_timeline</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ReviewItemFrame">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewItemFrame">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReviewItemFrame</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    The frame that is being reviewed for a particular piece of media.</span>
+<span class="sd">    There will be at least one of:</span>
+<span class="sd">    * A note</span>
+<span class="sd">    * A annotated image</span>
+<span class="sd">    * A set of annotated commands that should create the annotated image.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">        review_item (ReviewItem): The Review item associated with these frames.</span>
+<span class="sd">        frame (int): The frame that is being reviewed.</span>
+<span class="sd">        duration (int): The duration of the note, this is typically 1 frame, but it could be more.</span>
+<span class="sd">        note (str): The reviewers note, this should be in markdown format.</span>
+<span class="sd">        status (str): The status of the review, i.e. is it approved. Note, the task is stored on the media, so whether its a comp, or anim, etc.</span>
+<span class="sd">        annotation_renderer (str): If you have chosen to add the annotation commands, we need to know which renderer you were using, in case there are incompabilities between the renderers.</span>
+<span class="sd">        annotation_image (str): The path to the annotated image. Ideally this is just the annotations, or even better is a un-premultiplied PNG of the annotated image with an alpha, so you can choose whether you view just the annotation or both.</span>
+<span class="sd">        canvas_size ([width, height]): For the annotation_commands what are the units of the brush-strokes.</span>
+<span class="sd">        ocio_annotation_color_space (str): OCIO color space using the color-interop naming convention.</span>
+<span class="sd">    </span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">review_item</span><span class="p">:</span> <span class="s1">&#39;ReviewItem&#39;</span>
+    <span class="n">frame</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">duration</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">note</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">status</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">annotation_renderer</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">annotation_image</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">ocio_annotation_color_space</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">canvas_size</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">annotation_commands</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">SyncEvent</span><span class="o">.</span><span class="n">SyncEvent</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">SyncEvent</span><span class="o">.</span><span class="n">SyncEvent</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ReviewItemFrame.export_svg">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewItemFrame.export_svg">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">export_svg</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Export a SVG of any annotations.&quot;&quot;&quot;</span>
+        <span class="c1"># TODO.</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+    
+    <span class="k">def</span><span class="w"> </span><span class="nf">_otio_clip_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">clip</span><span class="p">):</span>
+        <span class="c1"># Populate metadata</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;note&#39;</span><span class="p">,</span> <span class="s1">&#39;task&#39;</span><span class="p">,</span> <span class="s1">&#39;status&#39;</span><span class="p">,</span> <span class="s1">&#39;annotation_renderer&#39;</span><span class="p">,</span> <span class="s1">&#39;annotation_commands&#39;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">clip</span><span class="o">.</span><span class="n">metadata</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">clip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">])</span>
+
+        
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_export_otio_clip</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Export an OTIO Clip</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">annotation_image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">annotation_image</span><span class="p">):</span>
+                <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;WARNING: annotation file </span><span class="si">{self.annotation_image}</span><span class="s2"> does not exist.&quot;</span><span class="p">)</span>
+            <span class="nb">range</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span><span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">frame</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">),</span>
+                                            <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">duration</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">))</span>
+            <span class="n">newclip</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Clip</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">frame</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                                               <span class="n">source_range</span><span class="o">=</span><span class="nb">range</span><span class="p">)</span>
+            <span class="n">mediarange</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span><span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">),</span>
+                                                 <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">duration</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">))</span>
+            <span class="n">media_ref</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">ExternalReference</span><span class="p">(</span>
+                        <span class="n">target_url</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;file:/</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">annotation_image</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                        <span class="n">available_range</span><span class="o">=</span><span class="n">mediarange</span>
+                    <span class="p">)</span>
+            <span class="n">newclip</span><span class="o">.</span><span class="n">media_reference</span> <span class="o">=</span> <span class="n">media_ref</span>
+            <span class="n">newclip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s1">&#39;annotation_commands&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">annotation_commands</span>
+            <span class="n">newclip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s1">&#39;annotated_clip_name&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">review_item</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">name</span>
+            <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;note&#39;</span><span class="p">,</span> <span class="s1">&#39;status&#39;</span><span class="p">,</span> <span class="s1">&#39;annotation_renderer&#39;</span><span class="p">]:</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">):</span>
+                    <span class="n">newclip</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span>
+
+            <span class="k">return</span> <span class="n">newclip</span></div>
+
+
+<div class="viewcode-block" id="ReviewItem">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewItem">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReviewItem</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    This is a single piece of reviewed media, there might be multiple notes and annotations on it.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">        media (Media): A single piece of media associated with a list of things to be reviewed.</span>
+<span class="sd">        review_frames (List[ReviewItemFrame]): A list of ReviewItemFrames that we have notes on.</span>
+<span class="sd">    </span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">media</span><span class="p">:</span> <span class="n">Media</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Media</span><span class="p">)</span>
+    <span class="n">review_frames</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">ReviewItemFrame</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_export_otio_media</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">track</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Export the media to the specified track&quot;&quot;&quot;</span>
+        <span class="n">lastframe</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">calc_otio_start_frame</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">frameinfo</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">review_frames</span><span class="p">:</span>
+            <span class="n">frame</span> <span class="o">=</span> <span class="n">frameinfo</span><span class="o">.</span><span class="n">frame</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\t</span><span class="si">{</span><span class="n">frame</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">frame</span> <span class="o">&gt;</span> <span class="n">lastframe</span><span class="p">:</span>
+                <span class="nb">range</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span><span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="n">lastframe</span><span class="o">+</span><span class="mi">1</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">),</span> 
+                                                <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="n">frame</span> <span class="o">-</span> <span class="n">lastframe</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">))</span>
+                <span class="n">gap</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Gap</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">,</span> <span class="n">source_range</span><span class="o">=</span><span class="nb">range</span><span class="p">)</span>
+                <span class="n">track</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gap</span><span class="p">)</span>
+            <span class="n">lastframe</span> <span class="o">=</span> <span class="n">frame</span>
+            <span class="n">track</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">frameinfo</span><span class="o">.</span><span class="n">_export_otio_clip</span><span class="p">())</span>
+        <span class="n">endframe</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">calc_otio_end_frame</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">endframe</span> <span class="o">&gt;</span> <span class="n">lastframe</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\t</span><span class="s2">Duration:</span><span class="si">{</span><span class="n">endframe</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lastframe</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">range</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">TimeRange</span><span class="p">(</span><span class="n">start_time</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">),</span> 
+                                            <span class="n">duration</span><span class="o">=</span><span class="n">otio</span><span class="o">.</span><span class="n">opentime</span><span class="o">.</span><span class="n">RationalTime</span><span class="p">(</span><span class="n">endframe</span> <span class="o">-</span> <span class="n">lastframe</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">))</span>
+            <span class="n">gap</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Gap</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">,</span> <span class="n">source_range</span><span class="o">=</span><span class="nb">range</span><span class="p">)</span>
+            <span class="n">track</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gap</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="Review">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.Review">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Review</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Top level review, treated as a separate timeline.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">    </span>
+<span class="sd">        title (str): The title of the review</span>
+<span class="sd">        review_start_time (datetime): When did this review start, useful if there is no timestamp in the title.</span>
+<span class="sd">        participants (List[str]): A list of partipants.</span>
+<span class="sd">        location (str): Where did this review happen.</span>
+<span class="sd">        notes (str): Any other overall notes for the review, also in markdown format.</span>
+<span class="sd">        Review_items (List[ReviewItem]): The list of things being reviewed.</span>
+<span class="sd">    </span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">title</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">review_start_time</span><span class="p">:</span> <span class="n">datetime</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">participants</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">location</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">notes</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">review_items</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">ReviewItem</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+
+<div class="viewcode-block" id="Review.otio_track_read">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.Review.otio_track_read">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">otio_track_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">reviewgroup</span><span class="p">,</span> <span class="n">timeline</span><span class="p">,</span> <span class="n">track</span><span class="p">,</span> <span class="n">mediamap</span><span class="p">):</span>
+
+        <span class="c1"># Populate metadata</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;title&quot;</span><span class="p">,</span> <span class="s2">&quot;location&quot;</span><span class="p">,</span> <span class="s2">&quot;description&quot;</span><span class="p">,</span> <span class="s2">&quot;vendor_name&quot;</span><span class="p">,</span> <span class="s2">&quot;participants&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">track</span><span class="o">.</span><span class="n">metadata</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">track</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">])</span>
+        <span class="n">ris</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="n">clipmatch</span> <span class="o">=</span> <span class="p">{}</span>
+
+        <span class="k">for</span> <span class="n">clip</span> <span class="ow">in</span> <span class="n">track</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">clip</span><span class="p">,</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Clip</span><span class="p">):</span>
+                <span class="c1"># Need to find what clip in the main timeline matches this clip.</span>
+                <span class="n">match_clips</span> <span class="o">=</span> <span class="n">find_overlapping_clips</span><span class="p">(</span><span class="n">clip</span><span class="p">,</span> <span class="n">timeline</span><span class="o">.</span><span class="n">tracks</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+                <span class="k">if</span> <span class="n">match_clips</span><span class="p">:</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Found:&quot;</span><span class="p">,</span> <span class="n">match_clips</span><span class="p">)</span>
+                    <span class="n">match_clip</span> <span class="o">=</span> <span class="n">match_clips</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                    <span class="k">if</span> <span class="n">match_clip</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">clipmatch</span><span class="p">:</span>
+                        <span class="c1"># NEED TO FIND Media Entry.</span>
+                        <span class="n">clipmatch</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">ReviewItem</span><span class="p">()</span>
+                        <span class="k">if</span> <span class="n">match_clip</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">mediamap</span><span class="p">:</span>
+                            <span class="n">main_media</span> <span class="o">=</span> <span class="n">mediamap</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">]</span>
+                            <span class="n">clipmatch</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">media</span> <span class="o">=</span> <span class="n">main_media</span>
+                        <span class="k">else</span><span class="p">:</span>
+                            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ERROR: cannot find media clip:</span><span class="si">{</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> Media:</span><span class="si">{</span><span class="n">mediamap</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                            <span class="k">continue</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">review_items</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">clipmatch</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">])</span>
+                    <span class="n">ri</span> <span class="o">=</span> <span class="n">clipmatch</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">]</span>
+                    <span class="n">rf</span> <span class="o">=</span> <span class="n">ReviewItemFrame</span><span class="p">(</span><span class="n">review_item</span> <span class="o">=</span> <span class="n">ri</span><span class="p">,</span> <span class="n">frame</span> <span class="o">=</span> <span class="n">clip</span><span class="o">.</span><span class="n">source_range</span><span class="o">.</span><span class="n">start_time</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+                    <span class="n">rf</span><span class="o">.</span><span class="n">_otio_clip_read</span><span class="p">(</span><span class="n">clip</span><span class="p">)</span>
+                    <span class="n">clipmatch</span><span class="p">[</span><span class="n">match_clip</span><span class="o">.</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">review_frames</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rf</span><span class="p">)</span></div>
+
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_export_otio_track</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">reviewgroup</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        internal function for exporting a single track of a review group.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">track</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Track</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">title</span><span class="p">)</span>
+
+        <span class="c1"># Populate metadata</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;title&quot;</span><span class="p">,</span> <span class="s2">&quot;location&quot;</span><span class="p">,</span> <span class="s2">&quot;notes&quot;</span><span class="p">,</span> <span class="s2">&quot;participants&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">):</span>
+                <span class="n">track</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="n">field</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">review_start_time</span><span class="p">:</span>
+            <span class="c1"># Special case since we are converting it too.</span>
+            <span class="n">track</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s1">&#39;review_start_time&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">review_start_time</span><span class="o">.</span><span class="n">isoformat</span><span class="p">()</span>
+        
+        <span class="c1"># Loop over media exporting it.</span>
+        <span class="k">for</span> <span class="n">media</span> <span class="ow">in</span> <span class="n">reviewgroup</span><span class="o">.</span><span class="n">media</span><span class="p">:</span>
+            <span class="c1"># Lets find the media in the review item list.</span>
+            <span class="k">for</span> <span class="n">ri</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">review_items</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">ri</span><span class="o">.</span><span class="n">media</span> <span class="o">==</span> <span class="n">media</span><span class="p">:</span>
+                    <span class="n">ri</span><span class="o">.</span><span class="n">_export_otio_media</span><span class="p">(</span><span class="n">track</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">track</span></div>
+
+                
+
+<div class="viewcode-block" id="ReviewGroup">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewGroup">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReviewGroup</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    This is a container for a selection of media, and one or more review</span>
+<span class="sd">    This will create a single OTIO file.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">media</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Media</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">reviews</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Review</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_export_otio_media_track</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Internal function for exporting all the media-tracks.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">track</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Track</span><span class="p">(</span><span class="s2">&quot;Media&quot;</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">mediaitem</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">media</span><span class="p">:</span>
+            <span class="n">otioclip</span> <span class="o">=</span> <span class="n">mediaitem</span><span class="o">.</span><span class="n">_create_otio_clip</span><span class="p">()</span>
+            <span class="n">track</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">otioclip</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">track</span>
+
+<div class="viewcode-block" id="ReviewGroup.export_otio_timeline">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewGroup.export_otio_timeline">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">export_otio_timeline</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Create an otio timeline of the whole reviewgroup</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">timeline</span> <span class="o">=</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Timeline</span><span class="p">()</span>
+        <span class="n">master_track</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_export_otio_media_track</span><span class="p">()</span>
+        <span class="n">timeline</span><span class="o">.</span><span class="n">tracks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">master_track</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">review</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">reviews</span><span class="p">:</span>
+            <span class="n">timeline</span><span class="o">.</span><span class="n">tracks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">review</span><span class="o">.</span><span class="n">_export_otio_track</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span>
+
+        <span class="k">return</span> <span class="n">timeline</span></div>
+
+
+<div class="viewcode-block" id="ReviewGroup.read_otio_timeline">
+<a class="viewcode-back" href="../ORIAnnotations.html#ORIAnnotations.ReviewGroup.read_otio_timeline">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">read_otio_timeline</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeline</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Read from an existing timeline, creating a full datastructure from that timeline.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">track</span> <span class="o">=</span> <span class="n">timeline</span><span class="o">.</span><span class="n">tracks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
+        <span class="n">media</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">mediamap</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">clip</span> <span class="ow">in</span> <span class="n">track</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">clip</span><span class="p">,</span> <span class="n">otio</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">Clip</span><span class="p">):</span>
+                <span class="n">m</span> <span class="o">=</span> <span class="n">Media</span><span class="p">()</span>
+                <span class="n">m</span><span class="o">.</span><span class="n">_otio_clip_read</span><span class="p">(</span><span class="n">clip</span><span class="p">)</span>
+                <span class="n">media</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">m</span><span class="o">.</span><span class="n">name</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;WARNING: clip </span><span class="si">{</span><span class="n">clip</span><span class="si">}</span><span class="s2"> doesnt have a name&quot;</span><span class="p">)</span>
+                <span class="n">mediamap</span><span class="p">[</span><span class="n">m</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">clip</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">media</span> <span class="o">=</span> <span class="n">media</span>
+
+        <span class="c1"># Read the review info.</span>
+        <span class="k">for</span> <span class="n">track</span> <span class="ow">in</span> <span class="n">timeline</span><span class="o">.</span><span class="n">tracks</span><span class="p">[</span><span class="mi">1</span><span class="p">:]:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Got Track:&quot;</span><span class="p">,</span> <span class="n">track</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+            <span class="n">review</span> <span class="o">=</span> <span class="n">Review</span><span class="p">(</span><span class="n">title</span><span class="o">=</span><span class="n">track</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+            <span class="n">review</span><span class="o">.</span><span class="n">otio_track_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeline</span><span class="p">,</span> <span class="n">track</span><span class="p">,</span> <span class="n">mediamap</span><span class="p">)</span></div>
+</div>
+
+
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">ORIAnnotations</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../introduction.html">Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ORIAnnotations.html">ORIAnnotations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ori_event_plugin.html">schemadefs.SyncEvent</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../index.html">Documentation overview</a><ul>
+  <li><a href="index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Sam Richards.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>
