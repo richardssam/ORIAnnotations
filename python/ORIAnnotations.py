@@ -8,8 +8,27 @@ SyncEvent = otio.schema.schemadef.module_from_name('SyncEvent')
 from datetime import datetime
 from typing import List
 
+
 @dataclass
 class Media:
+    """
+    The media class is the container for the media being reviewed.
+    It will end up on its own track.
+
+    Attributes:
+        name (str): Name of the media, typically the file basename.
+        media_path (str): Full path to the location of the media.
+        frame_rate (float): The frame rate of the media
+        duration (int): Duration of the media
+        start_frame (int): Start frame.
+        vendor_name (str): The name of the vendor
+        artist_name (str): The artist name
+        vendor_id (str): The unique vendor id
+        client_id (str): The unique client id
+        clip_uuid (str): The UUID of the clip
+        
+
+    """
     name: str = None
     media_path: str = None
     frame_rate: float = None,
@@ -20,13 +39,18 @@ class Media:
     vendor_id: str = None
     client_id: str = None
     clip_uuid: str = None
-    otio_clip: otio.schema.Clip = field(default_factory=otio.schema.Clip)
+    # otio_clip: otio.schema.Clip = field(default_factory=otio.schema.Clip)
 
-    def otio_clip_read(self, clip):
-        #TODO DO MAGIC HERE.
-        pass
+    def _otio_clip_read(self, clip):
+        """
+        Read an OTIO clip and populate the fields from its metadata.
+        """
+        self.name = clip.name
+        for field in ['artist_name', 'vendor_id', 'client_id', 'clip_uuid']:
+            if field in clip.metadata:
+                setattr(self, field, clip.metadata[field])
 
-    def create_otio_clip(self):
+    def _create_otio_clip(self):
         media_ref = otio.schema.ExternalReference(
                     target_url="file://"+self.media_path,
                     available_range=otio.opentime.TimeRange(
@@ -35,14 +59,9 @@ class Media:
                     )
                 )
         metadata = {}
-        if self.artist_name is not None:
-            metadata['artist_name'] = self.artist_name
-        if self.vendor_id is not None:
-            metadata['vendor_id'] = self.vendor_id
-        if self.client_id is not None:
-            metadata['client_id'] = self.client_id
-        if self.clip_uuid is not None:
-            metadata['clip_uuid'] = self.clip_uuid
+        for field in ['artist_name', 'vendor_id', 'client_id', 'clip_uuid']:
+                if getattr(self, field):
+                    newclip.metadata[field] = getattr(self, field)
 
         clip = otio.schema.Clip(
             name=self.name,
@@ -62,7 +81,15 @@ class Media:
 
 
 def find_overlapping_clips(source_clip, target_track):
-    """Find clips on target_track that overlap with source_clip on source_track."""
+    """Find clips on target_track that overlap with source_clip on source_track.
+
+    Args:
+        source_clip (Clip): A OTIO clip that we want to find the associated clips in the target_track
+        target_track (track): The track we are looking for the associated clips in.
+
+    Return:
+        [Clip]: The clip(s) that are in range.
+    """
     
     # Get the time range of the source clip in the timeline's coordinate system
     source_range_in_timeline = source_clip.range_in_parent()
@@ -72,33 +99,36 @@ def find_overlapping_clips(source_clip, target_track):
     overlapping_clips = []
     
     return target_track.children_in_range(source_range_in_timeline)
-    for item in target_track:
-        if isinstance(item, otio.schema.Clip):
-            # Get this clip's range in the timeline
-            item_range_in_timeline = target_track.range_of_child(item)
-            
-            # Check if ranges overlap
-            if source_range_in_timeline.overlaps(item_range_in_timeline):
-                overlap_range = source_range_in_timeline.intersect(item_range_in_timeline)
-                overlapping_clips.append({
-                    'clip': item,
-                    'overlap_range': overlap_range
-                })
-    
-    return overlapping_clips
 
 @dataclass
 class ReviewItemFrame:
     """
     The frame that is being reviewed for a particular piece of media.
+    There will be at least one of:
+    * A note
+    * A annotated image
+    * A set of annotated commands that should create the annotated image.
+
+    Attributes:
+        review_item (ReviewItem): The Review item associated with these frames.
+        frame (int): The frame that is being reviewed.
+        duration (int): The duration of the note, this is typically 1 frame, but it could be more.
+        note (str): The reviewers note, this should be in markdown format.
+        status (str): The status of the review, i.e. is it approved. Note, the task is stored on the media, so whether its a comp, or anim, etc.
+        annotation_renderer (str): If you have chosen to add the annotation commands, we need to know which renderer you were using, in case there are incompabilities between the renderers.
+        annotation_image (str): The path to the annotated image. Ideally this is just the annotations, or even better is a un-premultiplied PNG of the annotated image with an alpha, so you can choose whether you view just the annotation or both.
+        canvas_size ([width, height]): For the annotation_commands what are the units of the brush-strokes.
+        ocio_annotation_color_space (str): OCIO color space using the color-interop naming convention.
+    
     """
     review_item: 'ReviewItem'
     frame: int = None
+    duration: int = 1
     note: str = None
-    task: str = None
     status: str = None
     annotation_renderer: str = None
     annotation_image: str = None
+    ocio_annotation_color_space: str = None
     canvas_size: List[int] = field(default_factory=list)
     annotation_commands: List[SyncEvent.SyncEvent] = field(default_factory=SyncEvent.SyncEvent)
 
@@ -107,7 +137,7 @@ class ReviewItemFrame:
         # TODO.
         return None
     
-    def otio_clip_read(self, clip):
+    def _otio_clip_read(self, clip):
         # Populate metadata
         for field in ['note', 'task', 'status', 'annotation_renderer', 'annotation_commands']:
             if field in clip.metadata:
@@ -116,7 +146,7 @@ class ReviewItemFrame:
         
 
 
-    def export_otio_clip(self):
+    def _export_otio_clip(self):
         """
         Export an OTIO Clip
         """
@@ -124,11 +154,11 @@ class ReviewItemFrame:
             if not os.path.exists(self.annotation_image):
                 print("WARNING: annotation file {self.annotation_image} does not exist.")
             range = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(self.frame, rate=self.review_item.media.frame_rate),
-                                            duration=otio.opentime.RationalTime(1, rate=self.review_item.media.frame_rate))
+                                            duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
             newclip = otio.schema.Clip(name=f"{self.review_item.media.name}.{self.frame}",
                                                source_range=range)
             mediarange = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(0, rate=self.review_item.media.frame_rate),
-                                                  duration=otio.opentime.RationalTime(1, rate=self.review_item.media.frame_rate))
+                                                 duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
             media_ref = otio.schema.ExternalReference(
                         target_url=f"file:/{self.annotation_image}",
                         available_range=mediarange
@@ -136,7 +166,7 @@ class ReviewItemFrame:
             newclip.media_reference = media_ref
             newclip.metadata['annotation_commands'] = self.annotation_commands
             newclip.metadata['annotated_clip_name'] = self.review_item.media.name
-            for field in ['note', 'task', 'status', 'annotation_renderer']:
+            for field in ['note', 'status', 'annotation_renderer']:
                 if getattr(self, field):
                     newclip.metadata[field] = getattr(self, field)
 
@@ -146,13 +176,17 @@ class ReviewItemFrame:
 class ReviewItem:
     """
     This is a single piece of reviewed media, there might be multiple notes and annotations on it.
+
+    Attributes:
+        media (Media): A single piece of media associated with a list of things to be reviewed.
+        review_frames (List[ReviewItemFrame]): A list of ReviewItemFrames that we have notes on.
+    
     """
     media: Media = field(default_factory=Media)
     review_frames: List[ReviewItemFrame] = field(default_factory=list)
 
-    def export_otio_media(self, track):
+    def _export_otio_media(self, track):
         """Export the media to the specified track"""
-        print("Exporting:", self.media.name)
         lastframe = self.media.calc_otio_start_frame()
         for frameinfo in self.review_frames:
             frame = frameinfo.frame
@@ -163,9 +197,8 @@ class ReviewItem:
                 gap = otio.schema.Gap(name='', source_range=range)
                 track.append(gap)
             lastframe = frame
-            track.append(frameinfo.export_otio_clip())
+            track.append(frameinfo._export_otio_clip())
         endframe = self.media.calc_otio_end_frame()
-        print("END FRAME:", endframe)
         if endframe > lastframe + 1:
             print(f"\tDuration:{endframe - lastframe + 1}")
             range = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(0, rate=self.media.frame_rate), 
@@ -178,13 +211,22 @@ class ReviewItem:
 class Review:
     """
     Top level review, treated as a separate timeline.
+
+    Attributes:
+    
+        title (str): The title of the review
+        review_start_time (datetime): When did this review start, useful if there is no timestamp in the title.
+        participants (List[str]): A list of partipants.
+        location (str): Where did this review happen.
+        notes (str): Any other overall notes for the review, also in markdown format.
+        Review_items (List[ReviewItem]): The list of things being reviewed.
+    
     """
     title: str
     review_start_time: datetime = None
     participants: List[str] = field(default_factory=list)
     location: str = None
-    description: str = None
-    vendor_name: str = None
+    notes: str = None
     review_items: List[ReviewItem] = field(default_factory=list)
 
     def otio_track_read(self, reviewgroup, timeline, track, mediamap):
@@ -194,9 +236,9 @@ class Review:
             if field in track.metadata:
                 setattr(self, field, track.metadata[field])
         ris = []
-        
+
         clipmatch = {}
-    
+
         for clip in track:
             if isinstance(clip, otio.schema.Clip):
                 # Need to find what clip in the main timeline matches this clip.
@@ -211,20 +253,23 @@ class Review:
                             main_media = mediamap[match_clip.name]
                             clipmatch[match_clip.name].media = main_media
                         else:
-                            print("ERROR: cannot find media clip:{match_clip.name}")
+                            print(f"ERROR: cannot find media clip:{match_clip.name} Media:{mediamap.keys()}")
                             continue
                         self.review_items.append(clipmatch[match_clip.name])
                     ri = clipmatch[match_clip.name]
                     rf = ReviewItemFrame(review_item = ri, frame = clip.source_range.start_time.value)
-                    rf.otio_clip_read(clip)
+                    rf._otio_clip_read(clip)
                     clipmatch[match_clip.name].review_frames.append(rf)
 
 
-    def export_otio_track(self, reviewgroup):
+    def _export_otio_track(self, reviewgroup):
+        """
+        internal function for exporting a single track of a review group.
+        """
         track = otio.schema.Track(self.title)
 
         # Populate metadata
-        for field in ["title", "location", "description", "vendor_name", "participants"]:
+        for field in ["title", "location", "notes", "participants"]:
             if getattr(self, field):
                 track.metadata[field] = getattr(self, field)
 
@@ -237,7 +282,7 @@ class Review:
             # Lets find the media in the review item list.
             for ri in self.review_items:
                 if ri.media == media:
-                    ri.export_otio_media(track)
+                    ri._export_otio_media(track)
         return track
                 
 
@@ -251,10 +296,13 @@ class ReviewGroup:
     media: List[Media] = None
     reviews: List[Review] = None
 
-    def export_otio_media_track(self):
+    def _export_otio_media_track(self):
+        """
+        Internal function for exporting all the media-tracks.
+        """
         track = otio.schema.Track("Media")
         for mediaitem in self.media:
-            otioclip = mediaitem.create_otio_clip()
+            otioclip = mediaitem._create_otio_clip()
             track.append(otioclip)
         return track
 
@@ -263,10 +311,10 @@ class ReviewGroup:
         Create an otio timeline of the whole reviewgroup
         """
         timeline = otio.schema.Timeline()
-        master_track = self.export_otio_media_track()
+        master_track = self._export_otio_media_track()
         timeline.tracks.append(master_track)
         for review in self.reviews:
-            timeline.tracks.append(review.export_otio_track(self))
+            timeline.tracks.append(review._export_otio_track(self))
 
         return timeline
 
@@ -281,8 +329,10 @@ class ReviewGroup:
         for clip in track:
             if isinstance(clip, otio.schema.Clip):
                 m = Media()
-                m.otio_clip_read(clip)
+                m._otio_clip_read(clip)
                 media.append(m)
+                if m.name is None:
+                    print(f"WARNING: clip {clip} doesnt have a name")
                 mediamap[m.name] = clip
 
         self.media = media

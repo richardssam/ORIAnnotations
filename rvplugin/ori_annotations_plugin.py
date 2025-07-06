@@ -26,7 +26,6 @@ from rv import commands, extra_commands
 from rv import rvtypes
 
 import opentimelineio as otio
-import ORIAnnotations
 from otio_writer import get_source_node, get_movie_first_frame, get_movie_last_frame, get_movie_fps
 
 
@@ -82,6 +81,8 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
     def export_annotations(self, event):
 
         basepath = "/Users/sam/git/Annotations/test_export"
+
+        import ORIAnnotations
 
         otio.schema.schemadef.module_from_name('SyncEvent')
 
@@ -219,10 +220,11 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         timeline = reviewgroup.export_otio_timeline()
 
         otio.adapters.write_to_file(timeline, "/Users/sam/git/Annotations/test_export/test_export2.otio")
+        print("Exported to /Users/sam/git/Annotations/test_export/test_export2.otio")
 
 def createMode():
     support_files_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "..", "Python", "ori_annotations_plugin"
+        os.path.dirname(os.path.realpath(__file__)), "..", "Python", "otio_event_plugin"
     )
     print("Support files Annotation PLUGIN:", support_files_path, os.path.realpath(__file__))
     #print("About to run:", otio_mu)
@@ -234,6 +236,7 @@ def createMode():
     os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = manifest_path + os.path.join(
         support_files_path, "plugin_manifest.json"
     )
+    print("PLUGINS:", os.environ["OTIO_PLUGIN_MANIFEST_PATH"])
     sys.path.append(support_files_path)
 
     return ORIAnnotationsPlugin()

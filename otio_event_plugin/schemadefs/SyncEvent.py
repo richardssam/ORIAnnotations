@@ -5,10 +5,12 @@ import datetime
 
 
 class SyncEvent(otio.core.SerializableObject):
-    """A schema for the event system to define when play is enabled.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
-    value is a boolean indicating whether play is enabled or not.
+    """
+    This is the base-class of all schema events.
+
+    Attributes:
+        timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change. This is used to track when media changes occur in the timeline.
+
     """
 
 
@@ -75,9 +77,10 @@ class AnnotationEffect(otio.schema.Effect):
 @otio.core.register_type
 class Play(SyncEvent):
     """A schema for the event system to define when play is enabled.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
-    value is a boolean indicating whether play is enabled or not.
+
+    Attributes:
+        timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change. This is used to track when media changes occur in the timeline.
+        value (bool): value is a boolean indicating whether play is enabled or not.
     """
 
     _serializable_label = "play.1"
@@ -115,9 +118,11 @@ class Play(SyncEvent):
 @otio.core.register_type
 class SetCurrentFrame(SyncEvent):
     """A schema for the event system to define when the current frame is set.
-    time is a RationalTime representing the current frame in the timeline.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when the current frame changes occur in the timeline.
+
+    Attributes:
+        time (RationalTime): time is a RationalTime representing the current frame in the timeline.
+        timestamp (str): Timestamp is an ISO 8601 formatted string representing the time of the change.
+    
     """
 
     _serializable_label = "set_current_frame.1"
@@ -156,7 +161,8 @@ class SetCurrentFrame(SyncEvent):
 
 @otio.core.register_type
 class NewPresenter(SyncEvent):
-    """A schema for my thing."""
+    """
+    """
 
     _serializable_label = "NewPresenter.1"
     _name = "NewPresenter"
