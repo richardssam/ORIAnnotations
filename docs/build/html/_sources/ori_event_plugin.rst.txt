@@ -15,7 +15,20 @@ See:
    * https://docs.google.com/document/d/1dmo5Le5elqNNl9p4GpcRPT76BV7r6KYtrapHITD25uA/edit?tab=t.0#heading=h.3jckyebptegj
    * https://lf-aswf.atlassian.net/wiki/spaces/PRWG/pages/11274625/OTIO-Based+Synchronized+Review+Messaging#Annotation-Schemas
 
+
+SyncEvents
+==========
+
 .. automodule:: schemadefs.SyncEvent
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+Sync Paint Events
+=================
+
+   .. automodule:: schemadefs.SyncPaintEvent
    :members:
    :undoc-members:
    :show-inheritance:

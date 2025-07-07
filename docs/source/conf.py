@@ -48,3 +48,4 @@ templates_path = ['_templates']
 
 html_theme = 'alabaster'
 html_static_path = ['_static']
+html_baseurl = "https://richardssam.github.io/ORIAnnotations/docs/build/html"
