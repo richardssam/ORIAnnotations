@@ -567,8 +567,8 @@ class PaintStart(SyncEvent):
         if not isinstance(source_index, int):
             raise TypeError("source_index must be an integer")
 
-        if not isinstance(rgba, list) or len(rgba) != 4 or not all(isinstance(x, (int, float)) for x in rgba):
-            raise TypeError("rgba must be an list of numbers")
+        if rgba is not None and (not isinstance(rgba, list) or len(rgba) != 4 or not all(isinstance(x, (int, float)) for x in rgba)):
+            raise TypeError(f"rgba must be an list of numbers got {rgba}")
 
     source_index = otio.core.serializable_field(
         "source_index",
@@ -735,9 +735,9 @@ class PaintPoint(SyncEvent):
         if not isinstance(source_index, int):
             raise TypeError("source_index must be an integer")
 
-        if not isinstance(point, list):
+        if point is not None and not isinstance(point, list):
             print("Point type: ", type(point))
-            raise TypeError("point must be an PaintVertex")
+            raise TypeError(f"point must be an PaintVertex got {point}")
 
     source_index = otio.core.serializable_field(
         "source_index",

@@ -14,10 +14,32 @@ The goal of this format is to facilitate interchange of annotations and notes be
 TODO.
 
 
+Requirements
+------------
+
+The main requirement is on Opentimelineio.
+
+.. code-block:: bash
+
+   pip install opentimelineio
+
+
+However, to build the documentation, you also need:
+
+.. code-block: bash
+
+   pip install -U sphinx sphinx-mermaid
+
 
 Example Usage
-=============
+-------------
 
-```{literalinclude} ../../tests/testannotations.py
-:language: python
-:linenos:
+.. literalinclude:: ../../tests/testannotations.py
+   :language: python
+   :linenos:
+
+You can run this from the command line, once the libraries are installed with:
+
+.. code-block:: bash
+   python test/testannotations.py
+
