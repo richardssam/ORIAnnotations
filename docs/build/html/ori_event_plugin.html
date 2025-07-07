@@ -55,246 +55,25 @@ the activities of a review tool, either for later playback or for parts of the p
 </dl>
 <section id="syncevents">
 <h2>SyncEvents<a class="headerlink" href="#syncevents" title="Link to this heading">¶</a></h2>
-<dl class="py class">
+<p>This is the base-class of all schema events.</p>
+<dl class="py attribute">
 <dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">AnnotationEffect</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#AnnotationEffect"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">Effect</span></code></p>
-<p>A schema for annotations.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">layers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span></em></dt>
-<dd></dd></dl>
-
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
+<dd><p>timestamp is an ISO 8601 formatted string representing the time of the change. This is used to track when media changes occur in the timeline.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
 </dd></dl>
 
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">GetSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#GetSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">app</span></span></dt>
-<dd><p>The app making the request</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">user</span></span></dt>
-<dd><p>The user making the request</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">MediaChange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#MediaChange"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for the event system to denote when media changes.
-mediaReference is an otio.core.MediaReference
-timestamp is an ISO 8601 formatted string representing the time of the change.
-This is used to track when media changes occur in the timeline.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">mediaReference</span></span></dt>
-<dd><p>The reference to the media</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">NewParticipant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#NewParticipant"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">NewPresenter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#NewPresenter"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">presenter_hash</span></span></dt>
-<dd><p>The hash of the presenter</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">PaintEnd</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#PaintEnd"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for the event system to denote when painting ends.
-timestamp is an ISO 8601 formatted string representing the time of the change.
-This is used to track when media changes occur in the timeline.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">point</span></span></dt>
-<dd><p>The vertex of the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">uuid</span></span></dt>
-<dd><p>The unique identifier for the paint event</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">PaintPoint</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#PaintPoint"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for the event system to denote when painting starts.
-timestamp is an ISO 8601 formatted string representing the time of the change.
-This is used to track when media changes occur in the timeline.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">layer_range</span></span></dt>
-<dd><p>The range of the layer for the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">point</span></span></dt>
-<dd><p>The vertex of the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">source_index</span></span></dt>
-<dd><p>The index of the source media for the paint.</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">uuid</span></span></dt>
-<dd><p>The unique identifier for the paint event</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">PaintStart</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#PaintStart"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for the event system to denote when painting starts.
-timestamp is an ISO 8601 formatted string representing the time of the change.
-This is used to track when media changes occur in the timeline.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">brush</span></span></dt>
-<dd><p>The brush type of the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">friendly_name</span></span></dt>
-<dd><p>The friendly artist name for the paint event creator</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">ghost</span></span></dt>
-<dd><p>Is ghosting of the paint strokes enabled</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">ghost_after</span></span></dt>
-<dd><p>Number of frames to ghost after the current frame</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">ghost_before</span></span></dt>
-<dd><p>Number of frames to ghost before the current frame</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">hold</span></span></dt>
-<dd><p>The hold of the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">layer_range</span></span></dt>
-<dd><p>The range of the layer for the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">participant_hash</span></span></dt>
-<dd><p>The unique identifier for the participant</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">rgba</span></span></dt>
-<dd><p>The color of the paint event in RGBA format</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">source_index</span></span></dt>
-<dd><p>The index of the source media for the paint.</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">type</span></span></dt>
-<dd><p>The type of the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">uuid</span></span></dt>
-<dd><p>The unique identifier for the paint event</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">visible</span></span></dt>
-<dd><p>The visible type of the paint event</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">PaintVertex</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#PaintVertex"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SerializableObject</span></code></p>
-<p>A schema for the definition of a point vertex in a paint stroke.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">size</span></span></dt>
-<dd><p>The size of the point vertex</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">x</span></span></dt>
-<dd><p>The x coordinate of the point vertex</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">y</span></span></dt>
-<dd><p>The y coordinate of the point vertex</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">Play</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#Play"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
+</section>
+<section id="play">
+<h2>Play<a class="headerlink" href="#play" title="Link to this heading">¶</a></h2>
 <p>A schema for the event system to define when play is enabled.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.Play.</span></span><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
 <dd><p>timestamp is an ISO 8601 formatted string representing the time of the change. This is used to track when media changes occur in the timeline.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
@@ -305,7 +84,7 @@ This is used to track when media changes occur in the timeline.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">value</span></span></dt>
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.Play.</span></span><span class="sig-name descname"><span class="pre">value</span></span></dt>
 <dd><p>value is a boolean indicating whether play is enabled or not.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
@@ -314,29 +93,13 @@ This is used to track when media changes occur in the timeline.</p>
 </dl>
 </dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">value</span></span></dt>
-<dd><p>The value of the play event</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">RequestSyncPlayback</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#RequestSyncPlayback"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">SetCurrentFrame</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#SetCurrentFrame"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
+</section>
+<section id="setcurrentframe">
+<h2>SetCurrentFrame<a class="headerlink" href="#setcurrentframe" title="Link to this heading">¶</a></h2>
 <p>A schema for the event system to define when the current frame is set.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">time</span></span></dt>
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.SetCurrentFrame.</span></span><span class="sig-name descname"><span class="pre">time</span></span></dt>
 <dd><p>time is a RationalTime representing the current frame in the timeline.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
@@ -347,7 +110,7 @@ This is used to track when media changes occur in the timeline.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.SetCurrentFrame.</span></span><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
 <dd><p>Timestamp is an ISO 8601 formatted string representing the time of the change.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
@@ -356,49 +119,14 @@ This is used to track when media changes occur in the timeline.</p>
 </dl>
 </dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">time</span></span></dt>
-<dd><p>The current time in the timeline</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">SharedKeyRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#SharedKeyRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">key</span></span></dt>
-<dd><p>The shared key</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">SharedKeyResponse</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#SharedKeyResponse"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">key</span></span></dt>
-<dd><p>The shared key</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">SyncEvent</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timestamp</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#SyncEvent"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SerializableObject</span></code></p>
-<p>This is the base-class of all schema events.</p>
+</section>
+<section id="newpresenter">
+<h2>NewPresenter<a class="headerlink" href="#newpresenter" title="Link to this heading">¶</a></h2>
+<p>New Presenter</p>
 <dl class="py attribute">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
-<dd><p>timestamp is an ISO 8601 formatted string representing the time of the change. This is used to track when media changes occur in the timeline.</p>
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.NewPresenter.</span></span><span class="sig-name descname"><span class="pre">presenter_hash</span></span></dt>
+<dd><p>The hash of the presenter.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>str</p>
@@ -406,90 +134,169 @@ This is used to track when media changes occur in the timeline.</p>
 </dl>
 </dd></dl>
 
-<dl class="py property">
+</section>
+<section id="newparticipant">
+<h2>NewParticipant<a class="headerlink" href="#newparticipant" title="Link to this heading">¶</a></h2>
+<p>A new participant for the sync review</p>
+</section>
+<section id="sharedkeyrequest">
+<h2>SharedKeyRequest<a class="headerlink" href="#sharedkeyrequest" title="Link to this heading">¶</a></h2>
+<p>Shared Key Request</p>
+<dl class="py attribute">
 <dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
-<dd><p>The timestamp of the media change, in ISO 8601 format</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.</span></span><span class="sig-name descname"><span class="pre">SyncPlayback</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/schemadefs/SyncEvent.html#SyncPlayback"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">SyncEvent</span></code></p>
-<p>A schema for my thing.</p>
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">current_time</span></span></dt>
-<dd><p>The current time in the playback</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">looping</span></span></dt>
-<dd><p>Whether the playback is looping</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">muted</span></span></dt>
-<dd><p>Whether the playback is muted</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">output_bounds</span></span></dt>
-<dd><p>The output bounds of the playback</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">playback_range</span></span></dt>
-<dd><p>The range of playback</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">playing</span></span></dt>
-<dd><p>Whether the playback is currently playing</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">scrubbing</span></span></dt>
-<dd><p>Whether the playback is currently scrubbing</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">source</span></span></dt>
-<dd><p>The source of the playback</p>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">source_index</span></span></dt>
-<dd><p>The index of the source in the playback, used for multi-source playback</p>
-</dd></dl>
-
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.SharedKeyRequest.</span></span><span class="sig-name descname"><span class="pre">key</span></span></dt>
+<dd><p>The shared key</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
 <section id="sync-paint-events">
 <h2>Sync Paint Events<a class="headerlink" href="#sync-paint-events" title="Link to this heading">¶</a></h2>
-<blockquote>
-<div><dl class="field-list simple">
-<dt class="field-odd">members<span class="colon">:</span></dt>
-<dd class="field-odd"><p></p></dd>
-<dt class="field-even">undoc-members<span class="colon">:</span></dt>
-<dd class="field-even"><p></p></dd>
-<dt class="field-odd">show-inheritance<span class="colon">:</span></dt>
-<dd class="field-odd"><p></p></dd>
-<dt class="field-even">no-index<span class="colon">:</span></dt>
-<dd class="field-even"><p></p></dd>
+</section>
+<section id="paintstart">
+<h2>PaintStart<a class="headerlink" href="#paintstart" title="Link to this heading">¶</a></h2>
+<p>A schema for the event system to denote when painting starts.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">source_index</span></span></dt>
+<dd><p>A reference to the media source.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>int</p>
+</dd>
 </dl>
-</div></blockquote>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">uuid</span></span></dt>
+<dd><p>A Unique ID for the brush-stroke, used for subsequence brushes.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>int</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">friendly_name</span></span></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">rgba</span></span></dt>
+<dd><p>The color + alpha to be painted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>[r,g,b,a]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">type</span></span></dt>
+<dd><p>The type of paint stroke.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">brush</span></span></dt>
+<dd><p>The type of brush, currently one of circle, gaussian.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">visible</span></span></dt>
+<dd><p>Is the stroke visible.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>bool</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintStart.</span></span><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
+<dd><p>timestamp is an ISO 8601 formatted string representing the time of the change.
+TODO.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="paintpoint">
+<h2>PaintPoint<a class="headerlink" href="#paintpoint" title="Link to this heading">¶</a></h2>
+<p>A schema for the event system to denote when adding onto a paint stroke.</p>
+<dl class="simple">
+<dt>Attribute:</dt><dd><p>source_index:
+uuid (str): The UUID of the initial brush stroke.
+layer_range:
+point: [List[PaintVertex]]: List of paint vertices.
+timestamp (str):    timestamp is an ISO 8601 formatted string representing the time of the change.</p>
+</dd>
+</dl>
+</section>
+<section id="paintend">
+<h2>PaintEnd<a class="headerlink" href="#paintend" title="Link to this heading">¶</a></h2>
+<p>A schema for the event system to denote when painting ends.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintEnd.</span></span><span class="sig-name descname"><span class="pre">uuid</span></span></dt>
+<dd><p>uuid of curve to finish.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintEnd.</span></span><span class="sig-name descname"><span class="pre">point</span></span></dt>
+<dd><p>Last point in curve (if any)</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>VertexPoint</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">schemadefs.SyncEvent.PaintEnd.</span></span><span class="sig-name descname"><span class="pre">timestamp</span></span></dt>
+<dd><p>timestamp is an ISO 8601 formatted string representing the time of the change.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 </section>
 
@@ -521,10 +328,19 @@ This is used to track when media changes occur in the timeline.</p>
 <script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="introduction.html">Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="introduction.html#example-usage">Example Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ORIAnnotations.html">ORIAnnotations</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">SyncEvent</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#syncevents">SyncEvents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#play">Play</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#setcurrentframe">SetCurrentFrame</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#newpresenter">NewPresenter</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#newparticipant">NewParticipant</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sharedkeyrequest">SharedKeyRequest</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#sync-paint-events">Sync Paint Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#paintstart">PaintStart</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#paintpoint">PaintPoint</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#paintend">PaintEnd</a></li>
 </ul>
 </li>
 </ul>

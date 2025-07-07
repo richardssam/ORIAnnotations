@@ -19,7 +19,50 @@ See:
 SyncEvents
 ==========
 
-.. automodule:: schemadefs.SyncEvent
+.. automodule:: schemadefs.SyncEvent.SyncEvent
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+
+Play
+==========
+.. automodule:: schemadefs.SyncEvent.Play
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+
+SetCurrentFrame
+===============
+.. automodule:: schemadefs.SyncEvent.SetCurrentFrame
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+NewPresenter
+============
+.. automodule:: schemadefs.SyncEvent.NewPresenter
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+NewParticipant
+==============
+.. automodule:: schemadefs.SyncEvent.NewParticipant
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+SharedKeyRequest
+================
+
+.. automodule:: schemadefs.SyncEvent.SharedKeyRequest
    :members:
    :undoc-members:
    :show-inheritance:
@@ -28,7 +71,28 @@ SyncEvents
 Sync Paint Events
 =================
 
-   .. automodule:: schemadefs.SyncPaintEvent
+PaintStart
+============
+
+.. automodule:: schemadefs.SyncEvent.PaintStart
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+
+PaintPoint
+============
+.. automodule:: schemadefs.SyncEvent.PaintPoint
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :no-index:
+
+PaintEnd
+=========
+
+.. automodule:: schemadefs.SyncEvent.PaintEnd
    :members:
    :undoc-members:
    :show-inheritance:

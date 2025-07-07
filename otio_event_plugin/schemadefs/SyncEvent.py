@@ -162,6 +162,10 @@ class SetCurrentFrame(SyncEvent):
 @otio.core.register_type
 class NewPresenter(SyncEvent):
     """
+    New Presenter 
+
+    Attributes:
+       presenter_hash (str): The hash of the presenter.
     """
 
     _serializable_label = "NewPresenter.1"
@@ -194,10 +198,12 @@ class NewPresenter(SyncEvent):
 
 @otio.core.register_type
 class NewParticipant(SyncEvent):
-    """A schema for my thing."""
+    """A new participant for the sync review
 
-    _serializable_label = "NewPresenter.1"
-    _name = "NewPresenter"
+    """
+
+    _serializable_label = "NewParticipant.1"
+    _name = "NewParticipant"
 
     def __init__(
             self,
@@ -217,7 +223,11 @@ class NewParticipant(SyncEvent):
 
 @otio.core.register_type
 class SharedKeyRequest(SyncEvent):
-    """A schema for my thing."""
+    """Shared Key Request
+    
+    Attributes:
+       key (str): The shared key
+    """
 
     _serializable_label = "SharedKeyRequest.1"
     _name = "SharedKeyRequest"
@@ -250,7 +260,11 @@ class SharedKeyRequest(SyncEvent):
 
 @otio.core.register_type
 class SharedKeyResponse(SyncEvent):
-    """A schema for my thing."""
+    """SharedKeyResponse
+
+    Attributes:
+       key (str): The shared key
+    """
 
     _serializable_label = "SharedKeyResponse.1"
     _name = "SharedKeyResponse"
@@ -282,7 +296,13 @@ class SharedKeyResponse(SyncEvent):
 
 @otio.core.register_type
 class GetSession(SyncEvent):
-    """A schema for my thing."""
+    """
+    Get a sync Session
+
+    Attributes:
+       user (str): The user making the request
+       app (str): The app making the request
+    """
 
     _serializable_label = "GetSession.1"
     _name = "GetSession"
@@ -320,7 +340,10 @@ class GetSession(SyncEvent):
 
 @otio.core.register_type
 class RequestSyncPlayback(SyncEvent):
-    """A schema for my thing."""
+    """RequestSyncPlayback
+    
+    
+    """
 
     _serializable_label = "RequestSyncPlayback.1"
     _name = "RequestSyncPlayback"
@@ -345,7 +368,21 @@ class RequestSyncPlayback(SyncEvent):
 
 @otio.core.register_type
 class SyncPlayback(SyncEvent):
-    """A schema for my thing."""
+    """SyncPlayback
+    
+    Attributes:
+       looping (bool): Whether the playback is looping.
+       playing (bool): Is the media playing.
+       muted (bool): Is the playback muted.
+       scrubbing (bool): Is the playback currently scrubbing.
+       current_time (RationalTime): What is the current position on the timeline.
+       output_bounds (box2d): The output bounds of the playback.
+       source (str): The source of the playback.
+       source_index (int): The source index.
+       playback_range (TimeRange): What is the playback range.
+
+
+    """
 
     _serializable_label = "SyncPlayback.1"
     _name = "SyncPlayback"
@@ -435,9 +472,10 @@ class SyncPlayback(SyncEvent):
 @otio.core.register_type
 class MediaChange(SyncEvent):
     """A schema for the event system to denote when media changes.
-    mediaReference is an otio.core.MediaReference
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
+
+    Attributes:
+        mediaReference (MediaReference): mediaReference is an otio.core.MediaReference
+        timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change.
     """
 
     _serializable_label = "MediaChange.1"
@@ -474,9 +512,18 @@ class MediaChange(SyncEvent):
 @otio.core.register_type
 class PaintStart(SyncEvent):
     """A schema for the event system to denote when painting starts.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
-    """
+
+    Attributes:
+       source_index (int): A reference to the media source.
+       uuid (int): A Unique ID for the brush-stroke, used for subsequence brushes.
+       friendly_name (str):
+       rgba ([r,g,b,a]): The color + alpha to be painted.
+       type (str): The type of paint stroke.
+       brush (str): The type of brush, currently one of circle, gaussian.
+       visible (bool): Is the stroke visible.
+       timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change.
+        TODO.
+        """
 
     _serializable_label = "PaintStart.1"
     _name = "PaintStart"
@@ -600,7 +647,13 @@ class PaintStart(SyncEvent):
 
 @otio.core.register_type
 class PaintVertex(otio.core.SerializableObject):
-    """A schema for the definition of a point vertex in a paint stroke."""
+    """A schema for the definition of a point vertex in a paint stroke.
+    
+    Attributes:
+       x (float): X position
+       y (float): Y position
+       size (float): Size of paint vertex.
+    """
 
     _serializable_label = "PaintVertex.1"
     _name = "PaintVertex"
@@ -652,9 +705,14 @@ class PaintVertex(otio.core.SerializableObject):
 
 @otio.core.register_type
 class PaintPoint(SyncEvent):
-    """A schema for the event system to denote when painting starts.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
+    """A schema for the event system to denote when adding onto a paint stroke.
+
+    Attribute:
+       source_index:
+       uuid (str): The UUID of the initial brush stroke.
+       layer_range:
+       point: [List[PaintVertex]]: List of paint vertices.
+       timestamp (str):    timestamp is an ISO 8601 formatted string representing the time of the change.
     """
 
     _serializable_label = "PaintPoint.1"
@@ -716,8 +774,11 @@ class PaintPoint(SyncEvent):
 @otio.core.register_type
 class PaintEnd(SyncEvent):
     """A schema for the event system to denote when painting ends.
-    timestamp is an ISO 8601 formatted string representing the time of the change.
-    This is used to track when media changes occur in the timeline.
+
+    Attributes:
+       uuid (str): uuid of curve to finish.
+       point (VertexPoint): Last point in curve (if any)
+       timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change.
     """
 
     _serializable_label = "PaintEnd.1"
