@@ -37,3 +37,9 @@ Example Usage
 .. literalinclude:: ../../tests/testannotations.py
    :language: python
    :linenos:
+
+You can run this from the command line, once the libraries are installed with:
+
+.. code-block:: bash
+   python test/testannotations.py
+
