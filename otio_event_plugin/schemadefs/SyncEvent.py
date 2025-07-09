@@ -837,7 +837,7 @@ class TextAnnotation(SyncEvent):
             self,
             uuid=None,
             rgba=None,
-            user=None,
+            friendly_name=None,
             text=None,
             spacing=None,
             font_size=None,
@@ -850,7 +850,7 @@ class TextAnnotation(SyncEvent):
         SyncEvent.__init__(self, timestamp)
         self.uuid = uuid
         self.position = position
-        self.user = user
+        self.friendly_name = friendly_name
         self.rgba = rgba
         self.text = text
         self.spacing = spacing
@@ -868,9 +868,9 @@ class TextAnnotation(SyncEvent):
         "uuid",
         doc="The unique identifier for the paint event"
     )
-    user = otio.core.serializable_field(
-        "user",
-        doc="The user who created the annotation"
+    friendly_name = otio.core.serializable_field(
+        "friendly_name",
+        doc="The human usable name of the user who created the annotation"
     )
 
     position = otio.core.serializable_field(

@@ -156,7 +156,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                         #print("Base prop:", baseprop)
                         stroke = {'paint_node': paint_node}
                         if order.startswith("pen:"):
-                            stroke['type'] = 'pen'
+                            stroke['stroketype'] = 'pen'
                             stroke['width'] = commands.getFloatProperty(f"{baseprop}.width")
                             stroke['color'] = commands.getFloatProperty(f"{baseprop}.color")
                             stroke['points'] = commands.getFloatProperty(f"{baseprop}.points")
@@ -167,12 +167,18 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             penuuid = str(uuid.uuid4())
                             event = otio.schemadef.SyncEvent.PaintStart(brush=stroke['brush'],
                                                                         rgba=stroke['color'],
-                                                                        friendly_name=baseprop,
+                                                                        friendly_name=baseprop.split(':')[-1],
                                                                         uuid=penuuid
                                                                         )
+                            if  commands.propertyExists(f"{baseprop}.mode") and commands.getIntProperty(f"{baseprop}.mode")[0] == 1:
+                                event.type = 'erase'
+                                stroke['stroketype'] = 'erase'
                             otioevents.append(event)
                             points = stroke['points']
                             outpointlist = []
+                            if len(stroke['width']) == 1:
+                                # If we have a single width, we assume it's the same for all points.
+                                stroke['width'] = [stroke['width'][0]] * (len(points) // 2)
                             for width in stroke['width']:
                                 x = points.pop(0)
                                 y = points.pop(0)
@@ -186,7 +192,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             otioevents.append(event)
 
                         if order.startswith("text:"):
-                            stroke['type'] = 'text'
+                            stroke['stroketype'] = 'text'
                             stroke['user'] = order.split(":")[-1]
                             stroke['position'] = commands.getFloatProperty(f"{baseprop}.position")
                             stroke['color'] = commands.getFloatProperty(f"{baseprop}.color")
@@ -202,7 +208,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                                                                         rgba=stroke['color'],
                                                                         position=stroke['position'],
                                                                         spacing=stroke['spacing'],
-                                                                        user=stroke['user'],
+                                                                        friendly_name=stroke['user'],
                                                                         font_size=stroke['font_size'],
                                                                         font=stroke['font'],
                                                                         text=stroke['text'],
@@ -313,7 +319,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
                     for event in frame.annotation_commands:
                         if isinstance(event, otio.schemadef.SyncEvent.PaintStart):
-                            stroke = {'type': 'pen',
+                            stroke = {'type': event.type,
                                       'color': event.rgba,
                                       'brush': event.brush,
                                       'user': event.friendly_name.split(":")[-1],
@@ -340,7 +346,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             strokes.append(stroke)
                             stroke['type'] = 'text'
                             stroke['color'] = event.rgba
-                            stroke['user'] = event.user
+                            stroke['user'] = event.friendly_name
                             stroke['position'] = event.position
                             stroke['spacing'] = event.spacing
                             stroke['font_size'] = event.font_size
@@ -448,13 +454,13 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
                         commands.setIntProperty(f"{pen_node}.splat", [0], True)
 
+                        if stroke['type'] == 'erase':
+                            if not commands.propertyExists(f"{pen_node}.mode"):
+                                commands.newProperty(f"{pen_node}.mode", commands.IntType, 1)
 
-                        #if not commands.propertyExists(f"{pen_node}.mode"):
-                        #    commands.newProperty(f"{pen_node}.mode", commands.IntType, 1)
-
-                        #commands.setIntProperty(
-                        #    f"{pen_node}.mode", [0 if stroke.get('type', 'color') == "color" else 1], True
-                        #)
+                            commands.setIntProperty(
+                                f"{pen_node}.mode", [1], True
+                            )
 
 
                         if not commands.propertyExists(f"{pen_node}.width"):
