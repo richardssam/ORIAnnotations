@@ -39,12 +39,21 @@ class Media:
     vendor_id: str = None
     client_id: str = None
     clip_uuid: str = None
-    # otio_clip: otio.schema.Clip = field(default_factory=otio.schema.Clip)
+    otio_clip: otio.schema.Clip = None
 
     def _otio_clip_read(self, clip):
         """
         Read an OTIO clip and populate the fields from its metadata.
         """
+        from otio_reader import _get_media_path
+        self.otio_clip = clip
+
+        if isinstance(clip.media_reference, otio.schema.ExternalReference):
+            self.media_path = _get_media_path(str(clip.media_reference.target_url), {}).replace("file://", "")
+            self.frame_rate = clip.source_range.start_time.rate
+            self.start_frame = clip.source_range.start_time.value
+            self.duration = clip.source_range.duration.value
+
         self.name = clip.name
         for field in ['artist_name', 'vendor_id', 'client_id', 'clip_uuid']:
             if field in clip.metadata:
@@ -61,7 +70,7 @@ class Media:
         metadata = {}
         for field in ['artist_name', 'vendor_id', 'client_id', 'clip_uuid']:
                 if getattr(self, field):
-                    newclip.metadata[field] = getattr(self, field)
+                    metadata[field] = getattr(self, field)
 
         clip = otio.schema.Clip(
             name=self.name,
@@ -333,13 +342,17 @@ class ReviewGroup:
                 media.append(m)
                 if m.name is None:
                     print(f"WARNING: clip {clip} doesnt have a name")
-                mediamap[m.name] = clip
+                mediamap[m.name] = m
 
         self.media = media
 
         # Read the review info.
+        reviews = []
+        self.reviews = reviews
         for track in timeline.tracks[1:]:
             print("Got Track:", track.name)
             review = Review(title=track.name)
             review.otio_track_read(self, timeline, track, mediamap)
+            reviews.append(review)
+        print(f"Got {len(reviews)} reviews from timeline.")
 

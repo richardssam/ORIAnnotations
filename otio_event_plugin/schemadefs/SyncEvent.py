@@ -633,13 +633,13 @@ class PaintStart(SyncEvent):
 
     def __str__(self):
         
-        return "MediaChange({})".format(
-            repr(self.mediaReference)
+        return "PaintStart(type={})".format(
+            repr(self.type)
         )
 
     def __repr__(self):
-        return "otio.schemadef.SyncEvent.MediaChange(mediaReference={})".format(
-            repr(self.mediaReference)
+        return "otio.schemadef.SyncEvent.PaintStart(type={})".format(
+            repr(self.type)
         )
     
 
@@ -699,8 +699,8 @@ class PaintVertex(otio.core.SerializableObject):
         )
 
     def __repr__(self):
-        return "otio.schemadef.SyncEvent.PaintVertex(mediaReference={})".format(
-            repr(self.mediaReference)
+        return "otio.schemadef.SyncEvent.PaintVertex(x={},y={},size={})".format(
+            repr(self.x), repr(self.y), repr(self.size)
         )
 
 @otio.core.register_type
@@ -817,4 +817,116 @@ class PaintEnd(SyncEvent):
     def __repr__(self):
         return "otio.schemadef.SyncEvent.PaintEnd(point={})".format(
             repr(self.point)
+        )
+    
+
+@otio.core.register_type
+class TextAnnotation(SyncEvent):
+    """A schema for the event system to denote entering text.
+
+    Attributes:
+       uuid (str): uuid of curve to finish.
+       point (VertexPoint): Last point in curve (if any)
+       timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change.
+    """
+
+    _serializable_label = "TextAnnotation.1"
+    _name = "TextAnnotation"
+
+    def __init__(
+            self,
+            uuid=None,
+            rgba=None,
+            user=None,
+            text=None,
+            spacing=None,
+            font_size=None,
+            scale=None,
+            rotation=None,
+            font=None,
+            position=None,
+            timestamp=None
+        ):
+        SyncEvent.__init__(self, timestamp)
+        self.uuid = uuid
+        self.position = position
+        self.user = user
+        self.rgba = rgba
+        self.text = text
+        self.spacing = spacing
+        self.font_size = font_size
+        self.scale = scale
+        self.rotation = rotation
+        self.font = font
+        self.timestamp = timestamp
+
+
+        if position is not None and not isinstance(position, list):
+            raise TypeError("position must be a list of Floats")
+
+    uuid = otio.core.serializable_field(
+        "uuid",
+        doc="The unique identifier for the paint event"
+    )
+    user = otio.core.serializable_field(
+        "user",
+        doc="The user who created the annotation"
+    )
+
+    position = otio.core.serializable_field(
+        "position",
+        required_type=list,
+        doc="The position of the text annotation in the format [x, y]"
+    )
+
+    rgba = otio.core.serializable_field(
+        "rgba",
+        required_type=list,
+        doc="The color of the text annotation in RGBA format"
+    )
+
+    text = otio.core.serializable_field(
+        "text",
+        required_type=str,
+        doc="The text of the annotation"
+    )
+
+    spacing = otio.core.serializable_field(
+        "spacing",
+        required_type=float,
+        doc="The spacing between lines of text"
+    )
+
+    font_size = otio.core.serializable_field(
+        "font_size",
+        required_type=float,
+        doc="The size of the font for the text annotation"
+    )
+
+    scale = otio.core.serializable_field(
+        "scale",
+        required_type=float,
+        doc="The scale of the text annotation"
+    )
+
+    rotation = otio.core.serializable_field(
+        "rotation", 
+        required_type=float,
+        doc="The rotation of the text annotation in degrees"
+    )
+
+    font = otio.core.serializable_field(
+        "font",
+        required_type=str,
+        doc="The font family of the text annotation"
+    )
+
+    def __str__(self):
+        return "TextAnnotation({})".format(
+            repr(self.position)+ ", " +repr(self.text)
+        )
+
+    def __repr__(self):
+        return "otio.schemadef.SyncEvent.TextAnnotation(position={}, text={})".format(
+            repr(self.position), repr(self.text)
         )
