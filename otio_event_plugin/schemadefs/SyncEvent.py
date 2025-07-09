@@ -518,7 +518,7 @@ class PaintStart(SyncEvent):
        uuid (int): A Unique ID for the brush-stroke, used for subsequence brushes.
        friendly_name (str):
        rgba ([r,g,b,a]): The color + alpha to be painted.
-       type (str): The type of paint stroke.
+       type (str): "color" for a regular color brush stroke, "erase" for an eraser stroke.
        brush (str): The type of brush, currently one of circle, gaussian.
        visible (bool): Is the stroke visible.
        timestamp (str): timestamp is an ISO 8601 formatted string representing the time of the change.
