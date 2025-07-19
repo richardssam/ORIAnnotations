@@ -61,7 +61,7 @@ class Media:
 
     def _create_otio_clip(self):
         media_ref = otio.schema.ExternalReference(
-                    target_url="file://"+self.media_path,
+                    target_url=self.media_path,
                     available_range=otio.opentime.TimeRange(
                         start_time=otio.opentime.RationalTime(self.calc_otio_start_frame(), float(self.frame_rate)),
                         duration=otio.opentime.RationalTime(self.duration, float(self.frame_rate))
@@ -159,27 +159,28 @@ class ReviewItemFrame:
         """
         Export an OTIO Clip
         """
+        range = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(self.frame, rate=self.review_item.media.frame_rate),
+                                        duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
+        newclip = otio.schema.Clip(name=f"{self.review_item.media.name}.{self.frame}",
+                                            source_range=range)
+        mediarange = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(0, rate=self.review_item.media.frame_rate),
+                                                duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
+
         if self.annotation_image is not None:
             if not os.path.exists(self.annotation_image):
                 print("WARNING: annotation file {self.annotation_image} does not exist.")
-            range = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(self.frame, rate=self.review_item.media.frame_rate),
-                                            duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
-            newclip = otio.schema.Clip(name=f"{self.review_item.media.name}.{self.frame}",
-                                               source_range=range)
-            mediarange = otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(0, rate=self.review_item.media.frame_rate),
-                                                 duration=otio.opentime.RationalTime(self.duration, rate=self.review_item.media.frame_rate))
             media_ref = otio.schema.ExternalReference(
                         target_url=f"file:/{self.annotation_image}",
                         available_range=mediarange
                     )
             newclip.media_reference = media_ref
-            newclip.metadata['annotation_commands'] = self.annotation_commands
-            newclip.metadata['annotated_clip_name'] = self.review_item.media.name
-            for field in ['note', 'status', 'annotation_renderer']:
-                if getattr(self, field):
-                    newclip.metadata[field] = getattr(self, field)
+        newclip.metadata['annotation_commands'] = self.annotation_commands
+        newclip.metadata['annotated_clip_name'] = self.review_item.media.name
+        for field in ['note', 'status', 'annotation_renderer']:
+            if getattr(self, field):
+                newclip.metadata[field] = getattr(self, field)
 
-            return newclip
+        return newclip
 
 @dataclass
 class ReviewItem:

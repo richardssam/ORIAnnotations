@@ -6,6 +6,8 @@ import datetime
 import tempfile
 import subprocess
 import uuid
+from pathlib import Path
+import shutil
 try:
     from PySide2 import QtGui, QtCore, QtWidgets
     from PySide2.QtGui import *
@@ -81,36 +83,85 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
     def export_annotations(self, event):
 
+
+        class QAnnotationFileDialog(QFileDialog):
+            """
+            Custom QFileDialog to handle the export of annotations.
+            """
+            def __init__(self, parent=None):
+                super(QAnnotationFileDialog, self).__init__(parent)
+                # Force the use of the non-native dialog
+                self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+                # Create custom widgets
+                self.extra_widget = QWidget()
+                layout = QVBoxLayout()
+                self.includeMedia = QCheckBox("Include media in export")
+                self.includeMedia.setChecked(True)  # Default to checked
+                self.exportAnnotationMedia = QCheckBox("Include Annotation Media")
+                self.exportAnnotationMedia.setChecked(True)  # Default to checked
+                self.otioName = QLineEdit("OTIO Export Name")
+                self.otioName.setText("annotationreview.otio")  # Default text
+                #self.combobox = QComboBox()
+                #self.combobox.addItems(["Option A", "Option B", "Option C"])
+
+                layout.addWidget(QLabel("You are exporting annotations, media and the OTIO file to a directory."))
+
+                layout.addWidget(QLabel("Additional Options:"))
+                layout.addWidget(self.includeMedia)
+                layout.addWidget(self.exportAnnotationMedia)
+                layout.addWidget(QLabel("OTIO Export Name:"))
+                layout.addWidget(self.otioName)
+                #layout.addWidget(self.combobox)
+
+                self.extra_widget.setLayout(layout)
+
+                # Get the dialog's layout and insert your custom widget
+                layout = self.layout()
+                layout.addWidget(self.extra_widget)
+                self.setFileMode(QFileDialog.Directory)
+                self.setOption(QFileDialog.ShowDirsOnly, True)
+                self.setWindowTitle("Select Directory to export the annotations to")
+                self.setLabelText(QFileDialog.Accept, "Set Directory")
+
         basepath = "/Users/sam/git/Annotations/test_export"
-        dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.Directory)
+        dialog = QAnnotationFileDialog()
+        #dialog.setFileMode(QFileDialog.Directory)
         dialog.setOption(QFileDialog.ShowDirsOnly, True)
         dialog.setWindowTitle("Select Directory to export the annotations to")
         dialog.setLabelText(QFileDialog.Accept, "Set Directory")
-        if dialog.exec_() == QDialog.Accepted:
-            basepath = dialog.selectedFiles()[0]
-            print("Setting OTIO event log directory to:", basepath)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        export_media = dialog.includeMedia.isChecked()
+        export_annotation_media = dialog.exportAnnotationMedia.isChecked()
+        otio_export_name = dialog.otioName.text()
+        if not otio_export_name.endswith(".otio"):
+            otio_export_name += ".otio"
+        basepath = dialog.selectedFiles()[0]
+        print("Setting OTIO event log directory to:", basepath)
 
         import ORIAnnotations
 
         otio.schema.schemadef.module_from_name('SyncEvent')
 
         frames = extra_commands.findAnnotatedFrames()
-        tf = tempfile.NamedTemporaryFile(suffix=".rv")
-        filename = tf.name
-        commands.saveSession(filename, asACopy=True)
-        print("Saved to:", filename)
-        frametoimages = {frame: f"{basepath}/export.{frame}.png" for frame in frames}
-        cmd = [os.path.join(os.path.dirname(sys.argv[0]), "rvio"),
-               filename,
-               "-t",
-               ",".join([str(f) for f in frames]),
-               "-outsrgb",
-               "-o",
-               f"{basepath}/export.%d.png"
-                ]
-        print("Command to run:", cmd)
-        subprocess.run(cmd)
+        if export_annotation_media:
+            tf = tempfile.NamedTemporaryFile(suffix=".rv")
+            filename = tf.name
+            commands.saveSession(filename, asACopy=True)
+            print("Saved to:", filename)
+            frametoimages = {frame: f"{basepath}/export.{frame}.png" for frame in frames}
+            cmd = [os.path.join(os.path.dirname(sys.argv[0]), "rvio"),
+                filename,
+                "-t",
+                ",".join([str(f) for f in frames]),
+                "-outsrgb",
+                "-o",
+                f"{basepath}/export.%d.png"
+                    ]
+
+            print("Command to run:", cmd)
+            subprocess.run(cmd)
 
         annotations = {}
         # Loop over and build the initial structure.
@@ -130,10 +181,13 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                                             'startframe': get_movie_first_frame(source_group),
                                             'duration': get_movie_last_frame(source_group) - get_movie_first_frame(source_group) +1,
                                            'source_group': source_group}
-                inputframe = frametoimages[globalframe]
-                outputuiname = uiname.replace("@", "")
-                outputframe = f"{basepath}/{outputuiname}.{source_frame:05d}.png"
-                os.rename(inputframe, outputframe)
+                if export_annotation_media:
+                    inputframe = frametoimages[globalframe]
+                    outputuiname = uiname.replace("@", "")
+                    outputframe = f"{basepath}/{outputuiname}.{source_frame:05d}.png"
+                    os.rename(inputframe, outputframe)
+                else:
+                    outputframe = None
                 annotations[uiname]['annotations'][source_frame] = {'paint_node': paint_node, 'strokes': [], 'annotationframe': outputframe, 'note': ""}
 
         # Now we try to extract the brush strokes.
@@ -176,6 +230,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             otioevents.append(event)
                             points = stroke['points']
                             outpointlist = []
+                            print("STROKE LENGTH:", len(points), len(stroke['width']))
                             if len(stroke['width']) == 1:
                                 # If we have a single width, we assume it's the same for all points.
                                 stroke['width'] = [stroke['width'][0]] * (len(points) // 2)
@@ -225,7 +280,21 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         medialist = []
         reviewitems = []
         for uiname, annotationmediainfo in annotations.items():
-            media = ORIAnnotations.Media(media_path=annotationmediainfo['media'], 
+            if export_media:
+                media_path = annotationmediainfo['media']
+                new_media_path = f"{basepath}/{os.path.basename(media_path)}"
+                shutil.copy(media_path, new_media_path)
+                media_path = os.path.basename(new_media_path)
+            else:
+                media_path_p = Path(media_path)
+                if not media_path_p.is_absolute():
+                    # We try to make it a relative path, to make it as portable as possible.
+                    try:
+                        media_path = media_path_p.relative_to(basepath).as_posix()
+                    except ValueError:
+                        media_path = media_path_p.absolute().as_posix()
+            print("Media path for review item:", media_path, "UINAME:", uiname)
+            media = ORIAnnotations.Media(media_path=media_path, 
                                  name=uiname, 
                                  frame_rate=annotationmediainfo['frame_rate'], 
                                  start_frame=annotationmediainfo['startframe'],
@@ -248,8 +317,8 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         reviewgroup = ORIAnnotations.ReviewGroup(media=medialist, reviews=[review])
         timeline = reviewgroup.export_otio_timeline()
 
-        otio.adapters.write_to_file(timeline, f"{basepath}/annotationreview.otio")
-        print("Exported to:", f"{basepath}/annotationreview.otio")
+        otio.adapters.write_to_file(timeline, f"{basepath}/{otio_export_name}")
+        print("Exported to:", f"{basepath}/{otio_export_name}")
 
     def import_annotations(self, event):
         import opentimelineio as otio
@@ -279,14 +348,13 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         # We want a mapping from the source group to the media file.
         clipmap = {}
         for media in rg.media:
-            clipmap[media.media_path] = {'media': media.media_path,
+            mediapath = media.media_path.replace("file://", "")
+            clipmap[mediapath] = {'media_path': mediapath,
                                          'media': media}
             
-        paintnodes = extra_commands.nodesInGroupOfType(new_seq, 'RVPaint')
-
-
-        paintnodes = extra_commands.nodesInGroupOfType(new_seq, 'RVPaint')
         sourcenodes = commands.nodesOfType("RVFileSource")
+        # For the source nodes we have just imported (via the create_track), we wnat to find the actual 
+        # media loaded, and the associated paint nodes that we are applying the annotations to.
         for sourcenode in sourcenodes:
             print("Source node:", sourcenode)
             sourcegroup = commands.nodeGroup(sourcenode)
@@ -294,12 +362,14 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                 media = commands.getStringProperty(f"{sourcenode}.media.movie")[0]
                 if media is None or len(media) == 0:
                     continue
-                media = media.replace("file://", "")
-                print("Media for source node:", media)
+                mediaid = os.path.basename(media)
+                print("Media for source node:", media, mediaid)
                 paintnodes = extra_commands.nodesInGroupOfType(sourcegroup, 'RVPaint')
-                clipmap[media] = {'media': media, 'source_group': sourcegroup, 'paint_node': paintnodes[0] if paintnodes else None}
+                print("Paint nodes for source group:", sourcegroup, paintnodes)
+                clipmap[mediaid] = {'media_path': media, 'source_group': sourcegroup, 'paint_node': paintnodes[0] if paintnodes else None}
             else:
                 print("Source group already in clipmap:", sourcegroup)
+        print("Clipmap:", clipmap)
 
         for review in rg.reviews:
             for ri in review.review_items:
@@ -355,7 +425,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             stroke['scale'] = event.scale
                             stroke['rotation'] = event.rotation
 
-                    print("Annotations for frame:", frame.frame, "Strokes:", len(strokes))
+                    print("Annotations for frame:", frame.frame, "Strokes:", len(strokes), "Clip info:", clipinfo)
                     rv_node = clipinfo['paint_node']
             
                     if not commands.propertyExists(f"{rv_node}.tag.annotate"):
