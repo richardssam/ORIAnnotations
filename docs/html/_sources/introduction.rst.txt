@@ -11,7 +11,7 @@ Overview
 
 The goal of this format is to facilitate interchange of annotations and notes between different review systems or provide a very simple offline review format for a simple review system.
 
-TODO.
+The ORIAnnotations module provides a set of helper classes to manage media and annotations, primarily using OpenTimelineIO (OTIO) as the interchange format. This allows for easy integration with various production tracking systems without requiring specialized tools.
 
 
 Requirements
@@ -41,5 +41,10 @@ Example Usage
 You can run this from the command line, once the libraries are installed with:
 
 .. code-block:: bash
+
    python test/testannotations.py
+
+See also:
+   * https://lf-aswf.atlassian.net/wiki/spaces/PRWG/pages/11274625/OTIO-Based+Synchronized+Review+Messaging
+
 
