@@ -642,8 +642,66 @@ class PaintStart(SyncEvent):
             repr(self.type)
         )
     
+@otio.core.register_type
+class PaintVertices(otio.core.SerializableObject):
+    """A schema for the definition of a paint stroke.
+    Grouping paint vertices together to form a stroke, and be a little more efficient in storage.
+    Attributes:
+       x [float]: Array of x positions for the stroke.
+       y [float]: Array of y positions for the stroke.
+       size [float]: Array of sizes for the stroke.
+    """
 
+    _serializable_label = "PaintVertices.1"
+    _name = "PaintVertices"
 
+    def __init__(
+            self,
+            x=None,
+            y=None,
+            size=None
+        ):
+        print("List1:", isinstance(x, list), type(x))
+
+        otio.core.SerializableObject.__init__(self)
+        self.x = x if x is not None else []
+        self.y = y if y is not None else []
+        self.size = size if size is not None else []
+
+        if not isinstance(self.x, otio._otio.AnyVector) or not all(isinstance(i, float)  or isinstance(i, int) for i in self.x):
+            print("List:", isinstance(self.x, list), type(self.x))
+            print("contents type:", all(isinstance(i, float) or isinstance(i, int) for i in self.x))
+            for i in self.x:
+                if not isinstance(i, float):
+                    print(f"ERROR - {i} = {type(i)}")
+            raise TypeError(f"x must be a list of floats {self.x}")
+        if not isinstance(self.y, otio._otio.AnyVector) or not all(isinstance(i, float)  or isinstance(i, int) for i in self.y):
+            raise TypeError(f"y must be a list of floats {self.y}")
+        if not isinstance(self.size, otio._otio.AnyVector) or not all(isinstance(i, float) or isinstance(i, int) for i in self.size):
+            raise TypeError(f"size must be a list of floats {self.size}")
+    x = otio.core.serializable_field(
+        "x",
+        required_type=list,
+        doc="The x positions of the paint stroke"
+    )
+    y = otio.core.serializable_field(
+        "y",
+        required_type=list,
+        doc="The y positions of the paint stroke"
+    )
+    size = otio.core.serializable_field(
+        "size",
+        required_type=list,
+        doc="The sizes of the paint stroke"
+    )
+    def __str__(self):
+        return "PaintVertices({})".format(
+            repr(self.x) + ", " + repr(self.y) + ", " + repr(self.size)
+        )
+    def __repr__(self):
+        return "otio.schemadef.SyncEvent.PaintVertices(x={}, y={}, size={})".format(
+            repr(self.x), repr(self.y), repr(self.size)
+        )
 
 @otio.core.register_type
 class PaintVertex(otio.core.SerializableObject):
@@ -704,14 +762,14 @@ class PaintVertex(otio.core.SerializableObject):
         )
 
 @otio.core.register_type
-class PaintPoint(SyncEvent):
+class PaintPoints(SyncEvent):
     """A schema for the event system to denote when adding onto a paint stroke.
 
     Attribute:
        source_index:
        uuid (str): The UUID of the initial brush stroke.
        layer_range:
-       point: [List[PaintVertex]]: List of paint vertices.
+       points : [PaintVertices]: List of paint vertices.
        timestamp (str):    timestamp is an ISO 8601 formatted string representing the time of the change.
     """
 
@@ -723,21 +781,20 @@ class PaintPoint(SyncEvent):
             source_index=0,
             uuid=None,
             layer_range=None,
-            point=None,
+            points=None,
             timestamp=None 
         ):
         SyncEvent.__init__(self, timestamp)
         self.source_index = source_index
         self.uuid = uuid
         self.layer_range = layer_range
-        self.point = point
+        self.points = points
 
         if not isinstance(source_index, int):
             raise TypeError("source_index must be an integer")
 
-        if point is not None and not isinstance(point, list):
-            print("Point type: ", type(point))
-            raise TypeError(f"point must be an PaintVertex got {point}")
+        if points is not None and not isinstance(points, PaintVertices):
+            raise TypeError(f"point must be an PaintVertices got {points}")
 
     source_index = otio.core.serializable_field(
         "source_index",
@@ -753,21 +810,21 @@ class PaintPoint(SyncEvent):
         required_type=otio.opentime.TimeRange,
         doc="The range of the layer for the paint event"
     )
-    point = otio.core.serializable_field(
-        "point",
-        required_type=list,
-        doc="The vertex of the paint event"
+    points = otio.core.serializable_field(
+        "points",
+        required_type=PaintVertices,
+        doc="The vertices of the paint event"
     )
 
     def __str__(self):
         
-        return "PaintPoint({})".format(
-            repr(self.point)
+        return "PaintPoints({})".format(
+            repr(self.points)
         )
 
     def __repr__(self):
-        return "otio.schemadef.SyncEvent.MediaChange(point={})".format(
-            repr(self.point)
+        return "otio.schemadef.SyncEvent.PaintPoints(point={})".format(
+            repr(self.points)
         )
     
 
@@ -787,26 +844,26 @@ class PaintEnd(SyncEvent):
     def __init__(
             self,
             uuid=None,
-            point=None,
+            points=None,
             timestamp=None
         ):
         SyncEvent.__init__(self, timestamp)
         self.uuid = uuid
-        self.point = point
+        self.points = points
 
 
-        if point is not None and not isinstance(point, list):
-            raise TypeError("point must be a list of PaintVertex")
+        if points is not None and not isinstance(points, PaintVertices):
+            raise TypeError("point must be a list of otio.schemadef.SyncEvent.PaintVertices")
 
     uuid = otio.core.serializable_field(
         "uuid",
         doc="The unique identifier for the paint event"
     )
 
-    point = otio.core.serializable_field(
-        "point",
-        required_type=PaintVertex,
-        doc="The vertex of the paint event"
+    points = otio.core.serializable_field(
+        "points",
+        required_type=PaintVertices,
+        doc="The vertices of the paint event"
     )
 
     def __str__(self):

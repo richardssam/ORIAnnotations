@@ -199,15 +199,12 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                     if ".frame:" in prop:
                         frame = int(prop.split(".frame:")[1].split(".order")[0])
                         order = commands.getStringProperty(prop)
-                        print("Frame:", frame, " order:", order, uiname, paint_node)
-                        print("existing frames:", annotationframes.keys())
                         annotationframes[frame]['order'] = order
                 for frame in annotationframes:
                     strokes = []
                     otioevents = []
                     for order in annotationframes[frame]['order']:
                         baseprop = f'{paint_node}.{order}'
-                        #print("Base prop:", baseprop)
                         stroke = {'paint_node': paint_node}
                         if order.startswith("pen:"):
                             stroke['stroketype'] = 'pen'
@@ -230,19 +227,19 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             otioevents.append(event)
                             points = stroke['points']
                             outpointlist = []
-                            print("STROKE LENGTH:", len(points), len(stroke['width']))
                             if len(stroke['width']) == 1:
                                 # If we have a single width, we assume it's the same for all points.
-                                stroke['width'] = [stroke['width'][0]] * (len(points) // 2)
-                            for width in stroke['width']:
-                                x = points.pop(0)
-                                y = points.pop(0)
-                                p = otio.schemadef.SyncEvent.PaintVertex(x, y, width)
-                                outpointlist.append(p)
+                                w = [stroke['width'][0]] * (len(points) // 2)
+                            else:
+                                w = [ i for i in stroke['width']]
+                            x = [ i for i in points[::2]] # convert to list
+                            y = [ i for i in points[1::2]]# convert to list
+    
+                            p = otio.schemadef.SyncEvent.PaintVertices(x, y, w)
                             
-                            event = otio.schemadef.SyncEvent.PaintPoint(
+                            event = otio.schemadef.SyncEvent.PaintPoints(
                                 uuid=penuuid,
-                                point=outpointlist
+                                points=p
                             )
                             otioevents.append(event)
 
@@ -397,20 +394,17 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                                       'points': [],}
                             strokemap[event.uuid] = stroke
                             strokes.append(stroke)
-                        if isinstance(event, otio.schemadef.SyncEvent.PaintPoint):
+                        if isinstance(event, otio.schemadef.SyncEvent.PaintPoints):
                             stroke = strokemap[event.uuid]
-                            for point in event.point:
-                                stroke['points'].append(point.x)
-                                stroke['points'].append(point.y)
-                                stroke['width'].append(point.size)
+                            stroke['width'] = [v for v in event.points.size]
+                            stroke['points'] = [val for pair in zip(event.points.x, event.points.y) for val in pair]
+
                         if isinstance(event, otio.schemadef.SyncEvent.PaintEnd):
                             stroke = strokemap[event.uuid]
-                            stroke['points'].append(event.point.x)
-                            stroke['points'].append(event.point.y)
-                            stroke['width'].append(event.point.size)
+                            stroke['width'].extend(event.points.size)
+                            stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
 
                         if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
-                            print(" TextAnnotation Event:", event)
                             strokemap[event.uuid] = {'type': 'text'}
                             stroke = strokemap[event.uuid]
                             strokes.append(stroke)
@@ -425,7 +419,6 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             stroke['scale'] = event.scale
                             stroke['rotation'] = event.rotation
 
-                    print("Annotations for frame:", frame.frame, "Strokes:", len(strokes), "Clip info:", clipinfo)
                     rv_node = clipinfo['paint_node']
             
                     if not commands.propertyExists(f"{rv_node}.tag.annotate"):
@@ -444,7 +437,6 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                     for stroke in strokes:
                         if stroke['type'] == 'text':
                             text_node = f"{rv_node}.text:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                            print("Text Node:", text_node, stroke)
                             if not commands.propertyExists(f"{text_node}.position"):
                                 commands.newProperty(f"{text_node}.position", commands.FloatType, 2)
                             commands.setFloatProperty(
@@ -535,7 +527,6 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
                         if not commands.propertyExists(f"{pen_node}.width"):
                             commands.newProperty(f"{pen_node}.width", commands.FloatType, 1)
-
                         commands.setFloatProperty(
                             f"{pen_node}.width", stroke['width'], True
                         )
