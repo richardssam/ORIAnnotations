@@ -1,0 +1,263 @@
+# Example configuration for OTIO Sync Protocol Documentation
+# Each class can have one or more named examples
+
+Play:
+  _category: Playback
+  default:
+    value: true
+    timestamp: "2025-01-31T16:14:00Z"
+  pause:
+    value: false
+    timestamp: "2025-01-31T16:15:30Z"
+
+SetCurrentFrame:
+  _category: Playback
+  default:
+    time:
+      OTIO_SCHEMA: "RationalTime.1"
+      value: 24.0
+      rate: 24.0
+    timestamp: "2025-01-31T16:14:00Z"
+  jump_to_end:
+    time:
+      OTIO_SCHEMA: "RationalTime.1"
+      value: 240.0
+      rate: 24.0
+    timestamp: "2025-01-31T16:16:00Z"
+
+NewPresenter:
+  _category: Session
+  default:
+    presenter_hash: "d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"
+    timestamp: "2025-01-31T16:14:00Z"
+
+NewParticipant:
+  _category: Session
+  default:
+    timestamp: "2025-01-31T16:14:05Z"
+
+SharedKeyRequest:
+  _category: Session
+  default:
+    key: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...\n-----END PUBLIC KEY-----"
+    timestamp: "2025-01-31T16:14:00Z"
+
+SharedKeyResponse:
+  _category: Session
+  default:
+    key: "encrypted_shared_key_base64_encoded_string"
+    timestamp: "2025-01-31T16:14:01Z"
+
+GetSession:
+  _category: Session
+  default:
+    user: "user_hash_12345"
+    app: "RV"
+    timestamp: "2025-01-31T16:14:00Z"
+  shotgrid_user:
+    user: "shotgrid_user_789"
+    app: "ShotGrid"
+    timestamp: "2025-01-31T16:14:00Z"
+
+RequestSyncPlayback:
+  _category: Session
+  default:
+    timestamp: "2025-01-31T16:14:00Z"
+
+SyncPlayback:
+  _category: Playback
+  default:
+    looping: true
+    playing: false
+    muted: false
+    scrubbing: false
+    current_time:
+      OTIO_SCHEMA: "RationalTime.1"
+      value: 24.0
+      rate: 24.0
+    playback_range:
+      OTIO_SCHEMA: "TimeRange.1"
+      start_time:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 0.0
+        rate: 24.0
+      duration:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 120.0
+        rate: 24.0
+    source: "/path/to/media/shot_010_v003.mov"
+    source_index: 0
+    timestamp: "2025-01-31T16:14:00Z"
+  playing_state:
+    looping: false
+    playing: true
+    muted: false
+    scrubbing: false
+    current_time:
+      OTIO_SCHEMA: "RationalTime.1"
+      value: 48.0
+      rate: 24.0
+    source: "/path/to/media/shot_010_v003.mov"
+    source_index: 0
+    timestamp: "2025-01-31T16:15:00Z"
+
+MediaChange:
+  _category: Playback
+  default:
+    timestamp: "2025-01-31T16:14:00Z"
+    mediaReference:
+      OTIO_SCHEMA: "ExternalReference.1"
+      target_url: "/new/path/to/media/shot_010_v004.mov"
+      available_range:
+        OTIO_SCHEMA: "TimeRange.1"
+        start_time:
+          OTIO_SCHEMA: "RationalTime.1"
+          value: 0.0
+          rate: 24.0
+        duration:
+          OTIO_SCHEMA: "RationalTime.1"
+          value: 150.0
+          rate: 24.0
+
+PaintStart:
+  _category: Annotation
+  default:
+    source_index: 0
+    uuid: "paint_stroke_uuid_001"
+    friendly_name: "Patrick Chevalier"
+    participant_hash: "d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"
+    rgba: [1.0, 1.0, 0.0, 1.0]  # Yellow
+    type: "color"
+    brush: "circle"
+    visible: true
+    layer_range:
+      OTIO_SCHEMA: "TimeRange.1"
+      start_time:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 0.0
+        rate: 24.0
+      duration:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 1.0
+        rate: 24.0
+    hold: false
+    ghost: true
+    ghost_before: 3
+    ghost_after: 3
+    timestamp: "2025-01-31T16:14:00Z"
+  red_marker:
+    source_index: 0
+    uuid: "paint_stroke_uuid_002"
+    friendly_name: "Jane Doe"
+    participant_hash: "abc123def456ghi789"
+    rgba: [1.0, 0.0, 0.0, 1.0]  # Red
+    type: "color"
+    brush: "gaussian"
+    visible: true
+    layer_range:
+      OTIO_SCHEMA: "TimeRange.1"
+      start_time:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 5.0
+        rate: 24.0
+      duration:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 1.0
+        rate: 24.0
+    hold: true
+    ghost: false
+    timestamp: "2025-01-31T16:14:30Z"
+  eraser:
+    source_index: 0
+    uuid: "eraser_stroke_uuid_003"
+    friendly_name: "John Smith"
+    participant_hash: "xyz789abc123"
+    rgba: [1.0, 1.0, 1.0, 1.0]  # White (eraser)
+    type: "erase"
+    brush: "circle"
+    visible: true
+    layer_range:
+      OTIO_SCHEMA: "TimeRange.1"
+      start_time:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 10.0
+        rate: 24.0
+      duration:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 1.0
+        rate: 24.0
+    timestamp: "2025-01-31T16:15:00Z"
+
+PaintPoints:
+  _category: Annotation
+  default:
+    source_index: 0
+    uuid: "paint_stroke_uuid_001"
+    layer_range:
+      OTIO_SCHEMA: "TimeRange.1"
+      start_time:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 0.0
+        rate: 24.0
+      duration:
+        OTIO_SCHEMA: "RationalTime.1"
+        value: 1.0
+        rate: 24.0
+    points:
+      OTIO_SCHEMA: "PaintVertices.1"
+      size: [0.009, 0.009, 0.009, 0.009, 0.009]
+      x: [0.0, 0.1, 0.2, 0.3, 0.4]
+      y: [0.0, 0.1, 0.0, 0.0, -0.1]
+    # Note: points would be a PaintVertices object
+    # This is simplified for the config
+    timestamp: "2025-01-31T16:14:00.500Z"
+
+PaintEnd:
+  _category: Annotation
+  default:
+    uuid: "paint_stroke_uuid_001"
+    timestamp: "2025-01-31T16:14:01Z"
+    points:
+      OTIO_SCHEMA: "PaintVertices.1"
+      size: [0.009, 0.009, 0.009, 0.009, 0.009]
+      x: [0.0, 0.1, 0.2, 0.3, 0.4]
+      y: [0.0, 0.1, 0.0, 0.0, -0.1]
+
+TextAnnotation:
+  _category: Annotation
+  default:
+    uuid: "text_annotation_uuid_001"
+    friendly_name: "Director"
+    position: [5.5, 2.0]
+    rgba: [1.0, 0.0, 0.0, 1.0]  # Red text
+    text: "Fix the lighting in this shot"
+    spacing: 1.2
+    font_size: 24.0
+    scale: 1.0
+    rotation: 0.0
+    font: "Arial"
+    timestamp: "2025-01-31T16:14:00Z"
+  approval_note:
+    uuid: "text_annotation_uuid_002"
+    friendly_name: "Producer"
+    position: [-6.0, -3.0]
+    rgba: [0.0, 1.0, 0.0, 1.0]  # Green text
+    text: "Approved!"
+    spacing: 1.0
+    font_size: 36.0
+    scale: 1.5
+    rotation: 0.0
+    font: "Helvetica"
+    timestamp: "2025-01-31T16:20:00Z"
+  rotated_note:
+    uuid: "text_annotation_uuid_003"
+    friendly_name: "VFX Supervisor"
+    position: [0.0, 0.0]
+    rgba: [1.0, 1.0, 0.0, 1.0]  # Yellow text
+    text: "Add more explosion here"
+    spacing: 1.1
+    font_size: 28.0
+    scale: 1.2
+    rotation: 15.0
+    font: "Impact"
+    timestamp: "2025-01-31T16:18:00Z"

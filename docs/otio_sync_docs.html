@@ -1,0 +1,1891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OTIO Sync Protocol Documentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f5f5f5;
+        }
+        
+        .container {
+            display: flex;
+            min-height: 100vh;
+        }
+        
+        .sidebar {
+            width: 280px;
+            background: #2c3e50;
+            color: #ecf0f1;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        .sidebar h1 {
+            font-size: 1.4em;
+            margin-bottom: 20px;
+            color: #3498db;
+        }
+        
+        .sidebar h2 {
+            font-size: 1.1em;
+            margin-top: 20px;
+            margin-bottom: 10px;
+            color: #ecf0f1;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        
+        .sidebar ul {
+            list-style: none;
+        }
+        
+        .sidebar li {
+            margin: 5px 0;
+        }
+        
+        .sidebar a {
+            color: #bdc3c7;
+            text-decoration: none;
+            display: block;
+            padding: 5px 10px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        
+        .sidebar a:hover {
+            background: #34495e;
+            color: #3498db;
+        }
+        
+        .content {
+            margin-left: 280px;
+            padding: 40px;
+            flex: 1;
+            max-width: 1200px;
+        }
+        
+        .section {
+            background: white;
+            padding: 30px;
+            margin-bottom: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        h2 {
+            color: #2c3e50;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #3498db;
+        }
+        
+        h3 {
+            color: #34495e;
+            margin-top: 25px;
+            margin-bottom: 10px;
+        }
+        
+        .schema-label {
+            display: inline-block;
+            background: #3498db;
+            color: white;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        .description {
+            background: #ecf0f1;
+            padding: 15px;
+            border-left: 4px solid #3498db;
+            margin: 15px 0;
+            border-radius: 4px;
+            white-space: pre-wrap;
+        }
+        
+        .params-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        
+        .params-table th {
+            background: #34495e;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        
+        .params-table td {
+            padding: 12px;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        
+        .params-table tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .type-badge {
+            background: #e74c3c;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            font-family: monospace;
+        }
+        
+        .required-badge {
+            background: #f39c12;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75em;
+            margin-left: 5px;
+        }
+        
+        .code-block {
+            background: #282c34;
+            color: #abb2bf;
+            padding: 20px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 15px 0;
+            position: relative;
+        }
+        
+        .code-block pre {
+            margin: 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            line-height: 1.5;
+        }
+        
+        .copy-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: background 0.2s;
+        }
+        
+        .copy-btn:hover {
+            background: #2980b9;
+        }
+        
+        .copy-btn.copied {
+            background: #27ae60;
+        }
+        
+        .json-key { color: #e06c75; }
+        .json-string { color: #98c379; }
+        .json-number { color: #d19a66; }
+        .json-boolean { color: #56b6c2; }
+        .json-null { color: #c678dd; }
+        
+        code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .note {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        
+        .note strong {
+            color: #856404;
+        }
+        
+        .example-tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: -1px;
+        }
+        
+        .example-tab {
+            padding: 8px 16px;
+            background: #ecf0f1;
+            border: none;
+            border-radius: 6px 6px 0 0;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+            font-size: 0.9em;
+        }
+        
+        .example-tab:hover {
+            background: #bdc3c7;
+        }
+        
+        .example-tab.active {
+            background: #282c34;
+            color: white;
+        }
+        
+        .example-content {
+            display: none;
+        }
+        
+        .example-content.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <h1>OTIO Sync Protocol</h1>
+            <h2>Playback Events</h2>
+            <ul>
+                <li><a href="#play">Play</a></li>
+                <li><a href="#set-current-frame">SetCurrentFrame</a></li>
+                <li><a href="#sync-playback">SyncPlayback</a></li>
+                <li><a href="#media-change">MediaChange</a></li>
+            </ul>
+            <h2>Session Events</h2>
+            <ul>
+                <li><a href="#new-presenter">NewPresenter</a></li>
+                <li><a href="#new-participant">NewParticipant</a></li>
+                <li><a href="#shared-key-request">SharedKeyRequest</a></li>
+                <li><a href="#shared-key-response">SharedKeyResponse</a></li>
+                <li><a href="#get-session">GetSession</a></li>
+                <li><a href="#request-sync-playback">RequestSyncPlayback</a></li>
+            </ul>
+            <h2>Annotation Events</h2>
+            <ul>
+                <li><a href="#paint-start">PaintStart</a></li>
+                <li><a href="#paint-points">PaintPoints</a></li>
+                <li><a href="#paint-end">PaintEnd</a></li>
+                <li><a href="#text-annotation">TextAnnotation</a></li>
+            </ul>
+        </nav>
+        <main class="content">
+            <div class="section">
+                <h2>Overview</h2>
+                <p>This documentation describes the OTIO-based synchronized review messaging protocol. All events inherit from the base <code>SyncEvent</code> class and are serialized as OpenTimelineIO objects.</p>
+                
+                <div class="note">
+                    <strong>Note:</strong> This documentation was automatically generated from the Python schema definitions. Examples are created from actual OTIO class instances defined in the configuration file.
+                </div>
+            </div>
+            <div id="play" class="section">
+                <h2>Play</h2>
+                <span class="schema-label">play.1</span>
+                
+                <div class="description">A schema for the event system to define when play is enabled.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>value</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>The value of the play event</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-play">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'play', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'play', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'play', 'pause')">Pause</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'play', 'pause_python')">Pause (Python)</button>
+            </div>
+                <div id="play-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"play.1"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"value"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="play-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.Play(value=True, timestamp="2025-01-31T16:14:00Z")
+</pre>
+                    </div>
+                </div>
+                <div id="play-pause" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"play.1"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">30</span>Z"</span>,
+  <span class="json-key">"value"</span>: <span class="json-boolean">false</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="play-pause_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.Play(value=False, timestamp="2025-01-31T16:15:30Z")
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="set-current-frame" class="section">
+                <h2>SetCurrentFrame</h2>
+                <span class="schema-label">set_current_frame.1</span>
+                
+                <div class="description">A schema for the event system to define when the current frame is set.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>time</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">RationalTime</span></td>
+                            <td>The current time in the timeline</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-set-current-frame">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'set-current-frame', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'set-current-frame', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'set-current-frame', 'jump_to_end')">Jump To End</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'set-current-frame', 'jump_to_end_python')">Jump To End (Python)</button>
+            </div>
+                <div id="set-current-frame-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"set_current_frame.1"</span>,
+  <span class="json-key">"time"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+    <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+    <span class="json-key">"value"</span>: <span class="json-number">24.0</span>
+  },
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="set-current-frame-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SetCurrentFrame(
+    time=otio.opentime.RationalTime(value=24.0, rate=24.0),
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="set-current-frame-jump_to_end" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"set_current_frame.1"</span>,
+  <span class="json-key">"time"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+    <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+    <span class="json-key">"value"</span>: <span class="json-number">240.0</span>
+  },
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">16</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="set-current-frame-jump_to_end_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SetCurrentFrame(
+    time=otio.opentime.RationalTime(value=240.0, rate=24.0),
+    timestamp="2025-01-31T16:16:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="sync-playback" class="section">
+                <h2>SyncPlayback</h2>
+                <span class="schema-label">SyncPlayback.1</span>
+                
+                <div class="description">SyncPlayback</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>looping</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>Whether the playback is looping</td>
+                        </tr>
+                        <tr>
+                            <td><code>playing</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>Whether the playback is currently playing</td>
+                        </tr>
+                        <tr>
+                            <td><code>muted</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>Whether the playback is muted</td>
+                        </tr>
+                        <tr>
+                            <td><code>scrubbing</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>Whether the playback is currently scrubbing</td>
+                        </tr>
+                        <tr>
+                            <td><code>playback_range</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">TimeRange</span></td>
+                            <td>The range of playback</td>
+                        </tr>
+                        <tr>
+                            <td><code>current_time</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">RationalTime</span></td>
+                            <td>The current time in the playback</td>
+                        </tr>
+                        <tr>
+                            <td><code>output_bounds</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">box2d</span></td>
+                            <td>The output bounds of the playback</td>
+                        </tr>
+                        <tr>
+                            <td><code>source</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The source of the playback</td>
+                        </tr>
+                        <tr>
+                            <td><code>source_index</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">int</span></td>
+                            <td>The index of the source in the playback, used for multi-source playback</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-sync-playback">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'sync-playback', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'sync-playback', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'sync-playback', 'playing_state')">Playing State</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'sync-playback', 'playing_state_python')">Playing State (Python)</button>
+            </div>
+                <div id="sync-playback-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"SyncPlayback.1"</span>,
+  <span class="json-key">"current_time"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+    <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+    <span class="json-key">"value"</span>: <span class="json-number">24.0</span>
+  },
+  <span class="json-key">"looping"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"muted"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"output_bounds"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"playback_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">120.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+    }
+  },
+  <span class="json-key">"playing"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"scrubbing"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"source"</span>: <span class="json-string">"/path/to/media/shot_010_v003.mov"</span>,
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="sync-playback-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SyncPlayback(
+    looping=True,
+    playing=False,
+    muted=False,
+    scrubbing=False,
+    current_time=otio.opentime.RationalTime(value=24.0, rate=24.0),
+    playback_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=0.0, rate=24.0),
+        duration=otio.opentime.RationalTime(value=120.0, rate=24.0),
+    ),
+    source="/path/to/media/shot_010_v003.mov",
+    source_index=0,
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="sync-playback-playing_state" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"SyncPlayback.1"</span>,
+  <span class="json-key">"current_time"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+    <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+    <span class="json-key">"value"</span>: <span class="json-number">48.0</span>
+  },
+  <span class="json-key">"looping"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"muted"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"output_bounds"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"playback_range"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"playing"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"scrubbing"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"source"</span>: <span class="json-string">"/path/to/media/shot_010_v003.mov"</span>,
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="sync-playback-playing_state_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SyncPlayback(
+    looping=False,
+    playing=True,
+    muted=False,
+    scrubbing=False,
+    current_time=otio.opentime.RationalTime(value=48.0, rate=24.0),
+    source="/path/to/media/shot_010_v003.mov",
+    source_index=0,
+    timestamp="2025-01-31T16:15:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="media-change" class="section">
+                <h2>MediaChange</h2>
+                <span class="schema-label">MediaChange.1</span>
+                
+                <div class="description">A schema for the event system to denote when media changes.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>mediaReference</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">MediaReference</span></td>
+                            <td>The reference to the media</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-media-change">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'media-change', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'media-change', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="media-change-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"MediaChange.1"</span>,
+  <span class="json-key">"mediaReference"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"ExternalReference.1"</span>,
+    <span class="json-key">"metadata"</span>: {},
+    <span class="json-key">"name"</span>: <span class="json-string">""</span>,
+    <span class="json-key">"available_range"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+      <span class="json-key">"duration"</span>: {
+        <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+        <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+        <span class="json-key">"value"</span>: <span class="json-number">150.0</span>
+      },
+      <span class="json-key">"start_time"</span>: {
+        <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+        <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+        <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+      }
+    },
+    <span class="json-key">"available_image_bounds"</span>: <span class="json-null">null</span>,
+    <span class="json-key">"target_url"</span>: <span class="json-string">"/new/path/to/media/shot_010_v004.mov"</span>
+  },
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="media-change-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.MediaChange(
+    timestamp="2025-01-31T16:14:00Z",
+    mediaReference=otio.schema.schemadef.ExternalReference(
+        target_url="/new/path/to/media/shot_010_v004.mov",
+        available_range=otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(value=0.0, rate=24.0),
+            duration=otio.opentime.RationalTime(value=150.0, rate=24.0),
+        ),
+    ),
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="new-presenter" class="section">
+                <h2>NewPresenter</h2>
+                <span class="schema-label">NewPresenter.1</span>
+                
+                <div class="description">New Presenter</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>presenter_hash</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The hash of the presenter</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-new-presenter">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'new-presenter', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'new-presenter', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="new-presenter-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"NewPresenter.1"</span>,
+  <span class="json-key">"presenter_hash"</span>: <span class="json-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="new-presenter-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.NewPresenter(
+    presenter_hash="d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5",
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="new-participant" class="section">
+                <h2>NewParticipant</h2>
+                <span class="schema-label">NewParticipant.1</span>
+                
+                <div class="description">A new participant for the sync review
+
+    </div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-new-participant">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'new-participant', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'new-participant', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="new-participant-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"NewParticipant.1"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">05</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="new-participant-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.NewParticipant(timestamp="2025-01-31T16:14:05Z")
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="shared-key-request" class="section">
+                <h2>SharedKeyRequest</h2>
+                <span class="schema-label">SharedKeyRequest.1</span>
+                
+                <div class="description">Shared Key Request</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>key</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The shared key</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-shared-key-request">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'shared-key-request', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'shared-key-request', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="shared-key-request-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"SharedKeyRequest.1"</span>,
+  <span class="json-key">"key"</span>: <span class="json-string">"-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...\n-----END PUBLIC KEY-----"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="shared-key-request-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SharedKeyRequest(
+    key="-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...\n-----END PUBLIC KEY-----",
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="shared-key-response" class="section">
+                <h2>SharedKeyResponse</h2>
+                <span class="schema-label">SharedKeyResponse.1</span>
+                
+                <div class="description">SharedKeyResponse</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>key</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The shared key</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-shared-key-response">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'shared-key-response', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'shared-key-response', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="shared-key-response-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"SharedKeyResponse.1"</span>,
+  <span class="json-key">"key"</span>: <span class="json-string">"encrypted_shared_key_base64_encoded_string"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">01</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="shared-key-response-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.SharedKeyResponse(
+    key="encrypted_shared_key_base64_encoded_string", timestamp="2025-01-31T16:14:01Z"
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="get-session" class="section">
+                <h2>GetSession</h2>
+                <span class="schema-label">GetSession.1</span>
+                
+                <div class="description">Get a sync Session</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>user</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The user making the request</td>
+                        </tr>
+                        <tr>
+                            <td><code>app</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The app making the request</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-get-session">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'get-session', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'get-session', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'get-session', 'shotgrid_user')">Shotgrid User</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'get-session', 'shotgrid_user_python')">Shotgrid User (Python)</button>
+            </div>
+                <div id="get-session-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"GetSession.1"</span>,
+  <span class="json-key">"app"</span>: <span class="json-string">"RV"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"user"</span>: <span class="json-string">"user_hash_12345"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="get-session-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.GetSession(
+    user="user_hash_12345", app="RV", timestamp="2025-01-31T16:14:00Z"
+)
+</pre>
+                    </div>
+                </div>
+                <div id="get-session-shotgrid_user" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"GetSession.1"</span>,
+  <span class="json-key">"app"</span>: <span class="json-string">"ShotGrid"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"user"</span>: <span class="json-string">"shotgrid_user_789"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="get-session-shotgrid_user_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.GetSession(
+    user="shotgrid_user_789", app="ShotGrid", timestamp="2025-01-31T16:14:00Z"
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="request-sync-playback" class="section">
+                <h2>RequestSyncPlayback</h2>
+                <span class="schema-label">RequestSyncPlayback.1</span>
+                
+                <div class="description">RequestSyncPlayback
+    
+    
+    </div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-request-sync-playback">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'request-sync-playback', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'request-sync-playback', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="request-sync-playback-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RequestSyncPlayback.1"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="request-sync-playback-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.RequestSyncPlayback(timestamp="2025-01-31T16:14:00Z")
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="paint-start" class="section">
+                <h2>PaintStart</h2>
+                <span class="schema-label">PaintStart.1</span>
+                
+                <div class="description">A schema for the event system to denote when painting starts.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>source_index</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">int</span></td>
+                            <td>The index of the source media for the paint.</td>
+                        </tr>
+                        <tr>
+                            <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The unique identifier for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>friendly_name</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The friendly artist name for the paint event creator</td>
+                        </tr>
+                        <tr>
+                            <td><code>participant_hash</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The unique identifier for the participant</td>
+                        </tr>
+                        <tr>
+                            <td><code>rgba</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">list</span></td>
+                            <td>The color of the paint event in RGBA format</td>
+                        </tr>
+                        <tr>
+                            <td><code>type</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The type of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>brush</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The brush type of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>visible</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>The visible type of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>name</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                        <tr>
+                            <td><code>effect_name</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                        <tr>
+                            <td><code>layer_range</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">TimeRange</span></td>
+                            <td>The range of the layer for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>hold</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>The hold of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>ghost</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">bool</span></td>
+                            <td>Is ghosting of the paint strokes enabled</td>
+                        </tr>
+                        <tr>
+                            <td><code>ghost_before</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">int</span></td>
+                            <td>Number of frames to ghost before the current frame</td>
+                        </tr>
+                        <tr>
+                            <td><code>ghost_after</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">int</span></td>
+                            <td>Number of frames to ghost after the current frame</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-paint-start">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker')">Red Marker</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker_python')">Red Marker (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser')">Eraser</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser_python')">Eraser (Python)</button>
+            </div>
+                <div id="paint-start-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Patrick Chevalier"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-number">3</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-number">3</span>,
+  <span class="json-key">"hold"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="paint-start-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=0,
+    uuid="paint_stroke_uuid_001",
+    friendly_name="Patrick Chevalier",
+    participant_hash="d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5",
+    rgba=[1.0, 1.0, 0.0, 1.0],
+    type="color",
+    brush="circle",
+    visible=True,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=0.0, rate=24.0),
+        duration=otio.opentime.RationalTime(value=1.0, rate=24.0),
+    ),
+    hold=False,
+    ghost=True,
+    ghost_before=3,
+    ghost_after=3,
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-start-red_marker" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"gaussian"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Jane Doe"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"hold"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">5.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"abc123def456ghi789"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">30</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_002"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="paint-start-red_marker_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=0,
+    uuid="paint_stroke_uuid_002",
+    friendly_name="Jane Doe",
+    participant_hash="abc123def456ghi789",
+    rgba=[1.0, 0.0, 0.0, 1.0],
+    type="color",
+    brush="gaussian",
+    visible=True,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=5.0, rate=24.0),
+        duration=otio.opentime.RationalTime(value=1.0, rate=24.0),
+    ),
+    hold=True,
+    ghost=False,
+    timestamp="2025-01-31T16:14:30Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-start-eraser" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"John Smith"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"hold"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">10.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"xyz789abc123"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"erase"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"eraser_stroke_uuid_003"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="paint-start-eraser_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=0,
+    uuid="eraser_stroke_uuid_003",
+    friendly_name="John Smith",
+    participant_hash="xyz789abc123",
+    rgba=[1.0, 1.0, 1.0, 1.0],
+    type="erase",
+    brush="circle",
+    visible=True,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=10.0, rate=24.0),
+        duration=otio.opentime.RationalTime(value=1.0, rate=24.0),
+    ),
+    timestamp="2025-01-31T16:15:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="paint-points" class="section">
+                <h2>PaintPoints</h2>
+                <span class="schema-label">PaintPoint.1</span>
+                
+                <div class="description">A schema for the event system to denote when adding onto a paint stroke.
+
+Attribute:
+   source_index:
+   uuid (str): The UUID of the initial brush stroke.
+   layer_range:
+   points : [PaintVertices]: List of paint vertices.
+   timestamp (str):    timestamp is an ISO 8601 formatted string representing the time of the change.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>source_index</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">int</span></td>
+                            <td>The index of the source media for the paint.</td>
+                        </tr>
+                        <tr>
+                            <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The unique identifier for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>layer_range</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">TimeRange</span></td>
+                            <td>The range of the layer for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>points</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">PaintVertices</span></td>
+                            <td>The vertices of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>timestamp is an ISO 8601 formatted string representing the time of the change.</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-paint-points">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="paint-points-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintPoint.1"</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+    }
+  },
+  <span class="json-key">"points"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+    <span class="json-key">"size"</span>: [
+      0.009,
+      0.009,
+      0.009,
+      0.009,
+      0.009
+    ],
+    <span class="json-key">"x"</span>: [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4
+    ],
+    <span class="json-key">"y"</span>: [
+      0.0,
+      0.1,
+      0.0,
+      0.0,
+      -0.1
+    ]
+  },
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00.500</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="paint-points-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.PaintPoints(
+    source_index=0,
+    uuid="paint_stroke_uuid_001",
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=0.0, rate=24.0),
+        duration=otio.opentime.RationalTime(value=1.0, rate=24.0),
+    ),
+    points=otio.schema.schemadef.PaintVertices(
+        size=[0.009, 0.009, 0.009, 0.009, 0.009],
+        x=[0.0, 0.1, 0.2, 0.3, 0.4],
+        y=[0.0, 0.1, 0.0, 0.0, -0.1],
+    ),
+    timestamp="2025-01-31T16:14:00.500Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="paint-end" class="section">
+                <h2>PaintEnd</h2>
+                <span class="schema-label">PaintEnd.1</span>
+                
+                <div class="description">A schema for the event system to denote when painting ends.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The unique identifier for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>points</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">PaintVertices</span></td>
+                            <td>The vertices of the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Example</h3>
+            <div class="example-tabs" id="tabs-paint-end">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default_python')">Default (Python)</button>
+            </div>
+                <div id="paint-end-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintEnd.1"</span>,
+  <span class="json-key">"points"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+    <span class="json-key">"size"</span>: [
+      0.009,
+      0.009,
+      0.009,
+      0.009,
+      0.009
+    ],
+    <span class="json-key">"x"</span>: [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4
+    ],
+    <span class="json-key">"y"</span>: [
+      0.0,
+      0.1,
+      0.0,
+      0.0,
+      -0.1
+    ]
+  },
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">01</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="paint-end-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.PaintEnd(
+    uuid="paint_stroke_uuid_001",
+    timestamp="2025-01-31T16:14:01Z",
+    points=otio.schema.schemadef.PaintVertices(
+        size=[0.009, 0.009, 0.009, 0.009, 0.009],
+        x=[0.0, 0.1, 0.2, 0.3, 0.4],
+        y=[0.0, 0.1, 0.0, 0.0, -0.1],
+    ),
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+            <div id="text-annotation" class="section">
+                <h2>TextAnnotation</h2>
+                <span class="schema-label">TextAnnotation.1</span>
+                
+                <div class="description">A schema for the event system to denote entering text.</div>
+                <h3>Parameters</h3>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The unique identifier for the paint event</td>
+                        </tr>
+                        <tr>
+                            <td><code>rgba</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">list</span></td>
+                            <td>The color of the text annotation in RGBA format</td>
+                        </tr>
+                        <tr>
+                            <td><code>friendly_name</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The human usable name of the user who created the annotation</td>
+                        </tr>
+                        <tr>
+                            <td><code>text</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The text of the annotation</td>
+                        </tr>
+                        <tr>
+                            <td><code>spacing</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">float</span></td>
+                            <td>The spacing between lines of text</td>
+                        </tr>
+                        <tr>
+                            <td><code>font_size</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">float</span></td>
+                            <td>The size of the font for the text annotation</td>
+                        </tr>
+                        <tr>
+                            <td><code>scale</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">float</span></td>
+                            <td>The scale of the text annotation</td>
+                        </tr>
+                        <tr>
+                            <td><code>rotation</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">float</span></td>
+                            <td>The rotation of the text annotation in degrees</td>
+                        </tr>
+                        <tr>
+                            <td><code>font</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td>The font family of the text annotation</td>
+                        </tr>
+                        <tr>
+                            <td><code>position</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">list</span></td>
+                            <td>The position of the text annotation in the format [x, y]</td>
+                        </tr>
+                        <tr>
+                            <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                            <td><span class="type-badge">str</span></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3>Examples</h3>
+            <div class="example-tabs" id="tabs-text-annotation">
+                <button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default')">Default</button>
+                <button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default_python')">Default (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note')">Approval Note</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note_python')">Approval Note (Python)</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note')">Rotated Note</button>
+                <button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note_python')">Rotated Note (Python)</button>
+            </div>
+                <div id="text-annotation-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Arial"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">24.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Director"</span>,
+  <span class="json-key">"position"</span>: [
+    5.5,
+    2.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.0</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.2</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Fix the lighting in this shot"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-default_python" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid="text_annotation_uuid_001",
+    friendly_name="Director",
+    position=[5.5, 2.0],
+    rgba=[1.0, 0.0, 0.0, 1.0],
+    text="Fix the lighting in this shot",
+    spacing=1.2,
+    font_size=24.0,
+    scale=1.0,
+    rotation=0.0,
+    font="Arial",
+    timestamp="2025-01-31T16:14:00Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-approval_note" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Helvetica"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">36.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Producer"</span>,
+  <span class="json-key">"position"</span>: [
+    -6.0,
+    -3.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    0.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.5</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.0</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Approved!"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">20</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_002"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-approval_note_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid="text_annotation_uuid_002",
+    friendly_name="Producer",
+    position=[-6.0, -3.0],
+    rgba=[0.0, 1.0, 0.0, 1.0],
+    text="Approved!",
+    spacing=1.0,
+    font_size=36.0,
+    scale=1.5,
+    rotation=0.0,
+    font="Helvetica",
+    timestamp="2025-01-31T16:20:00Z",
+)
+</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-rotated_note" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Impact"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">28.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"VFX Supervisor"</span>,
+  <span class="json-key">"position"</span>: [
+    0.0,
+    0.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">15.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.2</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.1</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Add more explosion here"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">18</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_003"</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-rotated_note_python" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>import opentimelineio as otio
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid="text_annotation_uuid_003",
+    friendly_name="VFX Supervisor",
+    position=[0.0, 0.0],
+    rgba=[1.0, 1.0, 0.0, 1.0],
+    text="Add more explosion here",
+    spacing=1.1,
+    font_size=28.0,
+    scale=1.2,
+    rotation=15.0,
+    font="Impact",
+    timestamp="2025-01-31T16:18:00Z",
+)
+</pre>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        function copyCode(button) {
+            const codeBlock = button.nextElementSibling;
+            const text = codeBlock.textContent;
+            
+            navigator.clipboard.writeText(text).then(() => {
+                button.textContent = 'Copied!';
+                button.classList.add('copied');
+                setTimeout(() => {
+                    button.textContent = 'Copy';
+                    button.classList.remove('copied');
+                }, 2000);
+            });
+        }
+        
+        function switchExampleTab(event, schemaId, exampleName) {
+            // Get all tabs and contents for this schema
+            const tabContainer = document.getElementById('tabs-' + schemaId);
+            const tabs = tabContainer.querySelectorAll('.example-tab');
+            const contents = document.querySelectorAll('[id^="' + schemaId + '-"]');
+            
+            // Remove active class from all tabs and contents
+            tabs.forEach(tab => tab.classList.remove('active'));
+            contents.forEach(content => content.classList.remove('active'));
+            
+            // Add active class to clicked tab
+            event.currentTarget.classList.add('active');
+            
+            // Show corresponding content
+            const contentId = schemaId + '-' + exampleName;
+            const content = document.getElementById(contentId);
+            if (content) {
+                content.classList.add('active');
+            }
+        }
+        
+        // Smooth scrolling for anchor links
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+    </script>
+</body>
+</html>

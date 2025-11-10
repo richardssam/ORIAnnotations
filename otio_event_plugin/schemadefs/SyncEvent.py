@@ -16,7 +16,7 @@ class SyncEvent(otio.core.SerializableObject):
 
     timestamp = otio.core.serializable_field(
         "timestamp",
-        doc="The timestamp of the media change, in ISO 8601 format",
+        doc=("The timestamp of the media change, in ISO 8601 format"),
     )
 
     def __init__(
@@ -41,7 +41,7 @@ class AnnotationEffect(otio.schema.Effect):
     ) -> None:
         super().__init__(name=name, effect_name="Annotation.1")
         self.visible = visible
-        self.commands = commands
+        self.layers = layers if layers is not None else []
 
     _visible = otio.core.serializable_field(
         "visible", required_type=bool, doc=("visible: expects either true or false")
@@ -622,12 +622,12 @@ class PaintStart(SyncEvent):
     )
     ghost_before = otio.core.serializable_field(
         "ghost_before",
-        required_type=bool,
+        required_type=int,
         doc="Number of frames to ghost before the current frame"
     )
     ghost_after = otio.core.serializable_field(
         "ghost_after",
-        required_type=bool,
+        required_type=int,
         doc="Number of frames to ghost after the current frame"
     )
 
@@ -661,19 +661,12 @@ class PaintVertices(otio.core.SerializableObject):
             y=None,
             size=None
         ):
-        print("List1:", isinstance(x, list), type(x))
-
         otio.core.SerializableObject.__init__(self)
         self.x = x if x is not None else []
         self.y = y if y is not None else []
         self.size = size if size is not None else []
 
         if not isinstance(self.x, otio._otio.AnyVector) or not all(isinstance(i, float)  or isinstance(i, int) for i in self.x):
-            print("List:", isinstance(self.x, list), type(self.x))
-            print("contents type:", all(isinstance(i, float) or isinstance(i, int) for i in self.x))
-            for i in self.x:
-                if not isinstance(i, float):
-                    print(f"ERROR - {i} = {type(i)}")
             raise TypeError(f"x must be a list of floats {self.x}")
         if not isinstance(self.y, otio._otio.AnyVector) or not all(isinstance(i, float)  or isinstance(i, int) for i in self.y):
             raise TypeError(f"y must be a list of floats {self.y}")
