@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 OTIO Sync Protocol Documentation Generator
@@ -1083,6 +1084,54 @@ class HTMLDocGenerator:
     </script>"""
 
 
+
+class MarkdownDocGenerator(HTMLDocGenerator):
+    """Generates Markdown documentation from parsed schemas."""
+    
+    def __init__(self, schemas: List[SchemaClass], category_order: List[str], example_generator: ExampleGenerator):
+        super().__init__(schemas, category_order, example_generator)
+
+    def generate(self, output_path: str):
+        """Generate Markdown documentation file."""
+        md = self._generate_markdown()
+        with open(output_path, 'w') as f:
+            f.write(md)
+        print(f"Markdown documentation generated: {output_path}")
+
+    def _generate_markdown(self) -> str:
+        """Generate complete Markdown document."""
+        lines = ["# OTIO Sync Protocol Documentation", "", "This documentation describes the OTIO-based synchronized review messaging protocol. All events inherit from the base `SyncEvent` class and are serialized as OpenTimelineIO objects.", ""]
+        for category, schemas in self.categories.items():
+            if schemas:
+                lines.append(f"## {category} Events\n")
+                for schema in schemas:
+                    lines.append(self._generate_schema_markdown(schema))
+        return '\n'.join(lines)
+
+    def _generate_schema_markdown(self, schema: SchemaClass) -> str:
+        """Generate Markdown for a single schema."""
+        lines = [f"### {schema.name}", f"**Schema Label:** `{schema.schema_label}`", "", schema.description or "", ""]
+        if schema.parameters:
+            lines.append("**Parameters:**\n")
+            lines.append("| Parameter | Type | Description | Required |")
+            lines.append("|-----------|------|-------------|---------|")
+            for param in schema.parameters:
+                required = "Yes" if param.required else "No"
+                lines.append(f"| `{param.name}` | `{param.type_hint}` | {param.description} | {required} |")
+            lines.append("")
+        # Only JSON example
+        example_names = self.example_generator.get_available_examples(schema.name)
+        for example_name in example_names:
+            example_json = self.example_generator.generate_example(schema.name, example_name)
+            if example_json:
+                lines.append(f"**Example ({example_name}):**\n")
+                lines.append("```")
+                # Remove HTML highlighting if present
+                example_json_plain = re.sub(r'<[^>]+>', '', example_json)
+                lines.append(example_json_plain)
+                lines.append("```")
+        return '\n'.join(lines)
+
 def generate_example_config(output_path: str):
     """Generate an example configuration file."""
     example_config = {
@@ -1258,6 +1307,10 @@ Examples:
         help="YAML or JSON configuration file with example instances"
     )
     parser.add_argument(
+        "--markdown", "-m",
+        action="store_true",
+        help="Generate Markdown documentation instead of HTML")
+    parser.add_argument(
         "--output", "-o",
         default="otio_sync_docs.html",
         help="Output HTML file path (default: otio_sync_docs.html)"
@@ -1297,9 +1350,15 @@ Examples:
     else:
         print("No config provided - examples will use default values")
     
+
+
     # Generate documentation
-    print(f"Generating HTML documentation...")
-    generator = HTMLDocGenerator(schemas, categories, example_generator)
+    if args.markdown:
+        print(f"Generating Markdown documentation...")
+        generator = MarkdownDocGenerator(schemas, categories, example_generator)
+    else:
+        print(f"Generating HTML documentation...")
+        generator = HTMLDocGenerator(schemas, categories, example_generator)
     generator.generate(args.output)
     
     print("Done!")

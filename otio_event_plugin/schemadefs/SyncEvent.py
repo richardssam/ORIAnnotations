@@ -83,7 +83,7 @@ class Play(SyncEvent):
         value (bool): value is a boolean indicating whether play is enabled or not.
     """
 
-    _serializable_label = "play.1"
+    _serializable_label = "Play.1"
     _name = "Play"
 
     value = otio.core.serializable_field(
@@ -125,7 +125,7 @@ class SetCurrentFrame(SyncEvent):
     
     """
 
-    _serializable_label = "set_current_frame.1"
+    _serializable_label = "SetCurrentFrame.1"
     _name = "SetCurrentFrame"
 
 

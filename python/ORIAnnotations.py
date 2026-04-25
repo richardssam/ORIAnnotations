@@ -316,15 +316,38 @@ class ReviewGroup:
             track.append(otioclip)
         return track
 
-    def export_otio_timeline(self):
+    def export_otio_timeline(self, as_nested_stacks=False):
         """
         Create an otio timeline of the whole reviewgroup
         """
         timeline = otio.schema.Timeline()
-        master_track = self._export_otio_media_track()
-        timeline.tracks.append(master_track)
-        for review in self.reviews:
-            timeline.tracks.append(review._export_otio_track(self))
+
+        if as_nested_stacks:
+            master_track = otio.schema.Track("Master")
+            for mediaitem in self.media:
+                media_stack = otio.schema.Stack(name=mediaitem.name)
+                
+                # Media track inside the stack
+                clip_track = otio.schema.Track("Media")
+                clip_track.append(mediaitem._create_otio_clip())
+                media_stack.append(clip_track)
+                
+                # Annotation tracks inside the stack for each review
+                for review in self.reviews:
+                    review_track = otio.schema.Track(review.title)
+                    for ri in review.review_items:
+                        if ri.media == mediaitem:
+                            ri._export_otio_media(review_track)
+                    if len(review_track) > 0:
+                        media_stack.append(review_track)
+                        
+                master_track.append(media_stack)
+            timeline.tracks.append(master_track)
+        else:
+            master_track = self._export_otio_media_track()
+            timeline.tracks.append(master_track)
+            for review in self.reviews:
+                timeline.tracks.append(review._export_otio_track(self))
 
         return timeline
 

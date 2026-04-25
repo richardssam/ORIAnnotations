@@ -2,12 +2,10 @@ import sys, os
 
 project_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
 
-manifest_path = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
-if manifest_path:
-    manifest_path += os.pathsep
-os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = manifest_path + os.path.join(
-    project_root, "otio_event_plugin", "plugin_manifest.json"
-)
+manifest_paths = [os.path.join(project_root, "otio_event_plugin", "plugin_manifest.json")]
+if os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "").strip(os.pathsep):
+    manifest_paths.extend(os.environ["OTIO_PLUGIN_MANIFEST_PATH"].strip(os.pathsep).split(os.pathsep))
+os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = os.pathsep.join(manifest_paths)
 sys.path.append(os.path.join(project_root, "python"))
 
 
@@ -31,8 +29,8 @@ reviewdata = [
                        'frame': 15, 
                        'image': '/Users/sam/git/Annotations/test_export/chimera_cars_srgb-test_mov-prores_ks.00015.png',
                        "annotation_commands": """
-                           {"OTIO_SCHEMA": "PaintStart.1", "brush": "circle","friendly_name": "defaultSequence_p_sourceGroup000000.pen:13:1:sam","rgba": [1,1,1,1],"source_index": 0,"timestamp": "2025-07-06T23:21:48.664116","type": "color","uuid": "6500d2f3-e758-4cd6-9bf2-83c7d712786d","visible": true}
-                           {"OTIO_SCHEMA": "PaintPoint.1", "point": [{"OTIO_SCHEMA": "PaintVertex.1", "size": 0.00995635986328125, "x": -0.47882136702537537,"y": 0.046961307525634766},{"OTIO_SCHEMA": "PaintVertex.1","size": 0.00995635986328125,"x": -0.480663001537323,"y": 0.046961307525634766}]}
+                           {"OTIO_SCHEMA": "PaintStart.1", "brush": "circle","friendly_name": "defaultSequence_p_sourceGroup000000.pen:13:1:sam","rgba": [1.0,1.0,1.0,1.0],"source_index": 0,"timestamp": "2025-07-06T23:21:48.664116","type": "color","uuid": "6500d2f3-e758-4cd6-9bf2-83c7d712786d","visible": true}
+                           {"OTIO_SCHEMA": "PaintPoint.1", "points": {"OTIO_SCHEMA": "PaintVertices.1", "size": [0.00995635986328125, 0.00995635986328125], "x": [-0.47882136702537537, -0.480663001537323],"y": [0.046961307525634766, 0.046961307525634766]}}
 """
                     },
           ]
