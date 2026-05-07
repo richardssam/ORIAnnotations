@@ -1,0 +1,3 @@
+module ORIAnnotationsExporter
+ORIAnnotationsExportDialog 1.0 ORIAnnotationsExportDialog.qml
+ORIAnnotationsImportDialog 1.0 ORIAnnotationsImportDialog.qml
