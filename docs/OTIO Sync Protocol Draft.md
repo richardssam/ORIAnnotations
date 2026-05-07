@@ -56,10 +56,19 @@ Drawing events are broadcast live *and* appended to the Master's internal OTIO t
 
 ### **set_property**
 
-Used for modifying primitive values (strings, numbers, bools) or updating specific keys in metadata.
+Used for modifying primitive OTIO properties (strings, numbers, bools, `RationalTime`, `TimeRange`, etc.).
 
-* **Path**: A slash-separated string. metadata/vendor/key.  
-* **Value**: The new literal value.
+* **Target**: `sync_id` of the object — stable through reordering, unlike index-based paths.
+* **Property name**: The OTIO property name (e.g. `"name"`, `"source_range"`).
+* **Value**: The new value, serialized as OTIO JSON.
+
+### **set_metadata**
+
+A separate patch type for metadata sub-key mutations. Direct writes to `obj.metadata["x"] = y` are **not observed** by the patch system (see §8 — `AnyDictionary` gap). Metadata changes must be routed through an explicit helper to generate patches with sub-key granularity.
+
+* **Target**: `sync_id` of the object.
+* **Path**: A slash-separated sub-key path within the metadata dict, e.g. `"annotations/frame_1/strokes"`. Inspired by USD's property path addressing, which gives per-property granularity rather than replacing the whole metadata blob.
+* **Value**: The new value at that path.
 
 ### **insert_child (Adding Clips/Tracks)**
 
@@ -91,12 +100,35 @@ To avoid collisions and ensure objects can be tracked across clients:
 * **Creation Hook**: Whenever a SerializableObject is instantiated within the sync-aware context, the library should automatically inject a unique identifier into metadata["sync"]["guid"] if one does not exist.  
 * **Persistence**: This GUID must survive round-trips through standard OTIO adapters.
 
-### **B. The Observer Pattern (Generating Patches)**
+### **B. The OTIOPatcher (Generating and Applying Patches)**
 
-The library should implement an observer pattern on the OTIO C++ / Python objects:
+The OTIO C++ core now provides a native `MutationObserver` API, which supersedes the earlier `OTIOSyncProxy` transparent-proxy approach. `OTIOPatcher` is a `MutationObserver` subclass that serves as both the patch generator and patch applicator.
 
-* **Dirty Tracking (Transparent Proxy)**: Because native Python observer patterns (e.g., `__setattr__` monkey-patching) are highly restrictive on `pybind11` C++ bound objects, we use a **Transparent Proxy Wrapper** (`OTIOSyncProxy`). This proxy dynamically intercepts attribute assignments (like `clip.name = "New Name"`), mutates the underlying C++ object, and automatically generates an `otio_delta` message. This keeps the developer experience identical to native OTIO.  
-* **Batching**: Support "Transaction" blocks to group multiple changes (like moving five clips) into a single sync message to reduce network overhead.
+**Generation** — `OTIOPatcher` registers as an observer on the root timeline and receives two callbacks:
+* `on_property_changed(obj, property_name)` — fires after any OTIO property is mutated, e.g. `clip.name = "New Name"`. The patcher captures the new value immediately and emits a `SetPropertyPatch`.
+* `on_children_changed(composition, action, index, child)` — fires on insert, remove, or clear. Emits `InsertChildPatch`, `RemoveChildPatch`, or `ClearChildrenPatch`.
+
+Metadata sub-key changes are **not observable** through `MutationObserver` (see §8E). Metadata mutations must be routed through `patcher.set_metadata(obj, path, value)`, which applies the change and emits a `SetMetadataPatch` directly.
+
+**Transactions** — Multiple patches can be grouped into a `Transaction` using a context manager:
+```python
+with patcher.transaction("Draw annotation on frame 42"):
+    patcher.set_metadata(clip, "annotations/frame_1/strokes", data)
+    clip.name = "Annotation_42"
+# → emits one Transaction containing both patches
+```
+A single mutation outside a `with` block auto-wraps into a single-patch transaction. Consumers (`SyncManager`, Raven, etc.) always receive `Transaction` objects — uniform interface regardless of patch count.
+
+**Application** — `OTIOPatcher.apply(transaction)` executes each patch against the local OTIO graph. A re-entrancy guard (`_applying` flag) suppresses outgoing patch generation while applying an incoming transaction, preventing echo loops.
+
+**Patch data model** (plain, JSON-serializable — readable by C++ tools):
+* `SetPropertyPatch` — `target_id`, `property_name`, `new_value`, `old_value`
+* `SetMetadataPatch` — `target_id`, `path`, `new_value`, `old_value`
+* `InsertChildPatch` — `parent_id`, `index`, `child_json`
+* `RemoveChildPatch` — `parent_id`, `index`, `child_id`, `child_json`
+* `ClearChildrenPatch` — `parent_id`, `child_jsons`
+
+`old_value` / `child_json` fields are included to support future undo/redo without requiring shadow state.
 
 ### **C. Ingestion & Callbacks (Applying Patches)**
 
@@ -164,36 +196,57 @@ To prevent data loss during the transfer of large snapshots, New Clients utilize
 2. **Apply**: The client applies the full `STATE_SNAPSHOT` when it arrives.
 3. **Replay**: The client replays buffered events with a GUID index after `last_message_guid`, ensuring the late-joiner is perfectly in sync with the live stream.
 
-## **8. Proposed OTIO C++ Core Enhancements**
+## **8. OTIO C++ Core Enhancements**
 
-While the current Python Proxy implementation works for a POC, moving synchronization logic into the OTIO C++ core would provide significant performance and stability benefits.
+### **A. Native GUID Support** ✓ Implemented
 
-### **A. Native GUID Support**
+`sync_id` is now a first-class property on `SerializableObject` in the C++ core. It is generated lazily on first access and survives JSON round-trips. This eliminates the need for manual `metadata["sync"]["guid"]` injection.
 
-Moving the `sync:guid` property into the base `SerializableObject` class (C++) would ensure that every object has a globally unique, immutable ID from the moment of instantiation.
-*   **Benefit**: Eliminates the need for manual GUID injection and ensures consistency across all language bindings (Python, C++, Swift).
+### **B. Native MutationObserver API** ✓ Implemented
 
-### **B. Native Observer/Dirty Flag API**
+The C++ core now provides a `MutationObserver` base class with two callbacks:
 
-Implementing a native C++ observer pattern would allow the core to track mutations at the point of assignment.
-*   **Feature**: `SerializableObject::on_changed(callback)` or a `dirty` bitmask.
-*   **Benefit**: Removes the need for expensive Python-level `OTIOSyncProxy` wrappers and allows the library to generate deltas directly from C++ mutations.
+* `on_property_changed(obj, property_name)` — fires after any OTIO property is mutated.
+* `on_children_changed(composition, action, index, child)` — fires on structural changes (insert, remove, clear).
+
+Observers are registered per-object via `add_observer()` / `remove_observer()`. This replaces the earlier `OTIOSyncProxy` Python wrapper approach.
 
 ### **C. Partial/Delta Serialization**
 
 Extend the OTIO serialization API to support partial payloads.
-*   **Feature**: `obj.to_json_delta(path, value)` and `obj.apply_delta(json_delta)`.
-*   **Benefit**: Standardizes the "Patch" format within the library, making it easier for third-party integrations to support synchronization.
+
+* **Feature**: `obj.to_json_delta(path, value)` and `obj.apply_delta(json_delta)`.
+* **Benefit**: Standardizes the patch format within the library, making it easier for third-party integrations to support synchronization.
 
 ### **D. Mutation Transactions**
 
-Add a Transaction API to the C++ core to group related mutations.
-*   **Feature**: `Timeline.begin_transaction()` / `Timeline.end_transaction()`.
-*   **Benefit**: Allows complex operations (like a "ripple edit" or "move clips") to be broadcast as a single atomic network event, preventing intermediate (broken) states from being synced.
+Add a transaction API to the C++ core to group related mutations.
+
+* **Feature**: `Timeline.begin_transaction()` / `Timeline.end_transaction()`.
+* **Benefit**: Allows complex operations (like a ripple edit or clip move) to be broadcast as a single atomic event, preventing intermediate broken states from being synced.
+
+### **E. AnyDictionary Sub-key Observation** ⚠️ Gap
+
+The `MutationObserver` fires `on_property_changed(obj, "metadata")` when any metadata key changes, but provides no sub-key path or value. This is because `AnyDictionary` (the C++ type backing `obj.metadata`) has no observation mechanism of its own — it cannot notify its parent object which key changed or what the new value is.
+
+The consequence is that a patch system cannot generate fine-grained `SetMetadataPatch` records purely from observation. Metadata mutations must be routed through an explicit API (`patcher.set_metadata(obj, path, value)`) to produce useful patches. Direct writes to `obj.metadata["x"] = y` are invisible to any observer.
+
+**Comparison with USD**: USD's `TfNotice::ObjectsChanged` carries exact property paths (e.g. `/World/Cube.xformOp:translate`) including sub-keys, which is what makes efficient delta generation possible. OTIO's equivalent would require `AnyDictionary` to know its parent object and propagate keyed change events upward — a non-trivial structural change.
+
+**In Python**: A proxy wrapper around `AnyDictionary` can intercept `__setitem__` calls and generate sub-key patches, but still requires explicit routing through the patcher rather than direct dict access.
+
+**Recommended C++ enhancement**: `MutationObserver` should receive an optional sub-path and new value when metadata changes, consistent with how USD surfaces property-path-level granularity.
+
+### **F. Recursive Observer Registration**
+
+`add_observer()` registers on a single object only. Observing a full timeline currently requires traversing the entire tree and registering on every node, then re-registering on newly inserted subtrees via `on_children_changed`.
+
+* **Recommended enhancement**: `add_observer(observer, recursive=true)` to register on a root and all descendants automatically, with new children auto-registered on insert.
 
 ## **9. Implementation Strategy**
 
-1. **Instrument the OTIO Map**: Use the Transparent Python Proxy (`OTIOSyncProxy`) wrapper.
-2. **Networking (Production)**: Use **RabbitMQ** with a fanout exchange per session. 
+1. **Patch generation**: Use `OTIOPatcher` (a `MutationObserver` subclass) attached to the root timeline. Route metadata mutations through `patcher.set_metadata()` explicitly.
+2. **Networking (Production)**: Use **RabbitMQ** with a fanout exchange per session.
 3. **The "Master" Model**: Designation of an eldest peer as the state authority.
 4. **Serialization**: Use `otio.adapters.write_to_string(obj, 'otio_json')` for all payloads.
+5. **C++ tools (e.g. Raven)**: Act as patch consumers — receive `Transaction` objects and apply them via the C++ OTIO API. No observation required on the consumer side.

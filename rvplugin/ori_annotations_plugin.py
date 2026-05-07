@@ -201,7 +201,11 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                 annotationframes = annotationmediainfo['annotations']
                 for prop in commands.properties(paint_node):
                     if ".frame:" in prop:
-                        frame = int(prop.split(".frame:")[1].split(".order")[0])
+                        try:
+                            print("FRAME PROP:", prop)
+                            frame = int(prop.split(".frame:")[1].split(".order")[0])
+                        except ValueError:
+                            continue
                         order = commands.getStringProperty(prop)
                         annotationframes[frame]['order'] = order
                 for frame in annotationframes:

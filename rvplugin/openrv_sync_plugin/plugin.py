@@ -72,6 +72,20 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.sync_manager.start_session()
         self._discovery_start_time = time.time()
 
+        @self.sync_manager.on_property_changed
+        def _on_property_changed(target_uuid, path, new_value):
+            if not self._rv_updating:
+                rv.commands.redraw()
+
+        @self.sync_manager.on_hierarchy_changed
+        def _on_hierarchy_changed(parent_uuid, action, child_uuid):
+            if action == "insert_child" and not self._rv_updating:
+                child = self.sync_manager._object_map.get(child_uuid)
+                if isinstance(child, otio.schema.Clip):
+                    ref = child.media_reference
+                    if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
+                        rv.commands.addSource(ref.target_url)
+
         if QtCore:
             self._timer = QtCore.QTimer()
             self._timer.timeout.connect(self.poll_network)
@@ -152,10 +166,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self._apply_selection(data)
         elif action == "annotation_stroke_release":
             self._apply_annotation(data)
-        elif action == "insert_child":
-            self._apply_insert(data)
-        elif action == "set_property":
-            rv.commands.redraw()
 
     def _rebuild_rv_session(self):
         """Clear and rebuild the RV session based on the current OTIO timeline."""

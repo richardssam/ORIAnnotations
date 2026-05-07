@@ -22,7 +22,10 @@ class SyncManager:
         self._object_map = {}
         self.root_timeline = None
         self._is_syncing = False
-        
+
+        self._property_callbacks = []
+        self._hierarchy_callbacks = []
+
         # Master/Session State
         self.status = STATE_NONE
         self.is_master = False
@@ -63,6 +66,41 @@ class SyncManager:
             
         obj_uuid = obj.metadata["sync"]["guid"]
         self._object_map[obj_uuid] = obj
+
+    # ------------------------------------------------------------------
+    # Observer Registry
+    # ------------------------------------------------------------------
+
+    def on_property_changed(self, callback):
+        """Register callback(target_uuid, path, new_value). Usable as a decorator.
+
+        Fires for both locally-initiated and remotely-applied property changes.
+        """
+        self._property_callbacks.append(callback)
+        return callback
+
+    def on_hierarchy_changed(self, callback):
+        """Register callback(parent_uuid, action, child_uuid). Usable as a decorator.
+
+        action is one of: 'insert_child', 'remove_child'.
+        Fires for both locally-initiated and remotely-applied structural changes.
+        """
+        self._hierarchy_callbacks.append(callback)
+        return callback
+
+    def _fire_property_changed(self, target_uuid, path, value):
+        for cb in self._property_callbacks:
+            try:
+                cb(target_uuid, path, value)
+            except Exception as e:
+                print(f"[SyncManager] on_property_changed callback error: {e}")
+
+    def _fire_hierarchy_changed(self, parent_uuid, action, child_uuid):
+        for cb in self._hierarchy_callbacks:
+            try:
+                cb(parent_uuid, action, child_uuid)
+            except Exception as e:
+                print(f"[SyncManager] on_hierarchy_changed callback error: {e}")
 
     # ------------------------------------------------------------------
     # Master Election & Session State
@@ -133,6 +171,8 @@ class SyncManager:
         else:
             setattr(obj, path, value)
             
+        self._fire_property_changed(target_uuid, path, value)
+
         if not self._is_syncing and self.network:
             payload = {
                 "command": "OTIO_SESSION",
@@ -161,6 +201,9 @@ class SyncManager:
             parent.append(child_obj)
         else:
             parent.insert(index, child_obj)
+
+        child_uuid = child_obj.metadata["sync"]["guid"]
+        self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
 
         if not self._is_syncing and self.network:
             child_json = otio.adapters.write_to_string(child_obj, "otio_json")
@@ -394,6 +437,7 @@ class SyncManager:
                         curr[parts[-1]] = value
                     else:
                         setattr(obj, path, value)
+                    self._fire_property_changed(target_uuid, path, value)
                     return ("set_property", obj)
 
             elif event == "INSERT_CHILD":
@@ -409,6 +453,8 @@ class SyncManager:
                         parent.insert(index, child_obj)
                         
                     self._ensure_guid_and_map(child_obj)
+                    child_uuid = child_obj.metadata["sync"]["guid"]
+                    self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
                     return ("insert_child", child_obj)
         finally:
             self._is_syncing = False
