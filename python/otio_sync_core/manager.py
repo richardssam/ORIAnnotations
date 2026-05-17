@@ -1,7 +1,24 @@
 import uuid
 import time
+import json
+import logging as _logging
 import opentimelineio as otio
 from .proxy import OTIOSyncProxy
+
+_logger = _logging.getLogger("otio_sync")
+
+
+def _log(msg):
+    if _logger.handlers:
+        _logger.debug(msg)
+
+
+def _otio_to_dict(obj):
+    return json.loads(otio.adapters.write_to_string(obj, "otio_json", indent=-1))
+
+
+def _dict_to_otio(d):
+    return otio.adapters.read_from_string(json.dumps(d), "otio_json")
 
 # Constants for Session State
 STATE_NONE = "NONE"
@@ -20,7 +37,8 @@ class SyncManager:
         self.network = network
         
         self._object_map = {}
-        self.root_timeline = None
+        self._timelines = {}          # guid -> otio.Timeline
+        self.active_timeline_guid = None
         self._is_syncing = False
 
         self._property_callbacks = []
@@ -33,26 +51,40 @@ class SyncManager:
         self._delta_buffer = []
         self._last_snapshot_time = 0
 
+    @property
+    def root_timeline(self):
+        """The currently active timeline, or the first registered one."""
+        if self.active_timeline_guid:
+            tl = self._timelines.get(self.active_timeline_guid)
+            if tl is not None:
+                return tl
+        return next(iter(self._timelines.values()), None)
+
     def register_timeline(self, timeline: otio.schema.Timeline):
         """Map all objects in the timeline and wrap it in a proxy for change tracking."""
-        self.root_timeline = timeline
-        self._object_map = {}
-        
-        def traverse(item):
-            yield item
-            if hasattr(item, "tracks"):
-                stack = item.tracks
+        self._ensure_guid_and_map(timeline)
+        guid = timeline.metadata["sync"]["guid"]
+        self._timelines[guid] = timeline
+        self._traverse_and_map(timeline)
+        if self.active_timeline_guid is None:
+            self.active_timeline_guid = guid
+        return OTIOSyncProxy(timeline, self)
+
+    def _traverse_and_map(self, item):
+        """Recursively assign GUIDs and add all objects under item to _object_map."""
+        def _walk(node):
+            yield node
+            if hasattr(node, "tracks"):
+                stack = node.tracks
                 yield stack
                 for child in stack:
-                    yield from traverse(child)
-            elif hasattr(item, "children"):
-                for child in item.children:
-                    yield from traverse(child)
-
-        for thing in traverse(timeline):
-            self._ensure_guid_and_map(thing)
-            
-        return OTIOSyncProxy(timeline, self)
+                    yield from _walk(child)
+            elif hasattr(node, "__iter__") and not isinstance(node, str):
+                # OTIO Track/Stack expose children via __iter__ (not .children property)
+                for child in node:
+                    yield from _walk(child)
+        for obj in _walk(item):
+            self._ensure_guid_and_map(obj)
         
     def _ensure_guid_and_map(self, obj):
         if not isinstance(obj, otio.core.SerializableObject):
@@ -93,14 +125,14 @@ class SyncManager:
             try:
                 cb(target_uuid, path, value)
             except Exception as e:
-                print(f"[SyncManager] on_property_changed callback error: {e}")
+                _log(f"on_property_changed callback error: {e}")
 
     def _fire_hierarchy_changed(self, parent_uuid, action, child_uuid):
         for cb in self._hierarchy_callbacks:
             try:
                 cb(parent_uuid, action, child_uuid)
             except Exception as e:
-                print(f"[SyncManager] on_hierarchy_changed callback error: {e}")
+                _log(f"on_hierarchy_changed callback error: {e}")
 
     # ------------------------------------------------------------------
     # Master Election & Session State
@@ -126,16 +158,19 @@ class SyncManager:
                 "requester_guid": self.self_guid
             })
 
-    def send_state_snapshot(self, target_guid):
+    def send_state_snapshot(self, target_guid, playback_state=None):
         """Master sends full state to the requesting peer."""
-        if not self.is_master or not self.root_timeline: return
-        
-        otio_json = otio.adapters.write_to_string(self.root_timeline, "otio_json")
-        self._send_session_event("STATE_SNAPSHOT", {
+        if not self.is_master or not self._timelines: return
+
+        payload = {
             "target_guid": target_guid,
-            "otio_json": otio_json,
+            "timelines": {guid: _otio_to_dict(tl) for guid, tl in self._timelines.items()},
+            "active_timeline_guid": self.active_timeline_guid,
             "snapshot_timestamp": time.time()
-        })
+        }
+        if playback_state:
+            payload["playback_state"] = playback_state
+        self._send_session_event("STATE_SNAPSHOT", payload)
 
     def _send_session_event(self, event_name, payload_data):
         if not self.network: return
@@ -155,7 +190,7 @@ class SyncManager:
     def set_property(self, target_uuid, path, value):
         """Apply a property change locally and broadcast it."""
         if target_uuid not in self._object_map:
-            print(f"[SyncManager] Warning: object {target_uuid} not found")
+            _log(f"set_property FAILED: object {target_uuid} not found")
             return
             
         obj = self._object_map[target_uuid]
@@ -191,7 +226,7 @@ class SyncManager:
     def insert_child(self, parent_uuid, child_obj, index=-1):
         """Insert child into parent and broadcast."""
         if parent_uuid not in self._object_map:
-            print(f"[SyncManager] Warning: parent {parent_uuid} not found")
+            _log(f"insert_child FAILED: parent {parent_uuid} not in object_map (known={list(self._object_map.keys())[:5]})")
             return
 
         parent = self._object_map[parent_uuid]
@@ -206,7 +241,7 @@ class SyncManager:
         self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
 
         if not self._is_syncing and self.network:
-            child_json = otio.adapters.write_to_string(child_obj, "otio_json")
+            _log(f"insert_child broadcasting: parent={parent_uuid} index={index} child={getattr(child_obj, 'name', '?')}")
             payload = {
                 "command": "OTIO_SESSION",
                 "event": "INSERT_CHILD",
@@ -215,16 +250,17 @@ class SyncManager:
                 "payload": {
                     "parent_uuid": parent_uuid,
                     "index": index,
-                    "child_json": child_json,
+                    "child_data": _otio_to_dict(child_obj),
                     "sync_timestamp": time.time()
                 }
             }
             self.network.send_payload(payload)
 
-    def broadcast_playback_state(self, state_dict):
+    def broadcast_playback_state(self, state_dict, timeline_guid=None):
         if self._is_syncing or not self.network: return
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
+        inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
         payload = {
             "command": "PLAYBACK_SETTINGS",
             "event": "SET",
@@ -260,44 +296,128 @@ class SyncManager:
         }
         self.network.send_payload(payload)
 
+    def broadcast_move_child(self, parent_uuid, child_uuid, to_index):
+        """Broadcast a MOVE_CHILD patch per the OTIO Sync Protocol."""
+        if self._is_syncing:
+            _log(f"broadcast_move_child: skipped (_is_syncing)")
+            return
+        if not self.network:
+            _log(f"broadcast_move_child: skipped (no network)")
+            return
+        if self.status != STATE_SYNCED:
+            _log(f"broadcast_move_child: skipped (status={self.status})")
+            return
+        parent = self._object_map.get(parent_uuid)
+        child = self._object_map.get(child_uuid)
+        if parent is None:
+            _log(f"broadcast_move_child: skipped (parent {parent_uuid} not in object_map)")
+            return
+        if child is None:
+            _log(f"broadcast_move_child: skipped (child {child_uuid} not in object_map, known={list(self._object_map.keys())[:5]})")
+            return
+
+        # Apply locally first
+        current_index = next(
+            (i for i, item in enumerate(parent)
+             if item.metadata.get("sync", {}).get("guid") == child_uuid),
+            None
+        )
+        if current_index is None: return
+        # del[i] + insert(i, x) is always a no-op — skip to avoid spurious messages.
+        if current_index == to_index: return
+        del parent[current_index]
+        parent.insert(to_index, child)
+
+        self.network.send_payload({
+            "command": "OTIO_SESSION",
+            "event": "MOVE_CHILD",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "parent_uuid": parent_uuid,
+                "child_uuid": child_uuid,
+                "to_index": to_index,
+                "sync_timestamp": time.time(),
+            }
+        })
+
+    def broadcast_remove_child(self, parent_uuid, child_uuid):
+        """Broadcast a REMOVE_CHILD patch per the OTIO Sync Protocol."""
+        if self._is_syncing or not self.network or self.status != STATE_SYNCED:
+            return
+        parent = self._object_map.get(parent_uuid)
+        child = self._object_map.get(child_uuid)
+        if parent is None:
+            _log(f"broadcast_remove_child: skipped (parent {parent_uuid} not in object_map)")
+            return
+        if child is None:
+            _log(f"broadcast_remove_child: skipped (child {child_uuid} not in object_map)")
+            return
+
+        current_index = next(
+            (i for i, item in enumerate(parent)
+             if item.metadata.get("sync", {}).get("guid") == child_uuid),
+            None
+        )
+        if current_index is None:
+            _log(f"broadcast_remove_child: child {child_uuid} not found in parent track")
+            return
+        del parent[current_index]
+        del self._object_map[child_uuid]
+
+        _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
+        self.network.send_payload({
+            "command": "OTIO_SESSION",
+            "event": "REMOVE_CHILD",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "parent_uuid": parent_uuid,
+                "child_uuid": child_uuid,
+                "sync_timestamp": time.time(),
+            }
+        })
 
     def _persist_annotation_to_timeline(self, data):
-        if not self.root_timeline: return
+        timeline_guid = data.get("timeline_guid") or self.active_timeline_guid
+        timeline = self._timelines.get(timeline_guid) if timeline_guid else self.root_timeline
+        if not timeline: return
+
         import opentimelineio as otio
         try:
             otio.schema.schemadef.module_from_name('SyncEvent')
         except Exception:
             pass
-            
+
         # Extract native schema events from the dictionary
         events = []
-        if "start_event_json" in data:
-            events.append(otio.adapters.read_from_string(data["start_event_json"], "otio_json"))
-        if "points_event_json" in data:
-            events.append(otio.adapters.read_from_string(data["points_event_json"], "otio_json"))
-        
+        if "start_event_data" in data:
+            events.append(_dict_to_otio(data["start_event_data"]))
+        if "points_event_data" in data:
+            events.append(_dict_to_otio(data["points_event_data"]))
+
         # Find the appropriate Annotations track
         annotations_tracks = []
-        for track in self.root_timeline.tracks:
+        for track in timeline.tracks:
             if track.name and track.name.startswith("Annotations"):
                 annotations_tracks.append(track)
-                
+
         target_track = None
         if annotations_tracks:
             # Sort by suffix if it exists, or just pick the last one
             target_track = annotations_tracks[-1]
         else:
             target_track = otio.schema.Track("Annotations")
-            self.root_timeline.tracks.append(target_track)
-            
+            timeline.tracks.append(target_track)
+
         frame = data.get("frame", 1)
         fps = data.get("fps", 24.0)
         media_path = data.get("media_path")
-        
+
         target_time_offset = otio.opentime.RationalTime(0, fps)
-        
-        if media_path and self.root_timeline:
-            for track in self.root_timeline.tracks:
+
+        if media_path:
+            for track in timeline.tracks:
                 if track.name == "Media":
                     for c in track:
                         if isinstance(c, otio.schema.Clip):
@@ -384,6 +504,8 @@ class SyncManager:
         # Ignore our own messages
         if source == self.self_guid: return None
 
+        _log(f"apply_patch: command={command} event={event} source={source[:8]}")
+
         # If we are joining, buffer everything except session management
         if self.status == STATE_JOINING and command != "SESSION":
             self._delta_buffer.append(payload)
@@ -440,12 +562,44 @@ class SyncManager:
                     self._fire_property_changed(target_uuid, path, value)
                     return ("set_property", obj)
 
+            elif event == "MOVE_CHILD":
+                parent_uuid = data.get("parent_uuid")
+                child_uuid = data.get("child_uuid")
+                to_index = data.get("to_index", 0)
+                parent = self._object_map.get(parent_uuid)
+                child = self._object_map.get(child_uuid)
+                if parent is not None and child is not None:
+                    current_index = next(
+                        (i for i, item in enumerate(parent)
+                         if item.metadata.get("sync", {}).get("guid") == child_uuid),
+                        None
+                    )
+                    if current_index is not None:
+                        del parent[current_index]
+                        parent.insert(to_index, child)
+                        return ("move_child", data)
+
+            elif event == "REMOVE_CHILD":
+                parent_uuid = data.get("parent_uuid")
+                child_uuid = data.get("child_uuid")
+                parent = self._object_map.get(parent_uuid)
+                if parent is not None:
+                    current_index = next(
+                        (i for i, item in enumerate(parent)
+                         if item.metadata.get("sync", {}).get("guid") == child_uuid),
+                        None
+                    )
+                    if current_index is not None:
+                        del parent[current_index]
+                        self._object_map.pop(child_uuid, None)
+                        return ("remove_child", data)
+
             elif event == "INSERT_CHILD":
                 parent_uuid = data.get("parent_uuid")
                 if parent_uuid in self._object_map:
                     parent = self._object_map[parent_uuid]
                     index = data.get("index", -1)
-                    child_obj = otio.adapters.read_from_string(data.get("child_json"), "otio_json")
+                    child_obj = _dict_to_otio(data.get("child_data"))
                     
                     if index == -1:
                         parent.append(child_obj)
@@ -472,14 +626,18 @@ class SyncManager:
 
     def apply_snapshot(self, snapshot_data):
         """Process a full state snapshot and then replay buffered deltas."""
-        otio_json = snapshot_data.get("otio_json")
         timestamp = snapshot_data.get("snapshot_timestamp", 0)
-        
+
         self._is_syncing = True
         try:
-            self.root_timeline = otio.adapters.read_from_string(otio_json, "otio_json")
-            self.register_timeline(self.root_timeline)
-            
+            self._timelines = {}
+            self._object_map = {}
+            for guid, tl_dict in snapshot_data.get("timelines", {}).items():
+                tl = _dict_to_otio(tl_dict)
+                self._timelines[guid] = tl
+                self._traverse_and_map(tl)
+            self.active_timeline_guid = snapshot_data.get("active_timeline_guid")
+
             # Replay buffer for messages that came after the snapshot
             replay_results = []
             for payload in self._delta_buffer:
@@ -488,7 +646,7 @@ class SyncManager:
                 if p_time > timestamp:
                     res = self.apply_patch(payload)
                     if res: replay_results.append(res)
-            
+
             self._delta_buffer = []
             self.status = STATE_SYNCED
             return replay_results

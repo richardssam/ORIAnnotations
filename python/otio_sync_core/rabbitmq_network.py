@@ -1,9 +1,17 @@
 import pika
 import json
+import logging as _logging
 import threading
 import queue
 import uuid
 import opentimelineio as otio
+
+_logger = _logging.getLogger("otio_sync")
+
+
+def _log(msg):
+    if _logger.handlers:
+        _logger.debug(msg)
 
 class RabbitMQNetwork:
     """
@@ -48,13 +56,14 @@ class RabbitMQNetwork:
                         payload = json.loads(body.decode('utf-8'))
                         if payload.get("source_guid") == self.self_guid:
                             return
+                        _log(f"\n=== MQ RECV [{self.exchange_name}] ===\n{json.dumps(payload, indent=2)}\n")
                         self._incoming_queue.put(payload)
                     except Exception as e:
-                        print(f"[RabbitMQNetwork] Error processing message: {e}")
+                        _log(f"Error processing message: {e}")
 
                 channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
 
-                print(f"[RabbitMQNetwork] Connected to {self.host}:{self.port}, listening on {self.exchange_name}")
+                _log(f"Connected to {self.host}:{self.port}, listening on {self.exchange_name}")
 
                 while not self._stop_event.is_set():
                     connection.process_data_events(time_limit=1)
@@ -62,7 +71,7 @@ class RabbitMQNetwork:
                 connection.close()
             except Exception as e:
                 if not self._stop_event.is_set():
-                    print(f"[RabbitMQNetwork] Consumer error: {e}. Retrying in 5s...")
+                    _log(f"Consumer error: {e}. Retrying in 5s...")
                     self._stop_event.wait(5)
 
     def _get_send_channel(self):
@@ -80,12 +89,10 @@ class RabbitMQNetwork:
         try:
             if "source_guid" not in payload:
                 payload["source_guid"] = self.self_guid
-            
-            # If payload contains OTIO objects, they should have been 
-            # serialized to string/dict before getting here.
-            # But we'll handle the JSON encoding.
+
+            _log(f"\n=== MQ SEND [{self.exchange_name}] ===\n{json.dumps(payload, indent=2)}\n")
             data = json.dumps(payload).encode('utf-8')
-            
+
             channel = self._get_send_channel()
             channel.basic_publish(
                 exchange=self.exchange_name,
@@ -93,7 +100,7 @@ class RabbitMQNetwork:
                 body=data
             )
         except Exception as e:
-            print(f"[RabbitMQNetwork] Send error: {e}")
+            _log(f"Send error: {e}")
 
     def receive_payloads(self):
         """Fetch all queued payloads since last poll."""
