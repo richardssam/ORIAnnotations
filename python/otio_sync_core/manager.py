@@ -95,12 +95,18 @@ class SyncManager:
 
         self._property_callbacks: list[Callable[[str, str, Any], None]] = []
         self._hierarchy_callbacks: list[Callable[[str, str, str], None]] = []
+        self._status_callbacks: list[Callable[[str], None]] = []
+        self._playback_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._synced_callbacks: list[Callable[[], None]] = []
 
         self.status: str = STATE_NONE
         self.is_master: bool = False
         self.master_guid: str | None = None
         self._delta_buffer: list[dict[str, Any]] = []
         self._last_snapshot_time: float = 0
+
+        #: Last received playback state dict; empty until the first playback message.
+        self.playback_state: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -118,6 +124,16 @@ class SyncManager:
             if tl is not None:
                 return tl
         return next(iter(self._timelines.values()), None)
+
+    @property
+    def timelines(self) -> dict[str, otio.schema.Timeline]:
+        """Read-only view of all registered timelines, keyed by sync GUID."""
+        return self._timelines
+
+    @property
+    def object_map(self) -> dict[str, otio.core.SerializableObject]:
+        """Read-only view of the flat GUID → OTIO object index."""
+        return self._object_map
 
     # ------------------------------------------------------------------
     # Timeline Registration
@@ -208,6 +224,62 @@ class SyncManager:
         self._hierarchy_callbacks.append(callback)
         return callback
 
+    def on_status_changed(
+        self, callback: Callable[[str], None]
+    ) -> Callable[[str], None]:
+        """Register a callback fired whenever :attr:`status` transitions.
+
+        :param callback: Callable receiving the new status string.
+        :returns: The *callback* unchanged (decorator-compatible).
+        """
+        self._status_callbacks.append(callback)
+        return callback
+
+    def on_playback_changed(
+        self, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[dict[str, Any]], None]:
+        """Register a callback fired whenever a playback-state message arrives.
+
+        The callback receives the raw playback state dict (same structure as
+        :attr:`playback_state`).  Also usable as a decorator.
+
+        :param callback: Callable receiving the playback state dict.
+        :returns: The *callback* unchanged (decorator-compatible).
+        """
+        self._playback_callbacks.append(callback)
+        return callback
+
+    def on_synced(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Register a callback fired once when the session reaches ``STATE_SYNCED``.
+
+        Fires both when this peer self-elects as master and when it finishes
+        joining an existing master.  Also usable as a decorator.
+
+        :param callback: Zero-argument callable.
+        :returns: The *callback* unchanged (decorator-compatible).
+        """
+        self._synced_callbacks.append(callback)
+        return callback
+
+    def _set_status(self, new_status: str) -> None:
+        """Update :attr:`status` and fire registered status-change callbacks."""
+        if new_status == self.status:
+            return
+        self.status = new_status
+        for cb in self._status_callbacks:
+            try:
+                cb(new_status)
+            except Exception as e:
+                _log(f"on_status_changed callback error: {e}")
+        if new_status == STATE_SYNCED:
+            for cb in self._synced_callbacks:
+                try:
+                    cb()
+                except Exception as e:
+                    _log(f"on_synced callback error: {e}")
+
     def _fire_property_changed(
         self, target_uuid: str, path: str, value: Any
     ) -> None:
@@ -237,7 +309,7 @@ class SyncManager:
         responsible for timing out and calling the appropriate method if no master
         responds (see class docstring for the full lifecycle).
         """
-        self.status = STATE_DISCOVERING
+        self._set_status(STATE_DISCOVERING)
         self.broadcast_master_discovery()
 
     def broadcast_master_discovery(self) -> None:
@@ -259,7 +331,7 @@ class SyncManager:
         ``_delta_buffer`` and replayed by :meth:`apply_snapshot`.
         """
         if self.master_guid:
-            self.status = STATE_JOINING
+            self._set_status(STATE_JOINING)
             self._send_session_event("STATE_REQUEST", {
                 "target_guid": self.master_guid,
                 "requester_guid": self.self_guid,
@@ -751,14 +823,19 @@ class SyncManager:
                 return None
 
             if command == "PLAYBACK_SETTINGS" and event == "SET":
+                self.playback_state = data
+                for cb in self._playback_callbacks:
+                    try:
+                        cb(data)
+                    except Exception as e:
+                        _log(f"on_playback_changed callback error: {e}")
                 return ("playback_settings", data)
 
             if command == "SELECTION" and event == "SET":
                 return ("selection_changed", data)
 
             if command == "ANNOTATION":
-                if self.is_master:
-                    self._persist_annotation_to_timeline(data)
+                self._persist_annotation_to_timeline(data)
                 return (f"annotation_{event.lower()}", data)
 
             if command != "OTIO_SESSION":
@@ -834,6 +911,41 @@ class SyncManager:
 
         return None
 
+    def tick(self) -> list[tuple[str, Any]]:
+        """Poll the network and auto-advance the session handshake.
+
+        This is the recommended entry point for new client integrations.
+        It wraps :meth:`receive_and_apply_all` and handles the session
+        state machine automatically:
+
+        * ``master_found``          → calls :meth:`request_state` internally.
+        * ``state_snapshot_received`` → calls :meth:`apply_snapshot` internally.
+        * ``state_request_received`` → **returned to caller**; the master must
+          respond by calling :meth:`send_state_snapshot`.
+
+        Application-level events (``playback_settings``, ``selection_changed``,
+        ``annotation_*``, ``insert_child``, …) are returned so the caller can
+        react to them.  Playback updates are also delivered through the
+        :meth:`on_playback_changed` callback if one is registered.
+
+        Compare with :meth:`receive_and_apply_all`, which returns every raw
+        action tuple and leaves the handshake entirely to the caller.
+
+        :returns: List of ``(action, data)`` tuples requiring application
+            action (subset of what :meth:`receive_and_apply_all` would return).
+        """
+        app_events: list[tuple[str, Any]] = []
+        for action, data in self.receive_and_apply_all():
+            if action == "master_found":
+                self.request_state()
+            elif action == "state_snapshot_received":
+                self.apply_snapshot(data)
+                if "playback_state" in data:
+                    self.playback_state = data["playback_state"]
+            else:
+                app_events.append((action, data))
+        return app_events
+
     def receive_and_apply_all(self) -> list[tuple[str, Any]]:
         """Drain the network and apply every pending message.
 
@@ -884,7 +996,7 @@ class SyncManager:
                         replay_results.append(res)
 
             self._delta_buffer = []
-            self.status = STATE_SYNCED
+            self._set_status(STATE_SYNCED)
             return replay_results
         finally:
             self._is_syncing = False

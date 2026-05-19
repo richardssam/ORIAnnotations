@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OTIO Sync Viewer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #1a1a1e;
+    --surface:   #242428;
+    --border:    #3a3a42;
+    --text:      #d4d4d8;
+    --muted:     #71717a;
+    --accent:    #6366f1;
+    --synced:    #22c55e;
+    --joining:   #f59e0b;
+    --discover:  #3b82f6;
+    --none:      #71717a;
+    --clip-media:#3b82f6;
+    --clip-video:#6366f1;
+    --clip-annot:#f59e0b;
+    --clip-gap:  #3a3a42;
+    --clip-other:#10b981;
+    --playhead:  #ef4444;
+    --selected-border: #f4f4f5;
+    --row-h: 28px;
+    --label-w: 110px;
+    --ruler-h: 24px;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, monospace; font-size: 12px; }
+
+  /* ── Layout ────────────────────────────────────────────────── */
+  body { display: flex; flex-direction: column; overflow: hidden; }
+
+  #topbar {
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 12px;
+    padding: 6px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  #topbar h1 { font-size: 13px; font-weight: 600; letter-spacing: .02em; color: #f4f4f5; }
+  #topbar .sep { color: var(--border); }
+
+  .badge {
+    display: inline-block; padding: 2px 7px; border-radius: 4px;
+    font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  }
+  .badge-SYNCED     { background: #14532d; color: var(--synced); }
+  .badge-JOINING    { background: #451a03; color: var(--joining); }
+  .badge-DISCOVERING{ background: #1e3a5f; color: var(--discover); }
+  .badge-NONE       { background: #27272a; color: var(--muted); }
+  .badge-not_started{ background: #27272a; color: var(--muted); }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 7px; border-radius: 4px;
+    background: #27272a; color: var(--muted); font-size: 10px;
+  }
+  .pill .label { color: var(--muted); }
+  .pill .val { color: var(--text); font-weight: 600; }
+  .master-yes .val { color: var(--synced); }
+
+  #main {
+    flex: 1; display: flex; overflow: hidden;
+  }
+
+  /* ── Left sidebar: timeline list ───────────────────────────── */
+  #sidebar {
+    width: 160px; flex-shrink: 0;
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+  }
+  #sidebar h2 {
+    padding: 8px 10px 6px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .tl-item {
+    padding: 7px 10px; cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 6px;
+    transition: background .1s;
+  }
+  .tl-item:hover { background: #2e2e34; }
+  .tl-item.active { background: #2c2c3a; border-left: 2px solid var(--accent); padding-left: 8px; }
+  .tl-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .tl-item.active .tl-dot { background: var(--accent); }
+  .tl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tl-guid { font-size: 9px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+
+  /* ── Centre: timeline viewer ────────────────────────────────── */
+  #viewer {
+    flex: 1; display: flex; flex-direction: column;
+    overflow: hidden; min-width: 0;
+  }
+
+  #timeline-container {
+    flex: 1; overflow: auto; position: relative;
+    background: var(--bg);
+  }
+
+  #timeline-wrap { position: relative; }
+
+  /* ruler */
+  #ruler {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    height: var(--ruler-h);
+    pointer-events: none;
+  }
+
+  /* tracks area */
+  #tracks-area {
+    position: relative;
+  }
+
+  .track-row {
+    display: flex; align-items: stretch;
+    border-bottom: 1px solid var(--border);
+    height: var(--row-h);
+    position: relative;
+  }
+  .track-label {
+    width: var(--label-w); flex-shrink: 0;
+    display: flex; align-items: center;
+    padding: 0 8px; gap: 4px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    position: sticky; left: 0; z-index: 5;
+    font-size: 10px; font-weight: 600; color: var(--muted);
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  .track-label .kind-dot {
+    width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+  }
+  .track-label .kind-Video    { background: var(--clip-video); }
+  .track-label .kind-Audio    { background: #06b6d4; }
+  .track-label .kind-Annotations, .track-label .kind-annot { background: var(--clip-annot); }
+
+  .track-clips {
+    flex: 1; position: relative; height: 100%;
+  }
+
+  .clip-block {
+    position: absolute; top: 2px; bottom: 2px;
+    border-radius: 3px; cursor: pointer;
+    display: flex; align-items: center;
+    padding: 0 4px;
+    font-size: 10px; font-weight: 500;
+    overflow: hidden; white-space: nowrap;
+    transition: filter .1s, outline .05s;
+    user-select: none;
+  }
+  .clip-block:hover { filter: brightness(1.2); }
+  .clip-block.selected { outline: 1.5px solid var(--selected-border); outline-offset: 1px; }
+  .clip-block.type-Clip.track-Media  { background: #1e3a5f; color: #93c5fd; border: 1px solid #3b82f6; }
+  .clip-block.type-Clip.track-Video  { background: #2e1065; color: #c4b5fd; border: 1px solid #6366f1; }
+  .clip-block.type-Clip.track-Audio  { background: #083344; color: #67e8f9; border: 1px solid #06b6d4; }
+  .clip-block.type-Clip.track-Annotations { background: #451a03; color: #fcd34d; border: 1px solid #f59e0b; }
+  .clip-block.type-Clip              { background: #052e16; color: #86efac; border: 1px solid #10b981; }
+  .clip-block.type-Gap               { background: #1c1c20; color: var(--muted); border: 1px solid #3a3a42; cursor: default; }
+  .clip-block.type-Gap:hover         { filter: none; }
+
+  /* playhead */
+  #playhead {
+    position: absolute; top: 0; bottom: 0;
+    width: 1px; background: var(--playhead);
+    pointer-events: none; z-index: 20;
+    box-shadow: 0 0 4px rgba(239,68,68,.6);
+  }
+  #playhead::before {
+    content: '';
+    position: absolute; top: -4px; left: -4px;
+    width: 9px; height: 9px;
+    background: var(--playhead);
+    clip-path: polygon(50% 100%, 0 0, 100% 0);
+  }
+
+  /* no-timeline placeholder */
+  #placeholder {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--muted); font-size: 13px;
+  }
+
+  /* ── Bottom: playback bar ────────────────────────────────────── */
+  #playback-bar {
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 12px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .play-btn {
+    width: 20px; height: 20px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px;
+  }
+  .play-btn.playing { background: #14532d; color: var(--synced); }
+  .play-btn.stopped { background: #27272a; color: var(--muted); }
+  .pb-field { color: var(--muted); }
+  .pb-field span { color: var(--text); font-weight: 600; }
+
+  /* ── Right: metadata panel ──────────────────────────────────── */
+  #meta-panel {
+    width: 280px; flex-shrink: 0;
+    display: flex; flex-direction: column;
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+  #meta-panel h2 {
+    padding: 8px 10px 6px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #meta-header {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #meta-header .obj-name { font-size: 13px; font-weight: 600; color: #f4f4f5; margin-bottom: 2px; }
+  #meta-header .obj-type { font-size: 10px; color: var(--accent); }
+  #meta-header .obj-guid { font-size: 9px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+  #meta-json {
+    flex: 1; overflow: auto;
+    padding: 8px 10px;
+    font-size: 10px; line-height: 1.6;
+    font-family: 'SF Mono', 'Fira Mono', monospace;
+  }
+  #meta-empty {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 12px; text-align: center; padding: 20px;
+  }
+
+  /* JSON syntax highlighting */
+  .json-key   { color: #c4b5fd; }
+  .json-str   { color: #86efac; }
+  .json-num   { color: #fcd34d; }
+  .json-bool  { color: #f97316; }
+  .json-null  { color: #71717a; }
+
+  /* ── Zoom bar ───────────────────────────────────────────────── */
+  #zoom-bar {
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 5px;
+    padding: 3px 10px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+  }
+  #zoom-bar .zb-label { color: var(--muted); margin-right: 2px; }
+  .zoom-btn {
+    background: #2e2e34; color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 8px; cursor: pointer; font-size: 12px; line-height: 1.4;
+    user-select: none;
+  }
+  .zoom-btn:hover { background: #3a3a42; }
+  .zoom-btn.fit { font-size: 10px; padding: 2px 8px; }
+  #zoom-display { min-width: 38px; text-align: center; color: var(--text); font-weight: 600; }
+  #zoom-bar .zb-hint { color: var(--muted); font-size: 9px; margin-left: 4px; }
+
+  /* ── Connection overlay ──────────────────────────────────────── */
+  #conn-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7);
+    align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px;
+    z-index: 100; font-size: 14px; color: var(--muted);
+  }
+  #conn-overlay.visible { display: flex; }
+  .spinner {
+    width: 24px; height: 24px; border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ─────────────────────────────────────────────────── -->
+<div id="topbar">
+  <h1>OTIO Sync Viewer</h1>
+  <span class="sep">|</span>
+  <span id="status-badge" class="badge badge-NONE">NONE</span>
+  <span id="master-pill" class="pill">
+    <span class="label">master</span>
+    <span class="val" id="master-val">—</span>
+  </span>
+  <span id="self-pill" class="pill">
+    <span class="label">self</span>
+    <span class="val" id="self-val">—</span>
+  </span>
+  <span id="master-indicator" class="pill" style="display:none;">
+    <span class="val" style="color:var(--joining);">★ master</span>
+  </span>
+</div>
+
+<!-- ── Main area ───────────────────────────────────────────────── -->
+<div id="main">
+
+  <!-- Left: timeline list -->
+  <div id="sidebar">
+    <h2>Timelines</h2>
+    <div id="tl-list"></div>
+  </div>
+
+  <!-- Centre: viewer + playback bar -->
+  <div id="viewer">
+    <div id="timeline-container">
+      <div id="timeline-wrap">
+        <canvas id="ruler"></canvas>
+        <div id="tracks-area"></div>
+        <div id="playhead" style="display:none;"></div>
+      </div>
+      <div id="placeholder">Waiting for session data…</div>
+    </div>
+
+    <!-- Zoom bar -->
+    <div id="zoom-bar">
+      <span class="zb-label">Zoom</span>
+      <button id="zoom-out-btn" class="zoom-btn">−</button>
+      <span id="zoom-display">100%</span>
+      <button id="zoom-in-btn" class="zoom-btn">+</button>
+      <button id="zoom-fit-btn" class="zoom-btn fit">Fit</button>
+      <span id="dur-display" class="zb-hint" style="margin-left:4px;"></span>
+      <span id="dur-debug" class="zb-hint" style="margin-left:6px; color:#888;"></span>
+      <span class="zb-hint" style="margin-left:6px;">Ctrl+scroll</span>
+    </div>
+
+    <!-- Playback bar -->
+    <div id="playback-bar">
+      <div id="play-btn" class="play-btn stopped">▶</div>
+      <span class="pb-field">Time: <span id="pb-time">—</span></span>
+      <span class="pb-field">Frame: <span id="pb-frame">—</span></span>
+      <span class="pb-field">FPS: <span id="pb-fps">—</span></span>
+      <span class="pb-field">Loop: <span id="pb-loop">—</span></span>
+      <span class="pb-field" style="margin-left:auto;">Timeline: <span id="pb-tl">—</span></span>
+    </div>
+  </div>
+
+  <!-- Right: metadata panel -->
+  <div id="meta-panel">
+    <h2>Inspector</h2>
+    <div id="meta-header" style="display:none;">
+      <div class="obj-name" id="meta-name"></div>
+      <div class="obj-type" id="meta-type"></div>
+      <div class="obj-guid" id="meta-guid"></div>
+    </div>
+    <div id="meta-empty">Click a clip to inspect</div>
+    <pre id="meta-json" style="display:none;"></pre>
+  </div>
+</div>
+
+<!-- Connection overlay -->
+<div id="conn-overlay">
+  <div class="spinner"></div>
+  <span>Connecting to server…</span>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+
+let state = null;
+let activeTimelineGuid = null;
+let selectedGuid = null;
+let ws = null;
+let reconnectTimer = null;
+let zoom = 1.0;          // pixels per second
+let fitZoomValue = 1.0;  // zoom level at last Fit
+let autoZoomed = false;
+let lastFitDur = 0;      // contentDur used at last auto-fit — reset fit when it changes
+const MIN_ZOOM = 2, MAX_ZOOM = 1000;
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+
+function connect() {
+  const overlay = document.getElementById('conn-overlay');
+  overlay.classList.add('visible');
+  clearTimeout(reconnectTimer);
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+
+  ws.onopen = () => {
+    overlay.classList.remove('visible');
+  };
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'state') {
+      handleState(msg.data);
+    } else if (msg.type === 'detail') {
+      renderDetail(msg.data);
+    }
+  };
+
+  ws.onclose = () => {
+    overlay.classList.add('visible');
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+}
+
+// ── State handling ────────────────────────────────────────────────────────────
+
+function handleState(s) {
+  state = s;
+
+  // Preserve active timeline if it still exists, else default to server's active
+  const guids = (s.timelines || []).map(t => t.guid);
+  if (!activeTimelineGuid || !guids.includes(activeTimelineGuid)) {
+    activeTimelineGuid = s.active_timeline_guid || (guids[0] || null);
+  }
+
+  renderTopbar(s);
+  renderSidebar(s);
+  renderTimeline();
+  renderPlayback(s.playback || {});
+}
+
+// ── Topbar ────────────────────────────────────────────────────────────────────
+
+function renderTopbar(s) {
+  const badge = document.getElementById('status-badge');
+  const status = s.status || 'NONE';
+  badge.textContent = status;
+  badge.className = `badge badge-${status}`;
+
+  document.getElementById('master-val').textContent =
+    s.master_guid ? s.master_guid.slice(0, 8) : '—';
+
+  document.getElementById('self-val').textContent =
+    s.self_guid ? s.self_guid.slice(0, 8) : '—';
+
+  const masterInd = document.getElementById('master-indicator');
+  const masterPill = document.getElementById('master-pill');
+  if (s.is_master) {
+    masterInd.style.display = '';
+    masterPill.classList.add('master-yes');
+  } else {
+    masterInd.style.display = 'none';
+    masterPill.classList.remove('master-yes');
+  }
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+
+function renderSidebar(s) {
+  const list = document.getElementById('tl-list');
+  list.innerHTML = '';
+  (s.timelines || []).forEach(tl => {
+    const div = document.createElement('div');
+    div.className = 'tl-item' + (tl.guid === activeTimelineGuid ? ' active' : '');
+    div.innerHTML = `
+      <div class="tl-dot"></div>
+      <div>
+        <div class="tl-name">${esc(tl.name)}</div>
+        <div class="tl-guid">${tl.guid.slice(0, 12)}…</div>
+      </div>`;
+    div.addEventListener('click', () => {
+      activeTimelineGuid = tl.guid;
+      renderSidebar(state);
+      renderTimeline();
+    });
+    list.appendChild(div);
+  });
+}
+
+// ── Timeline ──────────────────────────────────────────────────────────────────
+
+function getActiveTl() {
+  if (!state || !state.timelines) return null;
+  return state.timelines.find(t => t.guid === activeTimelineGuid) || null;
+}
+
+function renderTimeline() {
+  const tl = getActiveTl();
+  const placeholder = document.getElementById('placeholder');
+  const tracksArea  = document.getElementById('tracks-area');
+  const ruler       = document.getElementById('ruler');
+  const playhead    = document.getElementById('playhead');
+  const wrap        = document.getElementById('timeline-wrap');
+
+  if (!tl || !tl.tracks || tl.tracks.length === 0) {
+    placeholder.style.display = 'flex';
+    tracksArea.innerHTML = '';
+    ruler.style.display = 'none';
+    playhead.style.display = 'none';
+    return;
+  }
+
+  placeholder.style.display = 'none';
+  ruler.style.display = '';
+
+  // Total duration — use contentDur() to ignore bogus outlier items
+  const totalDur = contentDur(tl);
+
+  // Auto-fit on first render OR when the content duration changes significantly
+  // (e.g. after the plugin corrects bogus clip durations).
+  // If the container isn't laid out yet (clientWidth==0), defer and bail.
+  const durChanged = lastFitDur > 0 && Math.abs(totalDur - lastFitDur) / lastFitDur > 0.2;
+  if (!autoZoomed || durChanged) {
+    const _avail = document.getElementById('timeline-container').clientWidth - 110;
+    if (_avail <= 0) { requestAnimationFrame(renderTimeline); return; }
+    doFitZoom();
+  }
+  const LABEL_W = 110;
+  const contentW = Math.max(totalDur * zoom, 400);
+  const totalW = LABEL_W + contentW;
+  const ROW_H = 28;
+
+  // ── Ruler ──
+  renderRuler(ruler, totalDur, LABEL_W, contentW, totalW);
+
+  // ── Tracks ──
+  tracksArea.innerHTML = '';
+
+  tl.tracks.forEach(track => {
+    const row = document.createElement('div');
+    row.className = 'track-row';
+    row.style.height = ROW_H + 'px';
+
+    // Label
+    const kindClass = track.name.startsWith('Annotations') ? 'Annotations'
+                    : track.kind || 'Video';
+    const label = document.createElement('div');
+    label.className = 'track-label';
+    label.style.width = LABEL_W + 'px';
+    label.innerHTML = `
+      <div class="kind-dot kind-${kindClass}"></div>
+      <span title="${esc(track.name)}">${esc(track.name || '(track)')}</span>`;
+    row.appendChild(label);
+
+    // Clips
+    const clipsDiv = document.createElement('div');
+    clipsDiv.className = 'track-clips';
+    clipsDiv.style.width = contentW + 'px';
+    clipsDiv.style.position = 'relative';
+
+    track.items.forEach(item => {
+      if (item.duration < 1e-6) return;
+
+      const block = document.createElement('div');
+      const trackClass = track.name.startsWith('Annotations') ? 'Annotations'
+                       : track.name === 'Media' ? 'Media'
+                       : track.kind || 'Video';
+      block.className =
+        `clip-block type-${item.type} track-${trackClass}` +
+        (item.guid === selectedGuid ? ' selected' : '');
+      block.style.left  = (item.start  * zoom) + 'px';
+      block.style.width = Math.max(item.duration * zoom - 1, 2) + 'px';
+      block.title = `${item.name || '(gap)'} — ${item.duration.toFixed(3)}s`;
+
+      if (item.type !== 'Gap') {
+        block.textContent = item.name || '(clip)';
+        if (item.guid) {
+          block.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectItem(item.guid);
+          });
+        }
+      }
+
+      clipsDiv.appendChild(block);
+    });
+
+    row.appendChild(clipsDiv);
+    tracksArea.appendChild(row);
+  });
+
+  // ── Playhead ──
+  updatePlayhead(tl, LABEL_W, contentW);
+
+  // Set wrap width so horizontal scroll works
+  wrap.style.width = totalW + 'px';
+  wrap.style.minWidth = '100%';
+}
+
+function renderRuler(canvas, totalDur, labelW, contentW, totalW) {
+  const container = document.getElementById('timeline-container');
+  const h = 24;
+  canvas.width  = totalW * devicePixelRatio;
+  canvas.height = h * devicePixelRatio;
+  canvas.style.width  = totalW + 'px';
+  canvas.style.height = h + 'px';
+  canvas.style.display = 'block';
+  canvas.style.position = 'sticky';
+  canvas.style.top = '0';
+  canvas.style.zIndex = '10';
+  canvas.style.background = '#242428';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.clearRect(0, 0, totalW, h);
+
+  // draw bottom border
+  ctx.fillStyle = '#3a3a42';
+  ctx.fillRect(0, h - 1, totalW, 1);
+
+  // Fill label area
+  ctx.fillStyle = '#242428';
+  ctx.fillRect(0, 0, labelW, h - 1);
+  ctx.fillStyle = '#3a3a42';
+  ctx.fillRect(labelW - 1, 0, 1, h);
+
+  // Tick interval — target ~60px apart
+  const targetPx = 80;
+  const secPerTick = niceInterval(targetPx / zoom);
+  const fps = (state && state.playback && (state.playback.fps || rtFps(state.playback.current_time))) || 24;
+
+  ctx.font = `9px system-ui, monospace`;
+  ctx.textBaseline = 'middle';
+
+  for (let t = 0; t <= totalDur + secPerTick; t += secPerTick) {
+    const x = labelW + t * zoom;
+    if (x > totalW + 5) break;
+
+    ctx.fillStyle = '#3a3a42';
+    ctx.fillRect(x, h * 0.4, 1, h * 0.6);
+
+    ctx.fillStyle = '#71717a';
+    const label = formatTime(t, fps);
+    ctx.fillText(label, x + 3, h * 0.5);
+  }
+}
+
+function niceInterval(raw) {
+  const nice = [0.04, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600];
+  return nice.find(v => v >= raw) || 600;
+}
+
+function formatTime(sec, fps) {
+  const frames = Math.round(sec * fps);
+  const totalSec = Math.floor(sec);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  const f = Math.round((sec - totalSec) * fps);
+  if (m > 0) return `${m}:${String(s).padStart(2,'0')}`;
+  if (sec < 10) return `${s}.${String(f).padStart(2,'0')}`;
+  return `${s}s`;
+}
+
+function updatePlayhead(tl, labelW, contentW) {
+  const playhead = document.getElementById('playhead');
+  if (!state || !state.playback) { playhead.style.display = 'none'; return; }
+
+  const pb = state.playback;
+  const currentSecs = rtToSeconds(pb.current_time);
+  if (currentSecs === undefined) {
+    playhead.style.display = 'none';
+    return;
+  }
+
+  const RULER_H = 24;
+  playhead.style.display = '';
+  playhead.style.left = (labelW + currentSecs * zoom) + 'px';
+  playhead.style.top  = RULER_H + 'px';
+}
+
+// ── Playback bar ──────────────────────────────────────────────────────────────
+
+function renderPlayback(pb) {
+  const btn = document.getElementById('play-btn');
+  const playing = pb.playing;
+  btn.className = 'play-btn ' + (playing ? 'playing' : 'stopped');
+  btn.textContent = playing ? '▶' : '■';
+
+  const fps = pb.fps || rtFps(pb.current_time) || 24;
+  const secs = rtToSeconds(pb.current_time);
+  document.getElementById('pb-time').textContent =
+    secs !== undefined ? secs.toFixed(3) + 's' : '—';
+  document.getElementById('pb-frame').textContent =
+    secs !== undefined ? Math.round(secs * fps) : '—';
+  document.getElementById('pb-fps').textContent = fps;
+  document.getElementById('pb-loop').textContent =
+    pb.looping !== undefined ? (pb.looping ? 'on' : 'off') : '—';
+
+  if (pb.timeline_guid && state) {
+    const tl = (state.timelines || []).find(t => t.guid === pb.timeline_guid);
+    document.getElementById('pb-tl').textContent =
+      tl ? tl.name : pb.timeline_guid.slice(0, 8) + '…';
+  } else {
+    document.getElementById('pb-tl').textContent = '—';
+  }
+}
+
+// ── Inspector panel ───────────────────────────────────────────────────────────
+
+function selectItem(guid) {
+  selectedGuid = guid;
+  // Re-render to update selected highlight
+  renderTimeline();
+  // Request detail from server
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'select', guid }));
+  }
+}
+
+function renderDetail(detail) {
+  const empty = document.getElementById('meta-empty');
+  const header = document.getElementById('meta-header');
+  const jsonEl  = document.getElementById('meta-json');
+
+  if (!detail) {
+    empty.style.display = 'flex';
+    header.style.display = 'none';
+    jsonEl.style.display = 'none';
+    return;
+  }
+
+  empty.style.display = 'none';
+  header.style.display = '';
+  jsonEl.style.display = '';
+
+  document.getElementById('meta-name').textContent = detail.name || '(untitled)';
+  document.getElementById('meta-type').textContent = detail.type || '';
+  document.getElementById('meta-guid').textContent = detail.guid || '';
+
+  jsonEl.innerHTML = syntaxHighlight(detail.otio || {});
+}
+
+function syntaxHighlight(obj) {
+  const raw = JSON.stringify(obj, null, 2);
+  return raw
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"([^"]+)":/g, '<span class="json-key">"$1"</span>:')
+    .replace(/: "([^"]*)"/g, ': <span class="json-str">"$1"</span>')
+    .replace(/: (-?\d+\.?\d*)/g, ': <span class="json-num">$1</span>')
+    .replace(/: (true|false)/g, ': <span class="json-bool">$1</span>')
+    .replace(/: null/g, ': <span class="json-null">null</span>');
+}
+
+// ── RationalTime helpers ──────────────────────────────────────────────────────
+
+// current_time on the wire is {"OTIO_SCHEMA":"RationalTime.1","value":142,"rate":24}
+function rtToSeconds(ct) {
+  if (ct === undefined || ct === null) return undefined;
+  if (typeof ct === 'number') return ct;
+  if (typeof ct === 'object' && 'rate' in ct) return ct.value / (ct.rate || 1);
+  return undefined;
+}
+
+function rtFps(ct) {
+  if (!ct || typeof ct !== 'object') return null;
+  return ct.rate || null;
+}
+
+// ── Duration helpers ─────────────────────────────────────────────────────────
+
+// Return the "content duration" of a timeline: the rightmost item-end across all
+// tracks, with single-outlier rejection.  If one item-end is >10× the next-largest
+// it is almost certainly a bogus fallback (e.g. 10000 frames at the wrong fps) and
+// is skipped so the fit is based on the real media.
+function contentDur(tl) {
+  const ends = [];
+  for (const track of (tl.tracks || [])) {
+    for (const item of (track.items || [])) {
+      const e = (item.start || 0) + (item.duration || 0);
+      if (e > 0.001) ends.push(e);
+    }
+  }
+  if (ends.length === 0) return 1;
+  ends.sort((a, b) => a - b);
+  console.log('[contentDur] ends:', ends);
+  // Iteratively drop top outliers: remove top values that are >= 5x
+  // the current low-end reference (25th percentile), protecting against
+  // cases where the majority of items have bogus large durations.
+  let arr = ends.slice();
+  while (arr.length > 1) {
+    const ref = arr[Math.max(0, Math.floor(arr.length * 0.25))];
+    if (arr[arr.length - 1] >= ref * 10) {
+      arr.pop();
+    } else {
+      break;
+    }
+  }
+  console.log('[contentDur] result:', arr[arr.length - 1]);
+  return arr[arr.length - 1];
+}
+
+// ── Zoom ──────────────────────────────────────────────────────────────────────
+
+function applyZoom(newZoom, anchorX) {
+  // anchorX: pixel offset within the content area to keep stable (optional)
+  const container = document.getElementById('timeline-container');
+  const LABEL_W = 110;
+  const oldZoom = zoom;
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+  autoZoomed = true;  // suppress auto-refit after manual zoom
+
+  if (anchorX !== undefined && oldZoom !== zoom) {
+    // anchorX is pixels from the right edge of the track label (content-area origin).
+    // absolute content pos under cursor = scrollLeft + anchorX + LABEL_W, time origin at LABEL_W.
+    const timeSec = (container.scrollLeft + anchorX) / oldZoom;
+    const newScrollLeft = timeSec * zoom - anchorX;
+    renderTimeline();
+    container.scrollLeft = Math.max(0, newScrollLeft);
+  } else {
+    renderTimeline();
+  }
+  updateZoomDisplay();
+}
+
+function doFitZoom() {
+  // Updates zoom state only. Returns false if the container isn't laid out yet
+  // (clientWidth == 0 at first paint), so the caller can retry next render.
+  const tl = getActiveTl();
+  if (!tl || !tl.tracks || tl.tracks.length === 0) return false;
+  const container = document.getElementById('timeline-container');
+  const LABEL_W = 110;
+  const avail = container.clientWidth - LABEL_W;
+  if (avail <= 0) return false;   // not laid out yet — don't lock in a bad zoom
+  const dur = contentDur(tl);
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, avail / dur));
+  fitZoomValue = zoom;
+  autoZoomed = true;
+  lastFitDur = dur;
+  updateZoomDisplay();
+  return true;
+}
+
+function updateZoomDisplay() {
+  const pct = fitZoomValue > 0 ? Math.round((zoom / fitZoomValue) * 100) : 100;
+  document.getElementById('zoom-display').textContent = pct + '%';
+  const tl = getActiveTl();
+  const dur = tl ? contentDur(tl) : 0;
+  const durEl = document.getElementById('dur-display');
+  durEl.textContent = dur > 0 ? dur.toFixed(1) + 's' : '';
+  const debugEl = document.getElementById('dur-debug');
+  if (tl) {
+    const rawEnds = [];
+    for (const track of (tl.tracks || [])) {
+      for (const item of (track.items || [])) {
+        const e = (item.start || 0) + (item.duration || 0);
+        if (e > 0.001) rawEnds.push(e.toFixed(1));
+      }
+    }
+    debugEl.textContent = 'ends:[' + rawEnds.join(', ') + ']';
+  } else {
+    debugEl.textContent = '';
+  }
+}
+
+document.getElementById('timeline-container').addEventListener('wheel', (e) => {
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  const LABEL_W = 110;
+  const rect = document.getElementById('timeline-container').getBoundingClientRect();
+  const mouseX = e.clientX - rect.left - LABEL_W;  // offset into content
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  applyZoom(zoom * factor, Math.max(0, mouseX));
+}, { passive: false });
+
+document.getElementById('zoom-in-btn').addEventListener('click', () => applyZoom(zoom * 1.5));
+document.getElementById('zoom-out-btn').addEventListener('click', () => applyZoom(zoom / 1.5));
+document.getElementById('zoom-fit-btn').addEventListener('click', () => {
+  const container = document.getElementById('timeline-container');
+  const tl = getActiveTl();
+  if (!tl || !tl.tracks || !tl.tracks.length) return;
+  const avail = container.clientWidth - 110;
+  if (avail <= 0) return;
+  const dur = contentDur(tl);
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, avail / dur));
+  fitZoomValue = zoom;
+  autoZoomed = true;
+  container.scrollLeft = 0;
+  renderTimeline();
+  updateZoomDisplay();
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+connect();
+</script>
+</body>
+</html>

@@ -166,11 +166,50 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
         if seq_groups:
             self._init_timelines_from_sequences(seq_groups, fps)
+            # If the graph wasn't fully wired yet all counts will be zero.
+            # Schedule a retry so we pick up the clips once RV settles.
+            total_clips = sum(
+                len(list(tr))
+                for tl in self.sync_manager._timelines.values()
+                for tr in tl.tracks
+            )
+            if total_clips == 0:
+                _log("No clips found on init — scheduling graph-settled retry")
+                QtCore.QTimer.singleShot(500, self._retry_init_timelines)
         else:
             self._init_single_timeline(fps)
 
         self.sync_manager.broadcast_master_response()
         _log("Session Initialized as MASTER")
+
+    def _retry_init_timelines(self):
+        """Re-scan source groups after the RV node graph has had time to settle."""
+        try:
+            fps = rv.commands.fps()
+        except Exception:
+            fps = 24.0
+
+        seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+        if not seq_groups:
+            return
+
+        seq_sources = self._source_groups_for_sequences(seq_groups)
+        total = sum(len(v) for v in seq_sources.values())
+        _log(f"Retry source counts: { {k: len(v) for k, v in seq_sources.items()} }")
+        if total == 0:
+            return  # still not ready — don't overwrite with empty data
+
+        # Re-register timelines with the now-populated source groups
+        self.sync_manager._timelines.clear()
+        self.sync_manager._object_map.clear()
+        self.sync_manager.active_timeline_guid = None
+        self._rv_node_to_timeline_guid.clear()
+        self._sequence_input_order.clear()
+        self._active_media_track_guid = None
+        self._track = None
+
+        self._init_timelines_from_sequences(seq_groups, fps)
+        _log("Retry init complete")
 
     def _make_otio_clip_for_sg(self, sg):
         """Create an OTIO Clip for a source group node, or None on failure."""
@@ -183,17 +222,23 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             _log(f"_make_otio_clip_for_sg failed for {sg}: {e}")
         return None
 
-    def _make_clip(self, file_source_node, fps):
+    def _make_clip(self, file_source_node, fps, num_frames=None):
         """Return an otio.schema.Clip for an RVFileSource node, or None on failure."""
         try:
             path = rv.commands.getStringProperty(f"{file_source_node}.media.movie")[0]
             if not path:
                 return None
+            # Prefer the fps stored in the media itself over the session fps;
+            # rv.commands.fps() can return 24 at init time before media is read.
             try:
-                num_frames = rv.commands.getIntProperty(f"{file_source_node}.media.numFrames")[0]
-                duration = otio.opentime.RationalTime(num_frames, fps)
+                media_fps = rv.commands.getFloatProperty(f"{file_source_node}.media.fps")[0]
+                if media_fps and media_fps > 0:
+                    fps = media_fps
             except Exception:
-                duration = otio.opentime.RationalTime(10000, fps)
+                pass
+            if num_frames is None:
+                num_frames = int(fps)  # 1-second fallback
+            duration = otio.opentime.RationalTime(num_frames, fps)
             time_range = otio.opentime.TimeRange(otio.opentime.RationalTime(0, fps), duration)
             return otio.schema.Clip(
                 name=os.path.basename(path),
@@ -202,6 +247,46 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log(f"_make_clip failed for {file_source_node}: {e}")
             return None
+
+    def _edl_frame_counts(self, seq_group):
+        """Return an ordered list of frame counts (one per source) read from the
+        sequence EDL, or an empty list if the EDL isn't readable.
+
+        The EDL lives on the inner RVSequence node, not the RVSequenceGroup.
+        """
+        try:
+            # Find the RVSequence node inside the group
+            seq_node = None
+            for n in rv.commands.nodesInGroup(seq_group):
+                if rv.commands.nodeType(n) == "RVSequence":
+                    seq_node = n
+                    break
+            if seq_node is None:
+                _log(f"No RVSequence found in {seq_group}")
+                return []
+            frames = rv.commands.getIntProperty(f"{seq_node}.edl.frame")
+            if not frames:
+                _log(f"edl.frame empty for {seq_node}")
+                return []
+            # Total sequence length from the global frame range of this view.
+            try:
+                fr = rv.commands.frameRange()
+                total = fr[1] - fr[0] + 1
+            except Exception:
+                total = None
+            counts = []
+            for i, start_f in enumerate(frames):
+                if i + 1 < len(frames):
+                    counts.append(frames[i + 1] - start_f)
+                elif total is not None:
+                    counts.append(total - start_f + 1)
+                else:
+                    counts.append(None)  # unknown last clip
+            _log(f"EDL frame counts for {seq_group} (via {seq_node}): {counts}")
+            return counts
+        except Exception as e:
+            _log(f"_edl_frame_counts failed for {seq_group}: {e}")
+            return []
 
     def _source_groups_for_sequences(self, seq_groups):
         """Return {seq_group: [RVSourceGroup, ...]} by querying connections from the source side.
@@ -251,14 +336,17 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             annotations_track = otio.schema.Track("Annotations")
             stack.append(annotations_track)
 
-            for sg in seq_sources.get(seq_group, []):
+            edl_counts = self._edl_frame_counts(seq_group)
+            _log(f"EDL frame counts for {seq_group}: {edl_counts}")
+            for idx, sg in enumerate(seq_sources.get(seq_group, [])):
+                num_frames = edl_counts[idx] if idx < len(edl_counts) else None
                 try:
                     for n in rv.commands.nodesInGroup(sg):
                         if rv.commands.nodeType(n) == "RVFileSource":
-                            clip = self._make_clip(n, fps)
+                            clip = self._make_clip(n, fps, num_frames)
                             if clip:
                                 media_track.append(clip)
-                                _log(f"Imported '{clip.name}' into '{seq_name}'")
+                                _log(f"Imported '{clip.name}' ({num_frames}f) into '{seq_name}'")
                 except Exception as e:
                     _log(f"Skipping source group {sg}: {e}")
 
@@ -531,7 +619,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         tl_guid = self._rv_node_to_timeline_guid.get(view) or self.sync_manager.active_timeline_guid
                         playback_state = {
                             "playing": playing,
-                            "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": float(frame), "rate": float(fps)},
+                            "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": float(frame - 1), "rate": float(fps)},
                             "looping": True,
                             "timeline_guid": tl_guid,
                         }
@@ -724,7 +812,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             "playing": playing,
             "current_time": {
                 "OTIO_SCHEMA": "RationalTime.1",
-                "value": float(current_frame),
+                "value": float(current_frame - 1),  # 0-indexed to match OTIO track time
                 "rate": float(fps)
             },
             "looping": looping,
@@ -929,7 +1017,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _apply_playback(self, data):
         playing = data.get("playing", False)
         current_time = data.get("current_time", {})
-        target_frame = int(current_time.get("value", 1))
+        target_frame = int(current_time.get("value", 0)) + 1  # protocol is 0-indexed; RV is 1-based
         timeline_guid = data.get("timeline_guid")
         _log(f"RECV playback playing={playing} frame={target_frame} tl={timeline_guid}")
 
