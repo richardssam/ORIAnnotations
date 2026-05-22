@@ -508,25 +508,181 @@ class SyncManager:
             "payload": inner,
         })
 
-    def broadcast_annotation(self, data: dict[str, Any]) -> None:
-        """Broadcast a completed annotation stroke to all peers.
+    @staticmethod
+    def _annotation_track_end(track: otio.schema.Track) -> int:
+        """Return the total duration (in frames) of all children in *track*.
 
-        If this peer is the master, the annotation is also persisted to the
-        OTIO Annotations track via :meth:`_persist_annotation_to_timeline`.
+        This is the track position at which the next appended child would start,
+        analogous to ``lastframe`` in ``ORIAnnotations._export_otio_media``.
 
-        :param data: Annotation payload as constructed by the host application.
+        :param track: An OTIO :class:`~opentimelineio.schema.Track`.
+        :returns: Sum of ``source_range.duration.value`` for all children.
+        :rtype: int
         """
-        if self._is_syncing or not self.network:
+        total = 0
+        for child in track:
+            sr = getattr(child, "source_range", None)
+            if sr is not None:
+                total += int(sr.duration.value)
+        return total
+
+    @staticmethod
+    def _find_annotation_clip_at(
+        track: otio.schema.Track,
+        clip_guid: str,
+        frame: int,
+    ) -> "otio.schema.Clip | None":
+        """Find an existing annotation clip for *(clip_guid, frame)* in *track*.
+
+        :param track: The Annotations :class:`~opentimelineio.schema.Track`.
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :returns: The matching :class:`~opentimelineio.schema.Clip`, or ``None``.
+        """
+        for child in track:
+            if not isinstance(child, otio.schema.Clip):
+                continue
+            if child.metadata.get("clip_guid") != clip_guid:
+                continue
+            sr = getattr(child, "source_range", None)
+            if sr is not None and int(sr.start_time.value) == frame:
+                return child
+        return None
+
+    @staticmethod
+    def _try_merge_annotation(
+        parent: otio.schema.Track,
+        child_obj: otio.core.SerializableObject,
+    ) -> "otio.schema.Clip | None":
+        """Check whether *child_obj* is an annotation-merge delta and apply it.
+
+        If *parent* already contains a clip for the same ``(clip_guid, frame)``
+        as *child_obj*, the incoming ``annotation_commands`` are appended to
+        that existing clip and the existing clip is returned (so the caller can
+        raise an ``annotation_commands_added`` event without inserting a
+        structural duplicate).  Returns ``None`` when no merge applies.
+
+        :param parent: The parent track that would receive *child_obj*.
+        :param child_obj: The incoming OTIO object from an ``INSERT_CHILD`` message.
+        :returns: The existing clip if a merge occurred, otherwise ``None``.
+        """
+        if not isinstance(parent, otio.schema.Track):
+            return None
+        if not hasattr(child_obj, "metadata"):
+            return None
+        incoming_cmds = child_obj.metadata.get("annotation_commands")
+        incoming_cg = child_obj.metadata.get("clip_guid")
+        incoming_sr = getattr(child_obj, "source_range", None)
+        if not incoming_cmds or not incoming_cg or incoming_sr is None:
+            return None
+        incoming_frame = int(incoming_sr.start_time.value)
+        existing = SyncManager._find_annotation_clip_at(
+            parent, incoming_cg, incoming_frame
+        )
+        if existing is None:
+            return None
+        existing.metadata["annotation_commands"].extend(incoming_cmds)
+        return existing
+
+    @staticmethod
+    def _make_annotation_clip(
+        clip_guid: str,
+        clip_local_time: otio.opentime.RationalTime,
+        otio_events: list,
+    ) -> otio.schema.Clip:
+        """Build a 1-frame annotation clip for *clip_guid* at *clip_local_time*.
+
+        :param clip_guid: GUID of the media clip being annotated.
+        :param clip_local_time: 0-indexed time within the clip source range.
+        :param otio_events: Deserialised SyncEvent objects to embed.
+        :returns: A new :class:`~opentimelineio.schema.Clip`.
+        """
+        frame = int(clip_local_time.value)
+        fps = clip_local_time.rate
+        clip = otio.schema.Clip(name=f"Annotation_{frame}")
+        clip.source_range = otio.opentime.TimeRange(
+            clip_local_time,
+            otio.opentime.RationalTime(1, fps),
+        )
+        clip.metadata["annotation_commands"] = otio_events
+        clip.metadata["clip_guid"] = clip_guid
+        return clip
+
+    def broadcast_add_annotation(
+        self,
+        annotation_track_guid: str,
+        clip_guid: str,
+        clip_local_time: otio.opentime.RationalTime,
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Build an annotation clip and insert it via the standard patch path.
+
+        Annotations are expressed as ``insert_child`` patches so that all peers
+        apply them through the same code path as any other timeline mutation.
+
+        The annotation track mirrors the structure produced by
+        :meth:`ORIAnnotations.ReviewItem._export_otio_media`: each annotated
+        frame is a 1-frame :class:`~opentimelineio.schema.Clip` and the gaps
+        between annotated frames are :class:`~opentimelineio.schema.Gap` objects
+        whose duration is ``frame − track_end`` frames.  A second stroke on an
+        already-annotated frame merges its commands into the existing clip rather
+        than inserting a duplicate.
+
+        :param annotation_track_guid: GUID of the target Annotations track.
+        :param clip_guid: GUID of the media clip being annotated.
+        :param clip_local_time: 0-indexed time within the clip's source range.
+        :param events: Serialised OTIO SyncEvent dicts (``PaintStart.1``,
+            ``PaintPoints.1``) as produced by ``otio.adapters.write_to_string``.
+        """
+        if not self.network or self.status != STATE_SYNCED:
             return
-        if self.is_master:
-            self._persist_annotation_to_timeline(data)
-        self.network.send_payload({
-            "command": "ANNOTATION",
-            "event": "STROKE_RELEASE",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": data,
-        })
+        if annotation_track_guid not in self._object_map:
+            _log(f"broadcast_add_annotation: annotation track {annotation_track_guid} not found")
+            return
+
+        otio_events: list[otio.core.SerializableObject] = []
+        for e in events:
+            try:
+                otio_events.append(_dict_to_otio(e) if isinstance(e, dict) else e)
+            except Exception as exc:
+                _log(f"broadcast_add_annotation: failed to deserialise event: {exc}")
+
+        annotation_track = self._object_map[annotation_track_guid]
+        frame = int(clip_local_time.value)
+        fps = clip_local_time.rate
+
+        existing = self._find_annotation_clip_at(annotation_track, clip_guid, frame)
+        if existing is not None:
+            # A clip already exists at this frame — merge the new commands in locally
+            # and broadcast a delta clip so peers can apply the same merge.
+            existing.metadata["annotation_commands"].extend(otio_events)
+            delta_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
+            self._ensure_guid_and_map(delta_clip)
+            self.network.send_payload({
+                "command": "OTIO_SESSION",
+                "event": "INSERT_CHILD",
+                "session_id": self.session_id,
+                "source_guid": self.self_guid,
+                "payload": {
+                    "parent_uuid": annotation_track_guid,
+                    "index": -1,
+                    "child_data": _otio_to_dict(delta_clip),
+                    "sync_timestamp": time.time(),
+                },
+            })
+        else:
+            # New frame — insert a Gap to reach it (if needed) then the clip.
+            track_end = self._annotation_track_end(annotation_track)
+            if frame > track_end:
+                gap = otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(track_end, fps),
+                        duration=otio.opentime.RationalTime(frame - track_end, fps),
+                    )
+                )
+                self.insert_child(annotation_track_guid, gap)
+            ann_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
+            self.insert_child(annotation_track_guid, ann_clip)
 
     def broadcast_selection(self, nodes: list[str]) -> None:
         """Broadcast the current UI selection to all peers.
@@ -649,130 +805,6 @@ class SyncManager:
             },
         })
 
-    def _persist_annotation_to_timeline(self, data: dict[str, Any]) -> None:
-        """Write an annotation stroke into the OTIO Annotations track.
-
-        Finds or creates an Annotations track in the target timeline, then either
-        appends to an existing annotation clip at the target frame or splits a Gap
-        to insert a new one.
-
-        :param data: Annotation payload dict as broadcast by the host application.
-        """
-        timeline_guid = data.get("timeline_guid") or self.active_timeline_guid
-        timeline = self._timelines.get(timeline_guid) if timeline_guid else self.root_timeline
-        if not timeline:
-            return
-
-        try:
-            otio.schema.schemadef.module_from_name('SyncEvent')
-        except Exception:
-            pass
-
-        events: list[otio.core.SerializableObject] = []
-        if "start_event_data" in data:
-            events.append(_dict_to_otio(data["start_event_data"]))
-        if "points_event_data" in data:
-            events.append(_dict_to_otio(data["points_event_data"]))
-
-        annotations_tracks = [
-            t for t in timeline.tracks
-            if t.name and t.name.startswith("Annotations")
-        ]
-        if annotations_tracks:
-            target_track = annotations_tracks[-1]
-        else:
-            target_track = otio.schema.Track("Annotations")
-            timeline.tracks.append(target_track)
-
-        frame: int = data.get("frame", 1)
-        fps: float = data.get("fps", 24.0)
-        media_path: str | None = data.get("media_path")
-
-        target_time_offset = otio.opentime.RationalTime(0, fps)
-        if media_path:
-            for track in timeline.tracks:
-                if track.name == "Media":
-                    for c in track:
-                        if isinstance(c, otio.schema.Clip):
-                            ref = c.media_reference
-                            if isinstance(ref, otio.schema.ExternalReference):
-                                import os
-                                if (ref.target_url == media_path
-                                        or os.path.basename(ref.target_url)
-                                        == os.path.basename(media_path)):
-                                    break
-                        target_time_offset += c.duration()
-
-        otio_frame = frame - 1 if frame > 0 else 0
-        target_time = target_time_offset + otio.opentime.RationalTime(otio_frame, fps)
-        current_time = otio.opentime.RationalTime(0, fps)
-        clip_duration = otio.opentime.RationalTime(1, fps)
-
-        for i, child in enumerate(list(target_track)):
-            child_duration = (
-                child.source_range.duration if child.source_range else child.duration()
-            )
-            child_end = current_time + child_duration
-
-            if current_time <= target_time < child_end:
-                if isinstance(child, otio.schema.Clip):
-                    if "annotation_commands" not in child.metadata:
-                        child.metadata["annotation_commands"] = []
-                    child.metadata["annotation_commands"].extend(events)
-                    return
-                elif isinstance(child, otio.schema.Gap):
-                    gap_start_duration = target_time - current_time
-                    gap_end_duration = child_end - (target_time + clip_duration)
-                    new_items: list[otio.core.SerializableObject] = []
-                    if gap_start_duration.value > 0:
-                        new_items.append(otio.schema.Gap(
-                            source_range=otio.opentime.TimeRange(
-                                start_time=otio.opentime.RationalTime(0, fps),
-                                duration=gap_start_duration,
-                            )
-                        ))
-                    clip = otio.schema.Clip(name=f"Annotation_{frame}")
-                    clip.source_range = otio.opentime.TimeRange(
-                        start_time=otio.opentime.RationalTime(0, fps),
-                        duration=clip_duration,
-                    )
-                    clip.metadata["annotation_commands"] = list(events)
-                    clip.metadata["annotated_clip_name"] = data.get("node_name", "unknown")
-                    clip.metadata["rv_frame"] = frame
-                    clip.metadata["media_path"] = media_path
-                    new_items.append(clip)
-                    if gap_end_duration.value > 0:
-                        new_items.append(otio.schema.Gap(
-                            source_range=otio.opentime.TimeRange(
-                                start_time=otio.opentime.RationalTime(0, fps),
-                                duration=gap_end_duration,
-                            )
-                        ))
-                    del target_track[i]
-                    for item in reversed(new_items):
-                        target_track.insert(i, item)
-                    return
-            current_time = child_end
-
-        if target_time > current_time:
-            target_track.append(otio.schema.Gap(
-                source_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(0, fps),
-                    duration=target_time - current_time,
-                )
-            ))
-
-        clip = otio.schema.Clip(name=f"Annotation_{frame}")
-        clip.source_range = otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(0, fps),
-            duration=clip_duration,
-        )
-        clip.metadata["annotation_commands"] = list(events)
-        clip.metadata["annotated_clip_name"] = data.get("node_name", "unknown")
-        clip.metadata["rv_frame"] = frame
-        clip.metadata["media_path"] = media_path
-        target_track.append(clip)
-
     # ------------------------------------------------------------------
     # Message Handling
     # ------------------------------------------------------------------
@@ -834,10 +866,6 @@ class SyncManager:
             if command == "SELECTION" and event == "SET":
                 return ("selection_changed", data)
 
-            if command == "ANNOTATION":
-                self._persist_annotation_to_timeline(data)
-                return (f"annotation_{event.lower()}", data)
-
             if command != "OTIO_SESSION":
                 return None
 
@@ -898,6 +926,13 @@ class SyncManager:
                     parent = self._object_map[parent_uuid]
                     index: int = data.get("index", -1)
                     child_obj = _dict_to_otio(data.get("child_data"))
+                    merged = self._try_merge_annotation(parent, child_obj)
+                    if merged is not None:
+                        self._ensure_guid_and_map(child_obj)
+                        # Return (merged_clip, delta_clip): merged has all commands
+                        # for full re-render; delta has only the new commands for
+                        # additive renderers (e.g. RV paint).
+                        return ("annotation_commands_added", (merged, child_obj))
                     if index == -1:
                         parent.append(child_obj)
                     else:

@@ -9,7 +9,8 @@ from otio_sync_core.manager import SyncManager
 from otio_sync_core.network import UDPNetwork
 
 def run_test():
-    sender = SyncManager(session_id="test", self_guid="sender_1", port=9997)
+    sender_net = UDPNetwork(port=9997, self_guid="sender_1")
+    sender = SyncManager(session_id="test", self_guid="sender_1", network=sender_net)
     receiver_net = UDPNetwork(port=9997, self_guid="receiver_1")
 
     # Create dummy timeline

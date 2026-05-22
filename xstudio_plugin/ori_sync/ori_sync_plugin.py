@@ -1,0 +1,1419 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+"""
+xStudio plugin: ORI Sync Review
+
+Joins an ORI Sync session via RabbitMQ, providing bidirectional playback
+sync and annotation broadcast/receive using SyncManager from ORIAnnotations.
+
+Threading model
+---------------
+xStudio calls plugin event handlers (``_on_bookmark_event``,
+``_on_playhead_event``, etc.) on its own message-dispatch thread.  The
+RabbitMQ send path (``RabbitMQNetwork.send_payload``) uses a
+BlockingConnection and must not run on xStudio's thread.
+
+All calls that mutate the manager are therefore pushed onto ``_cmd_queue``
+or handled by ``_flush_pending_local_bookmarks`` — both executed by the poll
+thread (``_poll_loop``).  The poll thread is the only thread that touches the
+SyncManager after startup.
+
+The one exception is ``_apply_playback_state``, which is called from the
+poll thread via the ``on_playback_changed`` callback and writes to the
+xStudio playhead.  xStudio's actor-based attribute system routes those
+writes safely, but this should be verified against the installed version.
+"""
+
+import datetime
+import json
+import logging
+import os
+import queue
+import sys
+import threading
+import time
+import uuid
+
+import opentimelineio as otio
+from xstudio.connection import Connection
+from xstudio.core import (
+    BookmarkDetail,
+    LoopMode,
+    annotation_atom,
+    bookmark_detail_atom,
+    event_atom,
+    show_atom,
+    viewport_playhead_atom,
+)
+from xstudio.api.session.playhead import Playhead
+
+# ── path setup ─────────────────────────────────────────────────────────────────
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_repo_root = os.path.dirname(os.path.dirname(_here))
+_python_dir = os.path.join(_repo_root, "python")
+_manifest_dir = os.path.join(_repo_root, "otio_event_plugin")
+_manifest_file = os.path.join(_manifest_dir, "plugin_manifest.json")
+
+for _p in (_python_dir, _manifest_dir):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+if os.path.exists(_manifest_file):
+    _existing = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
+    if _manifest_file not in _existing:
+        os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = (
+            _existing + os.pathsep + _manifest_file if _existing else _manifest_file
+        )
+
+from otio_sync_core.manager import (  # noqa: E402
+    STATE_DISCOVERING,
+    STATE_SYNCED,
+    SyncManager,
+)
+from otio_sync_core.rabbitmq_network import RabbitMQNetwork  # noqa: E402
+from xstudio.plugin import PluginBase  # noqa: E402
+
+SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+
+# ── logging ────────────────────────────────────────────────────────────────────
+
+
+def _make_logger() -> logging.Logger:
+    logger = logging.getLogger("ori_sync")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
+    # Always attach a console handler so output is visible in xStudio's Python output.
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    # ORI_SYNC_LOG_FILE adds a persistent file alongside the console output,
+    # mirroring the RV_OTIO_SYNC_LOG_FILE pattern in the RV plugin.
+    log_file = os.environ.get("ORI_SYNC_LOG_FILE")
+    if log_file:
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+_logger = _make_logger()
+
+
+def _log(msg: str) -> None:
+    _logger.debug(msg)
+
+
+def _log_exc(msg: str) -> None:
+    _logger.exception(msg)
+
+
+# ── QML folder ─────────────────────────────────────────────────────────────────
+
+_QML_FOLDER = "qml/ORISyncPlugin.1"
+
+
+# ── plugin ─────────────────────────────────────────────────────────────────────
+
+class ORISyncPlugin(PluginBase):
+    """xStudio plugin that joins an ORI Sync session.
+
+    :param connection: xStudio connection object passed by the plugin loader.
+    """
+
+    #: How often the poll thread calls manager.tick() (seconds).
+    POLL_INTERVAL = 0.05
+    #: How long to wait for a master before self-electing (seconds).
+    DISCOVERY_TIMEOUT = 2.0
+    #: Periodic fallback scan interval (seconds).  show_atom fires when a NEW
+    #: bookmark is created but not when the user adds strokes to an existing one
+    #: on the same frame.  This scan catches those missed updates.
+    ANNOTATION_SCAN_INTERVAL = 0.5
+
+    def __init__(self, connection):
+        PluginBase.__init__(
+            self,
+            connection,
+            name="ORI Sync Review",
+            qml_folder=_QML_FOLDER,
+        )
+
+        # ── connection preferences exposed to the UI ───────────────────────
+        self.mq_host_attr = self.add_attribute(
+            "MQ Host", "localhost", register_as_preference=True
+        )
+        self.mq_host_attr.expose_in_ui_attrs_group("ori_sync_conn")
+
+        self.mq_port_attr = self.add_attribute(
+            "MQ Port", 5672, register_as_preference=True
+        )
+        self.mq_port_attr.expose_in_ui_attrs_group("ori_sync_conn")
+
+        self.session_id_attr = self.add_attribute(
+            "Session ID", "otio-sync-demo", register_as_preference=True
+        )
+        self.session_id_attr.expose_in_ui_attrs_group("ori_sync_conn")
+
+        self.status_attr = self.add_attribute("Status", "Disconnected")
+        self.status_attr.expose_in_ui_attrs_group("ori_sync_conn")
+
+        # ── xStudio handles ────────────────────────────────────────────────
+        self.active_playhead: Playhead | None = None
+        self.subscribe_to_global_playhead_events(self._on_global_playhead_event)
+
+        # ── runtime state ──────────────────────────────────────────────────
+        self.manager: SyncManager | None = None
+        self._poll_stop = threading.Event()
+        self._poll_thread: threading.Thread | None = None
+
+        # One xStudio (playlist, timeline) per OTIO timeline GUID received from the session.
+        # Populated by _do_load_timelines() when we join as a non-master peer.
+        self._sync_playlists: dict[str, tuple] = {}
+
+        # Commands enqueued by xStudio callbacks; drained by poll thread.
+        # Items are (command_name, payload_dict).
+        self._cmd_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
+
+        # Tracks the xStudio Bookmark created for each (clip_guid, frame) pair
+        # so that additional strokes on the same frame can be merged into the
+        # existing bookmark rather than creating a new one.
+        self._annotation_bookmarks: dict[tuple, object] = {}
+
+        # UUIDs of bookmarks we created from *remote* annotations.
+        # show_atom scans skip these so we never re-broadcast them back.
+        self._our_bookmark_uuids: set = set()
+        self._our_bookmark_uuids_lock = threading.Lock()
+
+        # (Intentionally empty — broadcast delta tracking is now done by querying
+        # the annotation track directly via _count_track_strokes, which is always
+        # authoritative regardless of whether xStudio replaces or updates bookmarks.)
+
+        # Set by _on_annotation_event / show_atom when a local stroke completes.
+        # Cleared by _flush_pending_annotations after debounce + broadcast.
+        self._annotation_pending_time: float | None = None
+        # Timestamp of the last annotation scan (event-triggered or periodic).
+        # Used by the fallback scan path so we don't call bookmarks.bookmarks
+        # on every 50 ms tick when no events are pending.
+        self._last_annotation_scan: float = 0.0
+        # Retry counter: incremented when a flush finds unowned bookmarks but
+        # annotation_data hasn't been committed yet (reads stale stroke count).
+        # Reset to 0 after a successful broadcast or when no bookmarks are pending.
+        self._annotation_flush_retries: int = 0
+
+        # Polling-based scrub detection: last frame seen by the poll loop and
+        # last frame applied from a remote PLAYBACK_SETTINGS message.
+        # When the poll sees a frame change that matches _last_applied_frame the
+        # change came from a remote apply, so we skip re-broadcasting (echo guard).
+        self._last_polled_frame: int | None = None
+        self._last_applied_frame: int | None = None
+
+        # Auto-connect on startup using the current preference values.
+        _log("Plugin loaded — auto-connecting to session")
+        try:
+            self.connect_to_session()
+        except Exception:
+            _log_exc("connect_to_session failed")
+
+    # ── connection lifecycle ───────────────────────────────────────────────────
+
+    def connect_to_session(self) -> None:
+        """Connect to RabbitMQ and join the sync session.
+
+        Safe to call from the xStudio UI thread.
+        """
+        self.disconnect()
+        self._poll_stop.clear()
+
+        host = self.mq_host_attr.value()
+        port = int(self.mq_port_attr.value())
+        session = self.session_id_attr.value()
+
+        network = RabbitMQNetwork(
+            host=host,
+            port=port,
+            session_id=session,
+            self_guid=str(self.uuid),
+        )
+        self.manager = SyncManager(
+            session_id=session,
+            self_guid=str(self.uuid),
+            network=network,
+        )
+        self.manager.on_playback_changed(self._apply_playback_state)
+        self.manager.on_synced(self._on_synced)
+        self.manager.on_status_changed(
+            lambda s: self.status_attr.set_value(s)
+        )
+
+        self.manager.start_session()
+
+        # Grab the current playhead so the poll loop can start reading position.
+        try:
+            ph = self.current_playhead()
+            self.active_playhead = ph
+        except Exception:
+            _log_exc("Could not initialize active playhead at connect time")
+
+        # Subscribe to the AnnotationsUI plugin so we hear annotation_atom
+        # events whenever the user completes a stroke in xStudio.  This is
+        # the same pattern used by xstudio_live_review.py (proven to work).
+        try:
+            ann_plugin = self.get_plugin("AnnotationsUI")
+            self.subscribe_to_plugin_events(ann_plugin, self._on_annotation_event)
+            _log("Subscribed to AnnotationsUI plugin events")
+        except Exception:
+            _log_exc("Could not subscribe to AnnotationsUI events")
+
+        # Self-elect if no master answers within DISCOVERY_TIMEOUT.
+        threading.Thread(
+            target=self._discovery_timeout_task, daemon=True
+        ).start()
+
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, name="ori_sync_poll", daemon=True
+        )
+        self._poll_thread.start()
+
+        _log(f"Connecting: session={session!r} mq={host}:{port}")
+
+    def disconnect(self) -> None:
+        """Disconnect from the session and stop all background threads."""
+        self._poll_stop.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=1.0)
+        self._poll_thread = None
+        if self.manager:
+            self.manager.close()
+            self.manager = None
+        self.status_attr.set_value("Disconnected")
+
+    def cleanup(self) -> None:
+        """Called by xStudio when the plugin is unloaded."""
+        self.disconnect()
+
+    # ── discovery ──────────────────────────────────────────────────────────────
+
+    def _discovery_timeout_task(self) -> None:
+        """Self-elect as master when the discovery timeout expires."""
+        time.sleep(self.DISCOVERY_TIMEOUT)
+        if self.manager and self.manager.status == STATE_DISCOVERING:
+            _log("No master found — self-electing")
+            # Register the current xStudio session as the initial timeline.
+            # Done here rather than at connect time because viewed_container
+            # fails at startup before any media is loaded.
+            tl = self._build_otio_timeline()
+            if tl:
+                self.manager.register_timeline(tl)
+            self.manager.is_master = True
+            self.manager.master_guid = self.manager.self_guid
+            self.manager.broadcast_master_response()
+            self.manager._set_status(STATE_SYNCED)
+
+    # ── poll loop ──────────────────────────────────────────────────────────────
+
+    def _poll_loop(self) -> None:
+        """Background thread: processes the command queue then polls the manager."""
+        while not self._poll_stop.is_set():
+            try:
+                self._drain_cmd_queue()
+                if self.manager:
+                    for action, data in self.manager.tick():
+                        self._handle_manager_event(action, data)
+                self._flush_pending_annotations()
+                self._poll_and_broadcast_frame()
+            except Exception:
+                _log_exc("Poll loop error")
+            self._poll_stop.wait(self.POLL_INTERVAL)
+
+    def _drain_cmd_queue(self) -> None:
+        """Execute all enqueued commands on the poll thread."""
+        while True:
+            try:
+                cmd, payload = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if cmd == "load_timelines":
+                    self._do_load_timelines()
+            except Exception:
+                _log_exc(f"Command {cmd!r} failed")
+
+    # ── manager event dispatch ─────────────────────────────────────────────────
+
+    def _handle_manager_event(self, action: str, data) -> None:
+        """React to events returned by manager.tick()."""
+        _log(f"Event: {action}")
+        if action == "state_request_received":
+            requester_guid = data
+            _log(f"State request from {requester_guid[:8]} — sending snapshot")
+            if not self.manager.root_timeline:
+                tl = self._build_otio_timeline()
+                if tl:
+                    self.manager.register_timeline(tl)
+            self.manager.send_state_snapshot(
+                requester_guid,
+                playback_state=self._current_playback_state(),
+            )
+
+        elif action == "insert_child":
+            child_obj = data
+            ann_cmds = (
+                child_obj.metadata.get("annotation_commands")
+                if hasattr(child_obj, "metadata")
+                else None
+            )
+            if ann_cmds:
+                self._apply_remote_annotation(child_obj, ann_cmds)
+
+        elif action == "annotation_commands_added":
+            # An existing annotation clip had new commands merged into it on
+            # the manager side.  Update the corresponding xStudio bookmark with
+            # the full merged stroke set.
+            merged_clip, _delta_clip = data
+            self._refresh_annotation_bookmark(merged_clip)
+
+        elif action == "selection_changed":
+            _log(f"Remote selection: {data.get('clip_guid', '?')}")
+
+    def _on_synced(self) -> None:
+        _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
+        if not self.manager.is_master:
+            # We joined an existing session — create one playlist per received timeline.
+            self._cmd_queue.put(("load_timelines", {}))
+
+    @staticmethod
+    def _fill_source_ranges(otio_tl: otio.schema.Timeline) -> None:
+        """Backfill source_range from media available_range on clips where it is absent.
+
+        OTIO semantics allow ``source_range=None`` (meaning "use the full
+        available_range of the media reference"), but xStudio's ``load_otio``
+        does not honour that convention — it needs an explicit ``source_range``
+        to position and size each clip correctly in the track.  Without it
+        xStudio reports "Model size of -8" and renders clips as separate
+        playlist items rather than a joined sequence.
+        """
+        for track in otio_tl.tracks:
+            for item in track:
+                if not isinstance(item, otio.schema.Clip):
+                    continue
+                if item.source_range is not None:
+                    continue
+                mr = item.media_reference
+                if mr is None:
+                    continue
+                avail = getattr(mr, "available_range", None)
+                if avail is not None:
+                    item.source_range = avail
+
+    def _do_load_timelines(self) -> None:
+        """Create one xStudio Sequence playlist per OTIO timeline in the snapshot."""
+        if not self.manager or not self.manager.timelines:
+            _log("Snapshot had no timelines")
+            return
+
+        first_xs_timeline = None
+        for guid, otio_tl in self.manager.timelines.items():
+            if guid in self._sync_playlists:
+                continue  # already created
+
+            name = otio_tl.name or guid[:8]
+
+            # Backfill source_range so xStudio can position and size each clip.
+            self._fill_source_ranges(otio_tl)
+
+            tracks = list(otio_tl.tracks)
+            _log(f"OTIO Timeline {name!r}: {len(tracks)} track(s)")
+            for i, track in enumerate(tracks):
+                children = list(track)
+                _log(f"  Track {i} {track.name!r} kind={track.kind}: {len(children)} child(ren)")
+                for j, child in enumerate(children[:8]):
+                    sr = getattr(child, "source_range", None)
+                    _log(f"    [{j}] {type(child).__name__} {getattr(child, 'name', '?')!r} sr={sr}")
+
+            try:
+                playlist = self.connection.api.session.create_playlist(name)[1]
+                xs_timeline = playlist.create_timeline(name)[1]
+                otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+                xs_timeline.load_otio(otio_str, clear=True)
+                self._sync_playlists[guid] = (playlist, xs_timeline)
+                if first_xs_timeline is None:
+                    first_xs_timeline = xs_timeline
+                _log(f"Created playlist {name!r} from OTIO timeline {guid[:8]}")
+                # Convert any annotation clips already in the snapshot to bookmarks.
+                self._load_snapshot_annotations(otio_tl, playlist)
+            except Exception:
+                _log_exc(f"Failed to create playlist for {name!r}")
+
+        if first_xs_timeline is not None:
+            try:
+                self.connection.api.session.set_on_screen_source(first_xs_timeline)
+            except Exception:
+                pass
+
+    # ── OTIO construction ──────────────────────────────────────────────────────
+
+    def _build_otio_timeline(self) -> otio.schema.Timeline | None:
+        """Convert the current xStudio session into an OTIO Timeline."""
+        try:
+            container = self.connection.api.session.viewed_container
+            if container is None:
+                return otio.schema.Timeline(name="ori-sync")
+
+            if hasattr(container, "to_otio_string"):
+                otio_str = container.to_otio_string()
+            else:
+                from xstudio.api.auxiliary.otio import timeline_to_otio_string
+                otio_str = timeline_to_otio_string(container)
+
+            tl = otio.adapters.read_from_string(otio_str)
+            _log(f"Built OTIO timeline: {tl.name!r}")
+            return tl
+        except Exception:
+            _log_exc("Could not build OTIO from xStudio session — using empty timeline")
+            return otio.schema.Timeline(name="ori-sync")
+
+    # ── playback sync ──────────────────────────────────────────────────────────
+
+    def _on_global_playhead_event(self, event) -> None:
+        """Track the on-screen playhead and detect locally-drawn annotations.
+
+        PlayheadGlobalEventsActor broadcasts several shapes:
+        - ``(event_atom, viewport_playhead_atom, playhead_actor)`` — Form 1
+        - ``(event_atom, viewport_playhead_atom, viewport_name, playhead_actor)`` — Form 2
+        - ``(event_atom, show_atom, UuidActor, UuidActor, str, int)`` — bookmark shown
+          (fires when the user draws a stroke and when bookmarks are displayed)
+        """
+        if not (len(event) >= 2 and isinstance(event[0], event_atom)):
+            return
+
+        # show_atom: fires when a bookmark/annotation is shown or created.
+        # This is the signal that the user has drawn in xStudio.
+        if isinstance(event[1], show_atom):
+            if self.manager and self.manager.status == STATE_SYNCED:
+                self._annotation_pending_time = time.monotonic()
+            return
+
+        if not isinstance(event[1], viewport_playhead_atom):
+            return
+        # Only Form 2 carries a reliable playhead: (event_atom, viewport_playhead_atom,
+        # viewport_name, playhead_actor).  Form 1 (len==3) omits the viewport name and
+        # its playhead actor may differ from the one the user is actually scrubbing.
+        if len(event) <= 3:
+            return
+        ph_remote = event[3]
+        try:
+            self.active_playhead = Playhead(self.connection, ph_remote)
+            _log("Active playhead updated (form=2)")
+        except Exception:
+            _log_exc("_on_global_playhead_event: failed to update playhead")
+
+    def _poll_and_broadcast_frame(self) -> None:
+        """Broadcast the local playhead position when the user scrubs.
+
+        Called from the poll thread on every tick.  Reads position and play
+        state directly from ``active_playhead`` so it works regardless of
+        whether xStudio event subscriptions are delivering events.
+
+        Echo guard: when the poll loop itself applied a remote frame to the
+        local playhead, ``_last_applied_frame`` records that frame.  If the
+        polled position equals ``_last_applied_frame`` the change was caused
+        by the remote apply, not by local user interaction, and we skip the
+        broadcast to avoid an echo loop.
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        if not self.active_playhead:
+            return
+        try:
+            if self.active_playhead.playing:
+                return
+            frame: int = self.active_playhead.position
+            fps: float = self.active_playhead.frame_rate.fps() or 25.0
+        except Exception:
+            return
+        if frame == self._last_polled_frame:
+            return
+        self._last_polled_frame = frame
+        if frame == self._last_applied_frame:
+            # This change was caused by _apply_playback_state — skip re-broadcast.
+            return
+        state = {
+            "playing": False,
+            "current_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "value": float(frame),
+                "rate": fps,
+            },
+            "looping": False,
+        }
+        _log(f"Poll: broadcasting playback frame={frame} fps={fps}")
+        self.manager.broadcast_playback_state(state)
+
+    def _current_playback_state(self) -> dict | None:
+        """Return the local playback state dict for inclusion in a state snapshot."""
+        if not self.active_playhead:
+            return None
+        try:
+            frame = self.active_playhead.position
+            fps = self.active_playhead.frame_rate.fps() or 25.0
+            playing = self.active_playhead.playing
+            return {
+                "playing": playing,
+                "current_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "value": float(frame),
+                    "rate": fps,
+                },
+                "looping": False,
+            }
+        except Exception:
+            return None
+
+    def _apply_playback_state(self, state: dict) -> None:
+        """Apply an incoming playback state dict to the local xStudio playhead.
+
+        Called from the poll thread via the ``on_playback_changed`` callback.
+        xStudio's actor-based attribute writes are thread-safe.
+
+        Updates ``_last_applied_frame`` and ``_last_polled_frame`` so that
+        ``_poll_and_broadcast_frame`` recognises the resulting position change
+        as a remote apply and does not echo it back to the session.
+        """
+        if not self.active_playhead:
+            return
+        playing = state.get("playing", False)
+        current_time = state.get("current_time", {})
+        # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
+        frame = max(0, int(current_time.get("value", 0)))
+
+        if playing != self.active_playhead.playing:
+            self.active_playhead.playing = playing
+        if not playing:
+            self._last_applied_frame = frame
+            self._last_polled_frame = frame
+            self.active_playhead.position = frame
+
+    # ── annotation send ────────────────────────────────────────────────────────
+
+    #: How long to wait after the last annotation_atom before scanning bookmarks.
+    DEBOUNCE_SECONDS = 0.25
+
+    def _on_annotation_event(self, data) -> None:
+        """Called by xStudio when the user completes a stroke in the viewport.
+
+        Fired by the AnnotationsUI plugin's event group whenever a stroke is
+        committed (``annotation_atom``).  Records the time so the poll thread
+        can find and broadcast the new bookmark after debounce.
+
+        :param data: Event tuple from the AnnotationsUI plugin events group.
+            Shape: ``(event_atom, annotation_atom, JsonStore)``.
+        """
+        if not (
+            len(data) >= 3
+            and isinstance(data[0], event_atom)
+            and isinstance(data[1], annotation_atom)
+        ):
+            return
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        _log("Annotation event from AnnotationsUI — scheduling broadcast scan")
+        self._annotation_pending_time = time.monotonic()
+
+    def _flush_pending_annotations(self) -> None:
+        """Scan all bookmarks we don't own and broadcast any new strokes.
+
+        Called from the poll thread after every tick.  Runs when either:
+
+        * An event (``show_atom`` or ``annotation_atom``) set
+          ``_annotation_pending_time`` and the debounce has expired, OR
+        * No event fired but ``ANNOTATION_SCAN_INTERVAL`` seconds have elapsed
+          since the last scan (fallback for strokes added to an *existing*
+          bookmark where ``show_atom`` does not fire).
+
+        Iterates ``session.bookmarks.bookmarks``, skips UUIDs in
+        ``_our_bookmark_uuids`` (bookmarks we created from remote annotations),
+        and broadcasts any strokes not yet present in the OTIO timeline.
+        """
+        now = time.monotonic()
+        if self._annotation_pending_time is not None:
+            if now - self._annotation_pending_time < self.DEBOUNCE_SECONDS:
+                return
+            # Event-triggered flush — clear the pending flag.
+            self._annotation_pending_time = None
+        else:
+            # No event — run the periodic fallback scan.
+            if now - self._last_annotation_scan < self.ANNOTATION_SCAN_INTERVAL:
+                return
+        self._last_annotation_scan = now
+
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        try:
+            all_bms = self.connection.api.session.bookmarks.bookmarks
+        except Exception:
+            _log_exc("_flush_pending_annotations: could not list bookmarks")
+            return
+
+        with self._our_bookmark_uuids_lock:
+            owned = set(self._our_bookmark_uuids)
+        new_uuids = [bm.uuid for bm in all_bms if bm.uuid not in owned]
+        if not new_uuids:
+            return
+        _log(f"_flush_pending_annotations: {len(all_bms)} total, {len(new_uuids)} unowned")
+
+        stale_any = False
+        for bm_uuid in new_uuids:
+            try:
+                result = self._broadcast_local_bookmark(bm_uuid)
+                if result is None:
+                    stale_any = True
+            except Exception:
+                _log_exc("_flush_pending_annotations: failed to broadcast bookmark")
+
+        # xStudio may not have committed annotation_data yet when the debounce fires.
+        # Only retry when a bookmark explicitly returned None (empty annotation_data);
+        # if all bookmarks returned False the timeline is already up-to-date.
+        if stale_any and self._annotation_flush_retries < 5:
+            self._annotation_flush_retries += 1
+            _log(f"_flush_pending_annotations: stale annotation_data, retry {self._annotation_flush_retries}/5")
+            self._annotation_pending_time = time.monotonic()
+        else:
+            self._annotation_flush_retries = 0
+
+    def _broadcast_local_bookmark(self, bm_uuid) -> "bool | None":
+        """Read a locally-drawn bookmark's annotation and broadcast it to the session.
+
+        Uses the local OTIO timeline as the authoritative record of what has
+        already been broadcast.  This is robust even when xStudio replaces a
+        bookmark with a new UUID that contains both old and new strokes, because
+        the timeline count always reflects exactly what was sent — regardless of
+        which bookmark UUID carried those strokes.
+
+        :param bm_uuid: The ``Uuid`` of the bookmark to broadcast.
+        :returns: ``True`` if new events were broadcast; ``False`` if everything
+            is already in the timeline (no retry needed); ``None`` if
+            ``annotation_data`` was empty (xStudio hasn't committed the stroke
+            yet — caller should retry after a short delay).
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return False
+
+        try:
+            bm = self.connection.api.session.bookmarks.get_bookmark(bm_uuid)
+        except Exception:
+            _log_exc("_broadcast_local_bookmark: get_bookmark failed")
+            return False
+
+        # Read timing to determine which frame this annotation sits on.
+        fps = 25.0
+        if self.active_playhead:
+            fps = self.active_playhead.frame_rate.fps() or fps
+        try:
+            detail = bm.detail
+            if detail is None or detail.start is None:
+                return False
+            frame = int(round(detail.start.total_seconds() * fps))
+        except Exception:
+            _log_exc("_broadcast_local_bookmark: could not read timing")
+            return False
+
+        # Read stroke/caption data.
+        # annotation_data returns {"plugin_uuid": ..., "Data": {"pen_strokes": [...], ...}}
+        try:
+            ann_data = bm.annotation_data
+            if not ann_data:
+                # xStudio hasn't committed the stroke to annotation_data yet.
+                _log("_broadcast_local_bookmark: annotation_data is empty — will retry")
+                return None
+        except Exception:
+            _log_exc("_broadcast_local_bookmark: could not read annotation data")
+            return False
+
+        # The canvas dict lives under the "Data" key; fall back to the top-level
+        # dict in case the format has changed.
+        canvas = ann_data.get("Data", ann_data)
+
+        tl = self.manager.root_timeline
+        if tl is None:
+            _log("_broadcast_local_bookmark: no timeline registered")
+            return False
+
+        annotation_track_guid = self._find_annotation_track_guid(tl)
+        if annotation_track_guid is None:
+            _log("_broadcast_local_bookmark: no Annotations track")
+            return False
+
+        clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
+        if clip_guid is None:
+            _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
+            return False
+
+        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        all_strokes = canvas.get("pen_strokes", [])
+        all_captions = canvas.get("captions", [])
+
+        bm_key = (clip_guid, int(clip_local_time.value))
+        # Register the local bookmark so _refresh_annotation_bookmark can update it
+        # when a remote peer adds strokes to the same frame later.
+        self._annotation_bookmarks[bm_key] = bm
+
+        # Query the annotation track directly from _object_map (the same object that
+        # broadcast_add_annotation mutates) to find how many strokes are already
+        # broadcast for this (clip, frame).  Traversing tl.tracks could yield
+        # wrapper objects that don't reflect mutations made through _object_map.
+        ann_track_obj = self.manager._object_map.get(annotation_track_guid)
+        if ann_track_obj is not None:
+            sent_strokes, sent_captions = self._count_track_strokes(
+                ann_track_obj, clip_guid, int(clip_local_time.value)
+            )
+        else:
+            sent_strokes, sent_captions = 0, 0
+        new_strokes = all_strokes[sent_strokes:]
+        new_captions = all_captions[sent_captions:]
+
+        events = (
+            self._strokes_to_sync_events(new_strokes, aspect_half)
+            + self._captions_to_sync_events(new_captions, aspect_half)
+        )
+        if not events:
+            _log(f"_broadcast_local_bookmark: no new strokes at frame={frame} — already in timeline")
+            return False
+
+        _log(
+            f"Broadcasting local annotation: {len(events)} SyncEvent(s)"
+            f" (+{len(new_strokes)} strokes, +{len(new_captions)} captions)"
+            f" at frame={frame} clip={clip_guid[:8]}"
+        )
+        self.manager.broadcast_add_annotation(
+            annotation_track_guid=annotation_track_guid,
+            clip_guid=clip_guid,
+            clip_local_time=clip_local_time,
+            events=events,
+        )
+        return True
+
+    # ── OTIO timeline delta helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _count_track_strokes(
+        annotation_track: otio.schema.Track,
+        clip_guid: str,
+        frame: int,
+    ) -> tuple[int, int]:
+        """Return ``(n_strokes, n_captions)`` already broadcast for *(clip_guid, frame)*.
+
+        Searches *annotation_track* directly — the same object that
+        :meth:`~otio_sync_core.manager.SyncManager.broadcast_add_annotation`
+        mutates via ``_object_map``.  This avoids any indirection through
+        ``timeline.tracks`` which may yield wrapper objects that don't reflect
+        in-place mutations.
+
+        :param annotation_track: The Annotations :class:`~opentimelineio.schema.Track`
+            looked up from ``manager._object_map``.
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :returns: ``(n_strokes, n_captions)`` committed to the track so far.
+        :rtype: tuple
+        """
+        for item in annotation_track:
+            if not isinstance(item, otio.schema.Clip):
+                continue
+            if item.metadata.get("clip_guid") != clip_guid:
+                continue
+            sr = getattr(item, "source_range", None)
+            if sr is None or int(sr.start_time.value) != frame:
+                continue
+            n_strokes = 0
+            n_captions = 0
+            for cmd in item.metadata.get("annotation_commands", []):
+                if hasattr(cmd, "schema_name"):
+                    schema = cmd.schema_name()
+                elif isinstance(cmd, dict):
+                    schema = cmd.get("OTIO_SCHEMA", "")
+                else:
+                    schema = ""
+                if schema.startswith("PaintStart"):
+                    n_strokes += 1
+                elif schema.startswith("TextAnnotation"):
+                    n_captions += 1
+            return n_strokes, n_captions
+        return 0, 0
+
+    # ── annotation receive ─────────────────────────────────────────────────────
+
+    def _load_snapshot_annotations(
+        self, otio_tl: otio.schema.Timeline, playlist
+    ) -> None:
+        """
+        Create xStudio bookmarks for annotation clips already present in a snapshot.
+
+        ``_apply_remote_annotation`` only fires for *new* ``insert_child`` events
+        received after joining.  Annotation clips that arrived inside the initial
+        state snapshot must be converted to bookmarks here, immediately after the
+        playlist is created from the OTIO timeline.
+
+        :param otio_tl: The OTIO timeline that was just loaded into xStudio.
+        :param playlist: The xStudio playlist created from *otio_tl*.
+        """
+        if not self.manager:
+            return
+        # Build a name → media lookup from the playlist so each annotation clip
+        # can find its target without re-scanning for every clip.
+        try:
+            name_to_media: dict = {m.name: m for m in playlist.media}
+        except Exception:
+            _log_exc("_load_snapshot_annotations: could not iterate playlist.media")
+            return
+
+        _log(f"  Playlist media names: {list(name_to_media.keys())}")
+
+        # Group annotation clips by (clip_guid, frame) — old snapshots may have
+        # multiple separate clips per frame (one per stroke) because the Gap/merge
+        # logic was not yet in place.  Grouping ensures we create one bookmark per
+        # frame regardless of how many clips represent it.
+        groups: dict[tuple, dict] = {}  # (clip_guid, frame) → {commands, fps, media}
+        for track in otio_tl.tracks:
+            if "annotation" not in track.name.lower():
+                continue
+            for ann_clip in track:
+                if not isinstance(ann_clip, otio.schema.Clip):
+                    continue
+                commands = ann_clip.metadata.get("annotation_commands")
+                if not commands:
+                    continue
+                clip_guid = ann_clip.metadata.get("clip_guid")
+                if not clip_guid:
+                    continue
+
+                otio_clip = self.manager.object_map.get(clip_guid)
+                if otio_clip is None:
+                    _log(f"  Snapshot ann: clip_guid {clip_guid[:8]} not in object_map")
+                    continue
+                media = name_to_media.get(otio_clip.name)
+                if media is None:
+                    _log(
+                        f"  Snapshot ann: no playlist media named {otio_clip.name!r}"
+                        f" (available: {list(name_to_media.keys())})"
+                    )
+                    continue
+
+                frame = 0
+                fps = 25.0
+                if ann_clip.source_range:
+                    frame = int(ann_clip.source_range.start_time.value)
+                    rate = ann_clip.source_range.start_time.rate
+                    if rate and rate > 0:
+                        fps = float(rate)
+
+                key = (clip_guid, frame)
+                if key in groups:
+                    groups[key]["commands"].extend(commands)
+                else:
+                    groups[key] = {
+                        "commands": list(commands),
+                        "fps": fps,
+                        "frame": frame,
+                        "media": media,
+                        "clip_guid": clip_guid,
+                        "clip_name": otio_clip.name,
+                    }
+
+        count = 0
+        for (clip_guid, frame), grp in groups.items():
+            media = grp["media"]
+            fps = grp["fps"]
+            aspect_half = 0.8889
+            try:
+                ms = media.media_source()
+                streams = ms.streams()
+                if streams:
+                    res = streams[0].media_stream_detail.resolution()
+                    if res.y > 0:
+                        aspect_half = res.x / (2.0 * res.y)
+            except Exception:
+                pass
+
+            pen_strokes = self._commands_to_xs_strokes(grp["commands"], aspect_half)
+            captions = self._commands_to_xs_captions(grp["commands"], aspect_half)
+            if not pen_strokes and not captions:
+                continue
+
+            try:
+                bm = self.connection.api.session.bookmarks.add_bookmark(target=media)
+                detail = BookmarkDetail()
+                detail.start = datetime.timedelta(seconds=frame / fps)
+                detail.duration = datetime.timedelta(seconds=0.9 / fps)
+                self.connection.request_receive(bm.remote, bookmark_detail_atom(), detail)
+                bm.set_annotation(strokes=pen_strokes, captions=captions)
+                self._annotation_bookmarks[(clip_guid, frame)] = bm
+                with self._our_bookmark_uuids_lock:
+                    self._our_bookmark_uuids.add(bm.uuid)
+                count += 1
+            except Exception:
+                _log_exc(
+                    f"  Snapshot ann: failed bookmark for {grp['clip_name']!r} f{frame}"
+                )
+
+        if count:
+            _log(f"  Loaded {count} snapshot annotation(s) as bookmarks")
+
+    def _refresh_annotation_bookmark(
+        self, merged_clip: otio.schema.Clip
+    ) -> None:
+        """Re-render an existing bookmark after new commands were merged into *merged_clip*.
+
+        Called when the manager fires ``annotation_commands_added`` — the clip
+        already holds the full merged command list; we just need to re-derive the
+        strokes and overwrite the bookmark's annotation canvas.
+
+        :param merged_clip: The annotation clip in the manager's timeline, now
+            containing all commands including the newly merged ones.
+        """
+        frame = 0
+        if merged_clip.source_range:
+            frame = int(merged_clip.source_range.start_time.value)
+
+        clip_guid = merged_clip.metadata.get("clip_guid")
+        if not clip_guid:
+            return
+
+        bm_key = (clip_guid, frame)
+        bm = self._annotation_bookmarks.get(bm_key)
+        if bm is None:
+            _log(f"_refresh_annotation_bookmark: no tracked bookmark for {bm_key}")
+            return
+
+        media, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        if media is None:
+            return
+
+        all_commands = merged_clip.metadata.get("annotation_commands", [])
+        pen_strokes = self._commands_to_xs_strokes(all_commands, aspect_half)
+        captions = self._commands_to_xs_captions(all_commands, aspect_half)
+        if not pen_strokes and not captions:
+            return
+
+        try:
+            bm.set_annotation(strokes=pen_strokes, captions=captions)
+            _log(
+                f"Refreshed annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
+                f" at frame {frame}"
+            )
+        except Exception:
+            _log_exc("_refresh_annotation_bookmark: failed")
+
+    def _apply_remote_annotation(
+        self, ann_clip: otio.schema.Clip, commands: list
+    ) -> None:
+        """
+        Convert a received annotation clip into an xStudio bookmark with strokes.
+
+        Uses the xStudio bookmark API (``Bookmarks.add_bookmark`` +
+        ``Bookmark.set_annotation``) rather than raw actor messaging, which
+        mirrors how ``ori_annotations.py`` reads and writes annotation data.
+
+        :param ann_clip: The 1-frame annotation clip inserted into the Annotations track.
+        :param commands: Sequence of SyncEvent objects (``PaintStart``, ``PaintPoints``).
+        """
+        frame = 0
+        fps = 25.0
+        if ann_clip.source_range:
+            frame = int(ann_clip.source_range.start_time.value)
+            rate = ann_clip.source_range.start_time.rate
+            if rate and rate > 0:
+                fps = float(rate)
+
+        clip_guid = ann_clip.metadata.get("clip_guid")
+        if not clip_guid:
+            _log("_apply_remote_annotation: no clip_guid in metadata — skipping")
+            return
+
+        media, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        if media is None:
+            _log(
+                f"_apply_remote_annotation: no xStudio media for clip {clip_guid[:8]}"
+            )
+            return
+
+        pen_strokes = self._commands_to_xs_strokes(commands, aspect_half)
+        captions = self._commands_to_xs_captions(commands, aspect_half)
+        if not pen_strokes and not captions:
+            _log("_apply_remote_annotation: no strokes or captions decoded — skipping")
+            return
+
+        bm_key = (clip_guid, frame)
+        existing_bm = self._annotation_bookmarks.get(bm_key)
+        try:
+            if existing_bm is not None:
+                existing_bm.set_annotation(strokes=pen_strokes, captions=captions)
+                _log(
+                    f"Updated annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
+                    f" at frame {frame}"
+                )
+            else:
+                bm = self.connection.api.session.bookmarks.add_bookmark(target=media)
+                # Set start and duration in a single BookmarkDetail message.
+                # Doing them separately fires two bookmark_change_atom events and risks
+                # a full_bookmarks_update running between them with duration=k_flicks_max
+                # (which makes the annotation appear to hold for the whole media).
+                # Duration < 1 frame: floor(0.9) = 0 → end_frame = start_frame (1-frame display).
+                detail = BookmarkDetail()
+                detail.start = datetime.timedelta(seconds=frame / fps)
+                detail.duration = datetime.timedelta(seconds=0.9 / fps)
+                self.connection.request_receive(bm.remote, bookmark_detail_atom(), detail)
+                try:
+                    readback = bm.detail
+                    _log(
+                        f"  Bookmark timing: start={readback.start},"
+                        f" duration={readback.duration}"
+                    )
+                except Exception:
+                    pass
+                bm.set_annotation(strokes=pen_strokes, captions=captions)
+                self._annotation_bookmarks[bm_key] = bm
+                with self._our_bookmark_uuids_lock:
+                    self._our_bookmark_uuids.add(bm.uuid)
+                _log(
+                    f"Applied remote annotation: {len(pen_strokes)} stroke(s)"
+                    f" at frame {frame}"
+                )
+        except Exception:
+            _log_exc("_apply_remote_annotation: failed to set annotation")
+
+    def _find_media_for_clip_guid(
+        self, clip_guid: str
+    ) -> tuple:
+        """
+        Look up the xStudio media item corresponding to an OTIO clip GUID.
+
+        Searches all synced playlists for a media item whose name matches the
+        OTIO clip name.  Also derives ``aspect_half`` (``W / (2H)``) from the
+        media stream resolution so that coordinate conversion is accurate.
+
+        :param clip_guid: Sync GUID of the OTIO media clip.
+        :returns: ``(media, aspect_half)`` or ``(None, 0.8889)`` on failure.
+        :rtype: tuple
+        """
+        if not self.manager:
+            return None, 0.8889
+        otio_clip = self.manager.object_map.get(clip_guid)
+        if otio_clip is None:
+            _log(f"_find_media_for_clip_guid: {clip_guid[:8]} not in object_map")
+            return None, 0.8889
+        clip_name = getattr(otio_clip, "name", None)
+        _log(f"_find_media_for_clip_guid: looking for {clip_name!r}")
+
+        for playlist, _ in self._sync_playlists.values():
+            try:
+                available = [m.name for m in playlist.media]
+                _log(f"  playlist media: {available}")
+                for media in playlist.media:
+                    if media.name != clip_name:
+                        continue
+                    aspect_half = 0.8889  # 16:9 fallback
+                    try:
+                        ms = media.media_source()
+                        streams = ms.streams()
+                        if streams:
+                            res = streams[0].media_stream_detail.resolution()
+                            if res.y > 0:
+                                aspect_half = res.x / (2.0 * res.y)
+                    except Exception:
+                        pass
+                    return media, aspect_half
+            except Exception:
+                _log_exc("_find_media_for_clip_guid: error scanning playlist")
+        return None, 0.8889
+
+    def _commands_to_xs_strokes(
+        self, commands: list, aspect_half: float
+    ) -> list:
+        """
+        Convert a PaintStart / PaintPoints command sequence to xStudio stroke dicts.
+
+        Inverts the H-normalised / Y-up (OTIO/RV) coordinate system to the
+        W-normalised / Y-down system that xStudio expects:
+
+        .. code-block:: text
+
+            x_xs = x_otio / aspect_half
+            y_xs = -y_otio / aspect_half
+
+        :param commands: Sequence of SyncEvent objects from the annotation clip.
+        :param aspect_half: ``W / (2H)`` derived from the target media resolution.
+        :returns: List of xStudio pen-stroke dicts suitable for
+            :meth:`Bookmark.set_annotation`.
+        :rtype: list
+        """
+        pen_strokes: list[dict] = []
+        current_stroke: dict | None = None
+
+        for cmd in commands:
+            if hasattr(cmd, "schema_name"):
+                schema = cmd.schema_name()
+            elif isinstance(cmd, dict):
+                schema = cmd.get("OTIO_SCHEMA", "")
+            else:
+                schema = ""
+
+            if schema.startswith("PaintStart"):
+                rgba = getattr(cmd, "rgba", None) or [1.0, 1.0, 1.0, 1.0]
+                # PaintStart has no width field; thickness is set from PaintVertices.size.
+                is_erase = getattr(cmd, "type", "color") == "erase"
+                current_stroke = {
+                    "r": rgba[0] if len(rgba) > 0 else 1.0,
+                    "g": rgba[1] if len(rgba) > 1 else 1.0,
+                    "b": rgba[2] if len(rgba) > 2 else 1.0,
+                    "opacity": rgba[3] if len(rgba) > 3 else 1.0,
+                    "thickness": 0.003,
+                    "softness": 0.0,
+                    "size_sensitivity": 1.0,
+                    "opacity_sensitivity": 1.0,
+                    "is_erase_stroke": is_erase,
+                    "points": [],
+                }
+                pen_strokes.append(current_stroke)
+
+            # Python class is PaintPoints; serializable label is "PaintPoint.1".
+            elif schema.startswith("PaintPoint") and current_stroke is not None:
+                points_obj = getattr(cmd, "points", None)
+                if points_obj is None:
+                    continue
+                xs = list(getattr(points_obj, "x", []))
+                ys = list(getattr(points_obj, "y", []))
+                sizes = list(getattr(points_obj, "size", []))
+                raw_pts: list[float] = []
+                for x, y in zip(xs, ys):
+                    raw_pts.extend([
+                        x / aspect_half,
+                        -y / aspect_half,
+                        1.0,  # size_pressure — protocol has no per-point pressure
+                        1.0,  # opacity_pressure — 0.0 makes every point invisible
+                    ])
+                current_stroke["points"] = raw_pts
+                if sizes:
+                    current_stroke["thickness"] = sizes[0] / aspect_half
+
+        return pen_strokes
+
+    def _commands_to_xs_captions(
+        self, commands: list, aspect_half: float
+    ) -> list:
+        """
+        Convert a TextAnnotation command sequence to xStudio caption dicts.
+
+        Inverts coordinate systems and scales font size.
+
+        :param commands: Sequence of SyncEvent objects from the annotation clip.
+        :param aspect_half: ``W / (2H)`` derived from the target media resolution.
+        :returns: List of xStudio caption dicts suitable for
+            :meth:`Bookmark.set_annotation`.
+        :rtype: list
+        """
+        captions: list[dict] = []
+        for cmd in commands:
+            if hasattr(cmd, "schema_name"):
+                schema = cmd.schema_name()
+            elif isinstance(cmd, dict):
+                schema = cmd.get("OTIO_SCHEMA", "")
+            else:
+                schema = ""
+
+            if schema.startswith("TextAnnotation"):
+                rgba = getattr(cmd, "rgba", None)
+                if rgba is None and isinstance(cmd, dict):
+                    rgba = cmd.get("rgba")
+                if not rgba:
+                    rgba = [1.0, 1.0, 1.0, 1.0]
+
+                position = getattr(cmd, "position", None)
+                if position is None and isinstance(cmd, dict):
+                    position = cmd.get("position")
+                if not position:
+                    position = [0.0, 0.0]
+
+                text = getattr(cmd, "text", None)
+                if text is None and isinstance(cmd, dict):
+                    text = cmd.get("text")
+                if not text:
+                    text = ""
+
+                font = getattr(cmd, "font", None)
+                if font is None and isinstance(cmd, dict):
+                    font = cmd.get("font")
+                if not font:
+                    font = ""
+
+                font_size = getattr(cmd, "font_size", None)
+                if font_size is None and isinstance(cmd, dict):
+                    font_size = cmd.get("font_size")
+                if font_size is None:
+                    font_size = 50.0
+
+                # Convert coordinates and values
+                x_xs = float(position[0]) / aspect_half
+                y_xs = -float(position[1]) / aspect_half
+
+                captions.append({
+                    "colour": ["colour", 1, rgba[0], rgba[1], rgba[2]],
+                    "opacity": rgba[3],
+                    "position": ["vec2", 1, x_xs, y_xs],
+                    "font_name": font,
+                    "font_size": float(font_size),
+                    "text": text,
+                })
+        return captions
+
+    # ── OTIO helpers ───────────────────────────────────────────────────────────
+
+    def _find_annotation_track_guid(
+        self, timeline: otio.schema.Timeline
+    ) -> str | None:
+        """Return the sync GUID of the Annotations track, or the last track."""
+        for track in timeline.tracks:
+            if "annotation" in track.name.lower():
+                return track.metadata.get("sync", {}).get("guid")
+        tracks = list(timeline.tracks)
+        if tracks:
+            return tracks[-1].metadata.get("sync", {}).get("guid")
+        return None
+
+    def _resolve_clip_at_frame(
+        self,
+        timeline: otio.schema.Timeline,
+        frame: int,
+    ) -> tuple[str | None, otio.opentime.RationalTime | None]:
+        """
+        Return ``(clip_guid, clip_local_time)`` for the media clip at *frame*.
+
+        *frame* is 0-based (xStudio convention).  Returns ``(None, None)``
+        when the frame cannot be resolved to any clip in the first content track.
+        """
+        fps = 24.0
+        if self.active_playhead:
+            fps = self.active_playhead.frame_rate.fps() or fps
+
+        global_time = otio.opentime.RationalTime(frame, fps)
+        try:
+            for track in timeline.tracks:
+                if "annotation" in track.name.lower():
+                    continue
+                for clip in track:
+                    if not hasattr(clip, "source_range") or clip.source_range is None:
+                        continue
+                    clip_range = clip.range_in_parent()
+                    if clip_range.contains(global_time):
+                        clip_guid = clip.metadata.get("sync", {}).get("guid")
+                        # clip_local_time: position relative to clip's source_range start
+                        clip_local_time = otio.opentime.RationalTime(
+                            global_time.value - clip_range.start_time.value,
+                            fps,
+                        )
+                        return clip_guid, clip_local_time
+        except Exception:
+            _log_exc("_resolve_clip_at_frame error")
+        return None, None
+
+    # ── stroke / caption conversion ────────────────────────────────────────────
+
+    def _strokes_to_sync_events(
+        self, pen_strokes: list, aspect_half: float = 0.8889
+    ) -> list:
+        """
+        Convert xStudio pen_strokes to OTIO SyncEvent objects.
+
+        Mirrors ``ORIAnnotationsExporter._strokes_to_sync_events`` exactly so
+        that strokes broadcast here are readable by the existing RV plugin and
+        the OTIO export pipeline.
+
+        Coordinate convention:
+        - xStudio: W-normalised, Y-down  (X ∈ [−1,+1])
+        - OTIO/RV: H-normalised, Y-up    (X ∈ [−aspect/2,+aspect/2])
+        Scale factor: ``aspect_half = W / (2H)``
+        """
+        events = []
+        for stroke in pen_strokes:
+            stroke_uuid = str(uuid.uuid4())
+            rgba = [
+                stroke.get("r", 1.0),
+                stroke.get("g", 1.0),
+                stroke.get("b", 1.0),
+                stroke.get("opacity", 1.0),
+            ]
+            thickness = stroke.get("thickness", 0.003)
+            is_erase = stroke.get("is_erase_stroke", False)
+            raw_pts = stroke.get("points", [])
+
+            xs = [x * aspect_half for x in raw_pts[0::4]]
+            ys = [-y * aspect_half for y in raw_pts[1::4]]
+            sps = raw_pts[2::4]
+            widths = (
+                [thickness * aspect_half * sp for sp in sps]
+                if xs and any(sp != 0.0 for sp in sps)
+                else [thickness * aspect_half] * len(xs)
+            )
+
+            start_evt = SyncEvent.PaintStart(
+                brush="oval", rgba=rgba, friendly_name="", uuid=stroke_uuid
+            )
+            if is_erase:
+                start_evt.type = "erase"
+            events.append(start_evt)
+            events.append(
+                SyncEvent.PaintPoints(
+                    uuid=stroke_uuid,
+                    points=SyncEvent.PaintVertices(list(xs), list(ys), widths),
+                )
+            )
+        return events
+
+    def _captions_to_sync_events(
+        self, captions: list, aspect_half: float = 0.8889
+    ) -> list:
+        """Convert xStudio caption dicts to OTIO TextAnnotation SyncEvents."""
+        events = []
+        for caption in captions:
+            caption_uuid = str(uuid.uuid4())
+            colour = caption.get("colour", ["colour", 1, 1.0, 1.0, 1.0])
+            if isinstance(colour, list) and len(colour) >= 5:
+                r, g, b = float(colour[2]), float(colour[3]), float(colour[4])
+            else:
+                r, g, b = 1.0, 1.0, 1.0
+            opacity = float(caption.get("opacity", 1.0))
+            pos = caption.get("position", ["vec2", 1, 0.0, 0.0])
+            position = (
+                [float(pos[2]) * aspect_half, -float(pos[3]) * aspect_half]
+                if isinstance(pos, list) and len(pos) >= 4
+                else [0.0, 0.0]
+            )
+            events.append(
+                SyncEvent.TextAnnotation(
+                    rgba=[r, g, b, opacity],
+                    position=position,
+                    spacing=0.0,
+                    friendly_name=caption.get("font_name", ""),
+                    font_size=float(caption.get("font_size", 50.0)),
+                    font=caption.get("font_name", ""),
+                    text=caption.get("text", ""),
+                    rotation=0.0,
+                    scale=1.0,
+                    uuid=caption_uuid,
+                )
+            )
+        return events
+
+
+# ── xStudio entry points ───────────────────────────────────────────────────────
+
+
+def create_plugin_instance(connection):
+    return ORISyncPlugin(connection)
+
+
+if __name__ == "__main__":
+    XSTUDIO = Connection(auto_connect=True)
+    create_plugin_instance(XSTUDIO)
+    XSTUDIO.link.run_xstudio_message_loop()
