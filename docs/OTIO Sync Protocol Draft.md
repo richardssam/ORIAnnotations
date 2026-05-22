@@ -108,7 +108,7 @@ The OTIO C++ core now provides a native `MutationObserver` API, which supersedes
 * `on_property_changed(obj, property_name)` — fires after any OTIO property is mutated, e.g. `clip.name = "New Name"`. The patcher captures the new value immediately and emits a `SetPropertyPatch`.
 * `on_children_changed(composition, action, index, child)` — fires on insert, remove, or clear. Emits `InsertChildPatch`, `RemoveChildPatch`, or `ClearChildrenPatch`.
 
-Metadata sub-key changes are **not observable** through `MutationObserver` (see §8E). Metadata mutations must be routed through `patcher.set_metadata(obj, path, value)`, which applies the change and emits a `SetMetadataPatch` directly.
+We need to explore whether the metadata sub-key changes can be observable in python (C++ may be more problematic), so we may need to require metadata mutations must be routed through `patcher.set_metadata(obj, path, value)`, which applies the change and emits a `SetMetadataPatch` directly.
 
 **Transactions** — Multiple patches can be grouped into a `Transaction` using a context manager:
 ```python

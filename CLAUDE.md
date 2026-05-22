@@ -163,6 +163,140 @@ Before the EDL fix was in place, the plugin produced clips with a 10 000-frame f
 
 ---
 
+## xStudio plugin — non-obvious constraints
+
+The plugin lives in `xstudio_plugin/ori_sync/ori_sync_plugin.py`.  Set
+`ORI_SYNC_LOG_FILE=/path/to/xstudio_client.log` before launching xStudio so
+the plugin writes a persistent log (mirrors `RV_OTIO_SYNC_LOG_FILE` for RV).
+
+### Global playhead events — Form 1 vs Form 2
+
+`subscribe_to_global_playhead_events` delivers events in two shapes:
+
+| Form | Length | `event[1]` | Playhead actor |
+| --- | --- | --- | --- |
+| 1 | 3 | `viewport_playhead_atom` | `event[2]` |
+| 2 | 4 | `viewport_playhead_atom` | `event[3]` (also has viewport name at `event[2]`) |
+
+**Only handle Form 2** (`len(event) > 3`).  Form 1's playhead actor may differ
+from the one the user is actually scrubbing on.  This matches the reference
+plugin `xstudio_live_review.py`.
+
+### `subscribe_to_playhead_events` cancels all previous subscriptions
+
+`auto_cancel=True` (the default) calls `unsubscribe_from_event_group` on
+**every** entry in `self.playhead_subscriptions`, not just the one for the same
+event group.  With multiple timelines loaded, Form 2 fires once per timeline;
+each re-subscription cancels the previous one, leaving only the last timeline's
+playhead active.  The user scrubs on the first timeline → no events arrive.
+
+**Workaround**: do not rely on playhead-event subscriptions for scrub detection.
+Use poll-based position reading from the poll thread instead (see
+`_poll_and_broadcast_frame`).
+
+### Poll-based scrubbing with echo guard
+
+`_poll_and_broadcast_frame` (called every `POLL_INTERVAL` from the poll thread)
+reads `active_playhead.position` directly.  An echo guard prevents re-broadcasting
+a frame that was just applied from a remote `PLAYBACK_SETTINGS` message:
+
+```python
+# In _apply_playback_state, before setting position:
+self._last_applied_frame = frame
+self._last_polled_frame = frame
+
+# In _poll_and_broadcast_frame:
+if frame == self._last_polled_frame:
+    return          # no change
+self._last_polled_frame = frame
+if frame == self._last_applied_frame:
+    return          # remote-applied, skip echo
+```
+
+### Annotation trigger: `show_atom` + periodic fallback scan
+
+`annotation_atom` events from the `AnnotationsUI` plugin events group do **not**
+fire in the tested builds.  `show_atom` fires when a **new** bookmark is created,
+but does **not** fire when the user adds a second stroke to an existing bookmark
+on the same frame.
+
+Therefore `_on_global_playhead_event` sets `_annotation_pending_time` when
+`show_atom` arrives (fast path, ~250 ms debounce for new bookmarks), **and**
+`_flush_pending_annotations` also runs a periodic fallback scan every
+`ANNOTATION_SCAN_INTERVAL` (0.5 s) so that strokes added to existing bookmarks
+are caught even when no event fires.
+
+### `annotation_data` structure
+
+`bm.annotation_data` returns:
+
+```python
+{"plugin_uuid": "…", "Data": {"pen_strokes": […], "captions": […], …}}
+```
+
+The canvas dict lives under `"Data"`, **not** at the top level:
+
+```python
+canvas = ann_data.get("Data", ann_data)   # fallback covers format changes
+```
+
+### Coordinate system: xStudio ↔ OTIO/RV
+
+| System | x range | y | origin |
+| --- | --- | --- | --- |
+| xStudio native | `[-1, 1]` (W-norm) | down | centre |
+| OTIO SyncEvent / RV paint | `[-aspect_half, aspect_half]` (H-norm) | up | centre |
+
+Conversion (send path, xStudio → OTIO):
+
+```python
+x_otio =  x_xs * aspect_half    # aspect_half = W / (2 * H)
+y_otio = -y_xs * aspect_half
+```
+
+Inverse (receive path, OTIO → xStudio):
+
+```python
+x_xs =  x_otio / aspect_half
+y_xs = -y_otio / aspect_half
+```
+
+RV's `{pen}.points` property uses the same H-normalised Y-up system as the
+OTIO SyncEvent, so xStudio-origin OTIO coordinates can be written to
+`{pen}.points` directly without further transformation.
+
+### Multiple strokes per frame — delta tracking
+
+Delta tracking uses the **OTIO timeline as ground truth**, not a per-bookmark
+counter.  `_count_track_strokes(annotation_track, clip_guid, frame)` counts
+`PaintStart` events already in the annotation track (looked up directly from
+`manager._object_map`, not traversed from `timeline.tracks`).  The delta is
+`all_strokes[sent_strokes:]`.
+
+Why not a counter keyed by bookmark UUID or `(clip_guid, frame)`?  xStudio may
+replace a bookmark with a new UUID when the user adds strokes to an existing
+frame.  A UUID-keyed counter resets to zero for the new UUID and re-sends
+already-broadcast strokes.  A `(clip_guid, frame)`-keyed counter misses strokes
+when xStudio creates a fresh bookmark per stroke with only that one stroke in it.
+The OTIO timeline is always correct because `broadcast_add_annotation` updates
+it synchronously before returning.
+
+Do **not** add locally-drawn bookmark UUIDs to `_our_bookmark_uuids` — that set
+is only for *remote-sourced* bookmarks.  Local ones must remain scannable so
+subsequent strokes on the same frame are picked up.
+
+### Receiving annotations from remote peers
+
+Remote annotations arrive as `insert_child` events (action returned by
+`manager.tick()`).  If the clip has `annotation_commands` in metadata,
+`_apply_remote_annotation` converts the SyncEvent list to xStudio pen-stroke
+dicts and calls `bm.set_annotation(strokes=…)` on the relevant bookmark.
+`_annotation_bookmarks: dict[(clip_guid, frame), Bookmark]` caches the
+bookmark so that subsequent `annotation_commands_added` events can update it
+in place rather than creating a duplicate.
+
+---
+
 ## Python coding style
 
 All Python uses **Sphinx reStructuredText docstrings** (docs built with `make html` in `docs/`). See `python/otio_sync_core/manager.py` for examples. Key rules:
