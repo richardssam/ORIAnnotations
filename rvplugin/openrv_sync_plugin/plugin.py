@@ -610,7 +610,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self.sync_manager.broadcast_master_discovery()
             if time.time() - self._discovery_start_time > 2.0:
                 self._init_as_master()
-            return
+            # fall through to tick() so I_AM_MASTER responses are processed
 
         # tick() handles master_found → request_state and
         # state_snapshot_received → apply_snapshot internally.
@@ -872,6 +872,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 "width": list(points_event.points.size),
                 "join": 3,
                 "cap": 1,
+                "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
             })
             rendered += 1
 
@@ -1149,7 +1150,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                     "width": list(points_event.points.size),
                                     "points": [val for pair in zip(points_event.points.x, points_event.points.y) for val in pair],
                                     "join": 3,
-                                    "cap": 1
+                                    "cap": 1,
+                                    "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
                                 }
                                 self._apply_annotation(data)
 
@@ -1488,7 +1490,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             rv.commands.newProperty(f"{full_pen}.startFrame", rv.commands.IntType, 1)
             rv.commands.newProperty(f"{full_pen}.duration", rv.commands.IntType, 1)
             rv.commands.newProperty(f"{full_pen}.mode", rv.commands.IntType, 1)
-            rv.commands.setIntProperty(f"{full_pen}.mode", [0], True)  # RenderOverMode = 0
+            rv.commands.setIntProperty(f"{full_pen}.mode", [data.get("mode", 0)], True)
             rv.commands.setIntProperty(f"{full_pen}.debug", [0], True)
             rv.commands.setIntProperty(f"{full_pen}.join", [join], True)
             rv.commands.setIntProperty(f"{full_pen}.cap", [cap], True)
