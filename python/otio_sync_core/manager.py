@@ -684,6 +684,50 @@ class SyncManager:
             ann_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
             self.insert_child(annotation_track_guid, ann_clip)
 
+    def broadcast_replace_annotation_commands(
+        self,
+        annotation_clip_guid: str,
+        events: list,
+    ) -> None:
+        """Replace all annotation_commands on an existing clip and broadcast to peers.
+
+        Used when the user edits text in an annotation in place — the command
+        count stays the same but the text content changes.  Sends a
+        ``REPLACE_ANNOTATION_COMMANDS`` message so peers replace the full
+        command list rather than appending a delta.
+
+        :param annotation_clip_guid: Sync GUID of the annotation clip to update.
+        :param events: Full replacement list of SyncEvent objects (strokes +
+            captions) representing the current annotation state.
+        """
+        if not self.network or self.status != STATE_SYNCED:
+            return
+        clip = self._object_map.get(annotation_clip_guid)
+        if clip is None:
+            _log(f"broadcast_replace_annotation_commands: clip {annotation_clip_guid} not found")
+            return
+
+        otio_events: list[otio.core.SerializableObject] = []
+        for e in events:
+            try:
+                otio_events.append(_dict_to_otio(e) if isinstance(e, dict) else e)
+            except Exception as exc:
+                _log(f"broadcast_replace_annotation_commands: failed to deserialise event: {exc}")
+
+        clip.metadata["annotation_commands"] = otio_events
+
+        self.network.send_payload({
+            "command": "OTIO_SESSION",
+            "event": "REPLACE_ANNOTATION_COMMANDS",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "annotation_clip_guid": annotation_clip_guid,
+                "commands": [_otio_to_dict(e) for e in otio_events],
+                "sync_timestamp": time.time(),
+            },
+        })
+
     def broadcast_selection(self, nodes: list[str]) -> None:
         """Broadcast the current UI selection to all peers.
 
@@ -919,6 +963,23 @@ class SyncManager:
                         del parent[current_index]
                         self._object_map.pop(child_uuid, None)
                         return ("remove_child", data)
+
+            elif event == "REPLACE_ANNOTATION_COMMANDS":
+                ann_clip_guid = data.get("annotation_clip_guid")
+                clip = self._object_map.get(ann_clip_guid)
+                if clip is None:
+                    _log(f"REPLACE_ANNOTATION_COMMANDS: clip {ann_clip_guid} not found")
+                    return None
+                commands: list[otio.core.SerializableObject] = []
+                for cmd_dict in data.get("commands", []):
+                    try:
+                        commands.append(
+                            _dict_to_otio(cmd_dict) if isinstance(cmd_dict, dict) else cmd_dict
+                        )
+                    except Exception as exc:
+                        _log(f"REPLACE_ANNOTATION_COMMANDS: failed to deserialise: {exc}")
+                clip.metadata["annotation_commands"] = commands
+                return ("annotation_commands_replaced", clip)
 
             elif event == "INSERT_CHILD":
                 parent_uuid = data.get("parent_uuid")

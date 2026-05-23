@@ -180,6 +180,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self._init_single_timeline(fps)
 
         self.sync_manager.broadcast_master_response()
+        self._import_existing_rv_annotations()
         _log("Session Initialized as MASTER")
 
     def _retry_init_timelines(self):
@@ -209,6 +210,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._track = None
 
         self._init_timelines_from_sequences(seq_groups, fps)
+        self._import_existing_rv_annotations()
         _log("Retry init complete")
 
     def _make_otio_clip_for_sg(self, sg):
@@ -657,6 +659,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # don't duplicate strokes that RV already painted.
             _merged_clip, delta_clip = data
             self._apply_annotation_render(delta_clip)
+        elif action == "annotation_commands_replaced":
+            # Full annotation_commands replacement (e.g. text edit or drag-move).
+            # Update existing paint nodes in place instead of adding duplicates.
+            self._apply_annotation_replace(data)
         elif action == "insert_child":
             if isinstance(data, otio.schema.Clip) and "annotation_commands" in data.metadata:
                 self._apply_annotation_render(data)
@@ -677,6 +683,102 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 if isinstance(ref, otio.schema.ExternalReference) and ref.target_url == media_path:
                     return guid
         return None
+
+    def _resolve_media_path_for_paint_node(self, node_name):
+        """Return the media file path for an RVPaint node, or None.
+
+        Supports both sequence-context nodes (``{seq}_p_{slot}``) and
+        direct-source nodes (``{sg}_paint``).
+        """
+        if "_p_" in node_name:
+            seq_name = node_name.split("_p_")[0]
+            display_slot = node_name.split("_p_")[1]
+            try:
+                for n in rv.commands.nodesInGroup(display_slot):
+                    if rv.commands.nodeType(n) == "RVFileSource":
+                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                        if path:
+                            return path
+            except Exception:
+                pass
+            m = re.match(r'^sourceGroup(\d+)$', display_slot)
+            if m:
+                slot_idx = int(m.group(1))
+                seq_inputs = self._get_sequence_inputs(seq_name)
+                if 0 <= slot_idx < len(seq_inputs):
+                    actual_sg = seq_inputs[slot_idx]
+                    for n in rv.commands.nodesInGroup(actual_sg):
+                        if rv.commands.nodeType(n) == "RVFileSource":
+                            try:
+                                path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                                if path:
+                                    return path
+                            except Exception:
+                                pass
+        elif node_name.endswith("_paint"):
+            source_group = node_name[:-len("_paint")]
+            try:
+                for n in rv.commands.nodesInGroup(source_group):
+                    if rv.commands.nodeType(n) == "RVFileSource":
+                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                        if path:
+                            return path
+            except Exception:
+                pass
+        return None
+
+    def _import_existing_rv_annotations(self):
+        """Broadcast annotations already in RV paint nodes into the OTIO session.
+
+        Called during master initialisation so strokes painted before the sync
+        session started become part of the shared timeline.  Only sequence-context
+        paint nodes (``{seq}_p_{slot}``) and direct-source nodes (``{sg}_paint``)
+        are considered; other node types are ignored.
+        """
+        _log("_import_existing_rv_annotations: scanning pre-existing RV annotations")
+        try:
+            fps = rv.commands.fps()
+            for node in rv.commands.nodesOfType("RVPaint"):
+                if "_p_" not in node and not node.endswith("_paint"):
+                    continue
+                try:
+                    media_path = self._resolve_media_path_for_paint_node(node)
+                    if not media_path:
+                        continue
+                    clip_guid = self._clip_guid_for_media_path(media_path)
+                    if not clip_guid:
+                        continue
+                    annotation_track_guid = self._find_annotation_track_guid_for_clip(clip_guid)
+                    if not annotation_track_guid:
+                        continue
+                    clip = self.sync_manager._object_map.get(clip_guid)
+                    n_frames = 1000
+                    if clip and getattr(clip, 'source_range', None):
+                        try:
+                            n_frames = max(1, int(clip.source_range.duration.value))
+                        except Exception:
+                            pass
+                    count = 0
+                    for frame in range(1, n_frames + 1):
+                        order_prop = f"{node}.frame:{frame}.order"
+                        if not rv.commands.propertyExists(order_prop):
+                            continue
+                        try:
+                            items = rv.commands.getStringProperty(order_prop)
+                        except Exception:
+                            continue
+                        for item in items:
+                            try:
+                                self._broadcast_annotation(node, item)
+                                count += 1
+                            except Exception as e:
+                                _log(f"  import: failed {item}: {e}")
+                    if count:
+                        _log(f"  import: {count} annotation(s) from {node}")
+                except Exception as e:
+                    _log(f"  import: error scanning {node}: {e}")
+        except Exception as e:
+            _log_exc(f"_import_existing_rv_annotations failed: {e}")
 
     def _find_annotation_track_guid_for_clip(self, clip_guid):
         """Return the GUID of the Annotations track in the same timeline as clip_guid."""
@@ -723,12 +825,21 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         # rendered, not just the last PaintStart/PaintPoints pair.
         event_groups = {}
         rendered = 0
+        # Cache the paint node once for the UUID-existence checks below.
+        _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame)
         for ev in events_data:
             try:
                 if isinstance(ev, dict):
                     ev = otio.adapters.read_from_string(json.dumps(ev), "otio_json")
                 if isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
-                    rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
+                    uuid_val = ev.uuid or ""
+                    # Snapshot replay sends the full clip as insert_child; if the
+                    # node was already painted by _rebuild_rv_session, skip it.
+                    if _paint_node_cache and self._text_uuid_exists_in_rv(_paint_node_cache, rv_frame, uuid_val):
+                        _log(f"RECV annotation: skip dup text uuid={uuid_val[:8]!r} (already in RV)")
+                        continue
+                    rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+                    _log(f"RECV TextAnnotation font_size={getattr(ev, 'font_size', None)!r} → rv_size={rv_size!r}")
                     self._apply_text_annotation({
                         "media_path": media_path,
                         "frame": rv_frame,
@@ -741,7 +852,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         "rotation": float(ev.rotation) if getattr(ev, "rotation", None) is not None else 0.0,
                         "font": ev.font or "",
                         "text": ev.text or "",
-                        "uuid": ev.uuid or "",
+                        "uuid": uuid_val,
                     })
                     rendered += 1
                 else:
@@ -776,6 +887,119 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         if rendered == 0:
             _log("RECV annotation: no valid annotation events found")
+
+    def _apply_annotation_replace(self, ann_clip):
+        """Apply a full annotation_commands replacement to RV paint.
+
+        Called when a peer sends ``annotation_commands_replaced`` (e.g. a text
+        edit or drag-move in xStudio).  For each ``TextAnnotation`` command in
+        the replacement, the method finds the existing RV text node by UUID and
+        updates its ``text``, ``position``, ``color``, and ``size`` properties in
+        place.  This avoids the duplicate-text artefact that would result from
+        calling ``_apply_text_annotation`` (which always creates a new node).
+
+        Stroke commands (``PaintStart`` / ``PaintPoints``) are skipped because
+        they are already painted in RV and have not changed.
+
+        Falls back to ``_apply_text_annotation`` when no node with the matching
+        UUID is found (e.g. if the first broadcast was dropped).
+        """
+        clip_guid = ann_clip.metadata.get("clip_guid")
+        events_data = ann_clip.metadata.get("annotation_commands", [])
+        rv_frame = (int(ann_clip.source_range.start_time.value) + 1
+                    if ann_clip.source_range else 1)
+
+        media_clip = self.sync_manager._object_map.get(clip_guid) if clip_guid else None
+        if not isinstance(media_clip, otio.schema.Clip):
+            _log(f"RECV annotation replace: no media Clip for guid={clip_guid}")
+            return
+        ref = media_clip.media_reference
+        if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
+            return
+        media_path = ref.target_url
+
+        node = self._find_paint_node_for_media(media_path, rv_frame)
+        if not node:
+            _log(f"RECV annotation replace: no paint node for media_path={media_path} frame={rv_frame}")
+            return
+
+        order_prop = f"{node}.frame:{rv_frame}.order"
+
+        for ev in events_data:
+            try:
+                if isinstance(ev, dict):
+                    ev = otio.adapters.read_from_string(json.dumps(ev), "otio_json")
+            except Exception as e:
+                _log(f"RECV annotation replace: failed to deserialise event: {e}")
+                continue
+
+            if not isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
+                continue  # strokes are already in RV — do not re-add
+
+            uuid_val = ev.uuid or ""
+            text_val = ev.text or ""
+            position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
+            color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
+            rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+
+            # Scan the frame's draw-order list for a text node with this UUID.
+            found = False
+            if rv.commands.propertyExists(order_prop):
+                for item in rv.commands.getStringProperty(order_prop):
+                    if not item.startswith("text:"):
+                        continue
+                    uuid_prop = f"{node}.{item}.uuid"
+                    if not rv.commands.propertyExists(uuid_prop):
+                        continue
+                    existing_uuid = rv.commands.getStringProperty(uuid_prop)
+                    if not existing_uuid or existing_uuid[0] != uuid_val:
+                        continue
+                    rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
+                    rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
+                    rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
+                    rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
+                    _log(f"RECV annotation replace: updated {item} text={text_val!r}")
+                    found = True
+                    break
+
+            if not found:
+                # UUID not found — initial broadcast may have stored a null/empty uuid.
+                # If exactly one text node exists on this frame, update it in place and
+                # repair its uuid so subsequent replaces can find it by uuid.
+                updated_orphan = False
+                if rv.commands.propertyExists(order_prop):
+                    text_items = [
+                        i for i in rv.commands.getStringProperty(order_prop)
+                        if i.startswith("text:")
+                    ]
+                    if len(text_items) == 1:
+                        item = text_items[0]
+                        rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
+                        rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
+                        rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
+                        rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
+                        if rv.commands.propertyExists(f"{node}.{item}.uuid"):
+                            rv.commands.setStringProperty(f"{node}.{item}.uuid", [uuid_val], True)
+                        _log(f"RECV annotation replace: repaired orphan {item} → uuid={uuid_val[:8]!r} text={text_val!r}")
+                        updated_orphan = True
+                if not updated_orphan:
+                    _log(f"RECV annotation replace: UUID {uuid_val[:8]!r} not found, adding new node")
+                    self._apply_text_annotation({
+                        "media_path": media_path,
+                        "frame": rv_frame,
+                        "node_name": None,
+                        "position": position,
+                        "color": color,
+                        "spacing": float(ev.spacing) if getattr(ev, "spacing", None) is not None else 0.8,
+                        "size": rv_size,
+                        "scale": float(ev.scale) if getattr(ev, "scale", None) is not None else 1.0,
+                        "rotation": float(ev.rotation) if getattr(ev, "rotation", None) is not None else 0.0,
+                        "font": ev.font or "",
+                        "text": text_val,
+                        "uuid": uuid_val,
+                    })
+
+        QtCore.QTimer.singleShot(0, rv.commands.redraw)
 
     def _path_to_source_group_map(self):
         """Return {path: source_group_node_name} for all currently loaded RVSourceGroups."""
@@ -890,7 +1114,14 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                     except Exception:
                                         pass
                                 if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
-                                    rv_size = float(event.font_size) / 5000.0 if getattr(event, "font_size", None) else 0.01
+                                    rv_size = float(event.font_size) / 15000.0 if getattr(event, "font_size", None) else 0.01
+                                    uuid_val = event.uuid or ""
+                                    # Guard against duplicates when INSERT_CHILD already painted
+                                    # this node before the snapshot arrived.
+                                    paint_node = self._find_paint_node_for_media(media_path, frame) if media_path else None
+                                    if paint_node and self._text_uuid_exists_in_rv(paint_node, frame, uuid_val):
+                                        _log(f"  _rebuild_rv_session: skip dup text uuid={uuid_val[:8]!r}")
+                                        continue
                                     text_data = {
                                         "frame": frame,
                                         "node_name": node_name,
@@ -903,7 +1134,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                         "rotation": float(event.rotation) if getattr(event, "rotation", None) is not None else 0.0,
                                         "font": event.font or "",
                                         "text": event.text or "",
-                                        "uuid": event.uuid or "",
+                                        "uuid": uuid_val,
                                     }
                                     self._apply_text_annotation(text_data)
                                 elif hasattr(event, "uuid"):
@@ -1145,72 +1376,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     _log(f"SEND annotation skipped: SyncEvent serialisation failed: {e}")
                     return
 
-            # Resolve media_path from the paint node name.
             # Frame numbers in RV pen properties are clip-local, not global sequence
             # frames, so metaEvaluateClosestByType(frame) would land on the wrong clip.
-            # Instead we parse the node name to find the real source group.
-            #
-            # Node name formats:
-            #   {seq}_p_{display_slot}  — sequence context (e.g. Default_p_sourceGroup000005)
-            #   {sg}_paint              — direct-view context (e.g. sourceGroup000004_paint)
-            #
-            # When a source group appears twice in a sequence, RV creates an autogenerated
-            # display slot (e.g. sourceGroup000005) that is NOT itself a real source group.
-            # In that case we extract the slot index from the name and look up the
-            # actual source group from the sequence's input list.
-            media_path = None
-
-            if "_p_" in node_name:
-                seq_name = node_name.split("_p_")[0]
-                display_slot = node_name.split("_p_")[1]
-
-                # First: direct lookup — display_slot is a real source group
-                try:
-                    for n in rv.commands.nodesInGroup(display_slot):
-                        if rv.commands.nodeType(n) == "RVFileSource":
-                            try:
-                                path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                                if path:
-                                    media_path = path
-                                    break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                if not media_path:
-                    # Fallback: display_slot is an autogenerated slot node inside the
-                    # sequence whose numeric suffix IS the sequence input index.
-                    m = re.match(r'^sourceGroup(\d+)$', display_slot)
-                    if m:
-                        slot_idx = int(m.group(1))
-                        seq_inputs = self._get_sequence_inputs(seq_name)
-                        if 0 <= slot_idx < len(seq_inputs):
-                            actual_sg = seq_inputs[slot_idx]
-                            for n in rv.commands.nodesInGroup(actual_sg):
-                                if rv.commands.nodeType(n) == "RVFileSource":
-                                    try:
-                                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                                        if path:
-                                            media_path = path
-                                            break
-                                    except Exception:
-                                        pass
-
-            elif node_name.endswith("_paint"):
-                source_group = node_name[:-len("_paint")]
-                try:
-                    for n in rv.commands.nodesInGroup(source_group):
-                        if rv.commands.nodeType(n) == "RVFileSource":
-                            try:
-                                path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                                if path:
-                                    media_path = path
-                                    break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+            # Parse the node name instead to find the real source group.
+            media_path = self._resolve_media_path_for_paint_node(node_name)
 
             if not events:
                 _log("SEND annotation skipped: no events constructed")
@@ -1350,6 +1519,24 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:
             _log_exc(f"Failed to apply remote annotation: {e}")
+
+    def _text_uuid_exists_in_rv(self, node, frame, uuid_val):
+        """Return True if a text node with *uuid_val* already exists in *node*'s draw-order for *frame*."""
+        if not uuid_val or not node:
+            return False
+        order_prop = f"{node}.frame:{frame}.order"
+        if not rv.commands.propertyExists(order_prop):
+            return False
+        for item in rv.commands.getStringProperty(order_prop):
+            if not item.startswith("text:"):
+                continue
+            uuid_prop = f"{node}.{item}.uuid"
+            if not rv.commands.propertyExists(uuid_prop):
+                continue
+            existing = rv.commands.getStringProperty(uuid_prop)
+            if existing and existing[0] == uuid_val:
+                return True
+        return False
 
     def _apply_text_annotation(self, data):
         try:

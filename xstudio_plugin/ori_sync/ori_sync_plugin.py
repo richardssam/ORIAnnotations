@@ -187,9 +187,18 @@ class ORISyncPlugin(PluginBase):
         self._our_bookmark_uuids: set = set()
         self._our_bookmark_uuids_lock = threading.Lock()
 
-        # (Intentionally empty — broadcast delta tracking is now done by querying
-        # the annotation track directly via _count_track_strokes, which is always
-        # authoritative regardless of whether xStudio replaces or updates bookmarks.)
+        # Signature of the last xStudio caption data broadcast per (clip_guid, frame).
+        # Compared against the current bookmark on each scan to detect real user edits
+        # and avoid re-broadcasting when nothing has changed.  Keyed as
+        # "{clip_guid}:{frame}" → JSON string of the captions list.
+        self._last_sent_captions: dict[str, str] = {}
+
+        # Maps bookmark UUID → (clip_guid, clip_local_frame) for bookmarks created from
+        # remote annotations.  bm.detail.start is the clip-local time, not global sequence
+        # time; _resolve_clip_at_frame uses global time and lands on the wrong clip when
+        # two media clips share the same clip-local frame number (e.g. cars and coaster
+        # both have clip-local frame 199 → both falsely resolve to the cars clip).
+        self._our_bookmark_clip_frame: dict[str, tuple[str, int]] = {}
 
         # Set by _on_annotation_event / show_atom when a local stroke completes.
         # Cleared by _flush_pending_annotations after debounce + broadcast.
@@ -375,6 +384,11 @@ class ORISyncPlugin(PluginBase):
             merged_clip, _delta_clip = data
             self._refresh_annotation_bookmark(merged_clip)
 
+        elif action == "annotation_commands_replaced":
+            # A peer replaced the full annotation_commands list on an existing
+            # clip (e.g. in-place text edit).  Re-render the bookmark.
+            self._refresh_annotation_bookmark(data)
+
         elif action == "selection_changed":
             _log(f"Remote selection: {data.get('clip_guid', '?')}")
 
@@ -492,6 +506,7 @@ class ORISyncPlugin(PluginBase):
         # show_atom: fires when a bookmark/annotation is shown or created.
         # This is the signal that the user has drawn in xStudio.
         if isinstance(event[1], show_atom):
+            _log("show_atom fired — queuing annotation flush")
             if self.manager and self.manager.status == STATE_SYNCED:
                 self._annotation_pending_time = time.monotonic()
             return
@@ -657,15 +672,19 @@ class ORISyncPlugin(PluginBase):
             _log_exc("_flush_pending_annotations: could not list bookmarks")
             return
 
-        with self._our_bookmark_uuids_lock:
-            owned = set(self._our_bookmark_uuids)
-        new_uuids = [bm.uuid for bm in all_bms if bm.uuid not in owned]
-        if not new_uuids:
+        # Scan all bookmarks, not just unowned ones.  When the user draws on a
+        # frame that already has a remote annotation, xStudio adds to the existing
+        # bookmark in-place (same UUID).  That UUID is in _our_bookmark_uuids, so
+        # filtering it out would silently drop the new local stroke.  The OTIO
+        # delta check inside _broadcast_local_bookmark correctly handles
+        # deduplication — remote strokes are already in the timeline so delta=0.
+        scan_uuids = [bm.uuid for bm in all_bms]
+        if not scan_uuids:
             return
-        _log(f"_flush_pending_annotations: {len(all_bms)} total, {len(new_uuids)} unowned")
+        _log(f"_flush_pending_annotations: scanning {len(scan_uuids)} bookmark(s)")
 
         stale_any = False
-        for bm_uuid in new_uuids:
+        for bm_uuid in scan_uuids:
             try:
                 result = self._broadcast_local_bookmark(bm_uuid)
                 if result is None:
@@ -746,10 +765,19 @@ class ORISyncPlugin(PluginBase):
             _log("_broadcast_local_bookmark: no Annotations track")
             return False
 
-        clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
-        if clip_guid is None:
-            _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
-            return False
+        # Remote-sourced bookmarks have their correct (clip_guid, clip-local-frame) stored
+        # in _our_bookmark_clip_frame.  bm.detail.start is clip-local time, not global
+        # sequence time, so _resolve_clip_at_frame would land on the wrong media clip
+        # when two clips share the same clip-local frame number.
+        bm_uuid_str = str(bm_uuid)
+        if bm_uuid_str in self._our_bookmark_clip_frame:
+            clip_guid, _clip_frame_int = self._our_bookmark_clip_frame[bm_uuid_str]
+            clip_local_time = otio.opentime.RationalTime(_clip_frame_int, fps)
+        else:
+            clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
+            if clip_guid is None:
+                _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
+                return False
 
         _, aspect_half = self._find_media_for_clip_guid(clip_guid)
         all_strokes = canvas.get("pen_strokes", [])
@@ -774,6 +802,35 @@ class ORISyncPlugin(PluginBase):
         new_strokes = all_strokes[sent_strokes:]
         new_captions = all_captions[sent_captions:]
 
+        # Detect in-place text edits: caption count is unchanged but content
+        # differs.  Delta tracking (count-based) misses these, so we replace the
+        # full command list on the existing clip instead of appending a delta.
+        #
+        # Compare against *last sent xStudio captions* (not OTIO-stored positions)
+        # because xStudio quantises float values internally, so reading back from
+        # bm.annotation_data gives slightly different positions than what we set —
+        # comparing against OTIO-reconverted values would loop forever.
+        if sent_captions > 0 and sent_captions == len(all_captions):
+            cap_key = f"{clip_guid}:{int(clip_local_time.value)}"
+            current_sig = self._caption_signature(all_captions)
+            if self._last_sent_captions.get(cap_key) != current_sig:
+                ann_clip_guid = self._find_annotation_clip_guid(
+                    ann_track_obj, clip_guid, int(clip_local_time.value)
+                )
+                if ann_clip_guid:
+                    existing_uuids = self._extract_caption_uuids(ann_clip_guid)
+                    all_events = (
+                        self._strokes_to_sync_events(all_strokes, aspect_half)
+                        + self._captions_to_sync_events(all_captions, aspect_half, existing_uuids)
+                    )
+                    _log(
+                        f"Broadcasting annotation replace: {len(all_events)} event(s)"
+                        f" (caption edit) at frame={frame} clip={clip_guid[:8]}"
+                    )
+                    self.manager.broadcast_replace_annotation_commands(ann_clip_guid, all_events)
+                    self._last_sent_captions[cap_key] = current_sig
+                    return True
+
         events = (
             self._strokes_to_sync_events(new_strokes, aspect_half)
             + self._captions_to_sync_events(new_captions, aspect_half)
@@ -793,9 +850,152 @@ class ORISyncPlugin(PluginBase):
             clip_local_time=clip_local_time,
             events=events,
         )
+        # Record caption signature so the next scan doesn't re-broadcast them.
+        if new_captions:
+            cap_key = f"{clip_guid}:{int(clip_local_time.value)}"
+            self._last_sent_captions[cap_key] = self._caption_signature(all_captions)
         return True
 
     # ── OTIO timeline delta helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _find_annotation_clip_guid(
+        annotation_track: otio.schema.Track,
+        clip_guid: str,
+        frame: int,
+    ) -> "str | None":
+        """Return the sync GUID of the annotation clip at *(clip_guid, frame)*, or ``None``.
+
+        :param annotation_track: The Annotations track from ``manager._object_map``.
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :rtype: str or None
+        """
+        for item in annotation_track:
+            if not isinstance(item, otio.schema.Clip):
+                continue
+            if item.metadata.get("clip_guid") != clip_guid:
+                continue
+            sr = getattr(item, "source_range", None)
+            if sr is not None and int(sr.start_time.value) == frame:
+                return item.metadata.get("sync", {}).get("guid")
+        return None
+
+    @staticmethod
+    def _caption_signature(xs_captions: list) -> str:
+        """Return a stable JSON string representing the xStudio caption content.
+
+        Used to detect real user edits without comparing against OTIO-reconverted
+        coordinates (which suffer float quantisation on every xStudio round-trip).
+
+        :param xs_captions: Caption dicts from ``bm.annotation_data["Data"]["captions"]``.
+        :returns: JSON string that changes when text, position, or colour changes.
+        :rtype: str
+        """
+        import json as _json
+        return _json.dumps(
+            [
+                {
+                    "text": c.get("text", ""),
+                    "pos": c.get("position", []),
+                    "colour": c.get("colour", []),
+                    "opacity": c.get("opacity", 1.0),
+                }
+                for c in xs_captions
+            ],
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _captions_changed(
+        annotation_track: otio.schema.Track,
+        clip_guid: str,
+        frame: int,
+        xs_captions: list,
+        aspect_half: float,
+    ) -> bool:
+        """Return ``True`` when captions in *xs_captions* differ from the OTIO track.
+
+        Checks both ``text`` content and ``position`` so that in-place text edits
+        and drag-moves both trigger a :meth:`broadcast_replace_annotation_commands`.
+        Position is compared after reconverting OTIO H-normalised / Y-up coordinates
+        back to the xStudio W-normalised / Y-down space (``x_xs = x_otio / aspect_half``,
+        ``y_xs = -y_otio / aspect_half``) with a 1e-4 tolerance for float precision.
+
+        :param annotation_track: The Annotations track from ``manager._object_map``.
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :param xs_captions: Current caption dicts from ``bm.annotation_data``.
+        :param aspect_half: ``W / (2H)`` from the target media resolution.
+        :rtype: bool
+        """
+        for item in annotation_track:
+            if not isinstance(item, otio.schema.Clip):
+                continue
+            if item.metadata.get("clip_guid") != clip_guid:
+                continue
+            sr = getattr(item, "source_range", None)
+            if sr is None or int(sr.start_time.value) != frame:
+                continue
+            otio_captions = []
+            for cmd in item.metadata.get("annotation_commands", []):
+                if hasattr(cmd, "schema_name"):
+                    schema = cmd.schema_name()
+                elif isinstance(cmd, dict):
+                    schema = cmd.get("OTIO_SCHEMA", "")
+                else:
+                    continue
+                if schema.startswith("TextAnnotation"):
+                    text = getattr(cmd, "text", None)
+                    if text is None and isinstance(cmd, dict):
+                        text = cmd.get("text", "")
+                    pos = getattr(cmd, "position", None)
+                    if pos is None and isinstance(cmd, dict):
+                        pos = cmd.get("position", [0.0, 0.0])
+                    otio_captions.append((text or "", list(pos or [0.0, 0.0])))
+            if len(otio_captions) != len(xs_captions):
+                return True
+            for (otio_text, otio_pos), xs_cap in zip(otio_captions, xs_captions):
+                if otio_text != xs_cap.get("text", ""):
+                    return True
+                xs_pos = xs_cap.get("position", ["vec2", 1, 0.0, 0.0])
+                xs_x = float(xs_pos[2]) if len(xs_pos) > 2 else 0.0
+                xs_y = float(xs_pos[3]) if len(xs_pos) > 3 else 0.0
+                # Reconvert OTIO → xStudio coords and compare with tolerance
+                if (abs(otio_pos[0] / aspect_half - xs_x) > 1e-4
+                        or abs(-otio_pos[1] / aspect_half - xs_y) > 1e-4):
+                    return True
+            return False
+        return False
+
+    def _extract_caption_uuids(self, ann_clip_guid: str) -> "list[str]":
+        """Return the ordered UUIDs of all TextAnnotation commands in an annotation clip.
+
+        Used when building replacement events so that the same UUIDs are reused
+        and remote peers (e.g. RV) can find and update existing paint nodes in place.
+
+        :param ann_clip_guid: Sync GUID of the annotation clip in ``manager._object_map``.
+        :returns: List of UUID strings, one per TextAnnotation, in command order.
+        :rtype: list
+        """
+        clip = self.manager._object_map.get(ann_clip_guid) if self.manager else None
+        if clip is None:
+            return []
+        uuids: list[str] = []
+        for cmd in clip.metadata.get("annotation_commands", []):
+            if hasattr(cmd, "schema_name"):
+                schema = cmd.schema_name()
+            elif isinstance(cmd, dict):
+                schema = cmd.get("OTIO_SCHEMA", "")
+            else:
+                continue
+            if schema.startswith("TextAnnotation"):
+                uid = getattr(cmd, "uuid", None)
+                if uid is None and isinstance(cmd, dict):
+                    uid = cmd.get("uuid")
+                if uid:
+                    uuids.append(uid)
+        return uuids
 
     @staticmethod
     def _count_track_strokes(
@@ -818,6 +1018,13 @@ class ORISyncPlugin(PluginBase):
         :returns: ``(n_strokes, n_captions)`` committed to the track so far.
         :rtype: tuple
         """
+        # Accumulate across ALL matching clips — old snapshots can contain
+        # multiple annotation clips at the same (clip_guid, frame) due to
+        # the absence of the merge/gap logic.  Summing all of them gives the
+        # correct total so that the xStudio bookmark (which merges commands
+        # from all clips at a given frame) is compared against the right count.
+        n_strokes = 0
+        n_captions = 0
         for item in annotation_track:
             if not isinstance(item, otio.schema.Clip):
                 continue
@@ -826,8 +1033,6 @@ class ORISyncPlugin(PluginBase):
             sr = getattr(item, "source_range", None)
             if sr is None or int(sr.start_time.value) != frame:
                 continue
-            n_strokes = 0
-            n_captions = 0
             for cmd in item.metadata.get("annotation_commands", []):
                 if hasattr(cmd, "schema_name"):
                     schema = cmd.schema_name()
@@ -839,8 +1044,7 @@ class ORISyncPlugin(PluginBase):
                     n_strokes += 1
                 elif schema.startswith("TextAnnotation"):
                     n_captions += 1
-            return n_strokes, n_captions
-        return 0, 0
+        return n_strokes, n_captions
 
     # ── annotation receive ─────────────────────────────────────────────────────
 
@@ -951,6 +1155,20 @@ class ORISyncPlugin(PluginBase):
                 self._annotation_bookmarks[(clip_guid, frame)] = bm
                 with self._our_bookmark_uuids_lock:
                     self._our_bookmark_uuids.add(bm.uuid)
+                self._our_bookmark_clip_frame[str(bm.uuid)] = (clip_guid, frame)
+                # Pre-populate with xStudio's quantized readback so the first
+                # periodic scan sees these captions as already broadcast.
+                if captions:
+                    try:
+                        rb = bm.annotation_data
+                        if rb:
+                            rb_caps = rb.get("Data", rb).get("captions", [])
+                            if rb_caps:
+                                self._last_sent_captions[f"{clip_guid}:{frame}"] = (
+                                    self._caption_signature(rb_caps)
+                                )
+                    except Exception:
+                        pass
                 count += 1
             except Exception:
                 _log_exc(
@@ -1053,6 +1271,7 @@ class ORISyncPlugin(PluginBase):
                     f"Updated annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
                     f" at frame {frame}"
                 )
+                target_bm = existing_bm
             else:
                 bm = self.connection.api.session.bookmarks.add_bookmark(target=media)
                 # Set start and duration in a single BookmarkDetail message.
@@ -1080,6 +1299,21 @@ class ORISyncPlugin(PluginBase):
                     f"Applied remote annotation: {len(pen_strokes)} stroke(s)"
                     f" at frame {frame}"
                 )
+                target_bm = bm
+            self._our_bookmark_clip_frame[str(target_bm.uuid)] = (clip_guid, frame)
+            # Pre-populate caption signature using xStudio's quantized readback
+            # so the next periodic scan doesn't re-broadcast these remote captions.
+            if captions:
+                try:
+                    rb = target_bm.annotation_data
+                    if rb:
+                        rb_caps = rb.get("Data", rb).get("captions", [])
+                        if rb_caps:
+                            self._last_sent_captions[f"{clip_guid}:{frame}"] = (
+                                self._caption_signature(rb_caps)
+                            )
+                except Exception:
+                    pass
         except Exception:
             _log_exc("_apply_remote_annotation: failed to set annotation")
 
@@ -1264,6 +1498,8 @@ class ORISyncPlugin(PluginBase):
                     "font_name": font,
                     "font_size": float(font_size),
                     "text": text,
+                    "wrap_width": 0.0,
+                    "justification": 0,
                 })
         return captions
 
@@ -1371,12 +1607,26 @@ class ORISyncPlugin(PluginBase):
         return events
 
     def _captions_to_sync_events(
-        self, captions: list, aspect_half: float = 0.8889
+        self,
+        captions: list,
+        aspect_half: float = 0.8889,
+        existing_uuids: "list[str] | None" = None,
     ) -> list:
-        """Convert xStudio caption dicts to OTIO TextAnnotation SyncEvents."""
+        """Convert xStudio caption dicts to OTIO TextAnnotation SyncEvents.
+
+        :param captions: xStudio caption dicts from ``bm.annotation_data``.
+        :param aspect_half: ``W / (2H)`` coordinate scale factor.
+        :param existing_uuids: When provided, reuse these UUIDs (by index) instead
+            of generating new ones.  Pass the UUIDs from the OTIO clip when building
+            a replacement so that RV can update existing text nodes in place.
+        """
         events = []
-        for caption in captions:
-            caption_uuid = str(uuid.uuid4())
+        for i, caption in enumerate(captions):
+            caption_uuid = (
+                existing_uuids[i]
+                if existing_uuids and i < len(existing_uuids)
+                else str(uuid.uuid4())
+            )
             colour = caption.get("colour", ["colour", 1, 1.0, 1.0, 1.0])
             if isinstance(colour, list) and len(colour) >= 5:
                 r, g, b = float(colour[2]), float(colour[3]), float(colour[4])
@@ -1389,13 +1639,15 @@ class ORISyncPlugin(PluginBase):
                 if isinstance(pos, list) and len(pos) >= 4
                 else [0.0, 0.0]
             )
+            fs = float(caption.get("font_size", 50.0))
+            _log(f"  caption font_size={fs!r} text={caption.get('text', '')!r}")
             events.append(
                 SyncEvent.TextAnnotation(
                     rgba=[r, g, b, opacity],
                     position=position,
                     spacing=0.0,
                     friendly_name=caption.get("font_name", ""),
-                    font_size=float(caption.get("font_size", 50.0)),
+                    font_size=fs,
                     font=caption.get("font_name", ""),
                     text=caption.get("text", ""),
                     rotation=0.0,

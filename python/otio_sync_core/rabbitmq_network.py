@@ -10,7 +10,6 @@ import uuid
 from typing import Any
 
 import pika
-import pika.adapters.blocking_connection
 
 _logger = _logging.getLogger("otio_sync")
 
@@ -28,9 +27,17 @@ class RabbitMQNetwork:
     *session_id*, which implicitly scopes peers to a session without any
     server-side configuration.
 
-    A dedicated background thread runs the blocking pika consumer with
-    automatic reconnection on failure.  A separate lazy-initialised send
-    channel is used from the calling (main) thread.
+    Two dedicated background threads handle I/O so callers are never blocked
+    by pika:
+
+    * ``_consumer_thread`` — owns a ``BlockingConnection`` for receiving;
+      pushes decoded payloads onto ``_incoming_queue``.
+    * ``_publisher_thread`` — owns a separate ``BlockingConnection`` for
+      sending; drains ``_send_queue`` in a tight loop with automatic
+      reconnection on failure.
+
+    ``send_payload`` therefore never touches a socket directly; it is always
+    non-blocking for the caller.
 
     Self-filtering is applied in the consumer callback: any message whose
     ``source_guid`` matches *self_guid* is silently discarded before being
@@ -57,15 +64,17 @@ class RabbitMQNetwork:
 
         self.exchange_name = f"sync_session_{session_id}"
         self._incoming_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        self._send_conn: pika.BlockingConnection | None = None
-        self._send_channel: pika.adapters.blocking_connection.BlockingChannel | None = None
+        self._send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
         self._stop_event = threading.Event()
         self._consumer_thread = threading.Thread(
             target=self._run_consumer, daemon=True
         )
         self._consumer_thread.start()
+        self._publisher_thread = threading.Thread(
+            target=self._run_publisher, daemon=True, name="rmq_publisher"
+        )
+        self._publisher_thread.start()
 
     def _run_consumer(self) -> None:
         """Background consumer loop with automatic reconnection.
@@ -125,46 +134,60 @@ class RabbitMQNetwork:
                     _log(f"Consumer error: {e}. Retrying in 5s...")
                     self._stop_event.wait(5)
 
-    def _get_send_channel(
-        self,
-    ) -> pika.adapters.blocking_connection.BlockingChannel:
-        """Return the send channel, (re-)creating the connection if needed.
+    def _run_publisher(self) -> None:
+        """Background publisher loop with automatic reconnection.
 
-        :returns: A ready-to-use blocking channel connected to the fanout exchange.
+        Owns its own ``BlockingConnection`` so publishing never blocks the
+        poll thread.  Drains ``_send_queue`` as fast as the broker accepts
+        messages, reconnecting with a 5-second delay on failure.
+
+        Exits cleanly when :attr:`_stop_event` is set and the queue is empty.
         """
-        if self._send_channel is None or self._send_conn.is_closed:
-            self._send_conn = pika.BlockingConnection(
-                pika.ConnectionParameters(host=self.host, port=self.port)
-            )
-            self._send_channel = self._send_conn.channel()
-            self._send_channel.exchange_declare(
-                exchange=self.exchange_name, exchange_type='fanout'
-            )
-        return self._send_channel
+        while not self._stop_event.is_set():
+            try:
+                connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host=self.host, port=self.port)
+                )
+                channel = connection.channel()
+                channel.exchange_declare(
+                    exchange=self.exchange_name, exchange_type='fanout'
+                )
+                _log(f"Publisher connected to {self.host}:{self.port}")
+
+                while not self._stop_event.is_set():
+                    try:
+                        data = self._send_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        # Keep the connection alive while idle.
+                        connection.process_data_events(time_limit=0)
+                        continue
+                    channel.basic_publish(
+                        exchange=self.exchange_name,
+                        routing_key='',
+                        body=data,
+                    )
+
+                connection.close()
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    _log(f"Publisher error: {e}. Retrying in 5s...")
+                    self._stop_event.wait(5)
 
     def send_payload(self, payload: dict[str, Any]) -> None:
-        """Publish *payload* as JSON to the fanout exchange.
+        """Enqueue *payload* for publishing to the fanout exchange.
 
+        Non-blocking: the actual socket write happens on the publisher thread.
         Injects ``source_guid`` into the payload if not already present.
 
         :param payload: Message envelope to broadcast.
         """
-        try:
-            if "source_guid" not in payload:
-                payload["source_guid"] = self.self_guid
-            _log(
-                f"\n=== MQ SEND [{self.exchange_name}] ===\n"
-                f"{json.dumps(payload, indent=2)}\n"
-            )
-            data = json.dumps(payload).encode('utf-8')
-            channel = self._get_send_channel()
-            channel.basic_publish(
-                exchange=self.exchange_name,
-                routing_key='',
-                body=data,
-            )
-        except Exception as e:
-            _log(f"Send error: {e}")
+        if "source_guid" not in payload:
+            payload["source_guid"] = self.self_guid
+        _log(
+            f"\n=== MQ SEND [{self.exchange_name}] ===\n"
+            f"{json.dumps(payload, indent=2)}\n"
+        )
+        self._send_queue.put(json.dumps(payload).encode('utf-8'))
 
     def receive_payloads(self) -> list[dict[str, Any]]:
         """Drain the internal queue and return all pending payloads.
@@ -183,12 +206,12 @@ class RabbitMQNetwork:
         return payloads
 
     def stop(self) -> None:
-        """Signal the consumer thread to exit and close all connections.
+        """Signal background threads to exit and wait for them to finish.
 
-        Blocks for up to 2 seconds waiting for the consumer thread to finish.
+        Blocks for up to 2 seconds per thread.
         """
         self._stop_event.set()
         if self._consumer_thread.is_alive():
             self._consumer_thread.join(timeout=2)
-        if self._send_conn and self._send_conn.is_open:
-            self._send_conn.close()
+        if self._publisher_thread.is_alive():
+            self._publisher_thread.join(timeout=2)
