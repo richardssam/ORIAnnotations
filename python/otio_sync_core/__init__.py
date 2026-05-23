@@ -5,7 +5,7 @@ across a network session, along with UDP and RabbitMQ network backends and a
 transparent proxy for intercepting attribute writes.
 """
 
-from .manager import SyncManager
+from .manager import SyncManager, sync_event_schema
 from .network import SyncNetworkProtocol, UDPNetwork
 from .rabbitmq_network import RabbitMQNetwork
 from .proxy import OTIOSyncProxy

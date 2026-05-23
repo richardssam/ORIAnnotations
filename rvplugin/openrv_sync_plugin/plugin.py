@@ -3,8 +3,10 @@ import rv.rvtypes
 import logging as _logging
 import json
 import os
-import time
 import re
+import time
+import uuid
+from collections import Counter
 
 
 def _make_otio_logger():
@@ -140,13 +142,27 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # Only call addSource for remote inserts; local callers (do_add_clip)
             # already called addSource before insert_child.
             # Skip addSource for duplicate paths — the source group already exists.
-            if action == "insert_child" and self.sync_manager._is_syncing:
+            if action == "insert_child" and self.sync_manager.is_syncing:
                 child = self.sync_manager._object_map.get(child_uuid)
                 if isinstance(child, otio.schema.Clip):
                     ref = child.media_reference
                     if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
                         if ref.target_url not in self._path_to_source_group_map():
                             rv.commands.addSource(ref.target_url)
+
+        @self.sync_manager.on_synced
+        def _on_synced():
+            # Rebuild the RV session from the received snapshot when joining
+            # an existing session.  Self-elected masters skip this because
+            # they already have the correct RV state.
+            if not self.sync_manager.is_master:
+                self._rv_updating = True
+                try:
+                    self._rebuild_rv_session()
+                    if self.sync_manager.playback_state:
+                        self._apply_playback(self.sync_manager.playback_state)
+                finally:
+                    self._rv_updating = False
 
         if QtCore:
             self._timer = QtCore.QTimer()
@@ -156,7 +172,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _init_as_master(self):
         """Initialise the session as the first participant (Master)."""
         self.sync_manager.is_master = True
-        self.sync_manager.status = STATE_SYNCED
+        self.sync_manager._set_status(STATE_SYNCED)
 
         try:
             fps = rv.commands.fps()
@@ -201,9 +217,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             return  # still not ready — don't overwrite with empty data
 
         # Re-register timelines with the now-populated source groups
-        self.sync_manager._timelines.clear()
-        self.sync_manager._object_map.clear()
-        self.sync_manager.active_timeline_guid = None
+        self.sync_manager.reset_timelines()
         self._rv_node_to_timeline_guid.clear()
         self._sequence_input_order.clear()
         self._active_media_track_guid = None
@@ -459,7 +473,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
             # --- Additions: source groups whose path count exceeds the OTIO track count ---
             # Uses a Counter so that adding a duplicate of an existing clip is detected.
-            from collections import Counter
             otio_path_counts = Counter(
                 clip.media_reference.target_url
                 for clip in media_track
@@ -588,63 +601,53 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     return
 
     def poll_network(self):
-        if not self.sync_manager: return
+        if not self.sync_manager:
+            return
 
-        # 1. Process Network First (important!)
-        results = self.sync_manager.receive_and_apply_all()
-
-        # 2. Check for sequence reorders (poll every tick, cheap)
-        if not self._rv_updating:
-            self._check_sequence_reorders()
-
-        # 3. Check for Master Discovery Timeout
+        # Re-broadcast WHO_IS_MASTER on every tick during discovery and check
+        # for the self-election timeout.
         if self.sync_manager.status == STATE_DISCOVERING:
             self.sync_manager.broadcast_master_discovery()
             if time.time() - self._discovery_start_time > 2.0:
                 self._init_as_master()
+            return
 
-        for action, data in results:
+        # tick() handles master_found → request_state and
+        # state_snapshot_received → apply_snapshot internally.
+        # on_synced callback (registered in _setup_sync) rebuilds the RV
+        # session when we join an existing master.
+        for action, data in self.sync_manager.tick():
             self._rv_updating = True
             try:
-                # 1. Session Handshake Logic
-                if action == "master_found":
-                    _log("master_found — requesting state")
-                    self.sync_manager.request_state()
-
-                elif action == "state_request_received":
+                if action == "state_request_received":
                     _log("state_request_received — sending snapshot")
                     try:
                         fps = rv.commands.fps()
                         frame = rv.commands.frame()
                         playing = rv.commands.isPlaying()
                         view = rv.commands.viewNode()
-                        tl_guid = self._rv_node_to_timeline_guid.get(view) or self.sync_manager.active_timeline_guid
+                        tl_guid = (self._rv_node_to_timeline_guid.get(view)
+                                   or self.sync_manager.active_timeline_guid)
                         playback_state = {
                             "playing": playing,
-                            "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": float(frame - 1), "rate": float(fps)},
+                            "current_time": {
+                                "OTIO_SCHEMA": "RationalTime.1",
+                                "value": float(frame - 1),
+                                "rate": float(fps),
+                            },
                             "looping": True,
                             "timeline_guid": tl_guid,
                         }
                     except Exception:
                         playback_state = None
                     self.sync_manager.send_state_snapshot(data, playback_state=playback_state)
-
-                elif action == "state_snapshot_received":
-                    _log("state_snapshot_received — applying snapshot")
-                    replay_results = self.sync_manager.apply_snapshot(data)
-                    self._rebuild_rv_session()
-                    playback_state = data.get("playback_state")
-                    if playback_state:
-                        self._apply_playback(playback_state)
-                    # Process any results that were buffered
-                    for r_action, r_data in replay_results:
-                        self._handle_action(r_action, r_data)
-
-                # 2. Normal Sync Actions
                 else:
                     self._handle_action(action, data)
             finally:
                 self._rv_updating = False
+
+        if not self._rv_updating:
+            self._check_sequence_reorders()
 
     def _handle_action(self, action, data):
         """Common dispatcher for sync actions."""
@@ -748,7 +751,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     clip_guid = self._clip_guid_for_media_path(media_path)
                     if not clip_guid:
                         continue
-                    annotation_track_guid = self._find_annotation_track_guid_for_clip(clip_guid)
+                    annotation_track_guid = self.sync_manager.annotation_track_guid_for_clip(clip_guid)
                     if not annotation_track_guid:
                         continue
                     clip = self.sync_manager._object_map.get(clip_guid)
@@ -779,19 +782,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     _log(f"  import: error scanning {node}: {e}")
         except Exception as e:
             _log_exc(f"_import_existing_rv_annotations failed: {e}")
-
-    def _find_annotation_track_guid_for_clip(self, clip_guid):
-        """Return the GUID of the Annotations track in the same timeline as clip_guid."""
-        for timeline in self.sync_manager._timelines.values():
-            for track in timeline.tracks:
-                if track.name != "Media":
-                    continue
-                for item in track:
-                    if item.metadata.get("sync", {}).get("guid") == clip_guid:
-                        for ann_track in timeline.tracks:
-                            if ann_track.name and ann_track.name.startswith("Annotations"):
-                                return ann_track.metadata.get("sync", {}).get("guid")
-        return None
 
     def _apply_annotation_render(self, ann_clip):
         """Render an annotation clip received via insert_child into RV paint.
@@ -1301,7 +1291,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 if rv.commands.propertyExists(uuid_prop):
                     ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
                 else:
-                    import uuid
                     ann_uuid = str(uuid.uuid4())
                     rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
                     rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
@@ -1346,7 +1335,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 cap = rv.commands.getIntProperty(f"{full_prop}.cap")[0]
                 frame = int(component.split(":")[2])
 
-                import uuid
                 try:
                     otio.schema.schemadef.module_from_name('SyncEvent')
                     penuuid = str(uuid.uuid4())
@@ -1392,7 +1380,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if not clip_guid:
                 _log(f"SEND annotation skipped: no clip_guid for media_path={media_path}")
                 return
-            annotation_track_guid = self._find_annotation_track_guid_for_clip(clip_guid)
+            annotation_track_guid = self.sync_manager.annotation_track_guid_for_clip(clip_guid)
             if not annotation_track_guid:
                 _log(f"SEND annotation skipped: no annotation track for clip {clip_guid}")
                 return

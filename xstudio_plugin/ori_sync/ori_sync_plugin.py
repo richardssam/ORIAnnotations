@@ -70,6 +70,7 @@ from otio_sync_core.manager import (  # noqa: E402
     STATE_DISCOVERING,
     STATE_SYNCED,
     SyncManager,
+    sync_event_schema,
 )
 from otio_sync_core.rabbitmq_network import RabbitMQNetwork  # noqa: E402
 from xstudio.plugin import PluginBase  # noqa: E402
@@ -755,29 +756,29 @@ class ORISyncPlugin(PluginBase):
         # dict in case the format has changed.
         canvas = ann_data.get("Data", ann_data)
 
-        tl = self.manager.root_timeline
-        if tl is None:
-            _log("_broadcast_local_bookmark: no timeline registered")
-            return False
-
-        annotation_track_guid = self._find_annotation_track_guid(tl)
-        if annotation_track_guid is None:
-            _log("_broadcast_local_bookmark: no Annotations track")
-            return False
-
-        # Remote-sourced bookmarks have their correct (clip_guid, clip-local-frame) stored
-        # in _our_bookmark_clip_frame.  bm.detail.start is clip-local time, not global
-        # sequence time, so _resolve_clip_at_frame would land on the wrong media clip
-        # when two clips share the same clip-local frame number.
+        # Resolve clip_guid first — annotation_track_guid_for_clip requires it.
+        # Remote-sourced bookmarks have their correct (clip_guid, clip-local-frame)
+        # stored in _our_bookmark_clip_frame; bm.detail.start is clip-local time,
+        # not global sequence time, so _resolve_clip_at_frame would land on the
+        # wrong clip when two clips share the same clip-local frame number.
         bm_uuid_str = str(bm_uuid)
         if bm_uuid_str in self._our_bookmark_clip_frame:
             clip_guid, _clip_frame_int = self._our_bookmark_clip_frame[bm_uuid_str]
             clip_local_time = otio.opentime.RationalTime(_clip_frame_int, fps)
         else:
+            tl = self.manager.root_timeline
+            if tl is None:
+                _log("_broadcast_local_bookmark: no timeline registered")
+                return False
             clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
             if clip_guid is None:
                 _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
                 return False
+
+        annotation_track_guid = self.manager.annotation_track_guid_for_clip(clip_guid)
+        if annotation_track_guid is None:
+            _log("_broadcast_local_bookmark: no Annotations track")
+            return False
 
         _, aspect_half = self._find_media_for_clip_guid(clip_guid)
         all_strokes = canvas.get("pen_strokes", [])
@@ -792,13 +793,9 @@ class ORISyncPlugin(PluginBase):
         # broadcast_add_annotation mutates) to find how many strokes are already
         # broadcast for this (clip, frame).  Traversing tl.tracks could yield
         # wrapper objects that don't reflect mutations made through _object_map.
-        ann_track_obj = self.manager._object_map.get(annotation_track_guid)
-        if ann_track_obj is not None:
-            sent_strokes, sent_captions = self._count_track_strokes(
-                ann_track_obj, clip_guid, int(clip_local_time.value)
-            )
-        else:
-            sent_strokes, sent_captions = 0, 0
+        sent_strokes, sent_captions = self.manager.count_annotation_commands(
+            clip_guid, int(clip_local_time.value)
+        )
         new_strokes = all_strokes[sent_strokes:]
         new_captions = all_captions[sent_captions:]
 
@@ -814,8 +811,8 @@ class ORISyncPlugin(PluginBase):
             cap_key = f"{clip_guid}:{int(clip_local_time.value)}"
             current_sig = self._caption_signature(all_captions)
             if self._last_sent_captions.get(cap_key) != current_sig:
-                ann_clip_guid = self._find_annotation_clip_guid(
-                    ann_track_obj, clip_guid, int(clip_local_time.value)
+                ann_clip_guid = self.manager.annotation_clip_guid_at(
+                    clip_guid, int(clip_local_time.value)
                 )
                 if ann_clip_guid:
                     existing_uuids = self._extract_caption_uuids(ann_clip_guid)
@@ -859,29 +856,6 @@ class ORISyncPlugin(PluginBase):
     # ── OTIO timeline delta helpers ───────────────────────────────────────────
 
     @staticmethod
-    def _find_annotation_clip_guid(
-        annotation_track: otio.schema.Track,
-        clip_guid: str,
-        frame: int,
-    ) -> "str | None":
-        """Return the sync GUID of the annotation clip at *(clip_guid, frame)*, or ``None``.
-
-        :param annotation_track: The Annotations track from ``manager._object_map``.
-        :param clip_guid: GUID of the media clip being annotated.
-        :param frame: 0-indexed clip-local frame number.
-        :rtype: str or None
-        """
-        for item in annotation_track:
-            if not isinstance(item, otio.schema.Clip):
-                continue
-            if item.metadata.get("clip_guid") != clip_guid:
-                continue
-            sr = getattr(item, "source_range", None)
-            if sr is not None and int(sr.start_time.value) == frame:
-                return item.metadata.get("sync", {}).get("guid")
-        return None
-
-    @staticmethod
     def _caption_signature(xs_captions: list) -> str:
         """Return a stable JSON string representing the xStudio caption content.
 
@@ -892,8 +866,7 @@ class ORISyncPlugin(PluginBase):
         :returns: JSON string that changes when text, position, or colour changes.
         :rtype: str
         """
-        import json as _json
-        return _json.dumps(
+        return json.dumps(
             [
                 {
                     "text": c.get("text", ""),
@@ -905,68 +878,6 @@ class ORISyncPlugin(PluginBase):
             ],
             sort_keys=True,
         )
-
-    @staticmethod
-    def _captions_changed(
-        annotation_track: otio.schema.Track,
-        clip_guid: str,
-        frame: int,
-        xs_captions: list,
-        aspect_half: float,
-    ) -> bool:
-        """Return ``True`` when captions in *xs_captions* differ from the OTIO track.
-
-        Checks both ``text`` content and ``position`` so that in-place text edits
-        and drag-moves both trigger a :meth:`broadcast_replace_annotation_commands`.
-        Position is compared after reconverting OTIO H-normalised / Y-up coordinates
-        back to the xStudio W-normalised / Y-down space (``x_xs = x_otio / aspect_half``,
-        ``y_xs = -y_otio / aspect_half``) with a 1e-4 tolerance for float precision.
-
-        :param annotation_track: The Annotations track from ``manager._object_map``.
-        :param clip_guid: GUID of the media clip being annotated.
-        :param frame: 0-indexed clip-local frame number.
-        :param xs_captions: Current caption dicts from ``bm.annotation_data``.
-        :param aspect_half: ``W / (2H)`` from the target media resolution.
-        :rtype: bool
-        """
-        for item in annotation_track:
-            if not isinstance(item, otio.schema.Clip):
-                continue
-            if item.metadata.get("clip_guid") != clip_guid:
-                continue
-            sr = getattr(item, "source_range", None)
-            if sr is None or int(sr.start_time.value) != frame:
-                continue
-            otio_captions = []
-            for cmd in item.metadata.get("annotation_commands", []):
-                if hasattr(cmd, "schema_name"):
-                    schema = cmd.schema_name()
-                elif isinstance(cmd, dict):
-                    schema = cmd.get("OTIO_SCHEMA", "")
-                else:
-                    continue
-                if schema.startswith("TextAnnotation"):
-                    text = getattr(cmd, "text", None)
-                    if text is None and isinstance(cmd, dict):
-                        text = cmd.get("text", "")
-                    pos = getattr(cmd, "position", None)
-                    if pos is None and isinstance(cmd, dict):
-                        pos = cmd.get("position", [0.0, 0.0])
-                    otio_captions.append((text or "", list(pos or [0.0, 0.0])))
-            if len(otio_captions) != len(xs_captions):
-                return True
-            for (otio_text, otio_pos), xs_cap in zip(otio_captions, xs_captions):
-                if otio_text != xs_cap.get("text", ""):
-                    return True
-                xs_pos = xs_cap.get("position", ["vec2", 1, 0.0, 0.0])
-                xs_x = float(xs_pos[2]) if len(xs_pos) > 2 else 0.0
-                xs_y = float(xs_pos[3]) if len(xs_pos) > 3 else 0.0
-                # Reconvert OTIO → xStudio coords and compare with tolerance
-                if (abs(otio_pos[0] / aspect_half - xs_x) > 1e-4
-                        or abs(-otio_pos[1] / aspect_half - xs_y) > 1e-4):
-                    return True
-            return False
-        return False
 
     def _extract_caption_uuids(self, ann_clip_guid: str) -> "list[str]":
         """Return the ordered UUIDs of all TextAnnotation commands in an annotation clip.
@@ -983,11 +894,8 @@ class ORISyncPlugin(PluginBase):
             return []
         uuids: list[str] = []
         for cmd in clip.metadata.get("annotation_commands", []):
-            if hasattr(cmd, "schema_name"):
-                schema = cmd.schema_name()
-            elif isinstance(cmd, dict):
-                schema = cmd.get("OTIO_SCHEMA", "")
-            else:
+            schema = sync_event_schema(cmd)
+            if not schema:
                 continue
             if schema.startswith("TextAnnotation"):
                 uid = getattr(cmd, "uuid", None)
@@ -996,55 +904,6 @@ class ORISyncPlugin(PluginBase):
                 if uid:
                     uuids.append(uid)
         return uuids
-
-    @staticmethod
-    def _count_track_strokes(
-        annotation_track: otio.schema.Track,
-        clip_guid: str,
-        frame: int,
-    ) -> tuple[int, int]:
-        """Return ``(n_strokes, n_captions)`` already broadcast for *(clip_guid, frame)*.
-
-        Searches *annotation_track* directly — the same object that
-        :meth:`~otio_sync_core.manager.SyncManager.broadcast_add_annotation`
-        mutates via ``_object_map``.  This avoids any indirection through
-        ``timeline.tracks`` which may yield wrapper objects that don't reflect
-        in-place mutations.
-
-        :param annotation_track: The Annotations :class:`~opentimelineio.schema.Track`
-            looked up from ``manager._object_map``.
-        :param clip_guid: GUID of the media clip being annotated.
-        :param frame: 0-indexed clip-local frame number.
-        :returns: ``(n_strokes, n_captions)`` committed to the track so far.
-        :rtype: tuple
-        """
-        # Accumulate across ALL matching clips — old snapshots can contain
-        # multiple annotation clips at the same (clip_guid, frame) due to
-        # the absence of the merge/gap logic.  Summing all of them gives the
-        # correct total so that the xStudio bookmark (which merges commands
-        # from all clips at a given frame) is compared against the right count.
-        n_strokes = 0
-        n_captions = 0
-        for item in annotation_track:
-            if not isinstance(item, otio.schema.Clip):
-                continue
-            if item.metadata.get("clip_guid") != clip_guid:
-                continue
-            sr = getattr(item, "source_range", None)
-            if sr is None or int(sr.start_time.value) != frame:
-                continue
-            for cmd in item.metadata.get("annotation_commands", []):
-                if hasattr(cmd, "schema_name"):
-                    schema = cmd.schema_name()
-                elif isinstance(cmd, dict):
-                    schema = cmd.get("OTIO_SCHEMA", "")
-                else:
-                    schema = ""
-                if schema.startswith("PaintStart"):
-                    n_strokes += 1
-                elif schema.startswith("TextAnnotation"):
-                    n_captions += 1
-        return n_strokes, n_captions
 
     # ── annotation receive ─────────────────────────────────────────────────────
 
@@ -1092,7 +951,7 @@ class ORISyncPlugin(PluginBase):
                 if not clip_guid:
                     continue
 
-                otio_clip = self.manager.object_map.get(clip_guid)
+                otio_clip = self.manager._object_map.get(clip_guid)
                 if otio_clip is None:
                     _log(f"  Snapshot ann: clip_guid {clip_guid[:8]} not in object_map")
                     continue
@@ -1333,7 +1192,7 @@ class ORISyncPlugin(PluginBase):
         """
         if not self.manager:
             return None, 0.8889
-        otio_clip = self.manager.object_map.get(clip_guid)
+        otio_clip = self.manager._object_map.get(clip_guid)
         if otio_clip is None:
             _log(f"_find_media_for_clip_guid: {clip_guid[:8]} not in object_map")
             return None, 0.8889
@@ -1386,12 +1245,7 @@ class ORISyncPlugin(PluginBase):
         current_stroke: dict | None = None
 
         for cmd in commands:
-            if hasattr(cmd, "schema_name"):
-                schema = cmd.schema_name()
-            elif isinstance(cmd, dict):
-                schema = cmd.get("OTIO_SCHEMA", "")
-            else:
-                schema = ""
+            schema = sync_event_schema(cmd)
 
             if schema.startswith("PaintStart"):
                 rgba = getattr(cmd, "rgba", None) or [1.0, 1.0, 1.0, 1.0]
@@ -1449,12 +1303,7 @@ class ORISyncPlugin(PluginBase):
         """
         captions: list[dict] = []
         for cmd in commands:
-            if hasattr(cmd, "schema_name"):
-                schema = cmd.schema_name()
-            elif isinstance(cmd, dict):
-                schema = cmd.get("OTIO_SCHEMA", "")
-            else:
-                schema = ""
+            schema = sync_event_schema(cmd)
 
             if schema.startswith("TextAnnotation"):
                 rgba = getattr(cmd, "rgba", None)
@@ -1504,18 +1353,6 @@ class ORISyncPlugin(PluginBase):
         return captions
 
     # ── OTIO helpers ───────────────────────────────────────────────────────────
-
-    def _find_annotation_track_guid(
-        self, timeline: otio.schema.Timeline
-    ) -> str | None:
-        """Return the sync GUID of the Annotations track, or the last track."""
-        for track in timeline.tracks:
-            if "annotation" in track.name.lower():
-                return track.metadata.get("sync", {}).get("guid")
-        tracks = list(timeline.tracks)
-        if tracks:
-            return tracks[-1].metadata.get("sync", {}).get("guid")
-        return None
 
     def _resolve_clip_at_frame(
         self,

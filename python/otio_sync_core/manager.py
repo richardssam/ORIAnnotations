@@ -35,6 +35,25 @@ def _dict_to_otio(d: dict[str, Any]) -> otio.core.SerializableObject:
     return otio.adapters.read_from_string(json.dumps(d), "otio_json")
 
 
+def sync_event_schema(cmd: Any) -> str:
+    """Return the OTIO schema name for a SyncEvent object or a serialised dict.
+
+    Centralises the ``hasattr(cmd, "schema_name") / isinstance(cmd, dict)``
+    pattern that appears throughout annotation-handling code.
+
+    :param cmd: A deserialised SyncEvent object or a raw ``dict`` whose
+        ``"OTIO_SCHEMA"`` key carries the schema name.
+    :returns: Schema name string (e.g. ``"PaintStart.1"``), or ``""`` if
+        *cmd* is neither.
+    :rtype: str
+    """
+    if hasattr(cmd, "schema_name"):
+        return cmd.schema_name()
+    if isinstance(cmd, dict):
+        return cmd.get("OTIO_SCHEMA", "")
+    return ""
+
+
 #: Session has not yet started.
 STATE_NONE = "NONE"
 #: Broadcasting ``WHO_IS_MASTER``; waiting for a response.
@@ -113,6 +132,17 @@ class SyncManager:
     # ------------------------------------------------------------------
 
     @property
+    def is_syncing(self) -> bool:
+        """``True`` while a snapshot or incoming delta is being applied locally.
+
+        Callers can read this to suppress outgoing broadcasts that would echo
+        changes back to their source.
+
+        :rtype: bool
+        """
+        return self._is_syncing
+
+    @property
     def root_timeline(self) -> otio.schema.Timeline | None:
         """The active timeline, or the first registered timeline when none is active.
 
@@ -156,6 +186,16 @@ class SyncManager:
         if self.active_timeline_guid is None:
             self.active_timeline_guid = guid
         return OTIOSyncProxy(timeline, self)
+
+    def reset_timelines(self) -> None:
+        """Clear all registered timelines, the object map, and the active GUID.
+
+        Used during master re-initialisation when the timeline data must be
+        rebuilt from scratch (e.g. after the RV node graph settles).
+        """
+        self._timelines.clear()
+        self._object_map.clear()
+        self.active_timeline_guid = None
 
     def _traverse_and_map(self, item: otio.core.SerializableObject) -> None:
         """Recursively assign GUIDs to all OTIO objects under *item* and index them.
@@ -608,6 +648,97 @@ class SyncManager:
         clip.metadata["clip_guid"] = clip_guid
         return clip
 
+    def annotation_track_guid_for_clip(self, clip_guid: str) -> "str | None":
+        """Return the GUID of the Annotations track in the same timeline as *clip_guid*.
+
+        Searches every non-annotation track for *clip_guid*, then returns the
+        first track whose name contains ``"annotation"`` (case-insensitive) from
+        that same timeline.
+
+        :param clip_guid: Sync GUID of the media clip.
+        :returns: Annotation track GUID, or ``None`` if not found.
+        :rtype: str or None
+        """
+        for timeline in self._timelines.values():
+            clip_found = False
+            for track in timeline.tracks:
+                if "annotation" in (track.name or "").lower():
+                    continue
+                for item in track:
+                    if item.metadata.get("sync", {}).get("guid") == clip_guid:
+                        clip_found = True
+                        break
+                if clip_found:
+                    break
+            if not clip_found:
+                continue
+            for track in timeline.tracks:
+                if track.name and "annotation" in track.name.lower():
+                    return track.metadata.get("sync", {}).get("guid")
+        return None
+
+    def annotation_clip_guid_at(self, clip_guid: str, frame: int) -> "str | None":
+        """Return the sync GUID of the annotation clip at *(clip_guid, frame)*.
+
+        Convenience wrapper around :meth:`annotation_track_guid_for_clip` and
+        :meth:`_find_annotation_clip_at` that returns the clip's own GUID
+        rather than the object itself.
+
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :returns: Annotation clip GUID, or ``None`` if not found.
+        :rtype: str or None
+        """
+        ann_track_guid = self.annotation_track_guid_for_clip(clip_guid)
+        if ann_track_guid is None:
+            return None
+        ann_track = self._object_map.get(ann_track_guid)
+        if ann_track is None:
+            return None
+        clip = self._find_annotation_clip_at(ann_track, clip_guid, frame)
+        if clip is None:
+            return None
+        return clip.metadata.get("sync", {}).get("guid")
+
+    def count_annotation_commands(
+        self, clip_guid: str, frame: int
+    ) -> "tuple[int, int]":
+        """Return ``(n_strokes, n_captions)`` already committed for *(clip_guid, frame)*.
+
+        Counts ``PaintStart`` events (strokes) and ``TextAnnotation`` events
+        (captions) in the annotation track.  Accumulates across all matching
+        clips at the same frame so that old snapshots containing per-stroke
+        clips are handled correctly.
+
+        :param clip_guid: GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :returns: ``(n_strokes, n_captions)`` already in the annotation track.
+        :rtype: tuple
+        """
+        ann_track_guid = self.annotation_track_guid_for_clip(clip_guid)
+        if ann_track_guid is None:
+            return 0, 0
+        ann_track = self._object_map.get(ann_track_guid)
+        if ann_track is None:
+            return 0, 0
+        n_strokes = 0
+        n_captions = 0
+        for item in ann_track:
+            if not isinstance(item, otio.schema.Clip):
+                continue
+            if item.metadata.get("clip_guid") != clip_guid:
+                continue
+            sr = getattr(item, "source_range", None)
+            if sr is None or int(sr.start_time.value) != frame:
+                continue
+            for cmd in item.metadata.get("annotation_commands", []):
+                schema = sync_event_schema(cmd)
+                if schema.startswith("PaintStart"):
+                    n_strokes += 1
+                elif schema.startswith("TextAnnotation"):
+                    n_captions += 1
+        return n_strokes, n_captions
+
     def broadcast_add_annotation(
         self,
         annotation_track_guid: str,
@@ -1035,9 +1166,12 @@ class SyncManager:
             if action == "master_found":
                 self.request_state()
             elif action == "state_snapshot_received":
-                self.apply_snapshot(data)
+                # Replay results (buffered deltas newer than the snapshot) are
+                # forwarded so callers react to them just like live events.
+                replay = self.apply_snapshot(data)
                 if "playback_state" in data:
                     self.playback_state = data["playback_state"]
+                app_events.extend(replay)
             else:
                 app_events.append((action, data))
         return app_events
