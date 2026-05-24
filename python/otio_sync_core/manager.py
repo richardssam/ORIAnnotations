@@ -116,6 +116,7 @@ class SyncManager:
         self._hierarchy_callbacks: list[Callable[[str, str, str], None]] = []
         self._status_callbacks: list[Callable[[str], None]] = []
         self._playback_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._display_callbacks: list[Callable[[dict[str, Any]], None]] = []
         self._synced_callbacks: list[Callable[[], None]] = []
 
         self.status: str = STATE_NONE
@@ -126,6 +127,10 @@ class SyncManager:
 
         #: Last received playback state dict; empty until the first playback message.
         self.playback_state: dict[str, Any] = {}
+        #: Last received display state dict; empty until the first display message.
+        #: Keys: ``pan`` ([x, y] normalised), ``zoom`` (float), ``exposure`` (stops),
+        #: ``channel`` (``"RGBA"``, ``"R"``, ``"G"``, ``"B"``, or ``"A"``).
+        self.display_state: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -289,6 +294,20 @@ class SyncManager:
         self._playback_callbacks.append(callback)
         return callback
 
+    def on_display_changed(
+        self, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[dict[str, Any]], None]:
+        """Register a callback fired whenever a display-state message arrives.
+
+        The callback receives the raw display state dict (same structure as
+        :attr:`display_state`).  Also usable as a decorator.
+
+        :param callback: Callable receiving the display state dict.
+        :returns: The *callback* unchanged (decorator-compatible).
+        """
+        self._display_callbacks.append(callback)
+        return callback
+
     def on_synced(
         self, callback: Callable[[], None]
     ) -> Callable[[], None]:
@@ -404,6 +423,8 @@ class SyncManager:
         }
         if playback_state:
             payload["playback_state"] = playback_state
+        if self.display_state:
+            payload["display_state"] = self.display_state
         self._send_session_event("STATE_SNAPSHOT", payload)
 
     def _send_session_event(
@@ -542,6 +563,41 @@ class SyncManager:
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
         self.network.send_payload({
             "command": "PLAYBACK_SETTINGS",
+            "event": "SET",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": inner,
+        })
+
+    def broadcast_display_state(self, state_dict: dict[str, Any]) -> None:
+        """Broadcast the current display state to all peers and persist it.
+
+        Expected keys in *state_dict*:
+
+        * ``pan``      — ``[x, y]`` normalised pan offset.
+        * ``zoom``     — zoom multiplier (``1.0`` = no zoom).
+        * ``exposure`` — exposure adjustment in stops (``0.0`` = no change).
+        * ``channel``  — active channel string: ``"RGBA"``, ``"R"``, ``"G"``,
+          ``"B"``, or ``"A"``.
+
+        The state is also written into the active timeline's
+        ``metadata["display_settings"]`` so it survives a full session teardown
+        if the OTIO file is saved to disk.
+
+        :param state_dict: Display state fields as listed above.
+        """
+        if self._is_syncing or not self.network:
+            return
+        inner = dict(state_dict)
+        inner["sync_timestamp"] = time.time()
+        self.display_state = inner
+        tl = self.root_timeline
+        if tl is not None:
+            tl.metadata["display_settings"] = {
+                k: v for k, v in inner.items() if k != "sync_timestamp"
+            }
+        self.network.send_payload({
+            "command": "DISPLAY_SETTINGS",
             "event": "SET",
             "session_id": self.session_id,
             "source_guid": self.self_guid,
@@ -1038,6 +1094,20 @@ class SyncManager:
                         _log(f"on_playback_changed callback error: {e}")
                 return ("playback_settings", data)
 
+            if command == "DISPLAY_SETTINGS" and event == "SET":
+                self.display_state = data
+                tl = self.root_timeline
+                if tl is not None:
+                    tl.metadata["display_settings"] = {
+                        k: v for k, v in data.items() if k != "sync_timestamp"
+                    }
+                for cb in self._display_callbacks:
+                    try:
+                        cb(data)
+                    except Exception as e:
+                        _log(f"on_display_changed callback error: {e}")
+                return ("display_settings", data)
+
             if command == "SELECTION" and event == "SET":
                 return ("selection_changed", data)
 
@@ -1171,6 +1241,9 @@ class SyncManager:
                 replay = self.apply_snapshot(data)
                 if "playback_state" in data:
                     self.playback_state = data["playback_state"]
+                if "display_state" in data:
+                    self.display_state = data["display_state"]
+                    app_events.append(("display_settings", self.display_state))
                 app_events.extend(replay)
             else:
                 app_events.append((action, data))
@@ -1215,6 +1288,17 @@ class SyncManager:
                 self._timelines[guid] = tl
                 self._traverse_and_map(tl)
             self.active_timeline_guid = snapshot_data.get("active_timeline_guid")
+
+            # Restore display_state: prefer the explicit snapshot field; fall back
+            # to timeline custom_metadata written by a previous session to disk.
+            if "display_state" in snapshot_data:
+                self.display_state = snapshot_data["display_state"]
+            else:
+                for tl in self._timelines.values():
+                    ds = tl.metadata.get("display_settings")
+                    if ds:
+                        self.display_state = dict(ds)
+                        break
 
             replay_results: list[tuple[str, Any]] = []
             for payload in self._delta_buffer:

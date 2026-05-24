@@ -42,10 +42,12 @@ from xstudio.core import (
     annotation_atom,
     bookmark_detail_atom,
     event_atom,
+    serialise_atom,
     show_atom,
     viewport_playhead_atom,
 )
 from xstudio.api.session.playhead import Playhead
+from xstudio.api.intrinsic.viewport import Viewport
 
 # ── path setup ─────────────────────────────────────────────────────────────────
 
@@ -220,6 +222,15 @@ class ORISyncPlugin(PluginBase):
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
 
+        # Last display state broadcast; compared each poll tick to detect changes.
+        self._last_display_state: dict = {}
+        # xStudio's internal viewport scale at the first successful read.  Used
+        # to normalise state_.scale_ (which is image_pixels/viewport_pixels, not
+        # a zoom multiplier) to RV's convention (1.0 = fit-to-window).
+        self._xs_base_scale: float | None = None
+        # Cached Viewport object; created lazily, cleared on disconnect.
+        self._viewport: "Viewport | None" = None
+
         # Auto-connect on startup using the current preference values.
         _log("Plugin loaded — auto-connecting to session")
         try:
@@ -298,6 +309,9 @@ class ORISyncPlugin(PluginBase):
         if self.manager:
             self.manager.close()
             self.manager = None
+        self._viewport = None
+        self._last_display_state = {}
+        self._xs_base_scale = None
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -334,6 +348,7 @@ class ORISyncPlugin(PluginBase):
                         self._handle_manager_event(action, data)
                 self._flush_pending_annotations()
                 self._poll_and_broadcast_frame()
+                self._poll_and_broadcast_display()
             except Exception:
                 _log_exc("Poll loop error")
             self._poll_stop.wait(self.POLL_INTERVAL)
@@ -363,6 +378,10 @@ class ORISyncPlugin(PluginBase):
                 tl = self._build_otio_timeline()
                 if tl:
                     self.manager.register_timeline(tl)
+            # Snapshot current display state so the joiner inherits it.
+            current_display = self._read_xs_display_state()
+            self.manager.display_state = current_display
+            self._last_display_state = dict(current_display)
             self.manager.send_state_snapshot(
                 requester_guid,
                 playback_state=self._current_playback_state(),
@@ -390,6 +409,9 @@ class ORISyncPlugin(PluginBase):
             # clip (e.g. in-place text edit).  Re-render the bookmark.
             self._refresh_annotation_bookmark(data)
 
+        elif action == "display_settings":
+            self._apply_display_state(data)
+
         elif action == "selection_changed":
             _log(f"Remote selection: {data.get('clip_guid', '?')}")
 
@@ -398,6 +420,8 @@ class ORISyncPlugin(PluginBase):
         if not self.manager.is_master:
             # We joined an existing session — create one playlist per received timeline.
             self._cmd_queue.put(("load_timelines", {}))
+            if self.manager.display_state:
+                self._apply_display_state(self.manager.display_state)
 
     @staticmethod
     def _fill_source_ranges(otio_tl: otio.schema.Timeline) -> None:
@@ -542,7 +566,12 @@ class ORISyncPlugin(PluginBase):
         if not self.manager or self.manager.status != STATE_SYNCED:
             return
         if not self.active_playhead:
-            return
+            # Retry lazy init — xStudio may not have had an active playhead at
+            # connect time (e.g. no media loaded yet).
+            try:
+                self.active_playhead = self.current_playhead()
+            except Exception:
+                return
         try:
             if self.active_playhead.playing:
                 return
@@ -611,6 +640,146 @@ class ORISyncPlugin(PluginBase):
             self._last_applied_frame = frame
             self._last_polled_frame = frame
             self.active_playhead.position = frame
+
+    # ── display state ──────────────────────────────────────────────────────────
+
+    # xStudio's ColourPipeline.channel attribute uses these string values.
+    # Map to/from the protocol's single-letter convention.
+    _XS_TO_PROTO_CHANNEL = {
+        "RGB": "RGBA", "RGBA": "RGBA",
+        "Red": "R", "Green": "G", "Blue": "B", "Alpha": "A",
+        "R": "R", "G": "G", "B": "B", "A": "A",
+    }
+    _PROTO_TO_XS_CHANNEL = {
+        "RGBA": "RGB", "R": "Red", "G": "Green", "B": "Blue", "A": "Alpha",
+    }
+
+    def _get_viewport(self) -> "Viewport | None":
+        """Return a cached Viewport for the active xStudio window, or None on error."""
+        if self._viewport is not None:
+            return self._viewport
+        try:
+            self._viewport = Viewport(self.connection, active_viewport=True)
+            _log("Viewport acquired")
+        except Exception as e:
+            _log(f"_get_viewport: {e}")
+        return self._viewport
+
+    def _read_xs_display_state(self) -> dict:
+        """Return a display state dict read from the active xStudio viewport.
+
+        Uses ``Viewport.colour_pipeline`` for exposure and channel.
+        Zoom (scale) and pan (translate) are read via ``serialise_atom`` sent
+        to the viewport actor, which returns the internal viewport state as a
+        JsonStore with keys ``base.scale`` (float, 1.0 = no zoom) and
+        ``base.translate`` (dict with x/y/z float keys, 0/0/0 = no pan).
+        """
+        state: dict = {
+            "pan": None,
+            "zoom": None,
+            "exposure": 0.0,
+            "channel": "RGBA",
+        }
+        vp = self._get_viewport()
+        if vp is None:
+            return state
+
+        try:
+            cp = vp.colour_pipeline
+            state["exposure"] = float(cp.exposure.value())
+        except Exception as e:
+            _log(f"_read_xs_display_state: exposure read failed: {e}")
+
+        try:
+            cp = vp.colour_pipeline
+            xs_ch = cp.channel.value()
+            state["channel"] = self._XS_TO_PROTO_CHANNEL.get(str(xs_ch), "RGBA")
+        except Exception as e:
+            _log(f"_read_xs_display_state: channel read failed: {e}")
+
+        vp_state = None
+        try:
+            js = self.connection.request_receive(vp.remote, serialise_atom())[0]
+            vp_state = json.loads(js.dump())["base"]
+            raw_scale = float(vp_state["scale"])
+            # state_.scale_ is image_pixels/viewport_pixels — a larger value
+            # means more zoomed OUT (opposite of RV's convention).  Normalise
+            # to RV's 1.0 = fit-to-window by recording the first-seen scale as
+            # the baseline and dividing subsequent values by it.
+            if self._xs_base_scale is None and raw_scale > 0.0:
+                self._xs_base_scale = raw_scale
+                _log(f"xStudio base scale set to {raw_scale:.4f}")
+            if self._xs_base_scale:
+                state["zoom"] = raw_scale / self._xs_base_scale
+            else:
+                state["zoom"] = 1.0
+        except Exception as e:
+            _log(f"_read_xs_display_state: zoom read failed: {e}")
+        try:
+            if vp_state is not None:
+                # Imath::V3f serialises as a JSON array [x, y, z], not {"x":...}
+                t = vp_state["translate"]
+                state["pan"] = [float(t[0]), float(t[1])]
+        except Exception as e:
+            _log(f"_read_xs_display_state: pan read failed: {e}")
+
+        return state
+
+    def _apply_display_state(self, state: dict) -> None:
+        """Apply a received display state dict to the local xStudio viewport.
+
+        :param state: Display state dict with pan, zoom, exposure, channel keys.
+        """
+        vp = self._get_viewport()
+        if vp is None:
+            return
+
+        pan = state.get("pan")      # None means sender doesn't support pan
+        zoom = state.get("zoom")    # None means sender doesn't support zoom
+        exposure = state.get("exposure", 0.0)
+        channel = state.get("channel", "RGBA")
+
+        try:
+            vp.colour_pipeline.exposure.set_value(float(exposure))
+        except Exception as e:
+            _log(f"RECV display: exposure set failed: {e}")
+
+        try:
+            xs_ch = self._PROTO_TO_XS_CHANNEL.get(channel, "RGB")
+            vp.colour_pipeline.channel.set_value(xs_ch)
+        except Exception as e:
+            _log(f"RECV display: channel set failed: {e}")
+
+        # Pan/zoom cannot be safely written from the xStudio Python API —
+        # deserialise_atom round-trips through Python JSON and crashes on
+        # ColourTriplet deserialization in the viewport settings.  Read
+        # back the actual viewport state so the echo-guard sees the real
+        # current values and doesn't re-broadcast them as a spurious change.
+        readback = self._read_xs_display_state()
+        self._last_display_state = {
+            "pan": readback["pan"],
+            "zoom": readback["zoom"],
+            "exposure": exposure,
+            "channel": channel,
+        }
+        _log(f"RECV display exposure={exposure:.3f} channel={channel} "
+             f"(zoom={zoom} pan={pan} received but not applied — write not safe)")
+
+    def _poll_and_broadcast_display(self) -> None:
+        """Broadcast display state when exposure or channel changes.
+
+        Called from the poll thread on every tick.  Compares the current viewport
+        state against ``_last_display_state`` and broadcasts only on change.
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        state = self._read_xs_display_state()
+        if state == self._last_display_state:
+            return
+        self._last_display_state = state
+        _log(f"Poll display: broadcasting exposure={state['exposure']:.3f} "
+             f"channel={state['channel']}")
+        self.manager.broadcast_display_state(state)
 
     # ── annotation send ────────────────────────────────────────────────────────
 

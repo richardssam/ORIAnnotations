@@ -42,18 +42,39 @@ _JOINING_TIMEOUT = 10.0
 # ── Serialisation helpers ──────────────────────────────────────────────────────
 
 def _serialize_timeline(tl: otio.schema.Timeline, guid: str) -> dict:
+    # First pass: build clip_guid → timeline start (s) for all non-annotation items.
+    # Annotation clips use this to compute their absolute position from
+    # source_range.start_time (clip-local frame) + the owning clip's timeline start.
+    clip_timeline_start: dict[str, float] = {}
+    for track in tl.tracks:
+        if track.name and track.name.startswith("Annotations"):
+            continue
+        t = 0.0
+        for item in track:
+            item_guid = item.metadata.get("sync", {}).get("guid", "")
+            if item_guid:
+                clip_timeline_start[item_guid] = t
+            t += item.duration().to_seconds()
+
     tracks = []
     for track in tl.tracks:
         items = []
         t = 0.0
+        is_ann = bool(track.name and track.name.startswith("Annotations"))
         for item in track:
             dur = item.duration().to_seconds()
             item_guid = item.metadata.get("sync", {}).get("guid", "")
+            start = t
+            if is_ann and item.source_range is not None:
+                ann_clip_guid = item.metadata.get("clip_guid", "")
+                media_t = clip_timeline_start.get(ann_clip_guid)
+                if media_t is not None:
+                    start = media_t + item.source_range.start_time.to_seconds()
             items.append({
                 "guid": item_guid,
                 "name": item.name or "",
                 "type": type(item).__name__,
-                "start": round(t, 6),
+                "start": round(start, 6),
                 "duration": round(dur, 6),
             })
             t += dur
@@ -104,6 +125,7 @@ def _build_state() -> dict:
         "active_timeline_guid": _manager.active_timeline_guid,
         "timelines": timelines,
         "playback": _manager.playback_state,
+        "display": _manager.display_state,
     }
 
 

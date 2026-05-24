@@ -208,6 +208,26 @@
   .pb-field { color: var(--muted); }
   .pb-field span { color: var(--text); font-weight: 600; }
 
+  /* ── Bottom: display state bar ──────────────────────────────── */
+  #display-bar {
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 10px;
+    padding: 4px 10px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 11px;
+  }
+  .db-label { color: var(--muted); font-size: 10px; font-weight: 600;
+              text-transform: uppercase; letter-spacing: .05em; margin-right: 4px; }
+  .db-field { color: var(--muted); }
+  .db-field span { color: var(--text); font-weight: 600; }
+  .db-channel { display: inline-block; padding: 1px 5px; border-radius: 3px;
+                background: #27272a; color: var(--text); font-weight: 700; font-size: 10px; }
+  .db-channel-R { background: #4c1515; color: #f87171; }
+  .db-channel-G { background: #14362a; color: #4ade80; }
+  .db-channel-B { background: #172554; color: #60a5fa; }
+  .db-channel-A { background: #2e1065; color: #c084fc; }
+
   /* ── Right: metadata panel ──────────────────────────────────── */
   #meta-panel {
     width: 280px; flex-shrink: 0;
@@ -348,6 +368,13 @@
       <span class="pb-field">Loop: <span id="pb-loop">—</span></span>
       <span class="pb-field" style="margin-left:auto;">Timeline: <span id="pb-tl">—</span></span>
     </div>
+    <div id="display-bar">
+      <span class="db-label">Display</span>
+      <span class="db-field">Pan: <span id="db-pan">—</span></span>
+      <span class="db-field">Zoom: <span id="db-zoom">—</span></span>
+      <span class="db-field">Exposure: <span id="db-exposure">—</span></span>
+      <span class="db-field" style="margin-left:4px;">Ch: <span id="db-channel" class="db-channel">—</span></span>
+    </div>
   </div>
 
   <!-- Right: metadata panel -->
@@ -426,6 +453,7 @@ function handleState(s) {
   renderSidebar(s);
   renderTimeline();
   renderPlayback(s.playback || {});
+  renderDisplay(s.display || {});
 }
 
 // ── Topbar ────────────────────────────────────────────────────────────────────
@@ -692,6 +720,27 @@ function renderPlayback(pb) {
   } else {
     document.getElementById('pb-tl').textContent = '—';
   }
+}
+
+// ── Display state bar ─────────────────────────────────────────────────────────
+
+function renderDisplay(d) {
+  const pan = d.pan;
+  document.getElementById('db-pan').textContent =
+    Array.isArray(pan) ? `${pan[0].toFixed(2)}, ${pan[1].toFixed(2)}` : '—';
+
+  document.getElementById('db-zoom').textContent =
+    d.zoom !== undefined ? `${(d.zoom * 100).toFixed(0)}%` : '—';
+
+  document.getElementById('db-exposure').textContent =
+    d.exposure !== undefined
+      ? (d.exposure >= 0 ? '+' : '') + d.exposure.toFixed(2) + ' EV'
+      : '—';
+
+  const chEl = document.getElementById('db-channel');
+  const ch = d.channel || '—';
+  chEl.textContent = ch;
+  chEl.className = 'db-channel' + (ch !== '—' && ch !== 'RGBA' ? ` db-channel-${ch}` : '');
 }
 
 // ── Inspector panel ───────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import rv.commands
+import rv.extra_commands
 import rv.rvtypes
 import logging as _logging
 import json
@@ -113,6 +114,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._discovery_start_time = 0
         self._pending_stroke = None  # (node_name, pen_component)
         self._debounce_timer = None
+        self._last_display_state = {}  # last state broadcast to detect changes
 
         if SyncManager and RabbitMQNetwork:
             self._setup_sync()
@@ -161,6 +163,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self._rebuild_rv_session()
                     if self.sync_manager.playback_state:
                         self._apply_playback(self.sync_manager.playback_state)
+                    if self.sync_manager.display_state:
+                        self._apply_display_state(self.sync_manager.display_state)
                 finally:
                     self._rv_updating = False
 
@@ -640,6 +644,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         }
                     except Exception:
                         playback_state = None
+                    # Snapshot the current display state so joiners inherit it.
+                    self.sync_manager.display_state = self._read_rv_display_state()
+                    self._last_display_state = dict(self.sync_manager.display_state)
                     self.sync_manager.send_state_snapshot(data, playback_state=playback_state)
                 else:
                     self._handle_action(action, data)
@@ -648,12 +655,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         if not self._rv_updating:
             self._check_sequence_reorders()
+            self._broadcast_display_state()
 
     def _handle_action(self, action, data):
         """Common dispatcher for sync actions."""
         _log(f"RECV action={action}")
         if action == "playback_settings":
             self._apply_playback(data)
+        elif action == "display_settings":
+            self._rv_updating = True
+            try:
+                self._apply_display_state(data)
+            finally:
+                self._rv_updating = False
         elif action == "selection_changed":
             self._apply_selection(data)
         elif action == "annotation_commands_added":
@@ -1398,6 +1412,174 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
         except Exception as e:
             _log_exc(f"Failed to broadcast annotation: {e}")
+
+    def _rv_display_color_node(self):
+        """Return the active-display RVDisplayColor node, or None.
+
+        ``nodesOfType`` returns all RVDisplayColor nodes.  The first entry is
+        the ``defaultOutputGroup_colorPipeline_0`` node (output/export pipeline)
+        which is *not* what the channel-isolation keys (r/g/b/a) modify.
+        Those keys use ``#RVDisplayColor`` in Mu which resolves to the first
+        ``displayGroup*`` pipeline node — so we prefer that here.
+        """
+        nodes = rv.commands.nodesOfType("RVDisplayColor")
+        for n in nodes:
+            if n.startswith("displayGroup"):
+                return n
+        return nodes[0] if nodes else None
+
+    # channelFlood encoding from rvui.mu showChannel(): 0=RGBA, 1=R, 2=G, 3=B, 4=A, 5=Luma
+    _RV_FLOOD_TO_CH = {0: "RGBA", 1: "R", 2: "G", 3: "B", 4: "A"}
+    _RV_CH_TO_FLOOD = {"RGBA": 0, "R": 1, "G": 2, "B": 3, "A": 4}
+
+    def _rv_color_node_for_current_source(self):
+        """Return the RVColor node for the currently visible source, or None.
+
+        ``rv.commands.sourcesAtFrame`` returns a list of source node names of
+        the form ``sourceGroupNNNNNN_source``.  The corresponding RVColor pipeline
+        node is ``sourceGroupNNNNNN_colorPipeline_0``.
+        """
+        try:
+            sources = rv.commands.sourcesAtFrame(rv.commands.frame())
+            if sources:
+                src = sources[0]
+                if src.endswith("_source"):
+                    return src[:-len("_source")] + "_colorPipeline_0"
+        except Exception:
+            pass
+        nodes = rv.commands.nodesOfType("RVColor")
+        return nodes[0] if nodes else None
+
+    def _read_rv_display_state(self):
+        """Return a dict with pan, zoom, exposure and channel for the current session.
+
+        Pan/zoom come from ``rv.extra_commands.translation()`` / ``.scale()``.
+        Exposure comes from the ``RVColor.color.exposure`` node for the
+        *currently visible* source (the ``e`` key; 3-element RGB array, channel
+        0 used as scalar).  Channel comes from ``RVDisplayColor.color.channelFlood``
+        (``r``/``g``/``b``/``a`` keys; 0=RGBA 1=R 2=G 3=B 4=A).
+        """
+        state = {
+            "pan": [0.0, 0.0],
+            "zoom": 1.0,
+            "exposure": 0.0,
+            "channel": "RGBA",
+        }
+        # Pan and zoom via rv.extra_commands (viewer-level, not a node property).
+        try:
+            t = rv.extra_commands.translation()
+            state["pan"] = [float(t[0]), float(t[1])]
+        except Exception as e:
+            _log(f"WARN _read_rv_display_state translation: {e}")
+        try:
+            state["zoom"] = float(rv.extra_commands.scale())
+        except Exception as e:
+            _log(f"WARN _read_rv_display_state scale: {e}")
+        # Exposure — current source's RVColor node (e key).
+        try:
+            node = self._rv_color_node_for_current_source()
+            if node:
+                exp = rv.commands.getFloatProperty(f"{node}.color.exposure")
+                state["exposure"] = float(exp[0]) if exp else 0.0
+        except Exception as e:
+            _log(f"WARN _read_rv_display_state exposure: {e}")
+        # Channel — active displayGroup's RVDisplayColor (r/g/b/a keys).
+        dc = self._rv_display_color_node()
+        if dc:
+            try:
+                flood = rv.commands.getIntProperty(f"{dc}.color.channelFlood")
+                state["channel"] = self._RV_FLOOD_TO_CH.get(
+                    flood[0] if flood else 0, "RGBA")
+            except Exception as e:
+                _log(f"WARN _read_rv_display_state channelFlood: {e}")
+        return state
+
+    def _broadcast_display_state(self):
+        """Read the current RV display state and broadcast it if it has changed.
+
+        When exposure changes, all per-source ``RVColor`` nodes are normalised
+        to the new value before broadcasting.  This ensures that navigating
+        between clips (which may have had different per-clip exposures set
+        before the sync was active) does not trigger spurious re-broadcasts on
+        the next frame.
+        """
+        if self._rv_updating or not self.sync_manager or self.sync_manager.status != STATE_SYNCED:
+            return
+        state = self._read_rv_display_state()
+        if state == self._last_display_state:
+            return
+        # Normalise all source nodes to the new exposure so that navigating
+        # between clips does not trigger false change detections next tick.
+        if state["exposure"] != self._last_display_state.get("exposure"):
+            ev = float(state["exposure"])
+            try:
+                for node in rv.commands.nodesOfType("RVColor"):
+                    rv.commands.setFloatProperty(
+                        f"{node}.color.exposure", [ev, ev, ev], True)
+            except Exception:
+                pass
+        self._last_display_state = state
+        _log(f"SEND display zoom={state['zoom']:.3f} pan={state['pan']} "
+             f"exposure={state['exposure']:.3f} channel={state['channel']}")
+        self.sync_manager.broadcast_display_state(state)
+
+    def _apply_display_state(self, data):
+        """Apply an incoming display state dict to the local RV session.
+
+        Pan/zoom are applied via ``rv.extra_commands`` only when the incoming
+        values are non-None.  A ``None`` value means the sender does not support
+        pan/zoom (e.g. xStudio) and the local values should be left unchanged.
+        Exposure is written to **all** ``RVColor`` source nodes (3-element RGB)
+        so every clip matches.  Channel is written to
+        ``RVDisplayColor.color.channelFlood``.
+        """
+        pan = data.get("pan")
+        zoom = data.get("zoom")
+        exposure = data.get("exposure", 0.0)
+        channel = data.get("channel", "RGBA")
+        _log(f"RECV display pan={pan} zoom={zoom} "
+             f"exposure={exposure:.3f} channel={channel}")
+
+        if pan is not None:
+            try:
+                rv.extra_commands.setTranslation((float(pan[0]), float(pan[1])))
+            except Exception as e:
+                _log(f"RECV display: pan set failed: {e}")
+        if zoom is not None:
+            try:
+                rv.extra_commands.setScale(float(zoom))
+            except Exception as e:
+                _log(f"RECV display: zoom set failed: {e}")
+
+        # Apply exposure to every source node so all clips match.
+        try:
+            ev = float(exposure)
+            for node in rv.commands.nodesOfType("RVColor"):
+                rv.commands.setFloatProperty(
+                    f"{node}.color.exposure", [ev, ev, ev], True)
+        except Exception as e:
+            _log(f"RECV display: exposure set failed: {e}")
+
+        dc = self._rv_display_color_node()
+        if dc:
+            try:
+                flood = self._RV_CH_TO_FLOOD.get(channel, 0)
+                rv.commands.setIntProperty(f"{dc}.color.channelFlood",
+                                           [flood], True)
+            except Exception as e:
+                _log(f"RECV display: channel set failed: {e}")
+
+        # Keep _last_display_state consistent with what we actually hold.
+        # If the sender omitted pan/zoom, preserve our current read-back values
+        # so the next broadcast comparison doesn't spuriously see a change.
+        cur = self._read_rv_display_state()
+        self._last_display_state = {
+            "pan": [float(pan[0]), float(pan[1])] if pan is not None else cur["pan"],
+            "zoom": float(zoom) if zoom is not None else cur["zoom"],
+            "exposure": exposure,
+            "channel": channel,
+        }
+        rv.commands.redraw()
 
     def _apply_playback(self, data):
         playing = data.get("playing", False)
