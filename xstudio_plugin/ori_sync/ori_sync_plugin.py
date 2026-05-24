@@ -128,13 +128,13 @@ class ORISyncPlugin(PluginBase):
     """
 
     #: How often the poll thread calls manager.tick() (seconds).
-    POLL_INTERVAL = 0.05
+    POLL_INTERVAL = 0.033
     #: How long to wait for a master before self-electing (seconds).
     DISCOVERY_TIMEOUT = 2.0
     #: Periodic fallback scan interval (seconds).  show_atom fires when a NEW
     #: bookmark is created but not when the user adds strokes to an existing one
     #: on the same frame.  This scan catches those missed updates.
-    ANNOTATION_SCAN_INTERVAL = 0.5
+    ANNOTATION_SCAN_INTERVAL = 0.1
 
     def __init__(self, connection):
         PluginBase.__init__(
@@ -214,6 +214,17 @@ class ORISyncPlugin(PluginBase):
         # annotation_data hasn't been committed yet (reads stale stroke count).
         # Reset to 0 after a successful broadcast or when no bookmarks are pending.
         self._annotation_flush_retries: int = 0
+
+        # Stable UUID cache: maps f"{clip_guid}:{frame}" → [uuid_for_stroke_0, ...]
+        # Used so that partial and final broadcasts for the same frame share UUIDs,
+        # enabling receivers to update in-place rather than duplicate strokes.
+        self._stroke_uuid_cache: dict[str, list] = {}
+        # Hot-scan state: after show_atom fires the poll loop scans the active frame
+        # on every tick to detect mid-stroke data as soon as xStudio exposes it.
+        self._hot_scan_active: bool = False
+        self._hot_scan_frame: int | None = None
+        self._hot_scan_stroke_counts: dict[str, int] = {}  # f"{clip}:{frame}" → last sent count
+        self._hot_scan_last_change: float = 0.0
 
         # Polling-based scrub detection: last frame seen by the poll loop and
         # last frame applied from a remote PLAYBACK_SETTINGS message.
@@ -346,6 +357,7 @@ class ORISyncPlugin(PluginBase):
                 if self.manager:
                     for action, data in self.manager.tick():
                         self._handle_manager_event(action, data)
+                self._hot_scan_active_annotation()
                 self._flush_pending_annotations()
                 self._poll_and_broadcast_frame()
                 self._poll_and_broadcast_display()
@@ -386,6 +398,9 @@ class ORISyncPlugin(PluginBase):
                 requester_guid,
                 playback_state=self._current_playback_state(),
             )
+
+        elif action == "partial_annotation":
+            self._apply_partial_annotation_xs(data)
 
         elif action == "insert_child":
             child_obj = data
@@ -531,9 +546,19 @@ class ORISyncPlugin(PluginBase):
         # show_atom: fires when a bookmark/annotation is shown or created.
         # This is the signal that the user has drawn in xStudio.
         if isinstance(event[1], show_atom):
-            _log("show_atom fired — queuing annotation flush")
+            _log("show_atom fired — queuing annotation flush + activating hot scan")
             if self.manager and self.manager.status == STATE_SYNCED:
                 self._annotation_pending_time = time.monotonic()
+                # Start hot-scanning the current frame on every poll tick so that
+                # partial strokes are streamed before pen-up.
+                try:
+                    if self.active_playhead:
+                        self._hot_scan_frame = self.active_playhead.position
+                        self._hot_scan_active = True
+                        self._hot_scan_last_change = time.monotonic()
+                        _log(f"Hot scan activated at frame {self._hot_scan_frame}")
+                except Exception:
+                    pass
             return
 
         if not isinstance(event[1], viewport_playhead_atom):
@@ -668,11 +693,12 @@ class ORISyncPlugin(PluginBase):
     def _read_xs_display_state(self) -> dict:
         """Return a display state dict read from the active xStudio viewport.
 
-        Uses ``Viewport.colour_pipeline`` for exposure and channel.
-        Zoom (scale) and pan (translate) are read via ``serialise_atom`` sent
-        to the viewport actor, which returns the internal viewport state as a
-        JsonStore with keys ``base.scale`` (float, 1.0 = no zoom) and
-        ``base.translate`` (dict with x/y/z float keys, 0/0/0 = no pan).
+        Uses ``Viewport.colour_pipeline`` for exposure and channel.  Zoom
+        (scale) is read via ``serialise_atom`` and normalised against the
+        fit-to-window baseline.  Pan is always ``None`` — xStudio's internal
+        ``translate_`` is in image-space units incompatible with RV's
+        normalised translation, and applying them causes a ~50% pan jump on
+        join.  Pan sync requires ``viewport_pan_atom`` in ``py_atoms.cpp``.
         """
         state: dict = {
             "pan": None,
@@ -715,13 +741,11 @@ class ORISyncPlugin(PluginBase):
                 state["zoom"] = 1.0
         except Exception as e:
             _log(f"_read_xs_display_state: zoom read failed: {e}")
-        try:
-            if vp_state is not None:
-                # Imath::V3f serialises as a JSON array [x, y, z], not {"x":...}
-                t = vp_state["translate"]
-                state["pan"] = [float(t[0]), float(t[1])]
-        except Exception as e:
-            _log(f"_read_xs_display_state: pan read failed: {e}")
+        # Pan is intentionally left as None.
+        # xStudio's state_.translate_ is in internal image-space units that are
+        # not compatible with RV's normalised translation coordinates.  Sending
+        # the raw translate values causes RV to jump ~50% on join.  Pan sync
+        # requires viewport_pan_atom to be exposed in py_atoms.cpp (see TODO).
 
         return state
 
@@ -785,6 +809,8 @@ class ORISyncPlugin(PluginBase):
 
     #: How long to wait after the last annotation_atom before scanning bookmarks.
     DEBOUNCE_SECONDS = 0.25
+    #: Stop hot-scanning a frame after this many seconds of no new strokes.
+    HOT_SCAN_TIMEOUT = 0.6
 
     def _on_annotation_event(self, data) -> None:
         """Called by xStudio when the user completes a stroke in the viewport.
@@ -806,6 +832,136 @@ class ORISyncPlugin(PluginBase):
             return
         _log("Annotation event from AnnotationsUI — scheduling broadcast scan")
         self._annotation_pending_time = time.monotonic()
+
+    def _hot_scan_active_annotation(self) -> None:
+        """Poll the active drawing frame every tick to stream partial strokes.
+
+        Activated when ``show_atom`` fires (user starts drawing on a new frame).
+        Runs on every poll tick (33 ms) so that partial strokes are broadcast to
+        peers before pen-up, giving an interactive feel.
+
+        Uses ``_stroke_uuid_cache`` to assign stable UUIDs to strokes at each
+        index, so that a receiver that already rendered the partial via
+        ``_apply_partial_annotation_xs`` can update in-place rather than create
+        a duplicate when the final ``INSERT_CHILD`` arrives.
+        """
+        if not self._hot_scan_active:
+            return
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            self._hot_scan_active = False
+            return
+        now = time.monotonic()
+        if now - self._hot_scan_last_change > self.HOT_SCAN_TIMEOUT:
+            _log("Hot scan timed out — deactivating")
+            self._hot_scan_active = False
+            return
+
+        frame = self._hot_scan_frame
+        if frame is None:
+            return
+
+        tl = self.manager.root_timeline
+        if tl is None:
+            return
+
+        try:
+            clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
+        except Exception:
+            return
+        if clip_guid is None:
+            return
+
+        local_frame = int(clip_local_time.value)
+        fps = float(clip_local_time.rate) if clip_local_time.rate else 25.0
+
+        # Find a local (non-remote) bookmark at this frame.
+        try:
+            all_bms = self.connection.api.session.bookmarks.bookmarks
+        except Exception:
+            return
+
+        target_bm = None
+        for bm in all_bms:
+            bm_uuid_str = str(bm.uuid)
+            if bm_uuid_str in self._our_bookmark_clip_frame:
+                continue  # remote bookmark, skip
+            with self._our_bookmark_uuids_lock:
+                is_remote = bm_uuid_str in self._our_bookmark_uuids
+            if is_remote:
+                continue
+            try:
+                detail = bm.detail
+                if detail is None or detail.start is None:
+                    continue
+                bm_frame = int(round(detail.start.total_seconds() * fps))
+                if bm_frame == frame:
+                    target_bm = bm
+                    break
+            except Exception:
+                continue
+
+        if target_bm is None:
+            return
+
+        try:
+            ann_data = target_bm.annotation_data
+            if not ann_data:
+                return
+        except Exception:
+            return
+
+        canvas = ann_data.get("Data", ann_data)
+        all_strokes = canvas.get("pen_strokes", [])
+        if not all_strokes:
+            return
+
+        key = f"{clip_guid}:{local_frame}"
+        last_sent = self._hot_scan_stroke_counts.get(key, 0)
+        if len(all_strokes) <= last_sent:
+            return  # no new strokes since last hot broadcast
+
+        self._hot_scan_last_change = now
+        self._hot_scan_stroke_counts[key] = len(all_strokes)
+
+        # Ensure UUID cache covers all strokes (including pre-existing ones).
+        if key not in self._stroke_uuid_cache:
+            self._stroke_uuid_cache[key] = []
+        cache = self._stroke_uuid_cache[key]
+        while len(cache) < len(all_strokes):
+            cache.append(str(uuid.uuid4()))
+
+        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+
+        # Send ALL current strokes so peers can update from any starting point.
+        try:
+            otio.schema.schemadef.module_from_name("SyncEvent")
+        except Exception:
+            pass
+        events_obj = self._strokes_to_sync_events(all_strokes, aspect_half, uuid_list=cache)
+        if not events_obj:
+            return
+
+        events_dicts = []
+        for e in events_obj:
+            try:
+                events_dicts.append(
+                    json.loads(otio.adapters.write_to_string(e, "otio_json", indent=-1))
+                )
+            except Exception:
+                pass
+        if not events_dicts:
+            return
+
+        _log(
+            f"Hot scan: broadcasting {len(all_strokes)} stroke(s) as partial"
+            f" at frame={frame} clip={clip_guid[:8]}"
+        )
+        self.manager.broadcast_partial_annotation(
+            clip_guid=clip_guid,
+            frame=float(local_frame),
+            fps=fps,
+            events=events_dicts,
+        )
 
     def _flush_pending_annotations(self) -> None:
         """Scan all bookmarks we don't own and broadcast any new strokes.
@@ -968,6 +1124,17 @@ class ORISyncPlugin(PluginBase):
         new_strokes = all_strokes[sent_strokes:]
         new_captions = all_captions[sent_captions:]
 
+        # Ensure UUID cache covers all strokes so the final broadcast uses the
+        # same UUIDs as any earlier partial broadcasts for this frame.
+        uuid_key = f"{clip_guid}:{int(clip_local_time.value)}"
+        if uuid_key not in self._stroke_uuid_cache:
+            self._stroke_uuid_cache[uuid_key] = []
+        uuid_cache = self._stroke_uuid_cache[uuid_key]
+        while len(uuid_cache) < len(all_strokes):
+            uuid_cache.append(str(uuid.uuid4()))
+        # UUIDs for the delta strokes start at index sent_strokes.
+        delta_uuids = uuid_cache[sent_strokes:len(all_strokes)]
+
         # Detect in-place text edits: caption count is unchanged but content
         # differs.  Delta tracking (count-based) misses these, so we replace the
         # full command list on the existing clip instead of appending a delta.
@@ -986,7 +1153,7 @@ class ORISyncPlugin(PluginBase):
                 if ann_clip_guid:
                     existing_uuids = self._extract_caption_uuids(ann_clip_guid)
                     all_events = (
-                        self._strokes_to_sync_events(all_strokes, aspect_half)
+                        self._strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
                         + self._captions_to_sync_events(all_captions, aspect_half, existing_uuids)
                     )
                     _log(
@@ -998,7 +1165,7 @@ class ORISyncPlugin(PluginBase):
                     return True
 
         events = (
-            self._strokes_to_sync_events(new_strokes, aspect_half)
+            self._strokes_to_sync_events(new_strokes, aspect_half, uuid_list=delta_uuids)
             + self._captions_to_sync_events(new_captions, aspect_half)
         )
         if not events:
@@ -1250,6 +1417,51 @@ class ORISyncPlugin(PluginBase):
             )
         except Exception:
             _log_exc("_refresh_annotation_bookmark: failed")
+
+    def _apply_partial_annotation_xs(self, payload: dict) -> None:
+        """Render a mid-stroke partial annotation from a remote peer (visual only).
+
+        Constructs a temporary OTIO Clip from the payload and delegates to
+        :meth:`_apply_remote_annotation`, which handles both create and
+        update-in-place for the xStudio bookmark.  The clip is never inserted
+        into the timeline — it is used only to carry frame/fps/clip_guid.
+
+        Because :meth:`_apply_remote_annotation` adds the bookmark UUID to
+        ``_our_bookmark_uuids``, the periodic scan will not re-broadcast the
+        partial stroke as a local annotation.
+
+        :param payload: Dict with ``clip_guid``, ``frame``, ``fps``, ``events``.
+        """
+        clip_guid = payload.get("clip_guid")
+        frame = float(payload.get("frame", 0))
+        fps = float(payload.get("fps", 25.0))
+        events_raw = payload.get("events", [])
+
+        if not clip_guid or not events_raw:
+            return
+
+        commands: list = []
+        for ev_dict in events_raw:
+            try:
+                if isinstance(ev_dict, dict):
+                    ev_dict = otio.adapters.read_from_string(
+                        otio.adapters.write_to_string(ev_dict, "otio_json"), "otio_json"
+                    )
+                commands.append(ev_dict)
+            except Exception as e:
+                _log(f"_apply_partial_annotation_xs: failed to deserialise event: {e}")
+
+        if not commands:
+            return
+
+        temp_clip = otio.schema.Clip()
+        temp_clip.source_range = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(frame, fps),
+            otio.opentime.RationalTime(1.0, fps),
+        )
+        temp_clip.metadata["clip_guid"] = clip_guid
+
+        self._apply_remote_annotation(temp_clip, commands)
 
     def _apply_remote_annotation(
         self, ann_clip: otio.schema.Clip, commands: list
@@ -1562,7 +1774,10 @@ class ORISyncPlugin(PluginBase):
     # ── stroke / caption conversion ────────────────────────────────────────────
 
     def _strokes_to_sync_events(
-        self, pen_strokes: list, aspect_half: float = 0.8889
+        self,
+        pen_strokes: list,
+        aspect_half: float = 0.8889,
+        uuid_list: "list[str] | None" = None,
     ) -> list:
         """
         Convert xStudio pen_strokes to OTIO SyncEvent objects.
@@ -1571,14 +1786,20 @@ class ORISyncPlugin(PluginBase):
         that strokes broadcast here are readable by the existing RV plugin and
         the OTIO export pipeline.
 
+        :param uuid_list: If supplied, use ``uuid_list[i]`` as the UUID for stroke *i*
+            instead of generating a fresh one.  Callers that need stable UUIDs across
+            repeated broadcasts of the same frame (partial + final) maintain this list
+            in ``_stroke_uuid_cache`` and pass the appropriate slice here.
+
         Coordinate convention:
         - xStudio: W-normalised, Y-down  (X ∈ [−1,+1])
         - OTIO/RV: H-normalised, Y-up    (X ∈ [−aspect/2,+aspect/2])
         Scale factor: ``aspect_half = W / (2H)``
         """
         events = []
-        for stroke in pen_strokes:
-            stroke_uuid = str(uuid.uuid4())
+        for i, stroke in enumerate(pen_strokes):
+            stroke_uuid = (uuid_list[i] if uuid_list and i < len(uuid_list)
+                           else str(uuid.uuid4()))
             rgba = [
                 stroke.get("r", 1.0),
                 stroke.get("g", 1.0),

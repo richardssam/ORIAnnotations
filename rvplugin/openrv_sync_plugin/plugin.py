@@ -113,8 +113,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._last_broadcast_frame = -1
         self._last_selection = []
         self._discovery_start_time = 0
-        self._pending_stroke = None  # (node_name, pen_component)
+        self._pending_stroke = None  # (node_name, pen_component, stroke_uuid)
         self._debounce_timer = None
+        self._stroke_timer = None     # repeating partial-broadcast timer during drawing
+        self._last_partial_point_count = 0
+        self._partial_pen_nodes = {}  # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
         self._last_display_state = {}  # last state broadcast to detect changes
 
         if SyncManager and RabbitMQNetwork:
@@ -172,7 +175,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if QtCore:
             self._timer = QtCore.QTimer()
             self._timer.timeout.connect(self.poll_network)
-            self._timer.start(100)
+            self._timer.start(33)
 
     def _init_as_master(self):
         """Initialise the session as the first participant (Master)."""
@@ -681,6 +684,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # Full annotation_commands replacement (e.g. text edit or drag-move).
             # Update existing paint nodes in place instead of adding duplicates.
             self._apply_annotation_replace(data)
+        elif action == "partial_annotation":
+            self._apply_partial_annotation(data)
         elif action == "insert_child":
             if isinstance(data, otio.schema.Clip) and "annotation_commands" in data.metadata:
                 self._apply_annotation_render(data)
@@ -798,6 +803,109 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log_exc(f"_import_existing_rv_annotations failed: {e}")
 
+    def _apply_partial_annotation(self, payload):
+        """Render a mid-stroke partial annotation from a remote peer.
+
+        The stroke is drawn into RV paint using the same UUID as the final
+        stroke.  If this UUID was already seen (a previous partial), the
+        existing paint node's points are updated in-place instead of
+        creating a duplicate.  The OTIO timeline is not modified.
+
+        :param payload: Dict with keys ``clip_guid``, ``frame``, ``fps``, ``events``.
+        """
+        clip_guid = payload.get("clip_guid")
+        frame_val = payload.get("frame", 0)
+        fps = payload.get("fps", 25.0)
+        events_raw = payload.get("events", [])
+
+        rv_frame = int(frame_val) + 1  # OTIO 0-indexed → RV 1-indexed
+
+        media_clip = self.sync_manager._object_map.get(clip_guid) if clip_guid else None
+        if not isinstance(media_clip, otio.schema.Clip):
+            return
+        ref = media_clip.media_reference
+        if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
+            return
+        media_path = ref.target_url
+
+        try:
+            otio.schema.schemadef.module_from_name('SyncEvent')
+        except Exception:
+            pass
+
+        for ev_dict in events_raw:
+            try:
+                if isinstance(ev_dict, dict):
+                    ev_dict = otio.adapters.read_from_string(
+                        otio.adapters.write_to_string(ev_dict, "otio_json"), "otio_json"
+                    )
+                if not isinstance(ev_dict, otio.schemadef.SyncEvent.PaintStart):
+                    continue
+                stroke_uuid = getattr(ev_dict, "uuid", None)
+                if not stroke_uuid:
+                    continue
+            except Exception:
+                continue
+
+            # Find corresponding PaintPoints event in the list
+            pts_ev = None
+            for other in events_raw:
+                try:
+                    if isinstance(other, dict):
+                        other = otio.adapters.read_from_string(
+                            otio.adapters.write_to_string(other, "otio_json"), "otio_json"
+                        )
+                    if (isinstance(other, otio.schemadef.SyncEvent.PaintPoints)
+                            and getattr(other, "uuid", None) == stroke_uuid):
+                        pts_ev = other
+                        break
+                except Exception:
+                    continue
+
+            if not pts_ev:
+                continue
+
+            points_flat = [v for pair in zip(pts_ev.points.x, pts_ev.points.y) for v in pair]
+            node = self._find_paint_node_for_media(media_path, rv_frame)
+            if not node:
+                continue
+
+            existing_pen = self._partial_pen_nodes.get(stroke_uuid)
+            if existing_pen and rv.commands.propertyExists(f"{node}.{existing_pen}.points"):
+                # Update points in-place for an already-started partial stroke.
+                try:
+                    rv.commands.setFloatProperty(
+                        f"{node}.{existing_pen}.points", points_flat, True
+                    )
+                    widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
+                    if len(widths) == 1:
+                        widths = widths * (len(points_flat) // 2)
+                    rv.commands.setFloatProperty(
+                        f"{node}.{existing_pen}.width", widths, True
+                    )
+                    QtCore.QTimer.singleShot(0, rv.commands.redraw)
+                except Exception as e:
+                    _log(f"_apply_partial_annotation: update failed: {e}")
+            else:
+                # First partial for this UUID — create a new pen node.
+                color = list(ev_dict.rgba) if ev_dict.rgba else [1.0, 1.0, 1.0, 1.0]
+                brush = ev_dict.brush or "circle"
+                widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
+                mode = 1 if getattr(ev_dict, "type", "color") == "erase" else 0
+                self._apply_annotation({
+                    "media_path": media_path,
+                    "frame": rv_frame,
+                    "node_name": None,
+                    "points": points_flat,
+                    "color": color,
+                    "brush": brush,
+                    "width": widths,
+                    "join": 3,
+                    "cap": 1,
+                    "mode": mode,
+                    "_stroke_uuid": stroke_uuid,
+                })
+
     def _apply_annotation_render(self, ann_clip):
         """Render an annotation clip received via insert_child into RV paint.
 
@@ -901,6 +1009,22 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             start_event = grp["start"]
             points_event = grp["points"]
             if not start_event or not points_event:
+                continue
+            ev_uuid = getattr(start_event, "uuid", None)
+            if ev_uuid and ev_uuid in self._partial_pen_nodes:
+                # A partial render already placed this stroke; update its final
+                # points in-place rather than creating a duplicate pen node.
+                node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame)
+                pen_node = self._partial_pen_nodes.pop(ev_uuid)
+                if node and rv.commands.propertyExists(f"{node}.{pen_node}.points"):
+                    points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
+                    rv.commands.setFloatProperty(f"{node}.{pen_node}.points", points_flat, True)
+                    widths = list(points_event.points.size)
+                    if len(widths) == 1:
+                        widths = widths * (len(points_flat) // 2)
+                    rv.commands.setFloatProperty(f"{node}.{pen_node}.width", widths, True)
+                    QtCore.QTimer.singleShot(0, rv.commands.redraw)
+                    rendered += 1
                 continue
             points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
             self._apply_annotation({
@@ -1300,27 +1424,67 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if len(parts) == 3:
                 node_name, component = parts[0], parts[1]
                 _log(f"annotation updated: {node_name}.{component}")
-                if self._pending_stroke and self._pending_stroke[1] != component:
-                    if self._debounce_timer:
-                        self._debounce_timer.stop()
+                switching = self._pending_stroke and self._pending_stroke[1] != component
+                if switching:
+                    self._stop_stroke_timers()
                     self._flush_pending_stroke()
-                self._pending_stroke = (node_name, component)
+                if switching or self._pending_stroke is None:
+                    stroke_uuid = str(uuid.uuid4())
+                    self._last_partial_point_count = 0
+                else:
+                    stroke_uuid = self._pending_stroke[2]
+                self._pending_stroke = (node_name, component, stroke_uuid)
+                # Repeating partial broadcast (50 ms) — fires while user is drawing.
+                if self._stroke_timer is None:
+                    self._stroke_timer = QtCore.QTimer()
+                    self._stroke_timer.timeout.connect(self._send_partial_stroke)
+                if not self._stroke_timer.isActive():
+                    self._stroke_timer.start(50)
+                # Pen-up detector: fires 150 ms after the last point arrives.
                 if self._debounce_timer is None:
                     self._debounce_timer = QtCore.QTimer()
                     self._debounce_timer.setSingleShot(True)
-                    self._debounce_timer.timeout.connect(self._flush_pending_stroke)
+                    self._debounce_timer.timeout.connect(self._on_pen_up)
                 self._debounce_timer.start(150)
         event.reject()
+
+    def _stop_stroke_timers(self):
+        if self._stroke_timer and self._stroke_timer.isActive():
+            self._stroke_timer.stop()
+        if self._debounce_timer and self._debounce_timer.isActive():
+            self._debounce_timer.stop()
+
+    def _send_partial_stroke(self):
+        """Repeating timer callback: broadcast current points without persisting to timeline."""
+        if not self._pending_stroke:
+            if self._stroke_timer:
+                self._stroke_timer.stop()
+            return
+        node_name, component, stroke_uuid = self._pending_stroke
+        full_prop = f"{node_name}.{component}"
+        if not rv.commands.propertyExists(f"{full_prop}.points"):
+            return
+        pts = rv.commands.getFloatProperty(f"{full_prop}.points")
+        if len(pts) == self._last_partial_point_count:
+            return  # no new points since last broadcast
+        self._last_partial_point_count = len(pts)
+        self._broadcast_annotation(node_name, component, partial=True, stroke_uuid=stroke_uuid)
+
+    def _on_pen_up(self):
+        """Pen-up detected (150 ms idle): stop partial timer and send final stroke."""
+        if self._stroke_timer:
+            self._stroke_timer.stop()
+        self._flush_pending_stroke()
 
     def _flush_pending_stroke(self):
         if not self._pending_stroke:
             return
-        node_name, component = self._pending_stroke
+        node_name, component, stroke_uuid = self._pending_stroke
         self._pending_stroke = None
-        self._broadcast_annotation(node_name, component)
+        self._broadcast_annotation(node_name, component, partial=False, stroke_uuid=stroke_uuid)
 
-    def _broadcast_annotation(self, node_name, component):
-        _log(f"SEND annotation node={node_name} component={component}")
+    def _broadcast_annotation(self, node_name, component, partial=False, stroke_uuid=None):
+        _log(f"SEND annotation node={node_name} component={component} partial={partial}")
         try:
             full_prop = f"{node_name}.{component}"
             is_text = component.startswith("text:")
@@ -1392,7 +1556,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
                 try:
                     otio.schema.schemadef.module_from_name('SyncEvent')
-                    penuuid = str(uuid.uuid4())
+                    penuuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
                     start_event = otio.schemadef.SyncEvent.PaintStart(
                         brush=brush,
                         rgba=list(color),
@@ -1442,13 +1606,22 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
             fps = rv.commands.fps()
             # RV frames are 1-indexed; OTIO clip-local time is 0-indexed
-            clip_local_time = otio.opentime.RationalTime(frame - 1 if frame > 0 else 0, fps)
-            self.sync_manager.broadcast_add_annotation(
-                annotation_track_guid=annotation_track_guid,
-                clip_guid=clip_guid,
-                clip_local_time=clip_local_time,
-                events=events,
-            )
+            otio_frame = frame - 1 if frame > 0 else 0
+            if partial:
+                self.sync_manager.broadcast_partial_annotation(
+                    clip_guid=clip_guid,
+                    frame=float(otio_frame),
+                    fps=float(fps),
+                    events=events,
+                )
+            else:
+                clip_local_time = otio.opentime.RationalTime(otio_frame, fps)
+                self.sync_manager.broadcast_add_annotation(
+                    annotation_track_guid=annotation_track_guid,
+                    clip_guid=clip_guid,
+                    clip_local_time=clip_local_time,
+                    events=events,
+                )
         except Exception as e:
             _log_exc(f"Failed to broadcast annotation: {e}")
 
@@ -1743,6 +1916,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             rv.commands.insertStringProperty(order_prop, [pen_node])
             _log(f"  _apply_annotation: wrote {pen_node} to {order_prop}")
             rv.commands.setIntProperty(f"{paint_prop}.nextId", [next_id + 1], True)
+            # Record UUID→pen_node so partial updates can find this node,
+            # and so the final INSERT_CHILD render can skip re-creating it.
+            stroke_uuid = data.get("_stroke_uuid")
+            if stroke_uuid:
+                self._partial_pen_nodes[stroke_uuid] = pen_node
             QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:
             _log_exc(f"Failed to apply remote annotation: {e}")

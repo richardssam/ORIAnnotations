@@ -413,9 +413,15 @@ Reset `_xs_base_scale = None` on disconnect so it re-calibrates on reconnect.
 
 **Do not use `deserialise_atom` to write pan/zoom from Python.**
 
+#### Pan sync is disabled — coordinate system incompatibility
+
+xStudio's `state_.translate_` (read via `serialise_atom`) is in internal image-space units that are **not** compatible with RV's normalised translation coordinates.  Sending the raw translate values to RV causes a ~50% pan jump when xStudio joins a session.
+
+**`_read_xs_display_state` therefore always returns `pan: None`.**  RV skips null pan fields (see "None pan/zoom in the protocol" above), so no pan is applied in either direction.
+
 #### One-way zoom sync and the missing atoms
 
-As a result: xStudio → RV zoom sync works (read via `serialise_atom`, broadcast), but **RV → xStudio zoom sync is not possible** with the current Python API.
+As a result: xStudio → RV zoom sync works (read via `serialise_atom`, broadcast), but **RV → xStudio zoom/pan sync is not possible** with the current Python API.
 
 The proper fix is to expose `viewport_scale_atom` and `viewport_pan_atom` in `py_atoms.cpp` (two lines, both atoms already exist in `atoms.hpp` and are handled by the viewport actor).  `viewport_scale_atom` already takes/returns a plain `float`; `viewport_pan_atom` would need a `(float, float)` overload or an `Imath::V2f` binding.
 

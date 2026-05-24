@@ -871,6 +871,38 @@ class SyncManager:
             ann_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
             self.insert_child(annotation_track_guid, ann_clip)
 
+    def broadcast_partial_annotation(
+        self,
+        clip_guid: str,
+        frame: float,
+        fps: float,
+        events: list,
+    ) -> None:
+        """Broadcast a mid-stroke partial annotation to peers (visual only, no timeline persistence).
+
+        Called periodically while the user is drawing a stroke, before pen-up.
+        Peers render the stroke visually but do **not** write it to the OTIO
+        timeline — that happens on pen-up via :meth:`broadcast_add_annotation`.
+
+        :param clip_guid: Sync GUID of the media clip being annotated.
+        :param frame: 0-indexed clip-local frame number.
+        :param fps: Frame rate used to interpret *frame*.
+        :param events: Serialised SyncEvent dicts (``PaintStart.1``, ``PaintPoints.1``).
+        """
+        if not self.network or self.status != STATE_SYNCED:
+            return
+        self.network.send_payload({
+            "command": "PARTIAL_ANNOTATION",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "clip_guid": clip_guid,
+                "frame": frame,
+                "fps": fps,
+                "events": [_otio_to_dict(e) if not isinstance(e, dict) else e for e in events],
+            },
+        })
+
     def broadcast_replace_annotation_commands(
         self,
         annotation_clip_guid: str,
@@ -1110,6 +1142,9 @@ class SyncManager:
 
             if command == "SELECTION" and event == "SET":
                 return ("selection_changed", data)
+
+            if command == "PARTIAL_ANNOTATION":
+                return ("partial_annotation", data)
 
             if command != "OTIO_SESSION":
                 return None
