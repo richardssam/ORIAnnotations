@@ -37,11 +37,11 @@ OpenRV (master)
   └─ plugin.py
        └─ SyncManager ──► RabbitMQ fanout exchange
                                    │
-              ┌────────────────────┤
-              │                    │
-    sync_viewer/server.py     other RV instances
-      └─ SyncManager               └─ SyncManager
-         (passive observer)
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+    sync_viewer/server.py     other RV instances    xStudio
+      └─ SyncManager               └─ SyncManager   └─ ori_sync_plugin.py
+         (passive observer)                               └─ SyncManager
 ```
 
 - **Master election**: on join, peers broadcast `WHO_IS_MASTER`. The first to respond becomes master. If no response within ~2 s, the caller elects itself. Only one master per session.
@@ -109,6 +109,85 @@ media_fps = rv.commands.getFloatProperty(f"{file_source_node}.media.fps")[0]
 if media_fps and media_fps > 0:
     fps = media_fps
 ```
+
+### Display state sync — RV
+
+The plugin broadcasts and applies `DISPLAY_SETTINGS` messages containing `pan`, `zoom`, `exposure`, and `channel`.  Several non-obvious constraints apply.
+
+#### The two `RVDisplayColor` nodes
+
+`rv.commands.nodesOfType("RVDisplayColor")` returns **two** nodes:
+
+| Node name prefix | Pipeline | Affected by r/g/b/a keys? |
+| --- | --- | --- |
+| `defaultOutputGroup_colorPipeline_0` | Output / export | **No** |
+| `displayGroup0_colorPipeline_0` | Active viewer display | **Yes** |
+
+Always prefer the `displayGroup*` node for channel isolation:
+
+```python
+def _rv_display_color_node(self):
+    for n in rv.commands.nodesOfType("RVDisplayColor"):
+        if n.startswith("displayGroup"):
+            return n
+    return rv.commands.nodesOfType("RVDisplayColor")[0]
+```
+
+#### Channel isolation — `channelFlood`, not `channelOrder`
+
+The r/g/b/a key bindings change `color.channelFlood` (int), **not** `color.channelOrder` (string, used for channel reordering permutations like GBRA):
+
+```python
+_RV_FLOOD_TO_CH = {0: "RGBA", 1: "R", 2: "G", 3: "B", 4: "A"}
+_RV_CH_TO_FLOOD = {"RGBA": 0, "R": 1, "G": 2, "B": 3, "A": 4}
+```
+
+#### Pan and zoom — `rv.extra_commands`, not node properties
+
+Pan and zoom are viewer-level transforms, not properties on any DAG node.  Use:
+
+```python
+import rv.extra_commands
+zoom = rv.extra_commands.scale()           # float, 1.0 = fit-to-window
+rv.extra_commands.setScale(float(zoom))
+pan  = rv.extra_commands.translation()    # plain tuple (x, y)
+rv.extra_commands.setTranslation((x, y))  # plain tuple — rv.rvtypes.Point does NOT exist
+```
+
+`RVDisplayGroup` has no transform component; attempting to set transform2D properties on it raises `invalid property name`.
+
+#### Exposure — per-source `RVColor` node, 3-element array
+
+The `e` key changes `RVColor.color.exposure`, a **3-element** `[r, g, b]` float array on the **current source's** node.  To find it:
+
+```python
+sources = rv.commands.sourcesAtFrame(rv.commands.frame())
+src = sources[0]
+node = src[:-len("_source")] + "_colorPipeline_0"  # e.g. sourceGroup000002_colorPipeline_0
+exp = rv.commands.getFloatProperty(f"{node}.color.exposure")[0]
+```
+
+When broadcasting an exposure change, normalise **all** `RVColor` nodes to the same value so that navigating between clips doesn't trigger spurious re-broadcasts:
+
+```python
+for node in rv.commands.nodesOfType("RVColor"):
+    rv.commands.setFloatProperty(f"{node}.color.exposure", [ev, ev, ev], True)
+```
+
+#### `None` pan/zoom in the protocol
+
+A peer that cannot read its own pan/zoom (e.g. xStudio — see below) sends `"pan": null, "zoom": null` in the `DISPLAY_SETTINGS` payload.  **Skip** applying null fields rather than treating them as zero/one:
+
+```python
+pan = data.get("pan")   # None → don't touch local pan
+zoom = data.get("zoom") # None → don't touch local zoom
+if pan is not None:
+    rv.extra_commands.setTranslation((float(pan[0]), float(pan[1])))
+if zoom is not None:
+    rv.extra_commands.setScale(float(zoom))
+```
+
+After applying a received display state, read the current RV state back into `_last_display_state` so the null fields don't look like a change on the next broadcast poll.
 
 ### Annotation persistence must happen on all peers
 
@@ -285,6 +364,73 @@ Do **not** add locally-drawn bookmark UUIDs to `_our_bookmark_uuids` — that se
 is only for *remote-sourced* bookmarks.  Local ones must remain scannable so
 subsequent strokes on the same frame are picked up.
 
+### Display state sync — xStudio
+
+#### Reading zoom and pan via `serialise_atom`
+
+xStudio's viewport exposes its internal `state_.scale_` and `state_.translate_` through `serialise_atom` (exported to Python in `py_atoms.cpp`):
+
+```python
+from xstudio.core import serialise_atom
+import json
+
+js = connection.request_receive(vp.remote, serialise_atom())[0]
+vp_state = json.loads(js.dump())["base"]
+raw_scale = float(vp_state["scale"])
+translate = vp_state["translate"]   # Imath::V3f serialises as a JSON array [x, y, z]
+pan = [float(translate[0]), float(translate[1])]
+```
+
+`Imath::V3f` serialises as a **JSON array** `[x, y, z]`, **not** a dict `{"x":…, "y":…, "z":…}`.
+
+#### xStudio zoom convention vs. RV
+
+xStudio's `state_.scale_` is NOT a direct zoom multiplier.  It is proportional to `image_pixels / viewport_pixels`, so:
+
+- **Larger `state_.scale_`** → more zoomed in (the projection matrix uses `1/scale`, so a larger divisor magnifies the image)
+- At fit-to-window: `state_.scale_` ≈ `image_width / viewport_width` (can be 5–15 for a large image in a normal window)
+
+To convert to RV's convention (1.0 = fit-to-window, 2.0 = 2× zoom in):
+
+```python
+# On first successful read, record the fit-to-window baseline
+if self._xs_base_scale is None and raw_scale > 0.0:
+    self._xs_base_scale = raw_scale
+
+# Protocol zoom: ratio relative to baseline
+zoom_protocol = raw_scale / self._xs_base_scale  # >1 = zoomed in, <1 = zoomed out
+```
+
+Reset `_xs_base_scale = None` on disconnect so it re-calibrates on reconnect.
+
+#### "Pan" and "Zoom" module attributes are boolean toggles
+
+`vp.get_attribute("Zoom")` and `vp.get_attribute("Pan")` return **boolean mode toggles** (enter/exit zoom-drag or pan-drag mode), defined as `add_boolean_attribute("Zoom", "Zm", false)` in `viewport.cpp`.  They are **not** the current pan/zoom position.  Do not use them to read or set viewport position.
+
+#### Writing zoom/pan — `deserialise_atom` crashes xStudio
+
+`deserialise_atom` feeds the full viewport JSON back through `Viewport::deserialise`, which then reconstructs `ColourTriplet` and other complex C++ types from the JSON.  The round-trip through Python's `json.loads` does not preserve the type information those deserializers expect, causing a **signal 11 crash** inside `adl_serializer<ColourTriplet>::from_json`.
+
+**Do not use `deserialise_atom` to write pan/zoom from Python.**
+
+#### One-way zoom sync and the missing atoms
+
+As a result: xStudio → RV zoom sync works (read via `serialise_atom`, broadcast), but **RV → xStudio zoom sync is not possible** with the current Python API.
+
+The proper fix is to expose `viewport_scale_atom` and `viewport_pan_atom` in `py_atoms.cpp` (two lines, both atoms already exist in `atoms.hpp` and are handled by the viewport actor).  `viewport_scale_atom` already takes/returns a plain `float`; `viewport_pan_atom` would need a `(float, float)` overload or an `Imath::V2f` binding.
+
+#### Lazy playhead initialisation
+
+`current_playhead()` raises `RuntimeError: invalid_argument` if xStudio has no media loaded when the plugin connects.  The poll loop retries lazily:
+
+```python
+if not self.active_playhead:
+    try:
+        self.active_playhead = self.current_playhead()
+    except Exception:
+        return
+```
+
 ### Receiving annotations from remote peers
 
 Remote annotations arrive as `insert_child` events (action returned by
@@ -294,6 +440,80 @@ dicts and calls `bm.set_annotation(strokes=…)` on the relevant bookmark.
 `_annotation_bookmarks: dict[(clip_guid, frame), Bookmark]` caches the
 bookmark so that subsequent `annotation_commands_added` events can update it
 in place rather than creating a duplicate.
+
+---
+
+## Diagnosing live viewer state from an external script
+
+### OpenRV — rvpush
+
+`rvpush` connects to a running OpenRV session over its network port.  Use
+`py-eval-return` to get values back and `py-exec` to execute statements.
+
+```bash
+RVPUSH=/Applications/openRV.app/Contents/MacOS/rvpush
+
+# Current zoom and pan
+$RVPUSH py-eval-return "rv.extra_commands.scale()"
+$RVPUSH py-eval-return "rv.extra_commands.translation()"
+
+# All RVDisplayColor nodes and their channelFlood value
+$RVPUSH py-eval-return "[(n, rv.commands.getIntProperty(n+'.color.channelFlood')) for n in rv.commands.nodesOfType('RVDisplayColor')]"
+
+# Exposure on the current source
+$RVPUSH py-eval-return "[(n, rv.commands.getFloatProperty(n+'.color.exposure')) for n in rv.commands.nodesOfType('RVColor')]"
+
+# Fire a key event (e.g. simulate pressing 'r' to switch to red channel)
+$RVPUSH py-exec "rv.commands.sendInternalEvent('key-down--r', '')"
+
+# Set zoom and pan programmatically
+$RVPUSH py-exec "import rv.extra_commands; rv.extra_commands.setScale(2.0)"
+$RVPUSH py-exec "import rv.extra_commands; rv.extra_commands.setTranslation((0.1, 0.0))"
+```
+
+Note: use `py-eval-return` (not `py-eval`) for expressions that return values.
+
+### xStudio — external Python connection
+
+xStudio exposes the same Python API to external scripts as to in-process
+plugins.  `Connection(auto_connect=True)` discovers the running xStudio
+instance via a local socket file — no host/port needed.
+
+```python
+import json
+from xstudio.connection import Connection
+from xstudio.api.intrinsic.viewport import Viewport
+from xstudio.core import serialise_atom
+
+XSTUDIO = Connection(auto_connect=True)
+
+# Read current viewport zoom and pan via serialise_atom
+vp = Viewport(XSTUDIO, active_viewport=True)
+js = XSTUDIO.request_receive(vp.remote, serialise_atom())[0]
+state = json.loads(js.dump())["base"]
+print("scale  :", state["scale"])
+print("translate:", state["translate"])   # [x, y, z]
+
+# Read exposure and channel via colour pipeline
+cp = vp.colour_pipeline
+print("exposure:", cp.exposure.value())
+print("channel :", cp.channel.value())
+
+XSTUDIO.disconnect()
+```
+
+Run with xStudio's bundled Python so the `xstudio` package is on the path:
+
+```bash
+/Users/sam/git/xstudio/build/xSTUDIO.app/Contents/Frameworks/bin/python3 diag.py
+```
+
+Or add the package to your own Python's path:
+
+```bash
+export PYTHONPATH=/Users/sam/git/xstudio/build/xSTUDIO.app/Contents/Frameworks/lib/python3.12/site-packages:$PYTHONPATH
+python3 diag.py
+```
 
 ---
 

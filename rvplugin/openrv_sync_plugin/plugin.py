@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections import Counter
+import collections.abc
 
 
 def _make_otio_logger():
@@ -833,14 +834,40 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame)
         for ev in events_data:
             try:
-                if isinstance(ev, dict):
-                    ev = otio.adapters.read_from_string(json.dumps(ev), "otio_json")
+                if isinstance(ev, (dict, collections.abc.Mapping)):
+                    ev = otio.adapters.read_from_string(otio.adapters.write_to_string(ev, "otio_json"), "otio_json")
                 if isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
                     uuid_val = ev.uuid or ""
                     # Snapshot replay sends the full clip as insert_child; if the
                     # node was already painted by _rebuild_rv_session, skip it.
                     if _paint_node_cache and self._text_uuid_exists_in_rv(_paint_node_cache, rv_frame, uuid_val):
-                        _log(f"RECV annotation: skip dup text uuid={uuid_val[:8]!r} (already in RV)")
+                        text_val = ev.text or ""
+                        position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
+                        color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
+                        rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+                        order_prop = f"{_paint_node_cache}.frame:{rv_frame}.order"
+                        updated = False
+                        if rv.commands.propertyExists(order_prop):
+                            for item in rv.commands.getStringProperty(order_prop):
+                                if not item.startswith("text:"):
+                                    continue
+                                uuid_prop = f"{_paint_node_cache}.{item}.uuid"
+                                if not rv.commands.propertyExists(uuid_prop):
+                                    continue
+                                existing_uuid = rv.commands.getStringProperty(uuid_prop)
+                                if existing_uuid and existing_uuid[0] == uuid_val:
+                                    rv.commands.setStringProperty(f"{_paint_node_cache}.{item}.text", [text_val], True)
+                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.position", position, True)
+                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.color", color, True)
+                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.size", [rv_size], True)
+                                    _log(f"RECV annotation: updated dup text uuid={uuid_val[:8]!r} in place (text={text_val!r})")
+                                    updated = True
+                                    break
+                        if updated:
+                            QtCore.QTimer.singleShot(0, rv.commands.redraw)
+                            rendered += 1
+                        else:
+                            _log(f"RECV annotation: skip dup text uuid={uuid_val[:8]!r} (already in RV, but could not update)")
                         continue
                     rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
                     _log(f"RECV TextAnnotation font_size={getattr(ev, 'font_size', None)!r} → rv_size={rv_size!r}")
@@ -932,8 +959,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         for ev in events_data:
             try:
-                if isinstance(ev, dict):
-                    ev = otio.adapters.read_from_string(json.dumps(ev), "otio_json")
+                if isinstance(ev, (dict, collections.abc.Mapping)):
+                    ev = otio.adapters.read_from_string(otio.adapters.write_to_string(ev, "otio_json"), "otio_json")
             except Exception as e:
                 _log(f"RECV annotation replace: failed to deserialise event: {e}")
                 continue
@@ -1086,6 +1113,18 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         # Pass 4: replay annotations.
         for timeline in timelines:
+            tl_guid = timeline.metadata.get("sync", {}).get("guid")
+            if tl_guid:
+                for seq_node, node_tl_guid in self._rv_node_to_timeline_guid.items():
+                    if node_tl_guid == tl_guid:
+                        try:
+                            if rv.commands.viewNode() != seq_node:
+                                _log(f"Rebuild view change to '{seq_node}' to replay annotations for timeline '{timeline.name}'")
+                                rv.commands.setViewNode(seq_node)
+                        except Exception as e:
+                            _log(f"Failed to set view to '{seq_node}' for replaying annotations: {e}")
+                        break
+
             for item in timeline.tracks:
                 if item.name and item.name.startswith("Annotations"):
                     for child in item:
@@ -1113,9 +1152,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
                             event_groups = {}
                             for event in child.metadata["annotation_commands"]:
-                                if isinstance(event, dict):
+                                if isinstance(event, (dict, collections.abc.Mapping)):
                                     try:
-                                        event = otio.adapters.read_from_string(json.dumps(event), "otio_json")
+                                        event = otio.adapters.read_from_string(otio.adapters.write_to_string(event, "otio_json"), "otio_json")
                                     except Exception:
                                         pass
                                 if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
@@ -1618,8 +1657,24 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         source-level node is invisible in sequence view, so strokes written there
         never appear when the user is watching a sequence.
         """
-        eval_infos = rv.commands.metaEvaluateClosestByType(frame, "RVPaint")
-        _log(f"  _find_paint_node: metaEval frame={frame} → {[e.get('node') for e in eval_infos] if eval_infos else None}")
+        # frame is source-local (1-indexed).
+        # We need to map it to a sequence frame (1-indexed) if a sequence view is active.
+        seq_frame = frame
+        if self.sync_manager:
+            clip_guid = self._clip_guid_for_media_path(media_path)
+            if clip_guid:
+                clip = self.sync_manager._object_map.get(clip_guid)
+                if clip and clip.parent():
+                    try:
+                        range_in_parent = clip.trimmed_range_in_parent()
+                        if range_in_parent:
+                            start_val = range_in_parent.start_time.value
+                            seq_frame = int(start_val + (frame - 1)) + 1
+                    except Exception as e:
+                        _log(f"  _find_paint_node: could not get sequence frame: {e}")
+
+        eval_infos = rv.commands.metaEvaluateClosestByType(seq_frame, "RVPaint")
+        _log(f"  _find_paint_node: metaEval local_frame={frame} seq_frame={seq_frame} → {[e.get('node') for e in eval_infos] if eval_infos else None}")
         if eval_infos:
             return eval_infos[0]['node']
         # Fallback for source-view contexts (no sequence in the graph).
