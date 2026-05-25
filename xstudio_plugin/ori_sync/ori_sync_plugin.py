@@ -252,6 +252,12 @@ class ORISyncPlugin(PluginBase):
         # Also set to the received clip_guid on _apply_selection to prevent echoing
         # a received selection back to the sender.
         self._last_broadcast_clip_guid: str | None = None
+        # After a remote "selection clear" the playhead is still positioned on
+        # the previously-selected clip.  _poll_and_broadcast_selection would
+        # immediately re-broadcast that clip via playhead_selection, toggling RV
+        # back to clip view.  We suppress re-broadcasting this specific guid
+        # until the playhead moves to a DIFFERENT clip.
+        self._suppress_rebroadcast_clip_guid: str | None = None
         # Suppress frame/selection broadcasts until this monotonic timestamp.
         # Set to now+5 at connect time; also set to now+1 in _apply_selection to
         # let the viewport settle before resuming position broadcasts.
@@ -310,6 +316,13 @@ class ORISyncPlugin(PluginBase):
             lambda s: self.status_attr.set_value(s)
         )
 
+        # Wait for the consumer queue to be bound before broadcasting
+        # WHO_IS_MASTER.  Without this, the I_AM_MASTER response from an
+        # existing master can arrive before the queue exists and be lost,
+        # causing xStudio to self-elect and end up with two masters.
+        if not network.wait_until_ready(timeout=5.0):
+            _log("Warning: RabbitMQ consumer did not become ready within 5 s")
+
         self.manager.start_session()
 
         # Grab the current playhead so the poll loop can start reading position.
@@ -358,6 +371,7 @@ class ORISyncPlugin(PluginBase):
         self._last_display_state = {}
         self._xs_base_scale = None
         self._last_broadcast_clip_guid = None
+        self._suppress_rebroadcast_clip_guid = None
         self._selection_suppress_until = 0.0
         self._playhead_lock_until = 0.0
         self.status_attr.set_value("Disconnected")
@@ -787,6 +801,8 @@ class ORISyncPlugin(PluginBase):
                 if len(selected_items) == 1 and isinstance(selected_items[0], Clip):
                     media = selected_items[0].media
                 else:
+                    # Fall back to playhead_selection: returns the clip at the
+                    # current timecode (always exactly 1 in Timeline mode).
                     try:
                         sel = container.playhead_selection
                         selected_sources = sel.selected_sources
@@ -833,7 +849,15 @@ class ORISyncPlugin(PluginBase):
             
             # Handle broadcast if selection changed
             if clip_guid:
-                if clip_guid != self._last_broadcast_clip_guid:
+                if clip_guid == self._suppress_rebroadcast_clip_guid:
+                    # This is the clip that was active when we received a remote
+                    # "selection clear".  The playhead is still on it, so the
+                    # poll keeps seeing it — but broadcasting it would toggle RV
+                    # back to clip view.  Skip until the user moves to a different clip.
+                    pass
+                elif clip_guid != self._last_broadcast_clip_guid:
+                    # User moved to a new clip; clear the post-clear suppression.
+                    self._suppress_rebroadcast_clip_guid = None
                     _log(f"Poll selection: broadcasting selection clip_guid={clip_guid[:8]}")
                     self._last_broadcast_clip_guid = clip_guid
                     clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
@@ -1057,7 +1081,13 @@ class ORISyncPlugin(PluginBase):
         if not clip_guid:
             # Clear: return to timeline sequence view and select all media.
             _log("RECV selection clear → returning to sequence view")
+            # Remember which clip was active so the poll won't re-broadcast it
+            # while the playhead is still positioned there (which would toggle RV
+            # back to clip view).  Cleared when the playhead moves to a different clip.
+            self._suppress_rebroadcast_clip_guid = self._last_broadcast_clip_guid
             self._last_broadcast_clip_guid = None
+            # Also suppress the poll for 1 s to let the viewport switch settle.
+            self._selection_suppress_until = time.monotonic() + 1.0
             if self.manager:
                 seq_tl_guid = self.manager.sequence_timeline_guid
                 if seq_tl_guid:
@@ -1065,11 +1095,31 @@ class ORISyncPlugin(PluginBase):
                     if seq_tl_guid in self._sync_playlists:
                         pl, tl = self._sync_playlists[seq_tl_guid]
                         try:
-                            self.connection.api.session.viewed_container = tl
+                            # set_on_screen_source uses active_media_container_atom
+                            # (actor reference), which is the same path used at
+                            # initial load.  viewed_container= only sends a UUID via
+                            # viewport_active_media_container_atom and doesn't update
+                            # the video playback path, leaving the old single-clip
+                            # playhead in control.
+                            self.connection.api.session.set_on_screen_source(tl)
                             pl.playhead_selection.select_all()
-                            _log("RECV selection clear: switched viewed_container to timeline and selected all media")
+                            _log("RECV selection clear: set_on_screen_source to timeline and selected all media")
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container/select all")
+                        # Refresh active_playhead so subsequent position writes go to
+                        # the timeline's playhead, not the stale single-clip one.
+                        _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        try:
+                            fut = _ex.submit(self.current_playhead)
+                            new_ph = fut.result(timeout=3.0)
+                            self.active_playhead = new_ph
+                            _log("RECV selection clear: refreshed active_playhead")
+                        except concurrent.futures.TimeoutError:
+                            _log("RECV selection clear: current_playhead() timed out")
+                        except Exception:
+                            _log_exc("RECV selection clear: could not refresh active_playhead")
+                        finally:
+                            _ex.shutdown(wait=False)
             return
 
         # Skip if we already broadcast this same clip — this is an echo from RV
@@ -1093,6 +1143,8 @@ class ORISyncPlugin(PluginBase):
         # Mark the received clip as "already handled" so the selection poll does
         # not echo it back to the sender.
         self._last_broadcast_clip_guid = clip_guid
+        # A new inbound selection overrides any post-clear suppression.
+        self._suppress_rebroadcast_clip_guid = None
         # Suppress selection-broadcast poll for 1 s to let the viewport settle.
         self._selection_suppress_until = time.monotonic() + 1.0
 

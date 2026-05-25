@@ -134,7 +134,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         network = RabbitMQNetwork(host='localhost', session_id=SYNC_SESSION_ID, self_guid=self.sync_manager.self_guid)
         self.sync_manager.network = network
 
-        # Start Discovery Handshake
+        # Wait for the consumer queue to be bound before broadcasting
+        # WHO_IS_MASTER so the I_AM_MASTER response is not lost.
+        if not network.wait_until_ready(timeout=5.0):
+            _log("Warning: RabbitMQ consumer did not become ready within 5 s")
         _log(f"Starting Master Discovery (ID: {self.sync_manager.self_guid})...")
         self.sync_manager.start_session()
         self._discovery_start_time = time.time()
