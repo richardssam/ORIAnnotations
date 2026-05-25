@@ -18,6 +18,7 @@ import opentimelineio as otio
 
 from .network import SyncNetworkProtocol
 from .proxy import OTIOSyncProxy
+from .patcher import OTIOPatcher, _otio_to_dict, _dict_to_otio
 
 _logger = _logging.getLogger("otio_sync")
 
@@ -25,14 +26,6 @@ _logger = _logging.getLogger("otio_sync")
 def _log(msg: str) -> None:
     if _logger.handlers:
         _logger.debug(msg)
-
-
-def _otio_to_dict(obj: otio.core.SerializableObject) -> dict[str, Any]:
-    return json.loads(otio.adapters.write_to_string(obj, "otio_json", indent=-1))
-
-
-def _dict_to_otio(d: dict[str, Any]) -> otio.core.SerializableObject:
-    return otio.adapters.read_from_string(json.dumps(d), "otio_json")
 
 
 def sync_event_schema(cmd: Any) -> str:
@@ -107,19 +100,33 @@ class SyncManager:
         self.self_guid: str = self_guid or str(uuid.uuid4())
         self.network: SyncNetworkProtocol | None = network
 
-        self._object_map: dict[str, otio.core.SerializableObject] = {}
+        self.patcher = OTIOPatcher()
         self._timelines: dict[str, otio.schema.Timeline] = {}
         #: Maps seq_clip_guid → clip_timeline_guid for all single-clip timelines.
         self._clip_timelines: dict[str, str] = {}
         self.active_timeline_guid: str | None = None
-        self._is_syncing: bool = False
 
-        self._property_callbacks: list[Callable[[str, str, Any], None]] = []
-        self._hierarchy_callbacks: list[Callable[[str, str, str], None]] = []
         self._status_callbacks: list[Callable[[str], None]] = []
         self._playback_callbacks: list[Callable[[dict[str, Any]], None]] = []
         self._display_callbacks: list[Callable[[dict[str, Any]], None]] = []
         self._synced_callbacks: list[Callable[[], None]] = []
+
+        # Register internal callback to broadcast property changes
+        @self.patcher.on_property_changed
+        def _on_local_property_changed(target_uuid: str, path: str, value: Any) -> None:
+            if not self._is_syncing and self.network:
+                self.network.send_payload({
+                    "command": "OTIO_SESSION",
+                    "event": "SET_PROPERTY",
+                    "session_id": self.session_id,
+                    "source_guid": self.self_guid,
+                    "payload": {
+                        "target_uuid": target_uuid,
+                        "path": path,
+                        "value": value,
+                        "sync_timestamp": time.time(),
+                    },
+                })
 
         self.status: str = STATE_NONE
         self.is_master: bool = False
@@ -137,6 +144,30 @@ class SyncManager:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+
+    @property
+    def _object_map(self) -> dict[str, otio.core.SerializableObject]:
+        return self.patcher.object_map
+
+    @_object_map.setter
+    def _object_map(self, val: dict[str, otio.core.SerializableObject]) -> None:
+        self.patcher.object_map = val
+
+    @property
+    def _is_syncing(self) -> bool:
+        return self.patcher._is_syncing
+
+    @_is_syncing.setter
+    def _is_syncing(self, val: bool) -> None:
+        self.patcher._is_syncing = val
+
+    @property
+    def _property_callbacks(self) -> list[Callable[[str, str, Any], None]]:
+        return self.patcher._property_callbacks
+
+    @property
+    def _hierarchy_callbacks(self) -> list[Callable[[str, str, str], None]]:
+        return self.patcher._hierarchy_callbacks
 
     @property
     def is_syncing(self) -> bool:
@@ -217,7 +248,7 @@ class SyncManager:
         self._traverse_and_map(timeline)
         if self.active_timeline_guid is None:
             self.active_timeline_guid = guid
-        return OTIOSyncProxy(timeline, self)
+        return OTIOSyncProxy(timeline, self.patcher)
 
     def get_or_create_clip_timeline(self, clip_guid: str) -> "str | None":
         """Return the GUID of the single-clip timeline for *clip_guid*, creating it lazily.
@@ -335,69 +366,13 @@ class SyncManager:
         return str(uuid.uuid5(uuid.NAMESPACE_OID, key))
 
     def _traverse_and_map(self, item: otio.core.SerializableObject) -> None:
-        """Recursively assign GUIDs to all OTIO objects under *item* and index them.
-
-        :param item: Root OTIO object to traverse.
-        """
-        def _walk(node: otio.core.SerializableObject):
-            yield node
-            if hasattr(node, "tracks"):
-                stack = node.tracks
-                yield stack
-                for child in stack:
-                    yield from _walk(child)
-            elif hasattr(node, "__iter__") and not isinstance(node, str):
-                for child in node:
-                    yield from _walk(child)
-
-        for obj in _walk(item):
-            self._ensure_guid_and_map(obj)
+        self.patcher.traverse_and_map(item)
 
     def _traverse_and_map_preserve(self, item: otio.core.SerializableObject) -> None:
-        """Like :meth:`_traverse_and_map` but never overwrites existing ``_object_map`` entries.
-
-        Used when registering clip timelines whose single clip shares a GUID
-        with the corresponding sequence clip.  ``setdefault`` keeps the
-        sequence clip (which has a meaningful ``range_in_parent()``) rather
-        than replacing it with the clip-local copy.
-
-        :param item: Root OTIO object to traverse.
-        """
-        def _walk(node: otio.core.SerializableObject):
-            yield node
-            if hasattr(node, "tracks"):
-                stack = node.tracks
-                yield stack
-                for child in stack:
-                    yield from _walk(child)
-            elif hasattr(node, "__iter__") and not isinstance(node, str):
-                for child in node:
-                    yield from _walk(child)
-
-        for obj in _walk(item):
-            if not isinstance(obj, otio.core.SerializableObject):
-                continue
-            if "sync" not in obj.metadata:
-                obj.metadata["sync"] = {}
-            if "guid" not in obj.metadata["sync"]:
-                obj.metadata["sync"]["guid"] = str(uuid.uuid4())
-            guid = obj.metadata["sync"]["guid"]
-            self._object_map.setdefault(guid, obj)
+        self.patcher.traverse_and_map_preserve(item)
 
     def _ensure_guid_and_map(self, obj: Any) -> None:
-        """Assign a sync GUID to *obj* if absent, then add it to ``_object_map``.
-
-        Non-:class:`~opentimelineio.core.SerializableObject` values are ignored.
-
-        :param obj: Candidate OTIO object.
-        """
-        if not isinstance(obj, otio.core.SerializableObject):
-            return
-        if "sync" not in obj.metadata:
-            obj.metadata["sync"] = {}
-        if "guid" not in obj.metadata["sync"]:
-            obj.metadata["sync"]["guid"] = str(uuid.uuid4())
-        self._object_map[obj.metadata["sync"]["guid"]] = obj
+        self.patcher.ensure_guid_and_map(obj)
 
     # ------------------------------------------------------------------
     # Observer Registry
@@ -414,7 +389,7 @@ class SyncManager:
         :param callback: Callable receiving ``(target_uuid, path, new_value)``.
         :returns: The *callback* unchanged (decorator-compatible).
         """
-        self._property_callbacks.append(callback)
+        self.patcher.on_property_changed(callback)
         return callback
 
     def on_hierarchy_changed(
@@ -429,7 +404,7 @@ class SyncManager:
             where *action* is one of ``"insert_child"`` or ``"remove_child"``.
         :returns: The *callback* unchanged (decorator-compatible).
         """
-        self._hierarchy_callbacks.append(callback)
+        self.patcher.on_hierarchy_changed(callback)
         return callback
 
     def on_status_changed(
@@ -613,48 +588,16 @@ class SyncManager:
     # ------------------------------------------------------------------
 
     def set_property(self, target_uuid: str, path: str, value: Any) -> None:
-        """Apply a property change locally and broadcast it to peers.
+        """Set property *path* to *value* on object *target_uuid* and broadcast.
 
-        *path* may be a plain attribute name (e.g. ``"name"``) or a
-        ``metadata/``-prefixed slash-separated key path (e.g.
-        ``"metadata/custom/key"``).
+        Property paths are either plain attributes (e.g. ``"name"``) or metadata
+        sub-paths starting with ``"metadata/"`` (e.g. ``"metadata/annotations"``).
 
-        :param target_uuid: GUID of the target OTIO object.
-        :param path: Attribute or metadata key path.
-        :param value: New value to set.
+        :param target_uuid: GUID of the target object.
+        :param path: Target property or metadata sub-key path.
+        :param value: New value; must be a primitive type.
         """
-        if target_uuid not in self._object_map:
-            _log(f"set_property FAILED: object {target_uuid} not found")
-            return
-
-        obj = self._object_map[target_uuid]
-
-        if path.startswith("metadata/"):
-            parts = path.split("/")
-            curr = obj.metadata
-            for part in parts[1:-1]:
-                if part not in curr:
-                    curr[part] = {}
-                curr = curr[part]
-            curr[parts[-1]] = value
-        else:
-            setattr(obj, path, value)
-
-        self._fire_property_changed(target_uuid, path, value)
-
-        if not self._is_syncing and self.network:
-            self.network.send_payload({
-                "command": "OTIO_SESSION",
-                "event": "SET_PROPERTY",
-                "session_id": self.session_id,
-                "source_guid": self.self_guid,
-                "payload": {
-                    "target_uuid": target_uuid,
-                    "path": path,
-                    "value": value,
-                    "sync_timestamp": time.time(),
-                },
-            })
+        self.patcher.set_property(target_uuid, path, value)
 
     def insert_child(
         self,
@@ -671,25 +614,9 @@ class SyncManager:
         :param child_obj: OTIO object to insert.
         :param index: Position at which to insert; ``-1`` appends.
         """
-        if parent_uuid not in self._object_map:
-            _log(
-                f"insert_child FAILED: parent {parent_uuid} not in object_map "
-                f"(known={list(self._object_map.keys())[:5]})"
-            )
-            return
+        payload = self.patcher.insert_child(parent_uuid, child_obj, index)
 
-        parent = self._object_map[parent_uuid]
-        self._ensure_guid_and_map(child_obj)
-
-        if index == -1:
-            parent.append(child_obj)
-        else:
-            parent.insert(index, child_obj)
-
-        child_uuid = child_obj.metadata["sync"]["guid"]
-        self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
-
-        if not self._is_syncing and self.network:
+        if not self._is_syncing and self.network and payload:
             _log(
                 f"insert_child broadcasting: parent={parent_uuid} index={index} "
                 f"child={getattr(child_obj, 'name', '?')}"
@@ -699,12 +626,7 @@ class SyncManager:
                 "event": "INSERT_CHILD",
                 "session_id": self.session_id,
                 "source_guid": self.self_guid,
-                "payload": {
-                    "parent_uuid": parent_uuid,
-                    "index": index,
-                    "child_data": _otio_to_dict(child_obj),
-                    "sync_timestamp": time.time(),
-                },
+                "payload": payload,
             })
 
     def broadcast_playback_state(
@@ -1166,43 +1088,15 @@ class SyncManager:
             _log(f"broadcast_move_child: skipped (status={self.status})")
             return
 
-        parent = self._object_map.get(parent_uuid)
-        child = self._object_map.get(child_uuid)
-        if parent is None:
-            _log(f"broadcast_move_child: skipped (parent {parent_uuid} not in object_map)")
-            return
-        if child is None:
-            _log(
-                f"broadcast_move_child: skipped (child {child_uuid} not in object_map, "
-                f"known={list(self._object_map.keys())[:5]})"
-            )
-            return
-
-        current_index = next(
-            (i for i, item in enumerate(parent)
-             if item.metadata.get("sync", {}).get("guid") == child_uuid),
-            None,
-        )
-        if current_index is None:
-            return
-        if current_index == to_index:
-            return
-
-        del parent[current_index]
-        parent.insert(to_index, child)
-
-        self.network.send_payload({
-            "command": "OTIO_SESSION",
-            "event": "MOVE_CHILD",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
-                "parent_uuid": parent_uuid,
-                "child_uuid": child_uuid,
-                "to_index": to_index,
-                "sync_timestamp": time.time(),
-            },
-        })
+        payload = self.patcher.move_child(parent_uuid, child_uuid, to_index)
+        if payload:
+            self.network.send_payload({
+                "command": "OTIO_SESSION",
+                "event": "MOVE_CHILD",
+                "session_id": self.session_id,
+                "source_guid": self.self_guid,
+                "payload": payload,
+            })
 
     def broadcast_remove_child(self, parent_uuid: str, child_uuid: str) -> None:
         """Remove *child_uuid* from its parent and broadcast the change.
@@ -1215,39 +1109,16 @@ class SyncManager:
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return
 
-        parent = self._object_map.get(parent_uuid)
-        child = self._object_map.get(child_uuid)
-        if parent is None:
-            _log(f"broadcast_remove_child: skipped (parent {parent_uuid} not in object_map)")
-            return
-        if child is None:
-            _log(f"broadcast_remove_child: skipped (child {child_uuid} not in object_map)")
-            return
-
-        current_index = next(
-            (i for i, item in enumerate(parent)
-             if item.metadata.get("sync", {}).get("guid") == child_uuid),
-            None,
-        )
-        if current_index is None:
-            _log(f"broadcast_remove_child: child {child_uuid} not found in parent track")
-            return
-
-        del parent[current_index]
-        del self._object_map[child_uuid]
-
-        _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
-        self.network.send_payload({
-            "command": "OTIO_SESSION",
-            "event": "REMOVE_CHILD",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
-                "parent_uuid": parent_uuid,
-                "child_uuid": child_uuid,
-                "sync_timestamp": time.time(),
-            },
-        })
+        payload = self.patcher.remove_child(parent_uuid, child_uuid)
+        if payload:
+            _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
+            self.network.send_payload({
+                "command": "OTIO_SESSION",
+                "event": "REMOVE_CHILD",
+                "session_id": self.session_id,
+                "source_guid": self.self_guid,
+                "payload": payload,
+            })
 
     # ------------------------------------------------------------------
     # Message Handling
@@ -1346,95 +1217,7 @@ class SyncManager:
             if command != "OTIO_SESSION":
                 return None
 
-            if event == "SET_PROPERTY":
-                target_uuid = data.get("target_uuid")
-                if target_uuid in self._object_map:
-                    obj = self._object_map[target_uuid]
-                    path: str = data.get("path")
-                    value: Any = data.get("value")
-                    if path.startswith("metadata/"):
-                        parts = path.split("/")
-                        curr = obj.metadata
-                        for part in parts[1:-1]:
-                            if part not in curr:
-                                curr[part] = {}
-                            curr = curr[part]
-                        curr[parts[-1]] = value
-                    else:
-                        setattr(obj, path, value)
-                    self._fire_property_changed(target_uuid, path, value)
-                    return ("set_property", obj)
-
-            elif event == "MOVE_CHILD":
-                parent_uuid: str = data.get("parent_uuid")
-                child_uuid: str = data.get("child_uuid")
-                to_index: int = data.get("to_index", 0)
-                parent = self._object_map.get(parent_uuid)
-                child = self._object_map.get(child_uuid)
-                if parent is not None and child is not None:
-                    current_index = next(
-                        (i for i, item in enumerate(parent)
-                         if item.metadata.get("sync", {}).get("guid") == child_uuid),
-                        None,
-                    )
-                    if current_index is not None:
-                        del parent[current_index]
-                        parent.insert(to_index, child)
-                        return ("move_child", data)
-
-            elif event == "REMOVE_CHILD":
-                parent_uuid = data.get("parent_uuid")
-                child_uuid = data.get("child_uuid")
-                parent = self._object_map.get(parent_uuid)
-                if parent is not None:
-                    current_index = next(
-                        (i for i, item in enumerate(parent)
-                         if item.metadata.get("sync", {}).get("guid") == child_uuid),
-                        None,
-                    )
-                    if current_index is not None:
-                        del parent[current_index]
-                        self._object_map.pop(child_uuid, None)
-                        return ("remove_child", data)
-
-            elif event == "REPLACE_ANNOTATION_COMMANDS":
-                ann_clip_guid = data.get("annotation_clip_guid")
-                clip = self._object_map.get(ann_clip_guid)
-                if clip is None:
-                    _log(f"REPLACE_ANNOTATION_COMMANDS: clip {ann_clip_guid} not found")
-                    return None
-                commands: list[otio.core.SerializableObject] = []
-                for cmd_dict in data.get("commands", []):
-                    try:
-                        commands.append(
-                            _dict_to_otio(cmd_dict) if isinstance(cmd_dict, dict) else cmd_dict
-                        )
-                    except Exception as exc:
-                        _log(f"REPLACE_ANNOTATION_COMMANDS: failed to deserialise: {exc}")
-                clip.metadata["annotation_commands"] = commands
-                return ("annotation_commands_replaced", clip)
-
-            elif event == "INSERT_CHILD":
-                parent_uuid = data.get("parent_uuid")
-                if parent_uuid in self._object_map:
-                    parent = self._object_map[parent_uuid]
-                    index: int = data.get("index", -1)
-                    child_obj = _dict_to_otio(data.get("child_data"))
-                    merged = self._try_merge_annotation(parent, child_obj)
-                    if merged is not None:
-                        self._ensure_guid_and_map(child_obj)
-                        # Return (merged_clip, delta_clip): merged has all commands
-                        # for full re-render; delta has only the new commands for
-                        # additive renderers (e.g. RV paint).
-                        return ("annotation_commands_added", (merged, child_obj))
-                    if index == -1:
-                        parent.append(child_obj)
-                    else:
-                        parent.insert(index, child_obj)
-                    self._ensure_guid_and_map(child_obj)
-                    child_uuid = child_obj.metadata["sync"]["guid"]
-                    self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
-                    return ("insert_child", child_obj)
+            return self.patcher.apply_patch(event, data)
         finally:
             self._is_syncing = False
 

@@ -1,4 +1,4 @@
-"""Transparent proxy that intercepts attribute writes and forwards them to SyncManager."""
+"""Transparent proxy that intercepts attribute writes and forwards them to OTIOPatcher."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import opentimelineio as otio
 
 if TYPE_CHECKING:
-    from .manager import SyncManager
+    from .patcher import OTIOPatcher
 
 
 class OTIOSyncProxy:
@@ -15,7 +15,7 @@ class OTIOSyncProxy:
 
     Attribute reads are passed through to the wrapped object unchanged.  Attribute
     writes are applied to the wrapped object **and** forwarded to the
-    :class:`~otio_sync_core.manager.SyncManager` as a ``set_property`` broadcast,
+    :class:`~otio_sync_core.patcher.OTIOPatcher` as a ``set_property`` change,
     so that remote peers stay in sync without the caller needing to be aware of the
     sync layer.
 
@@ -23,8 +23,8 @@ class OTIOSyncProxy:
     :class:`OTIOSyncProxy` so that nested attribute writes are also captured.
 
     :param obj: The OTIO object to wrap.
-    :param manager: The :class:`~otio_sync_core.manager.SyncManager` that owns this
-        object.
+    :param patcher: The :class:`~otio_sync_core.patcher.OTIOPatcher` (or compatible)
+        that owns this object.
     :param parent_path: Dot-separated path prefix used when constructing the property
         path for nested objects.
     """
@@ -32,11 +32,11 @@ class OTIOSyncProxy:
     def __init__(
         self,
         obj: otio.core.SerializableObject,
-        manager: SyncManager,
+        patcher: OTIOPatcher,
         parent_path: str = "",
     ) -> None:
         object.__setattr__(self, "_obj", obj)
-        object.__setattr__(self, "_manager", manager)
+        object.__setattr__(self, "_patcher", patcher)
         object.__setattr__(self, "_path", parent_path)
 
     @property
@@ -55,23 +55,26 @@ class OTIOSyncProxy:
         """
         val = getattr(self._obj, name)
         if isinstance(val, otio.core.SerializableObject):
-            return OTIOSyncProxy(val, self._manager, "")
+            return OTIOSyncProxy(val, self._patcher, "")
         return val
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Write *value* to the wrapped object and broadcast the change.
 
-        Private proxy attributes (``_obj``, ``_manager``, ``_path``) are stored
+        Private proxy attributes (``_obj``, ``_patcher``, ``_path``) are stored
         directly on the proxy instance and are never forwarded.
 
         :param name: Attribute name.
         :param value: New value.
         """
-        if name in ("_obj", "_manager", "_path"):
+        if name in ("_obj", "_patcher", "_path"):
             object.__setattr__(self, name, value)
             return
 
         setattr(self._obj, name, value)
+
+        if getattr(self._patcher, "_is_syncing", False):
+            return
 
         guid: str | None = None
         if isinstance(self._obj, otio.core.SerializableObject):
@@ -80,7 +83,7 @@ class OTIOSyncProxy:
 
         if guid:
             path = name if not self._path else f"{self._path}/{name}"
-            self._manager.set_property(guid, path, value)
+            self._patcher.set_property(guid, path, value)
 
     def __repr__(self) -> str:
         return repr(self._obj)
