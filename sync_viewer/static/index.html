@@ -813,6 +813,9 @@ function rtFps(ct) {
 function contentDur(tl) {
   const ends = [];
   for (const track of (tl.tracks || [])) {
+    // Annotation clips are 1-frame long; including them corrupts the outlier
+    // rejection (25th-percentile drops near zero) and makes media look like outliers.
+    if (track.name && track.name.startsWith('Annotations')) continue;
     for (const item of (track.items || [])) {
       const e = (item.start || 0) + (item.duration || 0);
       if (e > 0.001) ends.push(e);

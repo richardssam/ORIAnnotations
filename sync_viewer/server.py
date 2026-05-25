@@ -64,6 +64,10 @@ def _serialize_timeline(tl: otio.schema.Timeline, guid: str) -> dict:
         for item in track:
             dur = item.duration().to_seconds()
             item_guid = item.metadata.get("sync", {}).get("guid", "")
+            if is_ann and type(item).__name__ == "Gap":
+                # Gaps in annotation tracks are structural spacers — skip them.
+                t += dur
+                continue
             start = t
             if is_ann and item.source_range is not None:
                 ann_clip_guid = item.metadata.get("clip_guid", "")

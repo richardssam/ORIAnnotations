@@ -109,6 +109,8 @@ class SyncManager:
 
         self._object_map: dict[str, otio.core.SerializableObject] = {}
         self._timelines: dict[str, otio.schema.Timeline] = {}
+        #: Maps seq_clip_guid → clip_timeline_guid for all single-clip timelines.
+        self._clip_timelines: dict[str, str] = {}
         self.active_timeline_guid: str | None = None
         self._is_syncing: bool = False
 
@@ -170,6 +172,31 @@ class SyncManager:
         """Read-only view of the flat GUID → OTIO object index."""
         return self._object_map
 
+    @property
+    def active_clip_guid(self) -> "str | None":
+        """Sequence clip GUID if the active timeline is a single-clip timeline, else ``None``.
+
+        :rtype: str or None
+        """
+        if not self.active_timeline_guid:
+            return None
+        for clip_guid, tl_guid in self._clip_timelines.items():
+            if tl_guid == self.active_timeline_guid:
+                return clip_guid
+        return None
+
+    @property
+    def sequence_timeline_guid(self) -> "str | None":
+        """GUID of the first registered timeline that is *not* a clip timeline.
+
+        :rtype: str or None
+        """
+        clip_tl_guids = set(self._clip_timelines.values())
+        for guid in self._timelines:
+            if guid not in clip_tl_guids:
+                return guid
+        return None
+
     # ------------------------------------------------------------------
     # Timeline Registration
     # ------------------------------------------------------------------
@@ -192,6 +219,96 @@ class SyncManager:
             self.active_timeline_guid = guid
         return OTIOSyncProxy(timeline, self)
 
+    def get_or_create_clip_timeline(self, clip_guid: str) -> "str | None":
+        """Return the GUID of the single-clip timeline for *clip_guid*, creating it lazily.
+
+        All peers independently derive the **same** GUIDs via :meth:`_derive_guid`,
+        so no coordination message is required before clips can be used across
+        peers.  Callers should broadcast the timeline via
+        :meth:`broadcast_clip_timeline` the first time it is created so that
+        peers without local creation can register the annotation track in their
+        ``_object_map`` (required for receiving annotation ``INSERT_CHILD``
+        patches).
+
+        The clip copy inside the clip timeline shares the same sync GUID as the
+        sequence clip.  :meth:`_traverse_and_map_preserve` ensures the sequence
+        clip remains canonical in ``_object_map`` so that
+        ``range_in_parent()`` returns the sequence-level position.
+
+        :param clip_guid: Sync GUID of the target sequence clip.
+        :returns: GUID of the clip timeline, or ``None`` if *clip_guid* is not
+            a known :class:`~opentimelineio.schema.Clip`.
+        :rtype: str or None
+        """
+        if clip_guid in self._clip_timelines:
+            return self._clip_timelines[clip_guid]
+
+        seq_clip = self._object_map.get(clip_guid)
+        if seq_clip is None or not isinstance(seq_clip, otio.schema.Clip):
+            _log(f"get_or_create_clip_timeline: clip {clip_guid} not in object_map or not a Clip")
+            return None
+
+        clip_tl_guid = self._derive_guid(f"clip_timeline:{clip_guid}")
+        video_track_guid = self._derive_guid(f"clip_timeline_video_track:{clip_guid}")
+        ann_track_guid = self._derive_guid(f"clip_timeline_ann_track:{clip_guid}")
+
+        # Deep-copy the clip preserving its sync GUID so annotations cross-reference.
+        clip_copy = _dict_to_otio(_otio_to_dict(seq_clip))
+        clip_copy.metadata.setdefault("sync", {})["guid"] = clip_guid
+
+        tl = otio.schema.Timeline(name=getattr(seq_clip, "name", None) or "clip")
+        tl.metadata["sync"] = {"guid": clip_tl_guid}
+        tl.metadata["clip_timeline_for"] = clip_guid
+
+        video_track = otio.schema.Track(
+            name="V1", kind=otio.schema.TrackKind.Video
+        )
+        video_track.metadata["sync"] = {"guid": video_track_guid}
+        video_track.append(clip_copy)
+
+        ann_track = otio.schema.Track(name="Annotations")
+        ann_track.metadata["sync"] = {"guid": ann_track_guid}
+
+        tl.tracks.append(video_track)
+        tl.tracks.append(ann_track)
+
+        self._timelines[clip_tl_guid] = tl
+        # Use preserve so the sequence clip stays canonical in _object_map.
+        self._traverse_and_map_preserve(tl)
+        self._clip_timelines[clip_guid] = clip_tl_guid
+
+        _log(
+            f"get_or_create_clip_timeline: created clip_tl={clip_tl_guid[:8]} "
+            f"for clip={clip_guid[:8]}"
+        )
+        return clip_tl_guid
+
+    def broadcast_clip_timeline(self, tl_guid: str) -> None:
+        """Broadcast a clip timeline to all peers so they can register its annotation track.
+
+        Should be called once per clip timeline, immediately after
+        :meth:`get_or_create_clip_timeline` returns a new GUID.  Peers that
+        already have the timeline (same deterministic GUID) will skip the
+        ``ADD_TIMELINE`` message.
+
+        :param tl_guid: GUID of the clip timeline to broadcast.
+        """
+        if not self.network or self.status != STATE_SYNCED:
+            return
+        tl = self._timelines.get(tl_guid)
+        if tl is None:
+            return
+        self.network.send_payload({
+            "command": "ADD_TIMELINE",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "timeline_guid": tl_guid,
+                "timeline": _otio_to_dict(tl),
+                "sync_timestamp": time.time(),
+            },
+        })
+
     def reset_timelines(self) -> None:
         """Clear all registered timelines, the object map, and the active GUID.
 
@@ -200,7 +317,22 @@ class SyncManager:
         """
         self._timelines.clear()
         self._object_map.clear()
+        self._clip_timelines.clear()
         self.active_timeline_guid = None
+
+    @staticmethod
+    def _derive_guid(key: str) -> str:
+        """Return a stable, deterministic UUID derived from *key*.
+
+        Uses :func:`uuid.uuid5` so that all peers independently compute the
+        same GUID for the same logical object (e.g. the clip timeline for a
+        given sequence clip) without any coordination message.
+
+        :param key: Namespace string (e.g. ``"clip_timeline:<seq_clip_guid>"``).
+        :returns: UUID string.
+        :rtype: str
+        """
+        return str(uuid.uuid5(uuid.NAMESPACE_OID, key))
 
     def _traverse_and_map(self, item: otio.core.SerializableObject) -> None:
         """Recursively assign GUIDs to all OTIO objects under *item* and index them.
@@ -220,6 +352,37 @@ class SyncManager:
 
         for obj in _walk(item):
             self._ensure_guid_and_map(obj)
+
+    def _traverse_and_map_preserve(self, item: otio.core.SerializableObject) -> None:
+        """Like :meth:`_traverse_and_map` but never overwrites existing ``_object_map`` entries.
+
+        Used when registering clip timelines whose single clip shares a GUID
+        with the corresponding sequence clip.  ``setdefault`` keeps the
+        sequence clip (which has a meaningful ``range_in_parent()``) rather
+        than replacing it with the clip-local copy.
+
+        :param item: Root OTIO object to traverse.
+        """
+        def _walk(node: otio.core.SerializableObject):
+            yield node
+            if hasattr(node, "tracks"):
+                stack = node.tracks
+                yield stack
+                for child in stack:
+                    yield from _walk(child)
+            elif hasattr(node, "__iter__") and not isinstance(node, str):
+                for child in node:
+                    yield from _walk(child)
+
+        for obj in _walk(item):
+            if not isinstance(obj, otio.core.SerializableObject):
+                continue
+            if "sync" not in obj.metadata:
+                obj.metadata["sync"] = {}
+            if "guid" not in obj.metadata["sync"]:
+                obj.metadata["sync"]["guid"] = str(uuid.uuid4())
+            guid = obj.metadata["sync"]["guid"]
+            self._object_map.setdefault(guid, obj)
 
     def _ensure_guid_and_map(self, obj: Any) -> None:
         """Assign a sync GUID to *obj* if absent, then add it to ``_object_map``.
@@ -704,18 +867,35 @@ class SyncManager:
         clip.metadata["clip_guid"] = clip_guid
         return clip
 
-    def annotation_track_guid_for_clip(self, clip_guid: str) -> "str | None":
+    def annotation_track_guid_for_clip(
+        self,
+        clip_guid: str,
+        preferred_timeline_guid: "str | None" = None,
+    ) -> "str | None":
         """Return the GUID of the Annotations track in the same timeline as *clip_guid*.
 
         Searches every non-annotation track for *clip_guid*, then returns the
         first track whose name contains ``"annotation"`` (case-insensitive) from
         that same timeline.
 
+        When *preferred_timeline_guid* is provided (e.g. the current
+        :attr:`active_timeline_guid`), that timeline is searched first.  This
+        ensures that annotations are written to the clip timeline's annotation
+        track while in clip mode, rather than the sequence timeline's track.
+
         :param clip_guid: Sync GUID of the media clip.
+        :param preferred_timeline_guid: GUID of the timeline to search first;
+            falls back to all timelines if not found there.
         :returns: Annotation track GUID, or ``None`` if not found.
         :rtype: str or None
         """
-        for timeline in self._timelines.values():
+        timelines = list(self._timelines.values())
+        if preferred_timeline_guid:
+            pref = self._timelines.get(preferred_timeline_guid)
+            if pref is not None:
+                timelines = [pref] + [t for t in timelines if t is not pref]
+
+        for timeline in timelines:
             clip_found = False
             for track in timeline.tracks:
                 if "annotation" in (track.name or "").lower():
@@ -947,11 +1127,12 @@ class SyncManager:
             },
         })
 
-    def broadcast_selection(self, nodes: list[str]) -> None:
-        """Broadcast the current UI selection to all peers.
+    def broadcast_selection(self, clip_guid: str) -> None:
+        """Broadcast the selected clip GUID to all peers.
 
-        :param nodes: List of selected node identifiers (currently RV node names;
-            see open question in the protocol spec about migrating to OTIO GUIDs).
+        :param clip_guid: OTIO sync GUID of the selected clip.  Receivers
+            map this back to their local representation (RV source group,
+            xStudio playlist position, etc.) before applying.
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return
@@ -960,7 +1141,7 @@ class SyncManager:
             "event": "SET",
             "session_id": self.session_id,
             "source_guid": self.self_guid,
-            "payload": {"nodes": nodes, "sync_timestamp": time.time()},
+            "payload": {"clip_guid": clip_guid, "sync_timestamp": time.time()},
         })
 
     def broadcast_move_child(
@@ -1143,6 +1324,22 @@ class SyncManager:
             if command == "SELECTION" and event == "SET":
                 return ("selection_changed", data)
 
+            if command == "ADD_TIMELINE":
+                tl_guid = data.get("timeline_guid")
+                tl_dict = data.get("timeline")
+                if tl_guid and tl_dict and tl_guid not in self._timelines:
+                    tl = _dict_to_otio(tl_dict)
+                    self._timelines[tl_guid] = tl
+                    self._traverse_and_map_preserve(tl)
+                    seq_clip_guid = tl.metadata.get("clip_timeline_for")
+                    if seq_clip_guid:
+                        self._clip_timelines[seq_clip_guid] = tl_guid
+                    _log(
+                        f"ADD_TIMELINE: registered clip_tl={tl_guid[:8]} "
+                        f"for seq_clip={str(seq_clip_guid)[:8] if seq_clip_guid else '?'}"
+                    )
+                return None
+
             if command == "PARTIAL_ANNOTATION":
                 return ("partial_annotation", data)
 
@@ -1318,11 +1515,28 @@ class SyncManager:
         try:
             self._timelines = {}
             self._object_map = {}
-            for guid, tl_dict in snapshot_data.get("timelines", {}).items():
+            self._clip_timelines = {}
+
+            # Sort so sequence timelines are processed before clip timelines.
+            # This guarantees the sequence clip is canonical in _object_map
+            # before the clip-timeline copy is registered via setdefault.
+            tl_items = sorted(
+                snapshot_data.get("timelines", {}).items(),
+                key=lambda kv: bool(kv[1].get("metadata", {}).get("clip_timeline_for")),
+            )
+            for guid, tl_dict in tl_items:
                 tl = _dict_to_otio(tl_dict)
                 self._timelines[guid] = tl
-                self._traverse_and_map(tl)
+                is_clip_tl = bool(tl.metadata.get("clip_timeline_for"))
+                if is_clip_tl:
+                    self._traverse_and_map_preserve(tl)
+                    seq_clip_guid = tl.metadata["clip_timeline_for"]
+                    self._clip_timelines[seq_clip_guid] = guid
+                else:
+                    self._traverse_and_map(tl)
             self.active_timeline_guid = snapshot_data.get("active_timeline_guid")
+            if "playback_state" in snapshot_data:
+                self.playback_state = snapshot_data["playback_state"]
 
             # Restore display_state: prefer the explicit snapshot field; fall back
             # to timeline custom_metadata written by a previous session to disk.

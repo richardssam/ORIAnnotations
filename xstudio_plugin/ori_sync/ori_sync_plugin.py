@@ -24,6 +24,7 @@ xStudio playhead.  xStudio's actor-based attribute system routes those
 writes safely, but this should be verified against the installed version.
 """
 
+import concurrent.futures
 import datetime
 import json
 import logging
@@ -45,9 +46,22 @@ from xstudio.core import (
     serialise_atom,
     show_atom,
     viewport_playhead_atom,
+    viewport_active_media_container_atom,
+    item_selection_atom,
+    item_type_atom,
+    selection_actor_atom,
+    get_media_atom,
+    attribute_value_atom,
 )
-from xstudio.api.session.playhead import Playhead
+from xstudio.api.session.playhead import Playhead, PlayheadSelection
 from xstudio.api.intrinsic.viewport import Viewport
+from xstudio.api.session.playlist.timeline import Timeline, create_item_container_from_type
+from xstudio.api.session.playlist import Playlist
+from xstudio.api.session.playlist.timeline.clip import Clip
+from xstudio.api.session.container import Container
+from xstudio.api.session.playlist.subset import Subset
+from xstudio.api.session.playlist.contact_sheet import ContactSheet
+from xstudio.api.session.media.media import Media
 
 # ── path setup ─────────────────────────────────────────────────────────────────
 
@@ -134,7 +148,7 @@ class ORISyncPlugin(PluginBase):
     #: Periodic fallback scan interval (seconds).  show_atom fires when a NEW
     #: bookmark is created but not when the user adds strokes to an existing one
     #: on the same frame.  This scan catches those missed updates.
-    ANNOTATION_SCAN_INTERVAL = 0.1
+    ANNOTATION_SCAN_INTERVAL = 1.0
 
     def __init__(self, connection):
         PluginBase.__init__(
@@ -233,6 +247,20 @@ class ORISyncPlugin(PluginBase):
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
 
+        # Last clip GUID broadcast as selection; compared each poll tick to avoid
+        # redundant selection broadcasts when the playhead is within the same clip.
+        # Also set to the received clip_guid on _apply_selection to prevent echoing
+        # a received selection back to the sender.
+        self._last_broadcast_clip_guid: str | None = None
+        # Suppress frame/selection broadcasts until this monotonic timestamp.
+        # Set to now+5 at connect time; also set to now+1 in _apply_selection to
+        # let the viewport settle before resuming position broadcasts.
+        self._selection_suppress_until: float = 0.0
+        # Monotonic timestamp until which Form-2 events must NOT overwrite
+        # active_playhead.  Set after a position write to block the spurious
+        # second Form-2 (~200 ms later) that fires for the other loaded playlist.
+        self._playhead_lock_until: float = 0.0
+
         # Last display state broadcast; compared each poll tick to detect changes.
         self._last_display_state: dict = {}
         # xStudio's internal viewport scale at the first successful read.  Used
@@ -241,6 +269,8 @@ class ORISyncPlugin(PluginBase):
         self._xs_base_scale: float | None = None
         # Cached Viewport object; created lazily, cleared on disconnect.
         self._viewport: "Viewport | None" = None
+        self._last_selection_scan = 0.0
+        self._last_display_scan = 0.0
 
         # Auto-connect on startup using the current preference values.
         _log("Plugin loaded — auto-connecting to session")
@@ -308,6 +338,10 @@ class ORISyncPlugin(PluginBase):
             target=self._poll_loop, name="ori_sync_poll", daemon=True
         )
         self._poll_thread.start()
+        # Suppress selection broadcasts for 5 s after connect so the initial
+        # playhead position doesn't immediately drive RV's view before the user
+        # has intentionally navigated anywhere.
+        self._selection_suppress_until = time.monotonic() + 5.0
 
         _log(f"Connecting: session={session!r} mq={host}:{port}")
 
@@ -323,6 +357,9 @@ class ORISyncPlugin(PluginBase):
         self._viewport = None
         self._last_display_state = {}
         self._xs_base_scale = None
+        self._last_broadcast_clip_guid = None
+        self._selection_suppress_until = 0.0
+        self._playhead_lock_until = 0.0
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -360,7 +397,15 @@ class ORISyncPlugin(PluginBase):
                 self._hot_scan_active_annotation()
                 self._flush_pending_annotations()
                 self._poll_and_broadcast_frame()
-                self._poll_and_broadcast_display()
+                
+                now = time.monotonic()
+                if now - self._last_selection_scan >= 0.2:
+                    self._poll_and_broadcast_selection()
+                    self._last_selection_scan = now
+                    
+                if now - self._last_display_scan >= 0.5:
+                    self._poll_and_broadcast_display()
+                    self._last_display_scan = now
             except Exception:
                 _log_exc("Poll loop error")
             self._poll_stop.wait(self.POLL_INTERVAL)
@@ -428,7 +473,7 @@ class ORISyncPlugin(PluginBase):
             self._apply_display_state(data)
 
         elif action == "selection_changed":
-            _log(f"Remote selection: {data.get('clip_guid', '?')}")
+            self._apply_selection(data)
 
     def _on_synced(self) -> None:
         _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
@@ -543,9 +588,67 @@ class ORISyncPlugin(PluginBase):
         if not (len(event) >= 2 and isinstance(event[0], event_atom)):
             return
 
-        # show_atom: fires when a bookmark/annotation is shown or created.
-        # This is the signal that the user has drawn in xStudio.
+        # show_atom: fires when a bookmark/annotation is shown or created,
+        # or when the active on-screen media item changes.
         if isinstance(event[1], show_atom):
+            if len(event) >= 5 and hasattr(event[2], 'uuid'):
+                # On-screen media changed (selection change).
+                # Only broadcast selection from media change if we are viewing Playlist (source view).
+                # If we are viewing Timeline, playhead sync handles it, and we only want to broadcast
+                # selections made explicitly via timeline selection widget.
+                try:
+                    container = self.connection.api.session.viewed_container
+                    is_playlist = isinstance(container, Playlist)
+                except Exception:
+                    is_playlist = False
+                
+                if is_playlist:
+                    media_ua = event[2]
+                    media_uuid_str = str(media_ua.uuid)
+                    _log(f"show_atom (media change) fired: media_uuid={media_uuid_str}")
+                    
+                    # Suppress if we are within the suppression window
+                    if time.monotonic() < self._selection_suppress_until:
+                        return
+                    
+                    # Find the media name by searching our sync playlists
+                    media_name = None
+                    for playlist, _ in self._sync_playlists.values():
+                        try:
+                            for m in playlist.media:
+                                if str(m.uuid) == media_uuid_str:
+                                    media_name = m.name
+                                    break
+                            if media_name:
+                                break
+                        except Exception:
+                            pass
+                    
+                    if media_name:
+                        # Find the clip_guid in the active timeline
+                        clip_guid = None
+                        if self.manager:
+                            for otio_tl in self.manager.timelines.values():
+                                for track in otio_tl.tracks:
+                                    for child in track:
+                                        if isinstance(child, otio.schema.Clip) and child.name == media_name:
+                                            clip_guid = child.metadata.get("sync", {}).get("guid")
+                                            break
+                                    if clip_guid:
+                                        break
+                                if clip_guid:
+                                    break
+                        
+                        if clip_guid and clip_guid != self._last_broadcast_clip_guid:
+                            _log(f"show_atom media change → broadcasting selection clip_guid={clip_guid[:8]} ({media_name})")
+                            self._last_broadcast_clip_guid = clip_guid
+                            clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+                            if clip_tl_guid:
+                                self.manager.active_timeline_guid = clip_tl_guid
+                            self.manager.broadcast_selection(clip_guid)
+                            self._broadcast_play_state_for_selection(clip_tl_guid)
+                return
+
             _log("show_atom fired — queuing annotation flush + activating hot scan")
             if self.manager and self.manager.status == STATE_SYNCED:
                 self._annotation_pending_time = time.monotonic()
@@ -569,6 +672,12 @@ class ORISyncPlugin(PluginBase):
         if len(event) <= 3:
             return
         ph_remote = event[3]
+        # After a position write in _apply_selection the viewport switch fires
+        # Form-2 once per loaded playlist (~200 ms apart).  Block updates for
+        # 500 ms so the second spurious event does not clobber active_playhead.
+        if time.monotonic() < self._playhead_lock_until:
+            _log("Form-2 suppressed — playhead locked after navigation")
+            return
         try:
             self.active_playhead = Playhead(self.connection, ph_remote)
             _log("Active playhead updated (form=2)")
@@ -606,21 +715,171 @@ class ORISyncPlugin(PluginBase):
             return
         if frame == self._last_polled_frame:
             return
+        # Suppress while waiting for xStudio to settle after _apply_selection.
+        # Without this, the poll may fire before position reaches start_frame and
+        # broadcast a negative clip-local frame (e.g. 99 - 400 = -301).
+        if time.monotonic() < self._selection_suppress_until:
+            return
         self._last_polled_frame = frame
         if frame == self._last_applied_frame:
             # This change was caused by _apply_playback_state — skip re-broadcast.
             return
+
+        broadcast_frame = frame
+        # xStudio's async position write may not have settled yet; a negative
+        # frame means the playhead hasn't reached the clip yet.
+        if broadcast_frame < 0:
+            return
+
         state = {
             "playing": False,
             "current_time": {
                 "OTIO_SCHEMA": "RationalTime.1",
-                "value": float(frame),
+                "value": float(broadcast_frame),
                 "rate": fps,
             },
             "looping": False,
         }
-        _log(f"Poll: broadcasting playback frame={frame} fps={fps}")
+        _log(f"Poll: broadcasting playback frame={frame} clip_local={broadcast_frame} fps={fps}")
         self.manager.broadcast_playback_state(state)
+
+    def _poll_and_broadcast_selection(self) -> None:
+        """Poll xStudio selection/view state and broadcast changes to the session."""
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        
+        # Suppress broadcasts for a short window after applying a remote update.
+        if time.monotonic() < self._selection_suppress_until:
+            return
+            
+        try:
+            # 1. Get current viewed container (with timeout)
+            session_actor = self.connection.api.session.remote
+            result = self.connection.request_receive_timeout(
+                100, session_actor, viewport_active_media_container_atom()
+            )[0]
+            c = Container(self.connection, result.actor)
+            if c.type == "Timeline":
+                container = Timeline(self.connection, result.actor, result.uuid)
+            elif c.type == "Subset":
+                container = Subset(self.connection, result.actor, result.uuid)
+            elif c.type == "ContactSheet":
+                container = ContactSheet(self.connection, result.actor, result.uuid)
+            else:
+                container = Playlist(self.connection, result.actor, result.uuid)
+
+            if container is None:
+                return
+            
+            clip_guid = None
+            is_timeline = isinstance(container, Timeline)
+            is_playlist = isinstance(container, Playlist)
+            
+            if is_timeline:
+                # Viewing Timeline: check its timeline item selection.
+                try:
+                    selected_items = container.selection
+                except Exception:
+                    _log_exc("Timeline selection poll failed")
+                    selected_items = []
+
+                media = None
+                if len(selected_items) == 1 and isinstance(selected_items[0], Clip):
+                    media = selected_items[0].media
+                else:
+                    try:
+                        sel = container.playhead_selection
+                        selected_sources = sel.selected_sources
+                    except Exception:
+                        selected_sources = []
+                    if len(selected_sources) == 1:
+                        media = selected_sources[0]
+
+                if media:
+                    media_name = media.name
+                    for otio_tl in self.manager.timelines.values():
+                        for track in otio_tl.tracks:
+                            for child in track:
+                                if isinstance(child, otio.schema.Clip) and child.name == media_name:
+                                    clip_guid = child.metadata.get("sync", {}).get("guid")
+                                    break
+                            if clip_guid:
+                                break
+                        if clip_guid:
+                            break
+            
+            elif is_playlist:
+                # Viewing Playlist: check playhead selection.
+                try:
+                    sel = container.playhead_selection
+                    selected_sources = sel.selected_sources
+                except Exception:
+                    _log_exc("Playlist selection poll failed")
+                    selected_sources = []
+
+                if len(selected_sources) == 1:
+                    media = selected_sources[0]
+                    media_name = media.name
+                    for otio_tl in self.manager.timelines.values():
+                        for track in otio_tl.tracks:
+                            for child in track:
+                                if isinstance(child, otio.schema.Clip) and child.name == media_name:
+                                    clip_guid = child.metadata.get("sync", {}).get("guid")
+                                    break
+                            if clip_guid:
+                                break
+                        if clip_guid:
+                            break
+            
+            # Handle broadcast if selection changed
+            if clip_guid:
+                if clip_guid != self._last_broadcast_clip_guid:
+                    _log(f"Poll selection: broadcasting selection clip_guid={clip_guid[:8]}")
+                    self._last_broadcast_clip_guid = clip_guid
+                    clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+                    if clip_tl_guid:
+                        self.manager.active_timeline_guid = clip_tl_guid
+                    self.manager.broadcast_selection(clip_guid)
+                    self._broadcast_play_state_for_selection(clip_tl_guid)
+            else:
+                # No selection found. We only broadcast selection clear when transitioning back to sequence (Timeline).
+                if is_timeline and self._last_broadcast_clip_guid is not None:
+                    _log("Poll selection: container is Timeline and selection is empty → broadcasting selection clear")
+                    self._last_broadcast_clip_guid = None
+                    if self.manager:
+                        seq_tl_guid = self.manager.sequence_timeline_guid
+                        if seq_tl_guid:
+                            self.manager.active_timeline_guid = seq_tl_guid
+                    self.manager.broadcast_selection("")
+        except Exception:
+            pass
+
+    def _broadcast_play_state_for_selection(self, clip_tl_guid: str) -> None:
+        """Broadcast playing=True state when a clip is selected, ensuring RV also starts playback."""
+        if not self.manager:
+            return
+        try:
+            if self.active_playhead:
+                frame = self.active_playhead.position
+                fps = self.active_playhead.frame_rate.fps() or 25.0
+            else:
+                frame = 0
+                fps = 25.0
+                
+            _log(f"Broadcasting play state True for timeline {clip_tl_guid[:8]}")
+            state = {
+                "playing": True,
+                "current_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "value": float(frame),
+                    "rate": fps,
+                },
+                "looping": False,
+                "timeline_guid": clip_tl_guid,
+            }
+            self.manager.broadcast_playback_state(state)
+        except Exception:
+            _log_exc("Failed to broadcast play state for selection")
 
     def _current_playback_state(self) -> dict | None:
         """Return the local playback state dict for inclusion in a state snapshot."""
@@ -658,6 +917,8 @@ class ORISyncPlugin(PluginBase):
         current_time = state.get("current_time", {})
         # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
         frame = max(0, int(current_time.get("value", 0)))
+
+
 
         if playing != self.active_playhead.playing:
             self.active_playhead.playing = playing
@@ -725,7 +986,9 @@ class ORISyncPlugin(PluginBase):
 
         vp_state = None
         try:
-            js = self.connection.request_receive(vp.remote, serialise_atom())[0]
+            js = self.connection.request_receive_timeout(
+                100, vp.remote, serialise_atom()
+            )[0]
             vp_state = json.loads(js.dump())["base"]
             raw_scale = float(vp_state["scale"])
             # state_.scale_ is image_pixels/viewport_pixels — a larger value
@@ -748,6 +1011,136 @@ class ORISyncPlugin(PluginBase):
         # requires viewport_pan_atom to be exposed in py_atoms.cpp (see TODO).
 
         return state
+
+    def _playhead_for_clip(self, clip_guid: str) -> "Playhead | None":
+        """Return the xStudio Playhead for the sequence playlist that contains *clip_guid*.
+
+        Iterates ``_sync_playlists`` (which holds only the sequence-level
+        playlists created by :meth:`_do_load_timelines`) and checks each
+        OTIO timeline's media track for the clip.  This avoids relying on the
+        OTIO parent chain, which may point at the clip-timeline copy rather
+        than the original sequence clip.
+
+        Falls back to ``None`` so the caller can fall back to
+        ``self.active_playhead``.
+        """
+        if not self.manager:
+            return None
+        try:
+            for tl_guid, (playlist, _) in self._sync_playlists.items():
+                otio_tl = self.manager.timelines.get(tl_guid)
+                if otio_tl is None:
+                    continue
+                for track in otio_tl.tracks:
+                    for child in track:
+                        if child.metadata.get("sync", {}).get("guid") == clip_guid:
+                            ph = playlist.playhead
+                            _log(f"_playhead_for_clip: {clip_guid[:8]} found in tl={tl_guid[:8]} → playhead ok")
+                            return ph
+            _log(f"_playhead_for_clip: {clip_guid[:8]} not found in any sequence timeline")
+            return None
+        except Exception:
+            _log_exc("_playhead_for_clip: exception")
+            return None
+
+    def _apply_selection(self, data: dict) -> None:
+        """Apply a remotely broadcast clip selection.
+
+        Switches the viewed container to the sequence's parent playlist and sets
+        the playlist playhead selection to the targeted clip (mimicking RV source view).
+        If selection is cleared, switches back to the sequence timeline and selects all.
+        """
+        if not self.active_playhead:
+            return
+        clip_guid = data.get("clip_guid", "")
+
+        if not clip_guid:
+            # Clear: return to timeline sequence view and select all media.
+            _log("RECV selection clear → returning to sequence view")
+            self._last_broadcast_clip_guid = None
+            if self.manager:
+                seq_tl_guid = self.manager.sequence_timeline_guid
+                if seq_tl_guid:
+                    self.manager.active_timeline_guid = seq_tl_guid
+                    if seq_tl_guid in self._sync_playlists:
+                        pl, tl = self._sync_playlists[seq_tl_guid]
+                        try:
+                            self.connection.api.session.viewed_container = tl
+                            pl.playhead_selection.select_all()
+                            _log("RECV selection clear: switched viewed_container to timeline and selected all media")
+                        except Exception:
+                            _log_exc("RECV selection clear: failed to switch container/select all")
+            return
+
+        # Skip if we already broadcast this same clip — this is an echo from RV
+        # confirming a selection we initiated.
+        if clip_guid == self._last_broadcast_clip_guid:
+            _log(f"RECV selection clip_guid={clip_guid[:8]} — same as last broadcast, skipping echo")
+            return
+
+        if not self.manager:
+            return
+        clip = self.manager._object_map.get(clip_guid)
+        if clip is None or not isinstance(clip, otio.schema.Clip):
+            _log(f"RECV selection: clip_guid={clip_guid} not found")
+            return
+
+        # Switch active_timeline_guid to the clip's own single-clip timeline.
+        clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+        if clip_tl_guid:
+            self.manager.active_timeline_guid = clip_tl_guid
+
+        # Mark the received clip as "already handled" so the selection poll does
+        # not echo it back to the sender.
+        self._last_broadcast_clip_guid = clip_guid
+        # Suppress selection-broadcast poll for 1 s to let the viewport settle.
+        self._selection_suppress_until = time.monotonic() + 1.0
+
+        # Find the playlist and media item that own this clip so we can switch the viewport.
+        playlist = None
+        for tl_guid, (pl, _) in self._sync_playlists.items():
+            otio_tl = self.manager.timelines.get(tl_guid)
+            if otio_tl is None:
+                continue
+            for track in otio_tl.tracks:
+                for child in track:
+                    if child.metadata.get("sync", {}).get("guid") == clip_guid:
+                        playlist = pl
+                        break
+                if playlist:
+                    break
+            if playlist:
+                break
+
+        if playlist is not None:
+            try:
+                self.connection.api.session.viewed_container = playlist
+                _log(f"RECV selection: switched viewed_container to playlist")
+                
+                # Find the media item in this playlist
+                media, _ = self._find_media_for_clip_guid(clip_guid)
+                if media:
+                    playlist.playhead_selection.set_selection([media.uuid])
+                    _log(f"RECV selection: set playlist selection to {[media.uuid]}")
+                else:
+                    _log(f"RECV selection: media not found for clip {clip_guid[:8]}")
+            except Exception:
+                _log_exc("RECV selection: viewed_container switch or selection failed")
+            
+            _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = _ex.submit(self.current_playhead)
+                new_ph = fut.result(timeout=3.0)
+                self.active_playhead = new_ph
+                _log("RECV selection: refreshed active_playhead after switch")
+            except concurrent.futures.TimeoutError:
+                _log("RECV selection: current_playhead() timed out, using existing playhead")
+            except Exception:
+                _log_exc("RECV selection: could not refresh active_playhead after switch")
+            finally:
+                _ex.shutdown(wait=False)
+        else:
+            _log(f"RECV selection: no playlist found for clip")
 
     def _apply_display_state(self, state: dict) -> None:
         """Apply a received display state dict to the local xStudio viewport.
@@ -1007,7 +1400,6 @@ class ORISyncPlugin(PluginBase):
         scan_uuids = [bm.uuid for bm in all_bms]
         if not scan_uuids:
             return
-        _log(f"_flush_pending_annotations: scanning {len(scan_uuids)} bookmark(s)")
 
         stale_any = False
         for bm_uuid in scan_uuids:
@@ -1169,7 +1561,6 @@ class ORISyncPlugin(PluginBase):
             + self._captions_to_sync_events(new_captions, aspect_half)
         )
         if not events:
-            _log(f"_broadcast_local_bookmark: no new strokes at frame={frame} — already in timeline")
             return False
 
         _log(
@@ -1578,12 +1969,9 @@ class ORISyncPlugin(PluginBase):
             _log(f"_find_media_for_clip_guid: {clip_guid[:8]} not in object_map")
             return None, 0.8889
         clip_name = getattr(otio_clip, "name", None)
-        _log(f"_find_media_for_clip_guid: looking for {clip_name!r}")
 
         for playlist, _ in self._sync_playlists.values():
             try:
-                available = [m.name for m in playlist.media]
-                _log(f"  playlist media: {available}")
                 for media in playlist.media:
                     if media.name != clip_name:
                         continue

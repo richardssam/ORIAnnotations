@@ -112,6 +112,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._timer = None
         self._last_broadcast_frame = -1
         self._last_selection = []
+        self._last_broadcast_clip_guid = None  # last clip GUID sent via SELECTION
         self._discovery_start_time = 0
         self._pending_stroke = None  # (node_name, pen_component, stroke_uuid)
         self._debounce_timer = None
@@ -1341,6 +1342,23 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self._track = track
                     break
 
+        # Restore view to the active timeline
+        active_tl_guid = self.sync_manager.active_timeline_guid
+        if active_tl_guid:
+            for rv_node, tl_guid in self._rv_node_to_timeline_guid.items():
+                if tl_guid == active_tl_guid:
+                    try:
+                        if rv.commands.viewNode() != rv_node:
+                            _log(f"Rebuild restoring active view to '{rv_node}' for timeline GUID '{active_tl_guid[:8]}'")
+                            self._rv_updating = True
+                            try:
+                                rv.commands.setViewNode(rv_node)
+                            finally:
+                                self._rv_updating = False
+                    except Exception as e:
+                        _log(f"Failed to restore view to '{rv_node}': {e}")
+                    break
+
         rv.commands.redraw()
 
     # ------------------------------------------------------------------
@@ -1378,11 +1396,38 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             event.reject()
             return
         view = rv.commands.viewNode()
+        # Timeline switch: view node is a sequence group.
         tl_guid = self._rv_node_to_timeline_guid.get(view)
         if tl_guid and tl_guid != self.sync_manager.active_timeline_guid:
             self.sync_manager.active_timeline_guid = tl_guid
             _log(f"SEND view_change view={view} tl={tl_guid}")
             self._broadcast_playback()
+        # Clip selection: user double-clicked into a source group (source view).
+        # Map source group → media path → OTIO clip GUID and broadcast.
+        if rv.commands.nodeType(view) == "RVSourceGroup":
+            sg_to_path = {v: k for k, v in self._path_to_source_group_map().items()}
+            media_path = sg_to_path.get(view)
+            if media_path:
+                clip_guid = self._clip_guid_for_media_path(media_path)
+                if clip_guid and clip_guid != self._last_broadcast_clip_guid:
+                    _log(f"SEND selection (view change) clip_guid={clip_guid} view={view}")
+                    is_new = clip_guid not in self.sync_manager._clip_timelines
+                    clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
+                    if clip_tl_guid:
+                        if is_new:
+                            self.sync_manager.broadcast_clip_timeline(clip_tl_guid)
+                        self.sync_manager.active_timeline_guid = clip_tl_guid
+                    self.sync_manager.broadcast_selection(clip_guid)
+                    self._last_broadcast_clip_guid = clip_guid
+        elif view in self._rv_node_to_timeline_guid and self._last_broadcast_clip_guid:
+            # Returned to sequence/timeline view — restore sequence active_timeline_guid
+            # and broadcast clear so peers exit single-clip mode.
+            _log(f"SEND selection clear (back to sequence) view={view}")
+            seq_tl_guid = self._rv_node_to_timeline_guid.get(view)
+            if seq_tl_guid:
+                self.sync_manager.active_timeline_guid = seq_tl_guid
+            self.sync_manager.broadcast_selection("")
+            self._last_broadcast_clip_guid = None
         event.reject()
 
     def on_rv_play_start(self, event):
@@ -1402,12 +1447,26 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         event.reject()
 
     def on_rv_selection_changed(self, event):
-        if self._rv_updating or not self.sync_manager or self.sync_manager.status != STATE_SYNCED: return
+        if self._rv_updating or not self.sync_manager or self.sync_manager.status != STATE_SYNCED:
+            event.reject()
+            return
         selection = rv.commands.selection()
-        if selection != self._last_selection:
-            _log(f"SEND selection={selection}")
-            self.sync_manager.broadcast_selection(selection)
-            self._last_selection = selection
+        if selection == self._last_selection:
+            event.reject()
+            return
+        self._last_selection = selection
+        # Map each selected source group to an OTIO clip GUID and broadcast the
+        # first one.  RV's "selection" can be a list of source-group nodes; the
+        # other peers only care about which clip the user is looping over.
+        sg_to_path = {v: k for k, v in self._path_to_source_group_map().items()}
+        for node in selection:
+            media_path = sg_to_path.get(node)
+            if media_path:
+                clip_guid = self._clip_guid_for_media_path(media_path)
+                if clip_guid:
+                    _log(f"SEND selection clip_guid={clip_guid} (node={node})")
+                    self.sync_manager.broadcast_selection(clip_guid)
+                    break
         event.reject()
 
     def on_rv_graph_state_change(self, event):
@@ -1599,7 +1658,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if not clip_guid:
                 _log(f"SEND annotation skipped: no clip_guid for media_path={media_path}")
                 return
-            annotation_track_guid = self.sync_manager.annotation_track_guid_for_clip(clip_guid)
+            annotation_track_guid = self.sync_manager.annotation_track_guid_for_clip(
+                clip_guid,
+                preferred_timeline_guid=self.sync_manager.active_timeline_guid,
+            )
             if not annotation_track_guid:
                 _log(f"SEND annotation skipped: no annotation track for clip {clip_guid}")
                 return
@@ -1801,11 +1863,20 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         _log(f"RECV playback playing={playing} frame={target_frame} tl={timeline_guid}")
 
         if timeline_guid:
-            for rv_node, tl_guid in self._rv_node_to_timeline_guid.items():
-                if tl_guid == timeline_guid and rv.commands.viewNode() != rv_node:
-                    _log(f"RECV view_change to {rv_node}")
-                    rv.commands.setViewNode(rv_node)
-                    break
+            current_view = rv.commands.viewNode()
+            # Only switch timeline view when the current node is already a known
+            # timeline/sequence node that maps to a *different* timeline.  If the
+            # user has double-clicked into a source group (source view), do not
+            # pull them back to the sequence — that would undo a SELECTION apply.
+            current_is_source_group = (
+                rv.commands.nodeType(current_view) == "RVSourceGroup"
+            )
+            if not current_is_source_group:
+                for rv_node, tl_guid in self._rv_node_to_timeline_guid.items():
+                    if tl_guid == timeline_guid and current_view != rv_node:
+                        _log(f"RECV view_change to {rv_node}")
+                        rv.commands.setViewNode(rv_node)
+                        break
 
         if rv.commands.frame() != target_frame:
             rv.commands.setFrame(target_frame)
@@ -1816,10 +1887,57 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             rv.commands.stop()
 
     def _apply_selection(self, data):
-        nodes = data.get("nodes", [])
-        if nodes:
-            _log(f"RECV selection nodes={nodes}")
-            rv.commands.setSelection(nodes)
+        clip_guid = data.get("clip_guid", "")
+
+        if not clip_guid:
+            # Clear: return to sequence/timeline view.
+            _log("RECV selection clear → returning to sequence view")
+            self._last_broadcast_clip_guid = None
+            seq_node = next(
+                (n for n in self._rv_node_to_timeline_guid
+                 if rv.commands.nodeType(n) != "RVSourceGroup"),
+                None
+            )
+            if seq_node:
+                seq_tl_guid = self._rv_node_to_timeline_guid.get(seq_node)
+                if seq_tl_guid:
+                    self.sync_manager.active_timeline_guid = seq_tl_guid
+                self._rv_updating = True
+                try:
+                    rv.commands.setViewNode(seq_node)
+                finally:
+                    self._rv_updating = False
+            return
+
+        # Find the media path for this GUID then look up the local source group.
+        clip = self.sync_manager._object_map.get(clip_guid) if self.sync_manager else None
+        if clip is None or not isinstance(clip, otio.schema.Clip):
+            _log(f"RECV selection: clip_guid={clip_guid} not found in object_map")
+            return
+        ref = clip.media_reference
+        if not isinstance(ref, otio.schema.ExternalReference):
+            return
+        media_path = ref.target_url
+        source_group = self._path_to_source_group_map().get(media_path)
+        if not source_group:
+            _log(f"RECV selection: no source group for {media_path}")
+            return
+        _log(f"RECV selection clip_guid={clip_guid} → source_group={source_group}")
+
+        # Switch active_timeline_guid to the clip's own timeline.
+        clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
+        if clip_tl_guid:
+            self.sync_manager.active_timeline_guid = clip_tl_guid
+
+        # Set echo guard before setViewNode so after-graph-view-change doesn't
+        # re-broadcast the remote-applied selection.
+        self._last_broadcast_clip_guid = clip_guid
+        self._rv_updating = True
+        try:
+            rv.commands.setViewNode(source_group)
+            rv.commands.setFrame(1)  # jump to first frame of this source
+        finally:
+            self._rv_updating = False
 
     def _find_paint_node_for_media(self, media_path, frame):
         """Find the local RVPaint node for a given media path and frame.
