@@ -67,6 +67,10 @@ class RabbitMQNetwork:
         self._send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
         self._stop_event = threading.Event()
+        # Set once the consumer queue is bound and basic_consume is registered.
+        # Callers should wait on this before broadcasting WHO_IS_MASTER so that
+        # the I_AM_MASTER response is not published before the queue exists.
+        self._consumer_ready = threading.Event()
         self._consumer_thread = threading.Thread(
             target=self._run_consumer, daemon=True
         )
@@ -124,6 +128,7 @@ class RabbitMQNetwork:
                     f"Connected to {self.host}:{self.port}, "
                     f"listening on {self.exchange_name}"
                 )
+                self._consumer_ready.set()
 
                 while not self._stop_event.is_set():
                     connection.process_data_events(time_limit=1)
@@ -172,6 +177,15 @@ class RabbitMQNetwork:
                 if not self._stop_event.is_set():
                     _log(f"Publisher error: {e}. Retrying in 5s...")
                     self._stop_event.wait(5)
+
+    def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """Block until the consumer queue is bound and ready to receive messages.
+
+        :param timeout: Maximum seconds to wait before returning False.
+        :returns: True if the consumer became ready within *timeout*, else False.
+        :rtype: bool
+        """
+        return self._consumer_ready.wait(timeout=timeout)
 
     def send_payload(self, payload: dict[str, Any]) -> None:
         """Enqueue *payload* for publishing to the fanout exchange.
