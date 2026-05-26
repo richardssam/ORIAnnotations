@@ -111,7 +111,7 @@ def _make_logger() -> logging.Logger:
     # mirroring the RV_OTIO_SYNC_LOG_FILE pattern in the RV plugin.
     log_file = os.environ.get("ORI_SYNC_LOG_FILE")
     if log_file:
-        fh = logging.FileHandler(log_file)
+        fh = logging.FileHandler(log_file, mode="w")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     return logger
@@ -290,6 +290,10 @@ class ORISyncPlugin(PluginBase):
         # Also set to the received clip_guid on _apply_selection to prevent echoing
         # a received selection back to the sender.
         self._last_broadcast_clip_guid: str | None = None
+        # Caches to track the last polled container UUID and clip GUID to prevent
+        # feedback loops caused by broadcasting selections/clears when no local changes occurred.
+        self._last_polled_container_uuid: str | None = None
+        self._last_polled_clip_guid: str | None = None
         # After a remote "selection clear" the playhead is still positioned on
         # the previously-selected clip.  _poll_and_broadcast_selection would
         # immediately re-broadcast that clip via playhead_selection, toggling RV
@@ -319,6 +323,9 @@ class ORISyncPlugin(PluginBase):
         self._last_selection_scan = 0.0
         self._last_display_scan = 0.0
         self._last_flat_playlist_scan = 0.0
+        # Timestamps to throttle log messages during viewport discovery retry loop.
+        self._last_timeline_defer_log_time: float = 0.0
+        self._last_viewport_error_log_time: float = 0.0
 
         # Maps tl_guid → (xs_playlist, [media_name_order]) for flat-Playlist
         # timelines built by _build_otio_from_playlist_media.  Only populated on
@@ -336,6 +343,12 @@ class ORISyncPlugin(PluginBase):
         # Avoids fragile name-based lookups when xStudio uses the full file path
         # as the media name after add_media(path).
         self._flat_clip_to_media: dict = {}
+
+        # Viewport container tracking state: caches whether the active viewport
+        # container is a Playlist or Timeline to avoid synchronous API calls in
+        # playhead event handlers.
+        self._viewport_container_is_playlist: bool = False
+        self._viewport_container_is_timeline: bool = False
 
         # Auto-connect on startup using the current preference values.
         _log("Plugin loaded — auto-connecting to session")
@@ -435,6 +448,8 @@ class ORISyncPlugin(PluginBase):
         self._xs_sequence_playlists.clear()
         self._flat_clip_to_media.clear()
         self._last_broadcast_clip_guid = None
+        self._last_polled_container_uuid = None
+        self._last_polled_clip_guid = None
         self._suppress_rebroadcast_clip_guid = None
         self._selection_suppress_until = 0.0
         self._playhead_lock_until = 0.0
@@ -495,7 +510,8 @@ class ORISyncPlugin(PluginBase):
 
     def _drain_cmd_queue(self) -> None:
         """Execute all enqueued commands on the poll thread."""
-        while True:
+        qsize = self._cmd_queue.qsize()
+        for _ in range(qsize):
             try:
                 cmd, payload = self._cmd_queue.get_nowait()
             except queue.Empty:
@@ -600,18 +616,33 @@ class ORISyncPlugin(PluginBase):
             _log("Snapshot had no timelines")
             return
 
+        # Defer loading timelines until viewport is acquired to prevent the empty playlist panel race.
+        if self._get_viewport() is None:
+            now = time.monotonic()
+            if now - getattr(self, "_last_timeline_defer_log_time", 0.0) >= 5.0:
+                _log("Deferring timeline loading — viewport not ready")
+                self._last_timeline_defer_log_time = now
+            self._cmd_queue.put(("load_timelines", {}))
+            return
+
         first_xs_timeline = None
         for guid, otio_tl in self.manager.timelines.items():
             if guid in self._sync_playlists:
                 continue  # already created
 
-            name = otio_tl.name or guid[:8]
+            # Skip creating xStudio playlist/timeline for dynamic clip timelines
+            if otio_tl.metadata.get("clip_timeline_for"):
+                _log(f"Skipping loading of dynamic clip timeline {otio_tl.name!r} to xStudio")
+                continue
+
+            playlist_name = otio_tl.metadata.get("xs_playlist_name") or otio_tl.name or guid[:8]
+            timeline_name = otio_tl.name or guid[:8]
 
             # Backfill source_range so xStudio can position and size each clip.
             self._fill_source_ranges(otio_tl)
 
             tracks = list(otio_tl.tracks)
-            _log(f"OTIO Timeline {name!r}: {len(tracks)} track(s)")
+            _log(f"OTIO Timeline {timeline_name!r}: {len(tracks)} track(s)")
             for i, track in enumerate(tracks):
                 children = list(track)
                 _log(f"  Track {i} {track.name!r} kind={track.kind}: {len(children)} child(ren)")
@@ -623,7 +654,7 @@ class ORISyncPlugin(PluginBase):
                 # Flat media-bin Playlist: add each clip by URI so xStudio reads
                 # file headers directly (avoids the source_range=None problem).
                 try:
-                    playlist = self.connection.api.session.create_playlist(name)[1]
+                    playlist = self.connection.api.session.create_playlist(playlist_name)[1]
                     added_media: list = []
                     for track in otio_tl.tracks:
                         if track.kind != otio.schema.TrackKind.Video:
@@ -648,26 +679,17 @@ class ORISyncPlugin(PluginBase):
                                         self._flat_clip_to_media[clip_guid] = media_obj
                                 except Exception:
                                     _log_exc(f"  Could not add {path!r}")
-                    # Create a Timeline inside the playlist so it appears in the
-                    # xStudio session panel (flat playlists without a Timeline
-                    # child are invisible in the sequence list).
-                    xs_timeline = playlist.create_timeline(name)[1]
-                    for media_obj in added_media:
-                        try:
-                            xs_timeline.add_media(media_obj)
-                        except Exception:
-                            _log_exc(f"  Could not add media to timeline")
-                    self._sync_playlists[guid] = (playlist, xs_timeline)
+                    self._sync_playlists[guid] = (playlist, None)
                     if first_xs_timeline is None:
-                        first_xs_timeline = xs_timeline
-                    _log(f"Created flat playlist {name!r} from OTIO timeline {guid[:8]}")
+                        first_xs_timeline = playlist
+                    _log(f"Created flat playlist {playlist_name!r} from OTIO timeline {guid[:8]}")
                     self._load_snapshot_annotations(otio_tl, playlist)
                 except Exception:
-                    _log_exc(f"Failed to create flat playlist for {name!r}")
+                    _log_exc(f"Failed to create flat playlist for {playlist_name!r}")
             else:
                 try:
-                    playlist = self.connection.api.session.create_playlist(name)[1]
-                    xs_timeline = playlist.create_timeline(name)[1]
+                    playlist = self.connection.api.session.create_playlist(playlist_name)[1]
+                    xs_timeline = playlist.create_timeline(timeline_name)[1]
                     otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
                     self._sync_playlists[guid] = (playlist, xs_timeline)
@@ -684,11 +706,11 @@ class ORISyncPlugin(PluginBase):
                         ]
                     if first_xs_timeline is None:
                         first_xs_timeline = xs_timeline
-                    _log(f"Created playlist {name!r} from OTIO timeline {guid[:8]}")
+                    _log(f"Created playlist {playlist_name!r} / timeline {timeline_name!r} from OTIO timeline {guid[:8]}")
                     # Convert any annotation clips already in the snapshot to bookmarks.
                     self._load_snapshot_annotations(otio_tl, playlist)
                 except Exception:
-                    _log_exc(f"Failed to create playlist for {name!r}")
+                    _log_exc(f"Failed to create playlist for {playlist_name!r}")
 
         if first_xs_timeline is not None:
             # Defer set_on_screen_source until the viewport is ready — calling it
@@ -737,12 +759,26 @@ class ORISyncPlugin(PluginBase):
                             from xstudio.api.auxiliary.otio import timeline_to_otio_string as _tl_str
                             otio_str = _tl_str(xs_tl)
                         tl = otio.adapters.read_from_string(otio_str)
-                        # Pre-assign a stable GUID so the mapping survives
-                        # register_timeline (which may otherwise re-assign one).
-                        if "sync" not in tl.metadata or "guid" not in tl.metadata.get("sync", {}):
-                            tl.metadata.setdefault("sync", {})["guid"] = str(uuid.uuid4())
-                        tl_guid = tl.metadata["sync"]["guid"]
-                        _log(f"Built OTIO timeline: {tl.name!r}")
+                        # Use C++ timeline UUID as the persistent sync GUID.
+                        tl_guid = str(xs_tl.uuid)
+                        tl.metadata.setdefault("sync", {})["guid"] = tl_guid
+                        tl.metadata["xs_playlist_name"] = playlist.name
+
+                        import hashlib
+                        # Generate deterministic GUIDs for tracks and clips
+                        for track_idx, track in enumerate(tl.tracks):
+                            track_seed = f"{tl_guid}:{track.kind}:{track_idx}:{track.name}"
+                            track_guid = hashlib.sha1(track_seed.encode("utf-8")).hexdigest()
+                            track.metadata.setdefault("sync", {})["guid"] = track_guid
+                            
+                            clip_idx = 0
+                            for child in track:
+                                if isinstance(child, otio.schema.Clip):
+                                    clip_seed = f"{track_guid}:{clip_idx}:{child.name}"
+                                    clip_guid = hashlib.sha1(clip_seed.encode("utf-8")).hexdigest()
+                                    child.metadata.setdefault("sync", {})["guid"] = clip_guid
+                                    clip_idx += 1
+                        _log(f"Built OTIO timeline: {tl.name!r} (parent playlist: {playlist.name!r})")
                         result.append(tl)
                         # Store for master-side new-clip polling and _apply_selection.
                         self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
@@ -769,7 +805,13 @@ class ORISyncPlugin(PluginBase):
         :rtype: opentimelineio.schema.Timeline or None
         """
         try:
-            container = self.connection.api.session.viewed_container
+            try:
+                container = self.connection.api.session.viewed_container
+            except RuntimeError as e:
+                if "invalid_argument" in str(e):
+                    _log("_build_otio_from_viewed_container: no valid viewed_container (session may be empty)")
+                    return None
+                raise
             if container is None:
                 return None
             if hasattr(container, "to_otio_string"):
@@ -807,10 +849,9 @@ class ORISyncPlugin(PluginBase):
 
         name = getattr(playlist, "name", "Playlist")
         tl = otio.schema.Timeline(name=name)
-        # Pre-assign a GUID so we can register the (playlist, media-order) mapping
-        # before register_timeline() runs, enabling reorder polling from the start.
-        tl_guid = str(uuid.uuid4())
-        tl.metadata["sync"] = {"guid": tl_guid}
+        # Use C++ playlist UUID as the persistent sync GUID.
+        tl_guid = str(playlist.uuid)
+        tl.metadata.setdefault("sync", {})["guid"] = tl_guid
         tl.metadata["xs_flat_playlist"] = True
         self._xs_flat_playlists[tl_guid] = (playlist, [m.name for m in media_list])
         # Also register in _sync_playlists so _apply_selection works on the master.
@@ -818,8 +859,12 @@ class ORISyncPlugin(PluginBase):
         # at build time); _apply_selection only needs the Playlist object.
         self._sync_playlists[tl_guid] = (playlist, None)
         track = otio.schema.Track(name="Video Track", kind=otio.schema.TrackKind.Video)
+        import hashlib
+        track_seed = f"{tl_guid}:Video:0:Video Track"
+        track_guid = hashlib.sha1(track_seed.encode("utf-8")).hexdigest()
+        track.metadata.setdefault("sync", {})["guid"] = track_guid
 
-        for media in media_list:
+        for media_idx, media in enumerate(media_list):
             try:
                 ms = media.media_source()
                 mr = ms.media_reference
@@ -844,6 +889,7 @@ class ORISyncPlugin(PluginBase):
                 except Exception:
                     pass
 
+                clip_guid = hashlib.sha1(f"{track_guid}:{media_idx}:{media.name}".encode("utf-8")).hexdigest()
                 if frame_count is not None:
                     sr = otio.opentime.TimeRange(
                         otio.opentime.RationalTime(0, fps),
@@ -862,6 +908,8 @@ class ORISyncPlugin(PluginBase):
                         media_reference=otio.schema.ExternalReference(target_url=uri),
                     )
 
+                clip.metadata["sync"] = {"guid": clip_guid}
+                self._flat_clip_to_media[clip_guid] = media
                 track.append(clip)
                 _log(f"  Flat media clip: {media.name!r} fps={fps} frames={frame_count}")
             except Exception:
@@ -897,11 +945,7 @@ class ORISyncPlugin(PluginBase):
                 # Only broadcast selection from media change if we are viewing Playlist (source view).
                 # If we are viewing Timeline, playhead sync handles it, and we only want to broadcast
                 # selections made explicitly via timeline selection widget.
-                try:
-                    container = self.connection.api.session.viewed_container
-                    is_playlist = isinstance(container, Playlist)
-                except Exception:
-                    is_playlist = False
+                is_playlist = getattr(self, "_viewport_container_is_playlist", False)
                 
                 if is_playlist:
                     media_ua = event[2]
@@ -934,7 +978,8 @@ class ORISyncPlugin(PluginBase):
                             clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
                             if clip_tl_guid:
                                 self.manager.active_timeline_guid = clip_tl_guid
-                            self.manager.broadcast_selection(clip_guid)
+                            view_mode = "sequence" if self._viewport_container_is_timeline else "source"
+                            self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
                             self._broadcast_play_state_for_selection(clip_tl_guid)
                 return
 
@@ -1039,22 +1084,27 @@ class ORISyncPlugin(PluginBase):
         if not self.manager or self.manager.status != STATE_SYNCED:
             return
         
-        # Suppress broadcasts for a short window after applying a remote update.
-        if time.monotonic() < self._selection_suppress_until:
-            return
-            
         try:
             # 1. Get current viewed container (with timeout)
             session_actor = self.connection.api.session.remote
             result = self.connection.request_receive_timeout(
                 100, session_actor, viewport_active_media_container_atom()
             )[0]
+            container_uuid = str(result.uuid)
             c = Container(self.connection, result.actor)
-            if c.type == "Timeline":
+            try:
+                c_type = c.type
+            except RuntimeError as re:
+                if "invalid_argument" in str(re):
+                    # No active container in viewport (e.g. startup / no image viewed)
+                    return
+                raise
+
+            if c_type == "Timeline":
                 container = Timeline(self.connection, result.actor, result.uuid)
-            elif c.type == "Subset":
+            elif c_type == "Subset":
                 container = Subset(self.connection, result.actor, result.uuid)
-            elif c.type == "ContactSheet":
+            elif c_type == "ContactSheet":
                 container = ContactSheet(self.connection, result.actor, result.uuid)
             else:
                 container = Playlist(self.connection, result.actor, result.uuid)
@@ -1065,28 +1115,31 @@ class ORISyncPlugin(PluginBase):
             clip_guid = None
             is_timeline = isinstance(container, Timeline)
             is_playlist = isinstance(container, Playlist)
+
+            # Cache the viewport container type for playhead event handlers
+            self._viewport_container_is_playlist = is_playlist
+            self._viewport_container_is_timeline = is_timeline
             
             if is_timeline:
                 # Viewing Timeline: check its timeline item selection.
                 try:
                     selected_items = container.selection
+                    sel_names = [f"{getattr(item, 'name', '')} ({type(item).__name__})" for item in selected_items]
+                    if getattr(self, "_last_sel_names", None) != sel_names:
+                        _log(f"Timeline selection changed: {sel_names}")
+                        self._last_sel_names = sel_names
                 except Exception:
                     _log_exc("Timeline selection poll failed")
                     selected_items = []
 
                 media = None
-                if len(selected_items) == 1 and isinstance(selected_items[0], Clip):
-                    media = selected_items[0].media
-                else:
-                    # Fall back to playhead_selection: returns the clip at the
-                    # current timecode (always exactly 1 in Timeline mode).
-                    try:
-                        sel = container.playhead_selection
-                        selected_sources = sel.selected_sources
-                    except Exception:
-                        selected_sources = []
-                    if len(selected_sources) == 1:
-                        media = selected_sources[0]
+                clip_item = None
+                for item in selected_items:
+                    if type(item).__name__ == "Clip":
+                        clip_item = item
+                        break
+                if clip_item:
+                    media = clip_item.media
 
                 if media:
                     clip_guid = self._clip_guid_for_media_name(media.name)
@@ -1096,13 +1149,36 @@ class ORISyncPlugin(PluginBase):
                 try:
                     sel = container.playhead_selection
                     selected_sources = sel.selected_sources
+                    src_names = [s.name for s in selected_sources]
+                    if getattr(self, "_last_src_names", None) != src_names:
+                        _log(f"Playlist selection changed: {src_names}")
+                        self._last_src_names = src_names
                 except Exception:
                     _log_exc("Playlist selection poll failed")
                     selected_sources = []
 
-                if len(selected_sources) == 1:
+                if len(selected_sources) >= 1:
                     clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
             
+            # Calculate local changes against cache
+            container_changed = (container_uuid != self._last_polled_container_uuid)
+            selection_changed = (clip_guid != self._last_polled_clip_guid)
+
+            # Update cache with current polled values
+            self._last_polled_container_uuid = container_uuid
+            self._last_polled_clip_guid = clip_guid
+
+            # Suppress broadcasts for a short window after applying a remote update.
+            # We do this after updating the cache to absorb remote-triggered updates.
+            if time.monotonic() < self._selection_suppress_until:
+                return
+                
+            # If nothing changed locally, do not broadcast (echo prevention)
+            if not (container_changed or selection_changed):
+                return
+
+            view_mode = "sequence" if is_timeline else "source"
+
             # Handle broadcast if selection changed
             if clip_guid:
                 if clip_guid == self._suppress_rebroadcast_clip_guid:
@@ -1111,28 +1187,28 @@ class ORISyncPlugin(PluginBase):
                     # poll keeps seeing it — but broadcasting it would toggle RV
                     # back to clip view.  Skip until the user moves to a different clip.
                     pass
-                elif clip_guid != self._last_broadcast_clip_guid:
+                elif clip_guid != self._last_broadcast_clip_guid or container_changed:
                     # User moved to a new clip; clear the post-clear suppression.
                     self._suppress_rebroadcast_clip_guid = None
-                    _log(f"Poll selection: broadcasting selection clip_guid={clip_guid[:8]}")
+                    _log(f"Poll selection: broadcasting selection clip_guid={clip_guid[:8]} view_mode={view_mode}")
                     self._last_broadcast_clip_guid = clip_guid
                     clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
                     if clip_tl_guid:
                         self.manager.active_timeline_guid = clip_tl_guid
-                    self.manager.broadcast_selection(clip_guid)
+                    self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
                     self._broadcast_play_state_for_selection(clip_tl_guid)
             else:
-                # No selection found. We only broadcast selection clear when transitioning back to sequence (Timeline).
-                if is_timeline and self._last_broadcast_clip_guid is not None:
-                    _log("Poll selection: container is Timeline and selection is empty → broadcasting selection clear")
+                # No selection found (clear or container switch)
+                if self._last_broadcast_clip_guid is not None or container_changed:
+                    _log(f"Poll selection: broadcasting selection clear/switch (view_mode={view_mode})")
                     self._last_broadcast_clip_guid = None
                     if self.manager:
                         seq_tl_guid = self.manager.sequence_timeline_guid
                         if seq_tl_guid:
                             self.manager.active_timeline_guid = seq_tl_guid
-                    self.manager.broadcast_selection("")
-        except Exception:
-            pass
+                    self.manager.broadcast_selection("", view_mode=view_mode)
+        except Exception as e:
+            _log_exc(f"Selection poll failed: {e}")
 
     def _broadcast_play_state_for_selection(self, clip_tl_guid: str) -> None:
         """Broadcast playing=True state when a clip is selected, ensuring RV also starts playback."""
@@ -1229,12 +1305,24 @@ class ORISyncPlugin(PluginBase):
     def _get_viewport(self) -> "Viewport | None":
         """Return a cached Viewport for the active xStudio window, or None on error."""
         if self._viewport is not None:
+            if self._pending_on_screen_source is not None:
+                try:
+                    self.connection.api.session.set_on_screen_source(
+                        self._pending_on_screen_source
+                    )
+                    _log(f"Applied deferred on-screen source: {getattr(self._pending_on_screen_source, 'name', '?')}")
+                except Exception:
+                    pass
+                self._pending_on_screen_source = None
             return self._viewport
         try:
             self._viewport = Viewport(self.connection, active_viewport=True)
             _log("Viewport acquired")
         except Exception as e:
-            _log(f"_get_viewport: {e}")
+            now = time.monotonic()
+            if now - getattr(self, "_last_viewport_error_log_time", 0.0) >= 5.0:
+                _log(f"_get_viewport: {e}")
+                self._last_viewport_error_log_time = now
             return self._viewport
         # Viewport just became available — apply any deferred on-screen source
         # so the session panel refreshes to show all loaded playlists.
@@ -1243,6 +1331,7 @@ class ORISyncPlugin(PluginBase):
                 self.connection.api.session.set_on_screen_source(
                     self._pending_on_screen_source
                 )
+                _log(f"Applied deferred on-screen source: {getattr(self._pending_on_screen_source, 'name', '?')}")
             except Exception:
                 pass
             self._pending_on_screen_source = None
@@ -1350,13 +1439,13 @@ class ORISyncPlugin(PluginBase):
         if not self.active_playhead:
             return
         clip_guid = data.get("clip_guid", "")
+        view_mode = data.get("view_mode", "source")
 
         if not clip_guid:
-            # Clear: return to timeline sequence view and select all media.
-            _log("RECV selection clear → returning to sequence view")
+            # Clear / container switch.
+            _log(f"RECV selection clear/switch (view_mode={view_mode})")
             # Remember which clip was active so the poll won't re-broadcast it
-            # while the playhead is still positioned there (which would toggle RV
-            # back to clip view).  Cleared when the playhead moves to a different clip.
+            # while the playhead is still positioned there.
             self._suppress_rebroadcast_clip_guid = self._last_broadcast_clip_guid
             self._last_broadcast_clip_guid = None
             # Also suppress the poll for 1 s to let the viewport switch settle.
@@ -1368,19 +1457,23 @@ class ORISyncPlugin(PluginBase):
                     if seq_tl_guid in self._sync_playlists:
                         pl, tl = self._sync_playlists[seq_tl_guid]
                         try:
-                            # set_on_screen_source uses active_media_container_atom
-                            # (actor reference), which is the same path used at
-                            # initial load.  viewed_container= only sends a UUID via
-                            # viewport_active_media_container_atom and doesn't update
-                            # the video playback path, leaving the old single-clip
-                            # playhead in control.
-                            self.connection.api.session.set_on_screen_source(tl)
+                            # Switch viewed_container and on_screen_source based on view_mode.
+                            viewed_c = tl if (view_mode == "sequence" and tl is not None) else pl
+                            self.connection.api.session.viewed_container = viewed_c
+                            
+                            # Update the viewport source
+                            if view_mode == "sequence" and tl:
+                                self.connection.api.session.set_on_screen_source(tl)
+                                _log("RECV selection clear: set_on_screen_source to timeline (Sequence)")
+                            else:
+                                self.connection.api.session.set_on_screen_source(pl)
+                                _log("RECV selection clear: set_on_screen_source to playlist (Source)")
+                            
                             pl.playhead_selection.select_all()
-                            _log("RECV selection clear: set_on_screen_source to timeline and selected all media")
                         except Exception:
-                            _log_exc("RECV selection clear: failed to switch container/select all")
-                        # Refresh active_playhead so subsequent position writes go to
-                        # the timeline's playhead, not the stale single-clip one.
+                            _log_exc("RECV selection clear: failed to switch container")
+                        
+                        # Refresh active_playhead
                         _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                         try:
                             fut = _ex.submit(self.current_playhead)
@@ -1420,6 +1513,8 @@ class ORISyncPlugin(PluginBase):
         self._suppress_rebroadcast_clip_guid = None
         # Suppress selection-broadcast poll for 1 s to let the viewport settle.
         self._selection_suppress_until = time.monotonic() + 1.0
+        # Block updates to active_playhead from Form-2 events during the transition.
+        self._playhead_lock_until = time.monotonic() + 1.0
 
         # Find the best playlist to use for switching the viewport.
         # Strategy:
@@ -1441,26 +1536,27 @@ class ORISyncPlugin(PluginBase):
         playlist_xs_tl = None
         use_source = False  # True → set_on_screen_source; False → set_selection
 
-        for tl_guid, (pl, xs_tl) in self._sync_playlists.items():
-            otio_tl = self.manager.timelines.get(tl_guid)
-            if otio_tl is None:
-                continue
-            video_clips = [
-                c for t in otio_tl.tracks
-                if t.kind == otio.schema.TrackKind.Video
-                for c in t if isinstance(c, otio.schema.Clip)
-            ]
-            if len(video_clips) != 1:
-                continue
-            cname = video_clips[0].name or ""
-            if (cname == clip_name
-                    or os.path.splitext(os.path.basename(cname))[0] == clip_stem):
-                playlist = pl
-                playlist_xs_tl = xs_tl
-                use_source = True
-                _log(f"RECV selection: matched individual playlist "
-                     f"{getattr(pl, 'name', '?')!r} for clip {clip_guid[:8]} ({clip_name!r})")
-                break
+        if view_mode == "source":
+            for tl_guid, (pl, xs_tl) in self._sync_playlists.items():
+                otio_tl = self.manager.timelines.get(tl_guid)
+                if otio_tl is None:
+                    continue
+                video_clips = [
+                    c for t in otio_tl.tracks
+                    if t.kind == otio.schema.TrackKind.Video
+                    for c in t if isinstance(c, otio.schema.Clip)
+                ]
+                if len(video_clips) != 1:
+                    continue
+                cname = video_clips[0].name or ""
+                if (cname == clip_name
+                        or os.path.splitext(os.path.basename(cname))[0] == clip_stem):
+                    playlist = pl
+                    playlist_xs_tl = xs_tl
+                    use_source = True
+                    _log(f"RECV selection: matched individual playlist "
+                         f"{getattr(pl, 'name', '?')!r} for clip {clip_guid[:8]} ({clip_name!r})")
+                    break
 
         matched_tl_guid = None  # set during pass-2 fallback
         if playlist is None:
@@ -1486,7 +1582,7 @@ class ORISyncPlugin(PluginBase):
             # multi-clip seq   → set_on_screen_source + seek to clip start frame.
             # flat playlist    → viewed_container + set_selection (still works for those).
             is_multi_clip = False
-            if not use_source and matched_tl_guid is not None and playlist_xs_tl is not None:
+            if not use_source and matched_tl_guid is not None and playlist_xs_tl is not None and view_mode == "sequence":
                 otio_tl = self.manager.timelines.get(matched_tl_guid)
                 if otio_tl is not None:
                     n_video = sum(
@@ -1497,27 +1593,45 @@ class ORISyncPlugin(PluginBase):
                     is_multi_clip = n_video > 1
 
             try:
+                # Switch the viewed container in the sidebar.
+                # If we are in sequence view and have a timeline, view the timeline. Otherwise view the playlist.
+                viewed_c = playlist_xs_tl if (view_mode == "sequence" and playlist_xs_tl is not None) else playlist
+                self.connection.api.session.viewed_container = viewed_c
+
                 if use_source and playlist_xs_tl is not None:
                     # Single-clip individual playlist: just show it.
                     self.connection.api.session.set_on_screen_source(playlist_xs_tl)
                     _log(f"RECV selection: set_on_screen_source (individual) → "
                          f"{getattr(playlist_xs_tl, 'name', '?')!r}")
                 elif is_multi_clip:
-                    # Multi-clip sequence: show the timeline then seek its playhead.
-                    # set_selection on a sequence playlist does not reliably fire
-                    # show_atom — seeking the sequence playhead does.
+                    # Multi-clip sequence: seek the playhead after the source switch
+                    # to avoid invalid_request errors.
                     start_frame = 0
                     try:
                         start_frame = int(clip.range_in_parent().start_time.value)
                     except Exception:
-                        pass
+                        # Fallback: Sum duration of all preceding items in the track
+                        otio_tl = self.manager.timelines.get(matched_tl_guid) if self.manager else None
+                        if otio_tl:
+                            for track in otio_tl.tracks:
+                                if track.kind == otio.schema.TrackKind.Video:
+                                    current_time = 0
+                                    for item in track:
+                                        if item.metadata.get("sync", {}).get("guid") == clip_guid:
+                                            start_frame = current_time
+                                            break
+                                        sr = getattr(item, "source_range", None)
+                                        if sr is not None:
+                                            current_time += int(sr.duration.value)
+
                     self.connection.api.session.set_on_screen_source(playlist_xs_tl)
-                    playlist_xs_tl.playhead.position = start_frame
                     _log(f"RECV selection: set_on_screen_source (sequence) → "
-                         f"{getattr(playlist_xs_tl, 'name', '?')!r} frame={start_frame}")
+                         f"{getattr(playlist_xs_tl, 'name', '?')!r}")
+
+                    self._pending_seek_frame = start_frame
                 else:
-                    # Flat playlist: viewed_container + set_selection still works.
-                    self.connection.api.session.viewed_container = playlist
+                    # Flat playlist: viewed_container + set_on_screen_source + set_selection
+                    self.connection.api.session.set_on_screen_source(playlist)
                     media, _ = self._find_media_for_clip_guid(clip_guid)
                     if media:
                         playlist.playhead_selection.set_selection([media.uuid])
@@ -1527,13 +1641,31 @@ class ORISyncPlugin(PluginBase):
                         _log(f"RECV selection: media not found for clip {clip_guid[:8]}")
             except Exception:
                 _log_exc("RECV selection: container switch or selection failed")
-            
+
             _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
                 fut = _ex.submit(self.current_playhead)
                 new_ph = fut.result(timeout=3.0)
                 self.active_playhead = new_ph
                 _log("RECV selection: refreshed active_playhead after switch")
+
+                # Apply sequence playhead seek now that the source switch is complete
+                # and the correct playhead actor is active.
+                # If the playhead actor returns invalid_request, it might still be
+                # resolving its duration asynchronously. Retry up to 5 times with a 100ms sleep.
+                if is_multi_clip and self.active_playhead and hasattr(self, "_pending_seek_frame"):
+                    seek_frame = self._pending_seek_frame
+                    delattr(self, "_pending_seek_frame")
+                    for attempt in range(5):
+                        try:
+                            self.active_playhead.position = seek_frame
+                            _log(f"RECV selection: seeked playhead to {seek_frame} (attempt {attempt+1})")
+                            break
+                        except Exception as seek_err:
+                            if attempt == 4:
+                                raise seek_err
+                            _log(f"RECV selection: seek attempt {attempt+1} failed: {seek_err}, retrying in 100ms...")
+                            time.sleep(0.1)
             except concurrent.futures.TimeoutError:
                 _log("RECV selection: current_playhead() timed out, using existing playhead")
             except Exception:
@@ -1724,12 +1856,36 @@ class ORISyncPlugin(PluginBase):
 
             self._xs_flat_playlists[tl_guid] = (xs_playlist, current_order)
 
+    @staticmethod
+    def _clips_match(c1: "otio.schema.Clip", c2: "otio.schema.Clip") -> bool:
+        """Check if two OTIO Clips refer to the same media item.
+
+        Compares the names and target URLs (if present) of the two clips.
+
+        :param c1: The first clip to compare.
+        :type c1: otio.schema.Clip
+        :param c2: The second clip to compare.
+        :type c2: otio.schema.Clip
+        :return: True if they refer to the same media, False otherwise.
+        :rtype: bool
+        """
+        if c1.name != c2.name:
+            return False
+        mr1 = getattr(c1, "media_reference", None)
+        mr2 = getattr(c2, "media_reference", None)
+        url1 = getattr(mr1, "target_url", None) if mr1 else None
+        url2 = getattr(mr2, "target_url", None) if mr2 else None
+        if url1 and url2 and url1 != url2:
+            return False
+        return True
+
     def _poll_sequence_new_media(self) -> None:
         """Detect and broadcast clips added to sequence Timelines.
 
         Only runs on the master.  Re-exports each tracked xStudio Timeline via
-        ``to_otio_string()`` and compares the clip names against the stored OTIO
-        track.  New clips are broadcast via ``manager.insert_child``.
+        ``to_otio_string()`` and compares the clip sequence against the stored
+        OTIO track using an index-based alignment loop. New clips are broadcast
+        via ``manager.insert_child``.
         """
         if not self.manager or not self.manager.is_master:
             return
@@ -1753,17 +1909,49 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 continue
 
-            stored_names = {
-                c.name for c in video_track if isinstance(c, otio.schema.Clip)
-            }
             for fresh_track in fresh_tl.tracks:
                 if fresh_track.kind != otio.schema.TrackKind.Video:
                     continue
                 fresh_clips = [c for c in fresh_track if isinstance(c, otio.schema.Clip)]
-                for i, fresh_clip in enumerate(fresh_clips):
-                    if fresh_clip.name not in stored_names:
-                        self.manager.insert_child(track_guid, fresh_clip, i)
-                        _log(f"sequence new clip: {fresh_clip.name!r} at index {i}")
+                stored_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
+
+                fresh_idx = 0
+                stored_idx = 0
+                while fresh_idx < len(fresh_clips):
+                    fresh_clip = fresh_clips[fresh_idx]
+
+                    # Check if it matches the current stored clip
+                    match = False
+                    if stored_idx < len(stored_clips):
+                        if self._clips_match(fresh_clip, stored_clips[stored_idx]):
+                            match = True
+
+                    if match:
+                        fresh_idx += 1
+                        stored_idx += 1
+                    else:
+                        # Check if fresh_clip matches any later stored clip
+                        found_later = False
+                        for temp_idx in range(stored_idx + 1, len(stored_clips)):
+                            if self._clips_match(fresh_clip, stored_clips[temp_idx]):
+                                stored_idx = temp_idx
+                                found_later = True
+                                break
+
+                        if found_later:
+                            # Now fresh_clip matches stored_clips[stored_idx]
+                            fresh_idx += 1
+                            stored_idx += 1
+                        else:
+                            # Truly a new clip insert
+                            # Deep-copy the clip using serialization to avoid ValueError: child already has a parent
+                            from otio_sync_core.patcher import _otio_to_dict, _dict_to_otio
+                            clip_copy = _dict_to_otio(_otio_to_dict(fresh_clip))
+                            self.manager.insert_child(track_guid, clip_copy, fresh_idx)
+                            _log(f"sequence new clip: {fresh_clip.name!r} at index {fresh_idx}")
+                            stored_clips.insert(fresh_idx, clip_copy)
+                            fresh_idx += 1
+                            stored_idx += 1
 
     def _apply_remote_clip_insert(self, clip_obj: "otio.schema.Clip") -> None:
         """Route a received non-annotation INSERT_CHILD clip to the right handler.
@@ -2622,15 +2810,30 @@ class ORISyncPlugin(PluginBase):
             media = self._flat_clip_to_media[clip_guid]
             return media, _aspect(media)
 
-        # Slow path: scan all playlists by name.
+        # Slow path: scan all playlists by name, path, or URI.
         import os
         clip_stem = os.path.splitext(os.path.basename(clip_name or ""))[0]
+        clip_uri = ""
+        clip_path = ""
+        mr = getattr(otio_clip, "media_reference", None)
+        if isinstance(mr, otio.schema.ExternalReference):
+            clip_uri = mr.target_url or ""
+            clip_path = _uri_to_posix_path(clip_uri)
+
         for playlist, _ in self._sync_playlists.values():
             try:
                 for media in playlist.media:
                     mname = media.name or ""
                     if mname == clip_name or os.path.splitext(os.path.basename(mname))[0] == clip_stem:
                         return media, _aspect(media)
+                    try:
+                        ms = media.media_source()
+                        m_uri = str(ms.media_reference.uri())
+                        m_path = _uri_to_posix_path(m_uri)
+                        if (clip_uri and m_uri == clip_uri) or (clip_path and m_path == clip_path):
+                            return media, _aspect(media)
+                    except Exception:
+                        pass
             except Exception:
                 _log_exc("_find_media_for_clip_guid: error scanning playlist")
         return None, 0.8889

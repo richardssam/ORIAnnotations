@@ -35,3 +35,8 @@ The plugin can be loaded using the OpenRV package manager by loading in the [ori
 
 If you need to rebuild the oriannotations.zip package, the script "makepackage.csh" should re-create the package given the files in the git repo.
 
+## Debugging & State Inspection
+
+For details on connecting to running review instances, configuring ports, and using the active viewport inspection utilities, see the [debug directory README](file:///Users/sam/git/ORIAnnotations/debug/README.md).
+
+

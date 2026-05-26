@@ -1049,12 +1049,14 @@ class SyncManager:
             },
         })
 
-    def broadcast_selection(self, clip_guid: str) -> None:
+    def broadcast_selection(self, clip_guid: str, view_mode: str = "source") -> None:
         """Broadcast the selected clip GUID to all peers.
 
         :param clip_guid: OTIO sync GUID of the selected clip.  Receivers
             map this back to their local representation (RV source group,
             xStudio playlist position, etc.) before applying.
+        :param view_mode: View mode string ("source" or "sequence").
+        :type view_mode: str
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return
@@ -1063,7 +1065,7 @@ class SyncManager:
             "event": "SET",
             "session_id": self.session_id,
             "source_guid": self.self_guid,
-            "payload": {"clip_guid": clip_guid, "sync_timestamp": time.time()},
+            "payload": {"clip_guid": clip_guid, "view_mode": view_mode, "sync_timestamp": time.time()},
         })
 
     def broadcast_move_child(

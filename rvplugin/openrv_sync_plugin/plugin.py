@@ -1477,6 +1477,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if self._rv_updating or not self.sync_manager or self.sync_manager.status != STATE_SYNCED:
             event.reject()
             return
+        # Channel change: RVDisplayColor.color.channelFlood written by r/g/b/a keys.
+        # Broadcast immediately rather than waiting for the next poll tick.
+        if "channelFlood" in contents:
+            self._broadcast_display_state()
+            event.reject()
+            return
+
         # Trigger on pen point changes: node.pen:N:F:user.points
         # Or on text string changes: node.text:N:F:user.text
         is_pen = ".pen:" in contents and contents.endswith(".points")
@@ -1690,19 +1697,26 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log_exc(f"Failed to broadcast annotation: {e}")
 
-    def _rv_display_color_node(self):
-        """Return the active-display RVDisplayColor node, or None.
+    def _rv_display_color_nodes(self):
+        """Return all active-viewer RVDisplayColor nodes (one per display pane).
 
-        ``nodesOfType`` returns all RVDisplayColor nodes.  The first entry is
-        the ``defaultOutputGroup_colorPipeline_0`` node (output/export pipeline)
-        which is *not* what the channel-isolation keys (r/g/b/a) modify.
-        Those keys use ``#RVDisplayColor`` in Mu which resolves to the first
-        ``displayGroup*`` pipeline node — so we prefer that here.
+        Excludes ``defaultOutputGroup*`` which is the export/output pipeline and
+        is NOT modified by the r/g/b/a channel-isolation keys.  RV creates one
+        ``displayGroup*_colorPipeline_0`` node per layout pane; pressing r/g/b/a
+        only changes the *focused* pane, so we must read and write all of them.
         """
-        nodes = rv.commands.nodesOfType("RVDisplayColor")
-        for n in nodes:
-            if n.startswith("displayGroup"):
-                return n
+        all_nodes = rv.commands.nodesOfType("RVDisplayColor")
+        if not all_nodes:
+            return []
+        if not getattr(self, "_display_color_nodes_logged", False):
+            self._display_color_nodes_logged = True
+            _log(f"RVDisplayColor nodes: {all_nodes}")
+        active = [n for n in all_nodes if "defaultoutput" not in n.lower()]
+        return active if active else all_nodes
+
+    def _rv_display_color_node(self):
+        """Return the first active-viewer RVDisplayColor node, or None."""
+        nodes = self._rv_display_color_nodes()
         return nodes[0] if nodes else None
 
     # channelFlood encoding from rvui.mu showChannel(): 0=RGBA, 1=R, 2=G, 3=B, 4=A, 5=Luma
@@ -1760,15 +1774,28 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 state["exposure"] = float(exp[0]) if exp else 0.0
         except Exception as e:
             _log(f"WARN _read_rv_display_state exposure: {e}")
-        # Channel — active displayGroup's RVDisplayColor (r/g/b/a keys).
-        dc = self._rv_display_color_node()
-        if dc:
-            try:
-                flood = rv.commands.getIntProperty(f"{dc}.color.channelFlood")
+        # Channel — scan ALL displayGroup RVDisplayColor nodes.
+        # Pressing r/g/b/a only changes the focused pane's node; if that pane is
+        # not displayGroup0 we'd miss the change reading just one node.  Scan all
+        # of them: if any deviates from the last known channel, use that value so
+        # the change is detected and broadcast.
+        dc_nodes = self._rv_display_color_nodes()
+        if dc_nodes:
+            last_flood = self._RV_CH_TO_FLOOD.get(
+                self._last_display_state.get("channel", "RGBA"), 0)
+            floods = []
+            for n in dc_nodes:
+                try:
+                    f = rv.commands.getIntProperty(f"{n}.color.channelFlood")
+                    floods.append(f[0] if f else 0)
+                except Exception as e:
+                    _log(f"WARN _read_rv_display_state channelFlood ({n}): {e}")
+            if floods:
+                # Prefer any pane that differs from the last broadcast state
+                # (that's the pane the user just changed).
+                changed = [f for f in floods if f != last_flood]
                 state["channel"] = self._RV_FLOOD_TO_CH.get(
-                    flood[0] if flood else 0, "RGBA")
-            except Exception as e:
-                _log(f"WARN _read_rv_display_state channelFlood: {e}")
+                    changed[0] if changed else floods[0], "RGBA")
         return state
 
     def _broadcast_display_state(self):
@@ -1785,17 +1812,38 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         state = self._read_rv_display_state()
         if state == self._last_display_state:
             return
-        # Normalise all source nodes to the new exposure so that navigating
-        # between clips does not trigger false change detections next tick.
-        if state["exposure"] != self._last_display_state.get("exposure"):
-            ev = float(state["exposure"])
-            try:
-                for node in rv.commands.nodesOfType("RVColor"):
-                    rv.commands.setFloatProperty(
-                        f"{node}.color.exposure", [ev, ev, ev], True)
-            except Exception:
-                pass
+        prev = self._last_display_state
         self._last_display_state = state
+        # Guard the normalisation writes with _rv_updating so that the
+        # synchronous graph-state-change events they fire are suppressed by
+        # on_rv_graph_state_change.  Without this, each write re-enters
+        # _broadcast_display_state while the other panes are still mid-update,
+        # causing the "changed" detection to misread a partially-normalised
+        # state and broadcast the wrong channel back.
+        self._rv_updating = True
+        try:
+            # Normalise all source nodes to the new exposure so that navigating
+            # between clips does not trigger false change detections next tick.
+            if state["exposure"] != prev.get("exposure"):
+                ev = float(state["exposure"])
+                try:
+                    for node in rv.commands.nodesOfType("RVColor"):
+                        rv.commands.setFloatProperty(
+                            f"{node}.color.exposure", [ev, ev, ev], True)
+                except Exception:
+                    pass
+            # Normalise all display panes to the new channel so that subsequent
+            # reads from any pane agree and don't re-trigger a broadcast.
+            if state["channel"] != prev.get("channel"):
+                flood = self._RV_CH_TO_FLOOD.get(state["channel"], 0)
+                for dc in self._rv_display_color_nodes():
+                    try:
+                        rv.commands.setIntProperty(
+                            f"{dc}.color.channelFlood", [flood], True)
+                    except Exception:
+                        pass
+        finally:
+            self._rv_updating = False
         _log(f"SEND display zoom={state['zoom']:.3f} pan={state['pan']} "
              f"exposure={state['exposure']:.3f} channel={state['channel']}")
         self.sync_manager.broadcast_display_state(state)
@@ -1837,14 +1885,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log(f"RECV display: exposure set failed: {e}")
 
-        dc = self._rv_display_color_node()
-        if dc:
+        flood = self._RV_CH_TO_FLOOD.get(channel, 0)
+        for dc in self._rv_display_color_nodes():
             try:
-                flood = self._RV_CH_TO_FLOOD.get(channel, 0)
                 rv.commands.setIntProperty(f"{dc}.color.channelFlood",
                                            [flood], True)
             except Exception as e:
-                _log(f"RECV display: channel set failed: {e}")
+                _log(f"RECV display: channel set failed ({dc}): {e}")
 
         # Keep _last_display_state consistent with what we actually hold.
         # If the sender omitted pan/zoom, preserve our current read-back values

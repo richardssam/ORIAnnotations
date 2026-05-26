@@ -292,6 +292,21 @@ if frame == self._last_applied_frame:
     return          # remote-applied, skip echo
 ```
 
+### Selection Sync Feedback Loop & Playhead Fallback Prevention
+
+Scrubbing or playing a `Timeline` sequence updates the active media under the playhead, firing `show_atom` events. To prevent these from being incorrectly broadcast as new selection changes (which forces the peer viewport to reload the single-clip view):
+- We query the active viewport container via `viewport_active_media_container_atom()` to determine if a `Playlist` or a `Timeline` is currently shown in the viewport.
+- We cache these boolean states as `self._viewport_container_is_playlist` and `self._viewport_container_is_timeline` inside the `_poll_and_broadcast_selection()` loop.
+- In `_on_global_playhead_event()`, we check the cached `self._viewport_container_is_playlist` state to discard media changes when viewing a Timeline.
+- We disable `playhead_selection` fallback inside `_poll_and_broadcast_selection()` for Timeline mode, ensuring only explicit clicks in the timeline track trigger selection broadcasts.
+
+### Index-Based Timeline Sequence Polling
+
+When checking for newly added clips on the master in `_poll_sequence_new_media()`, xStudio's `to_otio_string()` does not export custom `"sync"` metadata, meaning clips lack stable GUIDs.
+- Do not compare clip names using a set (which ignores duplicate-named clips or end-of-timeline additions).
+- Perform a sequential index-based alignment loop comparing `fresh_clips` from the xStudio export with the manager's `stored_clips`.
+- Use a robust `_clips_match(c1, c2)` helper that compares clip names and target media URLs to identify insertions, additions, and deletions cleanly.
+
 ### Annotation trigger: `show_atom` + periodic fallback scan
 
 `annotation_atom` events from the `AnnotationsUI` plugin events group do **not**
@@ -520,6 +535,16 @@ Or add the package to your own Python's path:
 export PYTHONPATH=/Users/sam/git/xstudio/build/xSTUDIO.app/Contents/Frameworks/lib/python3.12/site-packages:$PYTHONPATH
 python3 diag.py
 ```
+
+### Using the xStudio Inspector Debug Tool
+
+For quick and comprehensive connection status, viewport container type, active playhead frame, and playlist/track/clip hierarchy verification, use the dedicated [xstudio_inspect.py](file:///Users/sam/git/ORIAnnotations/debug/xstudio_inspect.py) script:
+
+```bash
+/Users/sam/git/xstudio/build/vcpkg_installed/arm-osx/tools/python3/python3 -u debug/xstudio_inspect.py
+```
+
+See [debug/README.md](file:///Users/sam/git/ORIAnnotations/debug/README.md) for more details on port numbers and log file locations.
 
 ---
 

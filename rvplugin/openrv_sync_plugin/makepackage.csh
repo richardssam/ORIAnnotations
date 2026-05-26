@@ -23,6 +23,7 @@ zip ../rvplugin/openrv_sync_plugin/otiosyncdemo-0.1.rvpkg \
     otio_sync_core/network.py \
     otio_sync_core/rabbitmq_network.py \
     otio_sync_core/manager.py \
+    otio_sync_core/patcher.py \
     otio_sync_core/proxy.py
 
 echo "Built otiosyncdemo-0.1.rvpkg"
