@@ -101,6 +101,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             ("selection-changed", self.on_rv_selection_changed, "Broadcast Selection"),
             ("graph-state-change", self.on_rv_graph_state_change, "Broadcast Annotation"),
             ("after-graph-view-change", self.on_rv_view_changed, "Broadcast View"),
+            ("pointer-1--release",      self.on_rv_pen_up, "Pen up (release)"),
+            ("pointer--leave",          self.on_rv_pen_up, "Pen up (leave viewport)"),
+            ("pointer--control--leave", self.on_rv_pen_up, "Pen up (leave control)"),
         ], None, menus)
 
         self.sync_manager = None
@@ -114,8 +117,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._last_selection = []
         self._last_broadcast_clip_guid = None  # last clip GUID sent via SELECTION
         self._discovery_start_time = 0
-        self._pending_stroke = None  # (node_name, pen_component, stroke_uuid)
-        self._debounce_timer = None
+        self._pending_stroke = None   # (node_name, pen_component, stroke_uuid)
+        self._next_stroke_uuid = None # set when paint.nextId fires; consumed on first .points
         self._stroke_timer = None     # repeating partial-broadcast timer during drawing
         self._last_partial_point_count = 0
         self._partial_pen_nodes = {}  # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
@@ -907,6 +910,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     "join": 3,
                     "cap": 1,
                     "mode": mode,
+                    "hold": int(bool(getattr(ev_dict, "hold", False))),
+                    "ghost": int(bool(getattr(ev_dict, "ghost", False))),
+                    "ghost_before": getattr(ev_dict, "ghost_before", 0) or 0,
+                    "ghost_after": getattr(ev_dict, "ghost_after", 0) or 0,
                     "_stroke_uuid": stroke_uuid,
                 })
 
@@ -1042,6 +1049,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 "join": 3,
                 "cap": 1,
                 "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
+                "hold": int(bool(getattr(start_event, "hold", False))),
+                "ghost": int(bool(getattr(start_event, "ghost", False))),
+                "ghost_before": getattr(start_event, "ghost_before", 0) or 0,
+                "ghost_after": getattr(start_event, "ghost_after", 0) or 0,
             })
             rendered += 1
 
@@ -1441,6 +1452,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._broadcast_playback()
         event.reject()
 
+    def on_rv_pen_up(self, event):
+        """Pointer release / leave — flush any in-progress stroke immediately."""
+        self._on_pen_up()
+        event.reject()
+
     def on_rv_frame_changed(self, event):
         if self._rv_updating: event.reject(); return
         current_frame = rv.commands.frame()
@@ -1484,8 +1500,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             event.reject()
             return
 
-        # Trigger on pen point changes: node.pen:N:F:user.points
-        # Or on text string changes: node.text:N:F:user.text
+        # New stroke: paint.nextId incremented — flush the previous stroke (if
+        # any) and prepare a fresh UUID.  The matching .points event that follows
+        # will start the partial-broadcast timer.
+        if re.search(r"\.paint\.nextId$", contents):
+            if self._pending_stroke:
+                self._stop_stroke_timers()
+                self._flush_pending_stroke()
+            self._next_stroke_uuid = str(uuid.uuid4())
+            self._last_partial_point_count = 0
+            event.reject()
+            return
+
+        # Pen point or text change: node.pen:N:F:user.points / node.text:N:F:user.text
         is_pen = ".pen:" in contents and contents.endswith(".points")
         is_text = ".text:" in contents and contents.endswith(".text")
         if is_pen or is_text:
@@ -1493,15 +1520,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if len(parts) == 3:
                 node_name, component = parts[0], parts[1]
                 _log(f"annotation updated: {node_name}.{component}")
-                switching = self._pending_stroke and self._pending_stroke[1] != component
-                if switching:
-                    self._stop_stroke_timers()
-                    self._flush_pending_stroke()
-                if switching or self._pending_stroke is None:
-                    stroke_uuid = str(uuid.uuid4())
-                    self._last_partial_point_count = 0
-                else:
-                    stroke_uuid = self._pending_stroke[2]
+                # Consume the UUID prepared by paint.nextId (or fall back for
+                # text strokes which don't trigger nextId).
+                stroke_uuid = self._next_stroke_uuid or str(uuid.uuid4())
+                self._next_stroke_uuid = None
                 self._pending_stroke = (node_name, component, stroke_uuid)
                 # Repeating partial broadcast (50 ms) — fires while user is drawing.
                 if self._stroke_timer is None:
@@ -1509,19 +1531,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self._stroke_timer.timeout.connect(self._send_partial_stroke)
                 if not self._stroke_timer.isActive():
                     self._stroke_timer.start(50)
-                # Pen-up detector: fires 150 ms after the last point arrives.
-                if self._debounce_timer is None:
-                    self._debounce_timer = QtCore.QTimer()
-                    self._debounce_timer.setSingleShot(True)
-                    self._debounce_timer.timeout.connect(self._on_pen_up)
-                self._debounce_timer.start(150)
         event.reject()
 
     def _stop_stroke_timers(self):
         if self._stroke_timer and self._stroke_timer.isActive():
             self._stroke_timer.stop()
-        if self._debounce_timer and self._debounce_timer.isActive():
-            self._debounce_timer.stop()
 
     def _send_partial_stroke(self):
         """Repeating timer callback: broadcast current points without persisting to timeline."""
@@ -1540,7 +1554,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._broadcast_annotation(node_name, component, partial=True, stroke_uuid=stroke_uuid)
 
     def _on_pen_up(self):
-        """Pen-up detected (150 ms idle): stop partial timer and send final stroke."""
+        """Pen-up: stop partial timer and send final stroke."""
         if self._stroke_timer:
             self._stroke_timer.stop()
         self._flush_pending_stroke()
@@ -1626,11 +1640,27 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 try:
                     otio.schema.schemadef.module_from_name('SyncEvent')
                     penuuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
+
+                    def _int_prop(prop, default=0):
+                        try:
+                            return rv.commands.getIntProperty(prop)[0]
+                        except Exception:
+                            return default
+
+                    hold         = bool(_int_prop(f"{full_prop}.hold"))
+                    ghost        = bool(_int_prop(f"{full_prop}.ghost"))
+                    ghost_before = _int_prop(f"{full_prop}.ghostBefore")
+                    ghost_after  = _int_prop(f"{full_prop}.ghostAfter")
+
                     start_event = otio.schemadef.SyncEvent.PaintStart(
                         brush=brush,
                         rgba=list(color),
                         friendly_name=component.split(':')[-1],
-                        uuid=penuuid
+                        uuid=penuuid,
+                        hold=hold,
+                        ghost=ghost,
+                        ghost_before=ghost_before,
+                        ghost_after=ghost_after,
                     )
                     mode_prop = f"{full_prop}.mode"
                     if rv.commands.propertyExists(mode_prop) and rv.commands.getIntProperty(mode_prop)[0] == 1:
@@ -2068,7 +2098,15 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             rv.commands.newProperty(f"{full_pen}.startFrame", rv.commands.IntType, 1)
             rv.commands.newProperty(f"{full_pen}.duration", rv.commands.IntType, 1)
             rv.commands.newProperty(f"{full_pen}.mode", rv.commands.IntType, 1)
+            rv.commands.newProperty(f"{full_pen}.hold", rv.commands.IntType, 1)
+            rv.commands.newProperty(f"{full_pen}.ghost", rv.commands.IntType, 1)
+            rv.commands.newProperty(f"{full_pen}.ghostBefore", rv.commands.IntType, 1)
+            rv.commands.newProperty(f"{full_pen}.ghostAfter", rv.commands.IntType, 1)
             rv.commands.setIntProperty(f"{full_pen}.mode", [data.get("mode", 0)], True)
+            rv.commands.setIntProperty(f"{full_pen}.hold", [data.get("hold", 0)], True)
+            rv.commands.setIntProperty(f"{full_pen}.ghost", [data.get("ghost", 0)], True)
+            rv.commands.setIntProperty(f"{full_pen}.ghostBefore", [data.get("ghost_before", 0)], True)
+            rv.commands.setIntProperty(f"{full_pen}.ghostAfter", [data.get("ghost_after", 0)], True)
             rv.commands.setIntProperty(f"{full_pen}.debug", [0], True)
             rv.commands.setIntProperty(f"{full_pen}.join", [join], True)
             rv.commands.setIntProperty(f"{full_pen}.cap", [cap], True)
