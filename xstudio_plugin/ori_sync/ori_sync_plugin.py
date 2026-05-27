@@ -535,6 +535,8 @@ class ORISyncPlugin(PluginBase):
                     self._poll_flat_playlist_reorders()
                     self._poll_flat_playlist_new_media()
                     self._poll_sequence_new_media()
+                    self._poll_new_playlists()
+                    self._poll_playlist_renames()
                     self._last_flat_playlist_scan = now
             except Exception:
                 _log_exc("Poll loop error")
@@ -609,6 +611,26 @@ class ORISyncPlugin(PluginBase):
 
         elif action == "selection_changed":
             self._apply_selection(data)
+
+        elif action == "add_timeline":
+            # A new sequence/playlist timeline arrived from a remote peer.
+            # Reuse _do_load_timelines — it skips GUIDs already in
+            # _sync_playlists, so it is safe to call repeatedly.
+            # Both master and client create the local playlist/timeline so
+            # any peer can receive new timelines regardless of master status.
+            self._cmd_queue.put(("load_timelines", {}))
+
+        elif action == "timeline_renamed":
+            tl_guid = data.get("timeline_guid")
+            new_name = data.get("name", "")
+            if tl_guid and new_name and tl_guid in self._sync_playlists:
+                pl, xs_tl = self._sync_playlists[tl_guid]
+                target = xs_tl if xs_tl is not None else pl
+                try:
+                    target.name = new_name
+                    _log(f"RECV timeline_renamed: {tl_guid[:8]} → {new_name!r}")
+                except Exception:
+                    _log_exc(f"Could not rename timeline {tl_guid[:8]}")
 
         elif action == "state_request_timeout":
             _log("State request timed out. Electing self as master.")
@@ -2042,6 +2064,156 @@ class ORISyncPlugin(PluginBase):
                     _log_exc(f"flat playlist new media: failed for {media.name!r}")
 
             self._xs_flat_playlists[tl_guid] = (xs_playlist, current_order)
+
+    def _build_single_sequence_otio(
+        self, playlist, xs_tl
+    ) -> "otio.schema.Timeline | None":
+        """Build an OTIO Timeline from a single xStudio Timeline container.
+
+        Counterpart to :meth:`_build_otio_timelines` for use when a new
+        sequence is detected after initial connection.  Assigns deterministic
+        sync GUIDs to all tracks and clips using the same hashing scheme as
+        :meth:`_build_otio_timelines`.
+
+        :param playlist: Parent xStudio :class:`Playlist`.
+        :param xs_tl: xStudio :class:`Timeline` to export.
+        :returns: OTIO Timeline, or ``None`` on failure.
+        :rtype: opentimelineio.schema.Timeline or None
+        """
+        try:
+            if hasattr(xs_tl, "to_otio_string"):
+                otio_str = xs_tl.to_otio_string()
+            else:
+                from xstudio.api.auxiliary.otio import timeline_to_otio_string as _tl_str
+                otio_str = _tl_str(xs_tl)
+            tl = otio.adapters.read_from_string(otio_str)
+            tl_guid = str(xs_tl.uuid)
+            tl.metadata.setdefault("sync", {})["guid"] = tl_guid
+            tl.metadata["xs_playlist_name"] = playlist.name
+            import hashlib
+            for track_idx, track in enumerate(tl.tracks):
+                track_seed = f"{tl_guid}:{track.kind}:{track_idx}:{track.name}"
+                track_guid = hashlib.sha1(track_seed.encode("utf-8")).hexdigest()
+                track.metadata.setdefault("sync", {})["guid"] = track_guid
+                clip_idx = 0
+                for child in track:
+                    if isinstance(child, otio.schema.Clip):
+                        clip_seed = f"{track_guid}:{clip_idx}:{child.name}"
+                        clip_guid = hashlib.sha1(clip_seed.encode("utf-8")).hexdigest()
+                        child.metadata.setdefault("sync", {})["guid"] = clip_guid
+                        clip_idx += 1
+            _log(f"_build_single_sequence_otio: {tl.name!r}")
+            return tl
+        except Exception:
+            _log_exc(
+                f"_build_single_sequence_otio: failed for "
+                f"{getattr(xs_tl, 'name', '?')!r}"
+            )
+            return None
+
+    def _poll_new_playlists(self) -> None:
+        """Detect newly created playlists or timelines and broadcast them.
+
+        Runs on any synced peer (not just the master).  Scans
+        ``session.playlists`` for containers not yet in ``_sync_playlists``
+        and broadcasts each new one via
+        :meth:`~otio_sync_core.manager.SyncManager.broadcast_add_timeline`.
+        Sequence (Timeline-backed) and flat (media-bin) playlists are both
+        handled.
+        """
+        if not self.manager:
+            return
+        if self.manager.status != STATE_SYNCED:
+            return
+        try:
+            playlists = self.connection.api.session.playlists
+        except Exception:
+            return
+
+        known_pl_uuids: set[str] = set()
+        for pl, _ in self._sync_playlists.values():
+            try:
+                known_pl_uuids.add(str(pl.uuid))
+            except Exception:
+                pass
+
+        for playlist in playlists:
+            try:
+                pl_uuid = str(playlist.uuid)
+            except Exception:
+                continue
+            if pl_uuid in known_pl_uuids:
+                continue
+
+            # Unknown playlist — determine type and register.
+            try:
+                containers = playlist.containers
+            except Exception:
+                _log_exc(
+                    f"_poll_new_playlists: cannot get containers for "
+                    f"{getattr(playlist, 'name', '?')!r}"
+                )
+                continue
+
+            timelines = [c for c in containers if isinstance(c, Timeline)]
+            if timelines:
+                for xs_tl in timelines:
+                    tl_guid = str(xs_tl.uuid)
+                    if tl_guid in self._sync_playlists:
+                        continue
+                    tl = self._build_single_sequence_otio(playlist, xs_tl)
+                    if tl is None:
+                        continue
+                    self.manager.register_timeline(tl)
+                    self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
+                    self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                    self.manager.broadcast_add_timeline(tl_guid)
+                    _log(
+                        f"New sequence timeline {xs_tl.name!r} "
+                        f"(playlist={playlist.name!r}) → broadcast"
+                    )
+            else:
+                tl = self._build_otio_from_playlist_media(playlist)
+                if tl is None:
+                    continue
+                tl_guid = tl.metadata.get("sync", {}).get("guid", "")
+                if not tl_guid:
+                    continue
+                # _build_otio_from_playlist_media already adds to _sync_playlists
+                # as a side effect, so do NOT check tl_guid in _sync_playlists here —
+                # it would always be True and suppress the broadcast.
+                # Deduplication is handled by the known_pl_uuids check at the top.
+                self.manager.register_timeline(tl)
+                self.manager.broadcast_add_timeline(tl_guid)
+                _log(f"New flat playlist {playlist.name!r} → broadcast")
+
+    def _poll_playlist_renames(self) -> None:
+        """Detect and broadcast playlist or timeline name changes.
+
+        Runs on any synced peer (not just the master).  Compares the current
+        xStudio name against the OTIO timeline name stored in the manager for
+        each tracked playlist.  When a change is detected,
+        :meth:`~otio_sync_core.manager.SyncManager.broadcast_timeline_rename`
+        propagates it to all peers.
+        """
+        if not self.manager:
+            return
+        if self.manager.status != STATE_SYNCED:
+            return
+        for tl_guid, (pl, xs_tl) in list(self._sync_playlists.items()):
+            otio_tl = self.manager.timelines.get(tl_guid)
+            if otio_tl is None:
+                continue
+            try:
+                current_name = xs_tl.name if xs_tl is not None else pl.name
+            except Exception:
+                continue
+            if current_name and current_name != (otio_tl.name or ""):
+                _log(
+                    f"Timeline rename: {otio_tl.name!r} → {current_name!r} "
+                    f"({tl_guid[:8]})"
+                )
+                self.manager.broadcast_timeline_rename(tl_guid, current_name)
 
     @staticmethod
     def _clips_match(c1: "otio.schema.Clip", c2: "otio.schema.Clip") -> bool:

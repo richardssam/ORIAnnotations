@@ -319,15 +319,16 @@ class SyncManager:
         )
         return clip_tl_guid
 
-    def broadcast_clip_timeline(self, tl_guid: str) -> None:
-        """Broadcast a clip timeline to all peers so they can register its annotation track.
+    def broadcast_add_timeline(self, tl_guid: str) -> None:
+        """Broadcast a timeline to all peers so they can register it.
 
-        Should be called once per clip timeline, immediately after
-        :meth:`get_or_create_clip_timeline` returns a new GUID.  Peers that
-        already have the timeline (same deterministic GUID) will skip the
-        ``ADD_TIMELINE`` message.
+        Works for both sequence timelines (new playlist / new sequence) and
+        single-clip annotation timelines.  Call once immediately after
+        :meth:`register_timeline` to propagate a locally-created timeline to
+        all connected peers.  Peers that already hold the same GUID silently
+        ignore the message.
 
-        :param tl_guid: GUID of the clip timeline to broadcast.
+        :param tl_guid: GUID of the timeline to broadcast.
         """
         if not self.network or self.status != STATE_SYNCED:
             return
@@ -341,6 +342,48 @@ class SyncManager:
             "payload": {
                 "timeline_guid": tl_guid,
                 "timeline": _otio_to_dict(tl),
+                "sync_timestamp": time.time(),
+            },
+        })
+
+    def broadcast_clip_timeline(self, tl_guid: str) -> None:
+        """Broadcast a clip timeline to all peers so they can register its annotation track.
+
+        Should be called once per clip timeline, immediately after
+        :meth:`get_or_create_clip_timeline` returns a new GUID.  Peers that
+        already have the timeline (same deterministic GUID) will skip the
+        ``ADD_TIMELINE`` message.
+
+        Delegates to :meth:`broadcast_add_timeline`.
+
+        :param tl_guid: GUID of the clip timeline to broadcast.
+        """
+        self.broadcast_add_timeline(tl_guid)
+
+    def broadcast_timeline_rename(self, tl_guid: str, new_name: str) -> None:
+        """Rename a timeline locally and broadcast the change to all peers.
+
+        Updates the timeline's ``name`` attribute in ``_timelines`` immediately,
+        then sends a ``RENAME_TIMELINE`` message so all connected peers apply the
+        same rename.
+
+        :param tl_guid: GUID of the timeline to rename.
+        :param new_name: New display name for the timeline.
+        """
+        if self._is_syncing or not self.network or self.status != STATE_SYNCED:
+            return
+        tl = self._timelines.get(tl_guid)
+        if tl is None:
+            _log(f"broadcast_timeline_rename: unknown timeline {tl_guid}")
+            return
+        tl.name = new_name
+        self.network.send_payload({
+            "command": "RENAME_TIMELINE",
+            "session_id": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "timeline_guid": tl_guid,
+                "name": new_name,
                 "sync_timestamp": time.time(),
             },
         })
@@ -1226,15 +1269,36 @@ class SyncManager:
                 if tl_guid and tl_dict and tl_guid not in self._timelines:
                     tl = _dict_to_otio(tl_dict)
                     self._timelines[tl_guid] = tl
-                    self._traverse_and_map_preserve(tl)
                     seq_clip_guid = tl.metadata.get("clip_timeline_for")
                     if seq_clip_guid:
+                        # Single-clip annotation timeline — preserve canonical
+                        # sequence clip in object_map.
+                        self._traverse_and_map_preserve(tl)
                         self._clip_timelines[seq_clip_guid] = tl_guid
-                    _log(
-                        f"ADD_TIMELINE: registered clip_tl={tl_guid[:8]} "
-                        f"for seq_clip={str(seq_clip_guid)[:8] if seq_clip_guid else '?'}"
-                    )
+                        _log(
+                            f"ADD_TIMELINE: registered clip_tl={tl_guid[:8]} "
+                            f"for seq_clip={str(seq_clip_guid)[:8]}"
+                        )
+                    else:
+                        # Full sequence / playlist timeline — traverse normally
+                        # and notify the host application so it can create the
+                        # corresponding viewer containers.
+                        self._traverse_and_map(tl)
+                        _log(
+                            f"ADD_TIMELINE: new sequence timeline={tl_guid[:8]}"
+                            f" name={tl.name!r}"
+                        )
+                        return ("add_timeline", tl)
                 return None
+
+            if command == "RENAME_TIMELINE":
+                tl_guid = data.get("timeline_guid")
+                new_name = data.get("name", "")
+                tl = self._timelines.get(tl_guid)
+                if tl is not None and new_name:
+                    tl.name = new_name
+                    _log(f"RENAME_TIMELINE: {tl_guid[:8]} → {new_name!r}")
+                return ("timeline_renamed", data)
 
             if command == "PARTIAL_ANNOTATION":
                 return ("partial_annotation", data)

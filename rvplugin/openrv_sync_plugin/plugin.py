@@ -429,6 +429,148 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     # Network Polling & State Handshake
     # ------------------------------------------------------------------
 
+    def _poll_new_sequences(self):
+        """Detect newly created RVSequenceGroups and broadcast them as new timelines.
+
+        Runs on any synced peer (not just the master).  Any ``RVSequenceGroup``
+        node not yet in ``_rv_node_to_timeline_guid`` is built into an OTIO
+        timeline, registered in the sync manager, and broadcast to all peers via
+        :meth:`~otio_sync_core.manager.SyncManager.broadcast_add_timeline`.
+        When a peer receives a remote ``add_timeline`` it registers the resulting
+        ``RVSequenceGroup`` in ``_rv_node_to_timeline_guid`` immediately, so
+        this method will not re-broadcast it on the next poll.
+        """
+        if not self.sync_manager:
+            return
+        if self.sync_manager.status != STATE_SYNCED:
+            return
+        try:
+            seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+            fps = rv.commands.fps() or 24.0
+        except Exception:
+            return
+        for seq_group in seq_groups:
+            if seq_group in self._rv_node_to_timeline_guid:
+                continue
+            # New sequence group not yet tracked — register and broadcast it.
+            try:
+                seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
+            except Exception:
+                seq_name = seq_group
+            timeline = otio.schema.Timeline(seq_name)
+            stack = otio.schema.Stack("tracks")
+            timeline.tracks = stack
+            media_track = otio.schema.Track("Media")
+            stack.append(media_track)
+            ann_track = otio.schema.Track("Annotations")
+            stack.append(ann_track)
+            seq_sources = self._source_groups_for_sequences([seq_group])
+            edl_counts = self._edl_frame_counts(seq_group)
+            for idx, sg in enumerate(seq_sources.get(seq_group, [])):
+                num_frames = edl_counts[idx] if idx < len(edl_counts) else None
+                try:
+                    for n in rv.commands.nodesInGroup(sg):
+                        if rv.commands.nodeType(n) == "RVFileSource":
+                            clip = self._make_clip(n, fps, num_frames)
+                            if clip:
+                                media_track.append(clip)
+                except Exception as e:
+                    _log(f"_poll_new_sequences: error reading {sg}: {e}")
+            self.sync_manager.register_timeline(timeline)
+            tl_guid = timeline.metadata["sync"]["guid"]
+            self._rv_node_to_timeline_guid[seq_group] = tl_guid
+            self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+            self.sync_manager.broadcast_add_timeline(tl_guid)
+            _log(f"New RVSequenceGroup '{seq_name}' → timeline {tl_guid[:8]} broadcast")
+
+    def _poll_sequence_renames(self):
+        """Detect and broadcast RVSequenceGroup name changes.
+
+        Runs on any synced peer (not just the master).  Compares the current
+        ``ui.name`` property of each tracked sequence group against the OTIO
+        timeline name stored in the sync manager.  When a change is detected,
+        :meth:`~otio_sync_core.manager.SyncManager.broadcast_timeline_rename`
+        is called to propagate it to all peers.
+        """
+        if not self.sync_manager:
+            return
+        if self.sync_manager.status != STATE_SYNCED:
+            return
+        for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
+            tl = self.sync_manager._timelines.get(tl_guid)
+            if tl is None:
+                continue
+            try:
+                current_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
+            except Exception:
+                continue
+            if current_name and current_name != (tl.name or ""):
+                _log(f"Sequence rename: '{tl.name}' → '{current_name}' (node={seq_group})")
+                self.sync_manager.broadcast_timeline_rename(tl_guid, current_name)
+
+    def _create_rv_sequence_for_timeline(self, tl):
+        """Create an RVSequenceGroup for a remotely-received OTIO timeline.
+
+        Loads any media sources not already present in RV, then creates a new
+        ``RVSequenceGroup`` wired in clip order.  Registers the node in
+        ``_rv_node_to_timeline_guid`` so subsequent polling and selection events
+        resolve correctly.
+
+        This is the client-side counterpart to :meth:`_init_timelines_from_sequences`
+        on the master.  It is called when an ``add_timeline`` event arrives from
+        a remote peer.
+
+        :param tl: The :class:`~opentimelineio.schema.Timeline` that was just
+            registered into the sync manager.
+        """
+        tl_guid = tl.metadata.get("sync", {}).get("guid") if tl else None
+        if not tl_guid:
+            _log("_create_rv_sequence_for_timeline: no GUID on timeline")
+            return
+
+        # Collect ordered media paths from the timeline's video tracks.
+        all_paths = []
+        for track in tl.tracks:
+            if not self._is_media_track(track):
+                continue
+            for child in track:
+                if not isinstance(child, otio.schema.Clip):
+                    continue
+                ref = child.media_reference
+                if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
+                    all_paths.append(self._media_path(ref.target_url))
+
+        if not all_paths:
+            _log(f"_create_rv_sequence_for_timeline: no media in '{tl.name}'")
+            return
+
+        # Load any sources not yet present in the RV session.
+        already = set(self._path_to_source_group_map())
+        for path in all_paths:
+            if path not in already:
+                rv.commands.addSource(path)
+                _log(f"  addSource: {path}")
+
+        # Rescan after addSource calls.
+        path_to_sg = self._path_to_source_group_map()
+        seq_sources = [path_to_sg[p] for p in all_paths if p in path_to_sg]
+        if not seq_sources:
+            _log(f"_create_rv_sequence_for_timeline: no source groups mapped for '{tl.name}'")
+            return
+
+        try:
+            seq_node = rv.commands.newNode("RVSequenceGroup", tl.name)
+            rv.commands.setNodeInputs(seq_node, seq_sources)
+            self._rv_node_to_timeline_guid[seq_node] = tl_guid
+            self._sequence_input_order[seq_node] = list(seq_sources)
+            _log(
+                f"RECV add_timeline: created RVSequenceGroup '{tl.name}' "
+                f"({len(seq_sources)} sources) for {tl_guid[:8]}"
+            )
+            rv.commands.redraw()
+        except Exception as e:
+            _log_exc(f"_create_rv_sequence_for_timeline: failed for '{tl.name}': {e}")
+
     def _get_sequence_inputs(self, seq_group):
         """Return the ordered list of source group inputs for a sequence group."""
         try:
@@ -494,17 +636,23 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 if hasattr(clip.media_reference, "target_url") and clip.media_reference.target_url
             )
             seen_counts = Counter()
-            for otio_idx, sg in enumerate(current):
+            valid_sgs_before = 0  # count of path-resolved source groups before current position
+            for sg in current:
                 path = sg_to_path.get(sg)
                 if not path:
+                    # Non-source-group nodes (e.g. RVSequenceGroup like 'defaultSequence')
+                    # must be skipped and must NOT consume an OTIO index — the OTIO track
+                    # only contains real media clips, so using enumerate() would give an
+                    # inflated index that exceeds the track length and raises in C++.
                     continue
                 seen_counts[path] += 1
                 if seen_counts[path] > otio_path_counts[path]:
                     clip = self._make_otio_clip_for_sg(sg)
                     if clip:
-                        _log(f"Add: broadcasting insert_child sg={sg} at index={otio_idx}")
-                        self.sync_manager.insert_child(track_guid, clip, otio_idx)
+                        _log(f"Add: broadcasting insert_child sg={sg} at index={valid_sgs_before}")
+                        self.sync_manager.insert_child(track_guid, clip, valid_sgs_before)
                         otio_path_counts[path] += 1
+                valid_sgs_before += 1  # only increment for resolved source groups
 
             # --- Reorders: among clips still present, detect position changes ---
             ptcg = _build_path_to_guid()  # rebuild after any additions above
@@ -666,6 +814,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         if not self._rv_updating:
             self._check_sequence_reorders()
+            self._poll_new_sequences()
+            self._poll_sequence_renames()
             self._broadcast_display_state()
 
     def _handle_action(self, action, data):
@@ -702,6 +852,27 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self._apply_remove_child(data)
         elif action == "move_child":
             self._apply_move_child(data)
+        elif action == "add_timeline":
+            # A new sequence/playlist timeline arrived from a remote peer.
+            # Create the corresponding RVSequenceGroup so the user can view it.
+            self._rv_updating = True
+            try:
+                self._create_rv_sequence_for_timeline(data)
+            finally:
+                self._rv_updating = False
+        elif action == "timeline_renamed":
+            tl_guid = data.get("timeline_guid")
+            new_name = data.get("name", "")
+            for seq_group, guid in list(self._rv_node_to_timeline_guid.items()):
+                if guid == tl_guid:
+                    try:
+                        rv.commands.setStringProperty(
+                            f"{seq_group}.ui.name", [new_name], True
+                        )
+                        _log(f"RECV timeline_renamed: '{seq_group}' → '{new_name}'")
+                    except Exception as e:
+                        _log(f"Could not rename RVSequenceGroup '{seq_group}': {e}")
+                    break
         elif action == "state_request_timeout":
             _log("State request timed out. Electing self as master.")
             self._init_as_master()
