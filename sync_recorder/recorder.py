@@ -86,6 +86,9 @@ class SyncRecorder:
                 )
                 self._own_network = True
 
+            if hasattr(self.network, "wait_until_ready"):
+                self.network.wait_until_ready(timeout=5.0)
+
             self.events.clear()
             self._start_time = time.time()
             self._stop_event.clear()
@@ -263,6 +266,7 @@ def main() -> None:
 
     try:
         recorder.start(output_file=args.output)
+        print("Started")
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:

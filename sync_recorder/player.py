@@ -52,6 +52,13 @@ class SyncPlayer:
         self._play_replace_source_guid = True
         self._own_network = False
 
+        # Peer-join gate: hold playback until a STATE_SNAPSHOT has been sent
+        # and a configurable delay has elapsed.
+        self._wait_for_peer = False
+        self._post_snapshot_delay: float = 3.0
+        self._peer_snapshot_sent_at: float | None = None
+        self._peer_active_received: bool = False
+
     def load_recording(self, filepath: str) -> None:
         """Load recorded events from a JSON Lines file.
 
@@ -89,6 +96,8 @@ class SyncPlayer:
         speed: float = 1.0,
         loop: bool = False,
         replace_source_guid: bool = True,
+        wait_for_peer: bool = False,
+        post_snapshot_delay: float = 3.0,
     ) -> None:
         """Synchronously play back the loaded events, blocking until finished.
 
@@ -96,11 +105,36 @@ class SyncPlayer:
         :param loop: If True, loops playback indefinitely until interrupted.
         :param replace_source_guid: If True, replaces payload source GUIDs with
             the player's own guid.
+        :param wait_for_peer: If True, hold playback until a peer has requested
+            and received a ``STATE_SNAPSHOT``, then wait *post_snapshot_delay*
+            seconds before sending the first recorded event.
+        :param post_snapshot_delay: Seconds to wait after the snapshot is
+            delivered before playback begins.  Gives the joining peer time to
+            apply the snapshot before events start arriving.  Default 1.0 s.
         """
         if not self.events:
             raise ValueError("No recording loaded. Call load_recording() first.")
 
         self._ensure_network()
+        self._peer_snapshot_sent_at = None
+
+        if wait_for_peer:
+            print("[*] Waiting for a peer to join and request state…")
+            while self._peer_snapshot_sent_at is None:
+                self._process_network_requests()
+                time.sleep(0.01)
+            print(
+                f"[*] State snapshot sent. Waiting up to {post_snapshot_delay:.1f}s "
+                "for peer to become ready…"
+            )
+            self._peer_active_received = False
+            start_wait = time.time()
+            while (time.time() - start_wait) < post_snapshot_delay:
+                self._process_network_requests()
+                if self._peer_active_received:
+                    print("[*] Peer activity detected! Starting playback early.")
+                    break
+                time.sleep(0.01)
 
         try:
             while True:
@@ -128,22 +162,39 @@ class SyncPlayer:
         speed: float = 1.0,
         loop: bool = False,
         replace_source_guid: bool = True,
+        wait_for_peer: bool = False,
+        post_snapshot_delay: float = 3.0,
     ) -> None:
         """Initialize non-blocking procedural playback.
 
         Subsequent calls to :meth:`tick` will send messages at the correct times.
 
+        When *wait_for_peer* is ``True``, :meth:`tick` enters a waiting state
+        and does not send any events until a peer has requested and received
+        the ``STATE_SNAPSHOT`` **and** *post_snapshot_delay* seconds have
+        elapsed.  During this phase :meth:`tick` still returns ``True`` and
+        continues to service incoming network requests.
+
         :param speed: Playback speed multiplier.
         :param loop: If True, loops playback indefinitely.
         :param replace_source_guid: If True, replaces payload source GUIDs with
             the player's own guid.
+        :param wait_for_peer: If True, hold event dispatch until a peer has
+            loaded the current state.
+        :param post_snapshot_delay: Seconds to wait after snapshot delivery
+            before the first event is sent.  Default 1.0 s.
         """
         if not self.events:
             raise ValueError("No recording loaded. Call load_recording() first.")
 
         self._ensure_network()
 
-        self._play_start_time = time.time()
+        self._peer_snapshot_sent_at = None
+        self._wait_for_peer = wait_for_peer
+        self._post_snapshot_delay = post_snapshot_delay
+        # When waiting for a peer, defer setting _play_start_time until the
+        # gate clears; tick() will set it then.
+        self._play_start_time = None if wait_for_peer else time.time()
         self._play_index = 0
         self._play_speed = speed
         self._play_loop = loop
@@ -156,18 +207,42 @@ class SyncPlayer:
         Should be called repeatedly in the application's idle loop. Sends any
         events whose scheduled time has passed.
 
+        While the peer-join gate is active (``wait_for_peer=True`` was passed
+        to :meth:`start_playback` and no peer has loaded state yet) this
+        method services incoming network requests but does not send recorded
+        events; it still returns ``True`` so callers keep ticking.
+
         :returns: True if playback is still active, False if finished.
         :rtype: bool
         """
         if not self._playing:
             return False
 
-        if not self.events or self._play_start_time is None:
+        if not self.events:
             self._playing = False
             self._close_own_network()
             return False
 
         self._process_network_requests()
+
+        # Peer-join gate: wait until the snapshot has been delivered and the
+        # post-snapshot delay has elapsed before sending any events.
+        if self._wait_for_peer:
+            if self._peer_snapshot_sent_at is None:
+                # Nobody has joined yet; keep servicing the network.
+                return True
+            elapsed = time.time() - self._peer_snapshot_sent_at
+            if not self._peer_active_received and elapsed < self._post_snapshot_delay:
+                # Snapshot sent but cooling-off delay not yet elapsed and no activity seen.
+                return True
+            # Gate cleared — arm the event clock and drop into normal playback.
+            self._wait_for_peer = False
+            self._play_start_time = time.time()
+
+        if self._play_start_time is None:
+            self._playing = False
+            self._close_own_network()
+            return False
 
         now = time.time()
         current_offset = (now - self._play_start_time) * self._play_speed
@@ -245,6 +320,14 @@ class SyncPlayer:
                         snapshot = self._update_timestamps(snapshot, current_now)
                         snapshot["source_guid"] = self.network.self_guid
                         self.network.send_payload(snapshot)
+                        # Record that a peer has loaded state; the peer-join
+                        # gate in tick() and play() watches this timestamp.
+                        self._peer_snapshot_sent_at = time.time()
+                        self._peer_active_received = False
+
+            if source and source != self.network.self_guid:
+                if self._peer_snapshot_sent_at is not None:
+                    self._peer_active_received = True
 
     def _send_event(self, event: dict[str, Any], replace_source_guid: bool) -> None:
         """Prepare, update timestamps, and send the event's payload."""
@@ -298,6 +381,25 @@ def main() -> None:
         action="store_true",
         help="Keep original source GUIDs instead of replacing them",
     )
+    p.add_argument(
+        "--wait-for-peer",
+        action="store_true",
+        help=(
+            "Hold playback until a peer has joined and received the state "
+            "snapshot, then wait --post-snapshot-delay seconds before "
+            "sending the first event."
+        ),
+    )
+    p.add_argument(
+        "--post-snapshot-delay",
+        type=float,
+        default=3.0,
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait after sending the state snapshot before "
+            "playback begins (only used with --wait-for-peer, default: 3.0)."
+        ),
+    )
     args = p.parse_args()
 
     player = SyncPlayer(session_id=args.session, host=args.host, port=args.port)
@@ -308,7 +410,11 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[*] Loaded {len(player.events)} events from: {args.input}")
-    print(f"[*] Playing to session '{args.session}' (speed={args.speed}, loop={args.loop})...")
+    print(
+        f"[*] Playing to session '{args.session}' "
+        f"(speed={args.speed}, loop={args.loop}, "
+        f"wait_for_peer={args.wait_for_peer})..."
+    )
     print(" [!] Press Ctrl+C to stop playback")
 
     try:
@@ -316,6 +422,8 @@ def main() -> None:
             speed=args.speed,
             loop=args.loop,
             replace_source_guid=not args.keep_guids,
+            wait_for_peer=args.wait_for_peer,
+            post_snapshot_delay=args.post_snapshot_delay,
         )
     except KeyboardInterrupt:
         print("\n[*] Playback stopped.")
