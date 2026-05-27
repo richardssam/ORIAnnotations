@@ -160,8 +160,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 if isinstance(child, otio.schema.Clip):
                     ref = child.media_reference
                     if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
-                        if ref.target_url not in self._path_to_source_group_map():
-                            rv.commands.addSource(ref.target_url)
+                        if self._media_path(ref.target_url) not in self._path_to_source_group_map():
+                            rv.commands.addSource(self._media_path(ref.target_url))
 
         @self.sync_manager.on_synced
         def _on_synced():
@@ -457,7 +457,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             timeline = self.sync_manager._timelines.get(tl_guid)
             if not timeline:
                 continue
-            media_track = next((t for t in timeline.tracks if t.name == "Media"), None)
+            media_track = next((t for t in timeline.tracks if self._is_media_track(t)), None)
             if not media_track:
                 continue
             track_guid = media_track.metadata.get("sync", {}).get("guid")
@@ -469,7 +469,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 for clip in media_track:
                     ref = clip.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
-                        result[ref.target_url] = clip.metadata.get("sync", {}).get("guid")
+                        result[self._media_path(ref.target_url)] = clip.metadata.get("sync", {}).get("guid")
                 return result
 
             # --- Deletions: source groups present in stored but gone from current ---
@@ -489,7 +489,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # --- Additions: source groups whose path count exceeds the OTIO track count ---
             # Uses a Counter so that adding a duplicate of an existing clip is detected.
             otio_path_counts = Counter(
-                clip.media_reference.target_url
+                self._media_path(clip.media_reference.target_url)
                 for clip in media_track
                 if hasattr(clip.media_reference, "target_url") and clip.media_reference.target_url
             )
@@ -542,7 +542,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if not timeline:
                 continue
             for track in timeline.tracks:
-                if track.name != "Media":
+                if not self._is_media_track(track):
                     continue
                 if not any(c.metadata.get("sync", {}).get("guid") == clip_guid for c in track):
                     continue
@@ -551,7 +551,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 for c in track:
                     ref = c.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
-                        sg = path_to_sg.get(ref.target_url)
+                        sg = path_to_sg.get(self._media_path(ref.target_url))
                         if sg:
                             new_inputs.append(sg)
                 if new_inputs:
@@ -569,7 +569,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if not timeline:
                 continue
             for track in timeline.tracks:
-                if track.name != "Media":
+                if not self._is_media_track(track):
                     continue
                 if track.metadata.get("sync", {}).get("guid") != parent_uuid:
                     continue
@@ -578,7 +578,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 for clip in track:
                     ref = clip.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
-                        sg = path_to_sg.get(ref.target_url)
+                        sg = path_to_sg.get(self._media_path(ref.target_url))
                         if sg:
                             new_inputs.append(sg)
                 rv.commands.setNodeInputs(seq_group, new_inputs)
@@ -597,7 +597,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if not timeline:
                 continue
             for track in timeline.tracks:
-                if track.name == "Media" and track.metadata.get("sync", {}).get("guid") == parent_uuid:
+                if self._is_media_track(track) and track.metadata.get("sync", {}).get("guid") == parent_uuid:
                     timeline_guid = tl_guid
                     # Rebuild RV sequence inputs from the updated OTIO track order
                     path_to_sg = self._path_to_source_group_map()
@@ -605,7 +605,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     for clip in track:
                         ref = clip.media_reference
                         if hasattr(ref, "target_url") and ref.target_url:
-                            sg = path_to_sg.get(ref.target_url)
+                            sg = path_to_sg.get(self._media_path(ref.target_url))
                             if sg:
                                 new_inputs.append(sg)
                     if new_inputs:
@@ -833,7 +833,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         ref = media_clip.media_reference
         if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
             return
-        media_path = ref.target_url
+        media_path = self._media_path(ref.target_url)
 
         try:
             otio.schema.schemadef.module_from_name('SyncEvent')
@@ -937,7 +937,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
             _log(f"RECV annotation: clip {clip_guid} has no ExternalReference")
             return
-        media_path = ref.target_url
+        media_path = self._media_path(ref.target_url)
 
         try:
             otio.schema.schemadef.module_from_name('SyncEvent')
@@ -1087,7 +1087,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         ref = media_clip.media_reference
         if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
             return
-        media_path = ref.target_url
+        media_path = self._media_path(ref.target_url)
 
         node = self._find_paint_node_for_media(media_path, rv_frame)
         if not node:
@@ -1172,6 +1172,52 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         QtCore.QTimer.singleShot(0, rv.commands.redraw)
 
+    @staticmethod
+    def _media_path(url: str) -> str:
+        """Normalise a ``file://`` URL (any variant) to a canonical POSIX path.
+
+        Delegates to :func:`opentimelineio.url_utils.filepath_from_url` for
+        correct handling of percent-encoding and Windows UNC paths, then
+        applies an extra pass to collapse the ``//path`` double-slash that
+        OTIO returns for the ``file://localhost//path`` form emitted by
+        xStudio's flat-playlist exporter.
+
+        Non-``file://`` strings (plain absolute paths, relative paths, URIs
+        with other schemes) are returned unchanged.
+
+        :param url: A media URL or path string.
+        :returns: A normalised absolute path suitable for use as a dict key
+            or as an argument to ``rv.commands.addSource``.
+        :rtype: str
+        """
+        if not url or not url.startswith('file://'):
+            return url
+        try:
+            import opentimelineio.url_utils as _url_utils
+            path = _url_utils.filepath_from_url(url)
+        except Exception:
+            # Fallback: manual parse (handles the common macOS cases).
+            from urllib.parse import urlparse, unquote
+            path = unquote(urlparse(url).path)
+        # OTIO returns '//path' for file://localhost//path — collapse to '/path'.
+        while path.startswith('//'):
+            path = path[1:]
+        return path
+
+    @staticmethod
+    def _is_media_track(track) -> bool:
+        """Return True if *track* carries source clips (not annotations).
+
+        Matches both the ``"Media"`` name used by RV-originated timelines and
+        the ``"Video Track"`` name used by xStudio-originated timelines.
+        Audio tracks (``kind != Video``) and the ``"Annotations"`` overlay
+        track are explicitly excluded.
+        """
+        if track.kind != otio.schema.TrackKind.Video:
+            return False
+        name = track.name or ""
+        return not name.startswith("Annotations")
+
     def _path_to_source_group_map(self):
         """Return {path: source_group_node_name} for all currently loaded RVSourceGroups."""
         mapping = {}
@@ -1181,7 +1227,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     if rv.commands.nodeType(n) == "RVFileSource":
                         path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
                         if path:
-                            mapping[path] = sg
+                            mapping[self._media_path(path)] = sg
             except Exception:
                 pass
         return mapping
@@ -1201,7 +1247,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         seen = set()
         for timeline in timelines:
             for item in timeline.tracks:
-                if item.name != "Media":
+                if not self._is_media_track(item):
                     continue
                 for child in item:
                     if not isinstance(child, otio.schema.Clip):
@@ -1209,9 +1255,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     ref = child.media_reference
                     if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
                         continue
-                    if ref.target_url not in seen:
-                        all_paths_ordered.append(ref.target_url)
-                        seen.add(ref.target_url)
+                    norm = self._media_path(ref.target_url)
+                    if norm not in seen:
+                        all_paths_ordered.append(norm)
+                        seen.add(norm)
 
         for path in all_paths_ordered:
             if path not in already_loaded:
@@ -1228,14 +1275,14 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             for timeline in timelines:
                 timeline_sgs = []
                 for item in timeline.tracks:
-                    if item.name != "Media":
+                    if not self._is_media_track(item):
                         continue
                     for child in item:
                         if not isinstance(child, otio.schema.Clip):
                             continue
                         ref = child.media_reference
                         if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
-                            sg = path_to_sg.get(ref.target_url)
+                            sg = path_to_sg.get(self._media_path(ref.target_url))
                             if sg:
                                 timeline_sgs.append(sg)
                 if timeline_sgs:
@@ -1282,7 +1329,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                 if isinstance(media_obj, otio.schema.Clip):
                                     ref = media_obj.media_reference
                                     if isinstance(ref, otio.schema.ExternalReference):
-                                        media_path = ref.target_url
+                                        media_path = self._media_path(ref.target_url)
                             frame = (
                                 int(child.source_range.start_time.value) + 1
                                 if child.source_range else 1
@@ -1351,7 +1398,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         active_tl = self.sync_manager._timelines.get(self.sync_manager.active_timeline_guid)
         if active_tl:
             for track in active_tl.tracks:
-                if track.name == "Media":
+                if self._is_media_track(track):
                     self._active_media_track_guid = track.metadata.get("sync", {}).get("guid")
                     self._track = track
                     break
@@ -1997,7 +2044,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         ref = clip.media_reference
         if not isinstance(ref, otio.schema.ExternalReference):
             return
-        media_path = ref.target_url
+        media_path = self._media_path(ref.target_url)
         source_group = self._path_to_source_group_map().get(media_path)
         if not source_group:
             _log(f"RECV selection: no source group for {media_path}")
@@ -2229,7 +2276,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _apply_insert(self, clip_obj):
         ref = clip_obj.media_reference
         if isinstance(ref, otio.schema.ExternalReference):
-            rv.commands.addSource(ref.target_url)
+            rv.commands.addSource(self._media_path(ref.target_url))
 
     def do_add_clip(self, event=None):
         paths = rv.commands.openFileDialog(False, False, False, "mp4|Movie Files|mov|Movie Files|m4v|Movie Files|mkv|Movie Files|avi|Movie Files", "")

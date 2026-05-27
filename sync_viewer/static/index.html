@@ -25,6 +25,7 @@
     --clip-other:#10b981;
     --playhead:  #ef4444;
     --selected-border: #f4f4f5;
+    --active-clip: #22c55e;
     --row-h: 28px;
     --label-w: 110px;
     --ruler-h: 24px;
@@ -160,6 +161,9 @@
   }
   .clip-block:hover { filter: brightness(1.2); }
   .clip-block.selected { outline: 1.5px solid var(--selected-border); outline-offset: 1px; }
+  /* Clip currently under the remote playhead */
+  .clip-block.playhead-active { box-shadow: 0 0 0 2px var(--active-clip); z-index: 2; }
+  .clip-block.playhead-active.selected { box-shadow: 0 0 0 2px var(--active-clip); }
   .clip-block.type-Clip.track-Media  { background: #1e3a5f; color: #93c5fd; border: 1px solid #3b82f6; }
   .clip-block.type-Clip.track-Video  { background: #2e1065; color: #c4b5fd; border: 1px solid #6366f1; }
   .clip-block.type-Clip.track-Audio  { background: #083344; color: #67e8f9; border: 1px solid #06b6d4; }
@@ -288,6 +292,18 @@
   .zoom-btn.fit { font-size: 10px; padding: 2px 8px; }
   #zoom-display { min-width: 38px; text-align: center; color: var(--text); font-weight: 600; }
   #zoom-bar .zb-hint { color: var(--muted); font-size: 9px; margin-left: 4px; }
+  #follow-btn {
+    margin-left: auto;
+    background: #1a2e1a; color: var(--active-clip);
+    border: 1px solid #22c55e55; border-radius: 3px;
+    padding: 2px 10px; cursor: pointer; font-size: 10px; line-height: 1.6;
+    user-select: none; white-space: nowrap;
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  #follow-btn.detached {
+    background: #2e2e34; color: var(--muted); border-color: var(--border);
+  }
+  #follow-btn:hover { filter: brightness(1.15); }
 
   /* ── Connection overlay ──────────────────────────────────────── */
   #conn-overlay {
@@ -357,6 +373,7 @@
       <span id="dur-display" class="zb-hint" style="margin-left:4px;"></span>
       <span id="dur-debug" class="zb-hint" style="margin-left:6px; color:#888;"></span>
       <span class="zb-hint" style="margin-left:6px;">Ctrl+scroll</span>
+      <button id="follow-btn" title="Auto-scroll to keep the playhead in view. Click to detach.">⊙ Follow</button>
     </div>
 
     <!-- Playback bar -->
@@ -410,6 +427,11 @@ let autoZoomed = false;
 let lastFitDur = 0;      // contentDur used at last auto-fit — reset fit when it changes
 const MIN_ZOOM = 2, MAX_ZOOM = 1000;
 
+// Follow-mode state
+let followMode = true;             // auto-scroll to keep playhead visible
+let activeClipGuid = null;        // guid of the clip currently under the remote playhead
+let prevRemoteSelectedGuid = null; // tracks last s.selected_clip_guid to detect changes
+
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 
 function connect() {
@@ -443,17 +465,147 @@ function connect() {
 function handleState(s) {
   state = s;
 
-  // Preserve active timeline if it still exists, else default to server's active
   const guids = (s.timelines || []).map(t => t.guid);
+
+  // Always follow the master's active sequence timeline.
+  // This is the fix for "viewer doesn't switch when master changes sequence":
+  // previously the viewer only set activeTimelineGuid once and never updated it.
+  const serverActive = s.active_timeline_guid;
   if (!activeTimelineGuid || !guids.includes(activeTimelineGuid)) {
-    activeTimelineGuid = s.active_timeline_guid || (guids[0] || null);
+    // Not set or stale — pick server's choice or first available.
+    activeTimelineGuid = serverActive || guids[0] || null;
+  } else if (serverActive && serverActive !== activeTimelineGuid && guids.includes(serverActive)) {
+    // Master switched sequences — follow it.
+    activeTimelineGuid = serverActive;
   }
+
+  // React to explicit clip selection from the master (SELECTION broadcast).
+  // When the selected clip changes, switch to the sequence that contains it
+  // and, in follow mode, scroll to bring it into view.
+  const remoteSelected = s.selected_clip_guid || null;
+  if (remoteSelected && remoteSelected !== prevRemoteSelectedGuid) {
+    prevRemoteSelectedGuid = remoteSelected;
+    // Find a sequence timeline that contains this clip.
+    const containingTl = findTimelineContainingClip(s, remoteSelected);
+    if (containingTl && containingTl !== activeTimelineGuid) {
+      activeTimelineGuid = containingTl;
+    }
+    if (followMode) {
+      // Scroll after render so the new timeline DOM is in place.
+      requestAnimationFrame(() => scrollToClipGuid(remoteSelected));
+    }
+  }
+
+  // Derive which clip the remote playhead is sitting on.
+  updateActiveClip(s);
 
   renderTopbar(s);
   renderSidebar(s);
   renderTimeline();
   renderPlayback(s.playback || {});
   renderDisplay(s.display || {});
+}
+
+// ── Clip-lookup helpers ───────────────────────────────────────────────────────
+
+/** Return the guid of the first sequence timeline that contains *clipGuid*. */
+function findTimelineContainingClip(s, clipGuid) {
+  for (const tl of (s.timelines || [])) {
+    for (const track of (tl.tracks || [])) {
+      if (track.name && track.name.startsWith('Annotations')) continue;
+      for (const item of (track.items || [])) {
+        if (item.guid === clipGuid) return tl.guid;
+      }
+    }
+  }
+  return null;
+}
+
+/** Scroll the timeline container to centre *clipGuid* horizontally. */
+function scrollToClipGuid(clipGuid) {
+  const tl = getActiveTl();
+  if (!tl) return;
+  for (const track of (tl.tracks || [])) {
+    if (track.name && track.name.startsWith('Annotations')) continue;
+    for (const item of (track.items || [])) {
+      if (item.guid !== clipGuid) continue;
+      const container = document.getElementById('timeline-container');
+      const LABEL_W = 110;
+      const midX = LABEL_W + (item.start + item.duration / 2) * zoom;
+      container.scrollLeft = Math.max(0, midX - container.clientWidth / 2);
+      return;
+    }
+  }
+}
+
+// ── Active-clip tracking ──────────────────────────────────────────────────────
+
+/**
+ * Return the guid of the first non-Gap clip in *tl* whose range contains
+ * *timeSecs*, ignoring Annotation tracks.  Returns null when nothing matches.
+ */
+function findClipAtTime(tl, timeSecs) {
+  if (!tl || timeSecs === undefined || timeSecs === null) return null;
+  for (const track of (tl.tracks || [])) {
+    if (track.name && track.name.startsWith('Annotations')) continue;
+    for (const item of (track.items || [])) {
+      if (item.type === 'Gap' || !item.guid) continue;
+      // Small epsilon so a playhead exactly on the boundary hits the right clip
+      if (timeSecs >= item.start - 1e-6 && timeSecs < item.start + item.duration - 1e-6) {
+        return item.guid;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Scroll *timeline-container* so that *timeSecs* (the playhead) is comfortably
+ * in view.  In follow mode we only move the scroll when the playhead is within
+ * 20 % of either edge or already outside — a "lazy follow" that avoids
+ * constant jumpy scrolling when the playhead is already centred.
+ */
+function scrollToEnsureVisible(timeSecs) {
+  if (timeSecs === undefined || timeSecs === null) return;
+  const container = document.getElementById('timeline-container');
+  const LABEL_W = 110;
+  const playheadX = LABEL_W + timeSecs * zoom;  // absolute pixel in timeline-wrap
+  const viewLeft  = container.scrollLeft;
+  const viewRight = viewLeft + container.clientWidth;
+  const margin    = Math.max(60, container.clientWidth * 0.18);
+
+  if (playheadX < viewLeft + LABEL_W + margin) {
+    // Playhead near or left of visible area — scroll left
+    container.scrollLeft = Math.max(0, playheadX - LABEL_W - margin);
+  } else if (playheadX > viewRight - margin) {
+    // Playhead near or right of visible area — scroll right
+    container.scrollLeft = playheadX - container.clientWidth + margin;
+  }
+  // Middle 60 %: don't touch scrollLeft
+}
+
+function updateActiveClip(s) {
+  const pb = s.playback || {};
+  const timeSecs = rtToSeconds(pb.current_time);
+
+  // Prefer the timeline the playback reports; fall back to whatever the viewer shows.
+  const tlGuid = pb.timeline_guid || activeTimelineGuid;
+  const tl = (s.timelines || []).find(t => t.guid === tlGuid) || null;
+
+  activeClipGuid = findClipAtTime(tl, timeSecs);
+
+  // When the playhead isn't over any clip (paused between clips, or the
+  // timeline hasn't been matched yet), fall back to the master's explicit
+  // selection so the green glow still appears.
+  if (!activeClipGuid && s.selected_clip_guid) {
+    activeClipGuid = s.selected_clip_guid;
+  }
+
+  if (followMode && timeSecs !== undefined) {
+    // Scroll lazily — only when the playhead is near/outside the edges.
+    // Use requestAnimationFrame so the DOM has been updated after renderTimeline.
+    requestAnimationFrame(() => scrollToEnsureVisible(timeSecs));
+  }
 }
 
 // ── Topbar ────────────────────────────────────────────────────────────────────
@@ -584,7 +736,8 @@ function renderTimeline() {
                        : track.kind || 'Video';
       block.className =
         `clip-block type-${item.type} track-${trackClass}` +
-        (item.guid === selectedGuid ? ' selected' : '');
+        (item.guid === selectedGuid   ? ' selected'       : '') +
+        (item.guid === activeClipGuid ? ' playhead-active': '');
       block.style.left  = (item.start  * zoom) + 'px';
       block.style.width = Math.max(item.duration * zoom - 1, 2) + 'px';
       block.title = `${item.name || '(gap)'} — ${item.duration.toFixed(3)}s`;
@@ -915,6 +1068,26 @@ document.getElementById('timeline-container').addEventListener('wheel', (e) => {
 
 document.getElementById('zoom-in-btn').addEventListener('click', () => applyZoom(zoom * 1.5));
 document.getElementById('zoom-out-btn').addEventListener('click', () => applyZoom(zoom / 1.5));
+
+document.getElementById('follow-btn').addEventListener('click', () => {
+  followMode = !followMode;
+  const btn = document.getElementById('follow-btn');
+  if (followMode) {
+    btn.classList.remove('detached');
+    btn.textContent = '⊙ Follow';
+    btn.title = 'Auto-scroll to keep the playhead in view. Click to detach.';
+    // Snap to playhead immediately on re-attach
+    if (state) {
+      const timeSecs = rtToSeconds((state.playback || {}).current_time);
+      if (timeSecs !== undefined) scrollToEnsureVisible(timeSecs);
+    }
+  } else {
+    btn.classList.add('detached');
+    btn.textContent = '⊙ Detach';
+    btn.title = 'Scroll is detached. Active clip is still highlighted. Click to re-follow.';
+  }
+});
+
 document.getElementById('zoom-fit-btn').addEventListener('click', () => {
   const container = document.getElementById('timeline-container');
   const tl = getActiveTl();

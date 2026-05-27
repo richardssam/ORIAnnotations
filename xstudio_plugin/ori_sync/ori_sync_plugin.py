@@ -42,7 +42,9 @@ from xstudio.core import (
     LoopMode,
     annotation_atom,
     bookmark_detail_atom,
+    change_atom,
     event_atom,
+    position_atom,
     serialise_atom,
     show_atom,
     viewport_playhead_atom,
@@ -284,6 +286,7 @@ class ORISyncPlugin(PluginBase):
         # change came from a remote apply, so we skip re-broadcasting (echo guard).
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
+        self._last_polled_playing: bool | None = None
 
         # Last clip GUID broadcast as selection; compared each poll tick to avoid
         # redundant selection broadcasts when the playhead is within the same clip.
@@ -349,6 +352,8 @@ class ORISyncPlugin(PluginBase):
         # playhead event handlers.
         self._viewport_container_is_playlist: bool = False
         self._viewport_container_is_timeline: bool = False
+        # [TEST] subscription ID returned by subscribe_to_event_group for change_atom probe
+        self._test_container_sub_id = None
 
         # Auto-connect on startup using the current preference values.
         _log("Plugin loaded — auto-connecting to session")
@@ -413,6 +418,21 @@ class ORISyncPlugin(PluginBase):
             _log("Subscribed to AnnotationsUI plugin events")
         except Exception:
             _log_exc("Could not subscribe to AnnotationsUI events")
+
+        # [TEST change_atom] Subscribe to the current viewed container's event
+        # group.  If change_atom fires reliably here we can replace the
+        # _poll_sequence_new_media poll with an event-driven path.
+        try:
+            container = self.connection.api.session.viewed_container
+            self._test_container_sub_id = self.subscribe_to_event_group(
+                container, self._on_test_container_event
+            )
+            _log(
+                f"[TEST change_atom] subscribed to viewed_container events"
+                f" (type={type(container).__name__})"
+            )
+        except Exception:
+            _log_exc("[TEST change_atom] subscribe_to_event_group failed")
 
         # Self-elect if no master answers within DISCOVERY_TIMEOUT.
         threading.Thread(
@@ -1020,6 +1040,30 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("_on_global_playhead_event: failed to update playhead")
 
+        # [TEST position_atom] Subscribe to this playhead's position events.
+        # If position_atom fires reliably (even across timeline switches) we can
+        # replace the poll-based frame detection with an event-driven path.
+        try:
+            self.subscribe_to_playhead_events(ph_remote, self._on_test_position_event)
+            _log("[TEST position_atom] subscribed to playhead events")
+        except Exception:
+            _log_exc("[TEST position_atom] subscribe_to_playhead_events failed")
+
+    def _on_test_position_event(self, event) -> None:
+        """[TEST] Fires if subscribe_to_playhead_events + position_atom works."""
+        if (
+            len(event) > 2
+            and isinstance(event[0], event_atom)
+            and isinstance(event[1], position_atom)
+        ):
+            _log(f"[TEST position_atom] FIRED frame={event[2]}")
+
+    def _on_test_container_event(self, event) -> None:
+        """[TEST] Fires if subscribe_to_event_group + change_atom works."""
+        t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
+        is_change = len(event) > 1 and isinstance(event[1], change_atom)
+        _log(f"[TEST change_atom] event: len={len(event)}, t1={t1}, is_change_atom={is_change}")
+
     def _poll_and_broadcast_frame(self) -> None:
         """Broadcast the local playhead position when the user scrubs.
 
@@ -1043,23 +1087,37 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 return
         try:
-            if self.active_playhead.playing:
-                return
+            playing: bool = self.active_playhead.playing
             frame: int = self.active_playhead.position
             fps: float = self.active_playhead.frame_rate.fps() or 25.0
         except Exception:
             return
-        if frame == self._last_polled_frame:
+
+        # Initialize play state on first run
+        if self._last_polled_playing is None:
+            self._last_polled_playing = playing
+            self._last_polled_frame = frame
             return
-        # Suppress while waiting for xStudio to settle after _apply_selection.
-        # Without this, the poll may fire before position reaches start_frame and
-        # broadcast a negative clip-local frame (e.g. 99 - 400 = -301).
-        if time.monotonic() < self._selection_suppress_until:
+
+        playing_changed = (playing != self._last_polled_playing)
+
+        # Skip polling frame updates while actively playing if there's no state transition
+        if playing and not playing_changed:
             return
-        self._last_polled_frame = frame
-        if frame == self._last_applied_frame:
-            # This change was caused by _apply_playback_state — skip re-broadcast.
-            return
+
+        # Check frame/scrub changes if paused
+        if not playing and not playing_changed:
+            if frame == self._last_polled_frame:
+                return
+            # Suppress while waiting for xStudio to settle after _apply_selection.
+            # Without this, the poll may fire before position reaches start_frame and
+            # broadcast a negative clip-local frame (e.g. 99 - 400 = -301).
+            if time.monotonic() < self._selection_suppress_until:
+                return
+            self._last_polled_frame = frame
+            if frame == self._last_applied_frame:
+                # This change was caused by _apply_playback_state — skip re-broadcast.
+                return
 
         broadcast_frame = frame
         # xStudio's async position write may not have settled yet; a negative
@@ -1068,7 +1126,7 @@ class ORISyncPlugin(PluginBase):
             return
 
         state = {
-            "playing": False,
+            "playing": playing,
             "current_time": {
                 "OTIO_SCHEMA": "RationalTime.1",
                 "value": float(broadcast_frame),
@@ -1076,7 +1134,12 @@ class ORISyncPlugin(PluginBase):
             },
             "looping": False,
         }
-        _log(f"Poll: broadcasting playback frame={frame} clip_local={broadcast_frame} fps={fps}")
+
+        # Update cache to prevent echo loops
+        self._last_polled_playing = playing
+        self._last_polled_frame = frame
+
+        _log(f"Poll: broadcasting playback playing={playing} frame={frame} fps={fps}")
         self.manager.broadcast_playback_state(state)
 
     def _poll_and_broadcast_selection(self) -> None:
@@ -1263,28 +1326,99 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             return None
 
+    def _get_local_viewed_timeline_guid(self) -> str | None:
+        """Query the active container from the viewport and map it to its sync GUID.
+
+        :returns: GUID string, or ``None`` if it cannot be resolved.
+        :rtype: str or None
+        """
+        if not self.manager:
+            return None
+        try:
+            session_actor = self.connection.api.session.remote
+            result = self.connection.request_receive_timeout(
+                100, session_actor, viewport_active_media_container_atom()
+            )[0]
+            container_uuid = str(result.uuid)
+            c = Container(self.connection, result.actor)
+            c_type = c.type
+        except Exception:
+            return None
+
+        if c_type == "Timeline":
+            # Check if this container UUID is one of our synced sequence timelines.
+            for tl_guid, (pl, xs_tl) in self._sync_playlists.items():
+                if xs_tl and str(xs_tl.uuid) == container_uuid:
+                    return tl_guid
+            return container_uuid
+        else:
+            # Viewing a Playlist (or Subset/ContactSheet).
+            # Check if it's a flat playlist.
+            for tl_guid, (pl, xs_tl) in self._sync_playlists.items():
+                if xs_tl is None and str(pl.uuid) == container_uuid:
+                    return tl_guid
+
+            # Check if we are viewing a sequence's parent playlist (source view of a clip).
+            matching_pl = None
+            for tl_guid, (pl, xs_tl) in self._sync_playlists.items():
+                if str(pl.uuid) == container_uuid:
+                    matching_pl = pl
+                    break
+
+            if matching_pl:
+                try:
+                    sel = matching_pl.playhead_selection
+                    selected_sources = sel.selected_sources
+                    if len(selected_sources) == 1:
+                        clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
+                        if clip_guid:
+                            return self.manager.get_or_create_clip_timeline(clip_guid)
+                except Exception:
+                    pass
+                return self.manager.sequence_timeline_guid
+
+            return container_uuid
+
     def _apply_playback_state(self, state: dict) -> None:
         """Apply an incoming playback state dict to the local xStudio playhead.
 
         Called from the poll thread via the ``on_playback_changed`` callback.
         xStudio's actor-based attribute writes are thread-safe.
 
-        Updates ``_last_applied_frame`` and ``_last_polled_frame`` so that
-        ``_poll_and_broadcast_frame`` recognises the resulting position change
-        as a remote apply and does not echo it back to the session.
+        Updates ``_last_applied_frame``, ``_last_polled_frame``, and
+        ``_last_polled_playing`` so that ``_poll_and_broadcast_frame``
+        recognises the resulting changes as remote applies and does not
+        echo them back to the session.
         """
         if not self.active_playhead:
             return
+
+        incoming_tl_guid = state.get("timeline_guid")
+        if incoming_tl_guid and self.manager:
+            # Check against target active_timeline_guid first (handles the selection change transition)
+            if incoming_tl_guid != self.manager.active_timeline_guid:
+                # Query actual viewed container GUID as a fallback in case active_timeline_guid is transitioning
+                local_tl_guid = self._get_local_viewed_timeline_guid()
+                if local_tl_guid and local_tl_guid != incoming_tl_guid:
+                    _log(f"RECV playback state: mismatched timeline_guid (local={local_tl_guid[:8]}, "
+                         f"target={self.manager.active_timeline_guid[:8]}, incoming={incoming_tl_guid[:8]}) — ignoring")
+                    return
+
         playing = state.get("playing", False)
         current_time = state.get("current_time", {})
         # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
         frame = max(0, int(current_time.get("value", 0)))
 
+        playing_changed = (playing != self.active_playhead.playing)
 
+        # Update cache to prevent poll loop from echoing back this change
+        self._last_polled_playing = playing
 
-        if playing != self.active_playhead.playing:
+        if playing_changed:
             self.active_playhead.playing = playing
-        if not playing:
+
+        # Apply position if we are paused, or if the play/pause state has transitioned
+        if not playing or playing_changed:
             self._last_applied_frame = frame
             self._last_polled_frame = frame
             self.active_playhead.position = frame
@@ -1465,6 +1599,11 @@ class ORISyncPlugin(PluginBase):
                             if view_mode == "sequence" and tl:
                                 self.connection.api.session.set_on_screen_source(tl)
                                 _log("RECV selection clear: set_on_screen_source to timeline (Sequence)")
+                                try:
+                                    from xstudio.core import UuidActorVec, item_selection_atom
+                                    self.connection.send(tl.remote, item_selection_atom(), UuidActorVec())
+                                except Exception:
+                                    pass
                             else:
                                 self.connection.api.session.set_on_screen_source(pl)
                                 _log("RECV selection clear: set_on_screen_source to playlist (Source)")
@@ -1629,6 +1768,32 @@ class ORISyncPlugin(PluginBase):
                          f"{getattr(playlist_xs_tl, 'name', '?')!r}")
 
                     self._pending_seek_frame = start_frame
+
+                    # Programmatically select/highlight the clip in the timeline track.
+                    if otio_tl:
+                        target_track_idx = -1
+                        target_child_idx = -1
+                        for track_idx, track in enumerate(otio_tl.tracks):
+                            for child_idx, child in enumerate(track):
+                                if child.metadata.get("sync", {}).get("guid") == clip_guid:
+                                    target_track_idx = track_idx
+                                    target_child_idx = child_idx
+                                    break
+                            if target_track_idx != -1:
+                                break
+
+                        if target_track_idx != -1 and target_child_idx != -1:
+                            try:
+                                xs_track = playlist_xs_tl.stack.children[target_track_idx]
+                                xs_child = xs_track.children[target_child_idx]
+                                from xstudio.core import UuidActor, UuidActorVec, item_selection_atom
+                                ua = UuidActor(xs_child.uuid, xs_child.remote)
+                                ua_vec = UuidActorVec()
+                                ua_vec.push_back(ua)
+                                self.connection.send(playlist_xs_tl.remote, item_selection_atom(), ua_vec)
+                                _log(f"RECV selection: set timeline selection to track={target_track_idx} child={target_child_idx}")
+                            except Exception:
+                                _log_exc("RECV selection: failed to set timeline item selection")
                 else:
                     # Flat playlist: viewed_container + set_on_screen_source + set_selection
                     self.connection.api.session.set_on_screen_source(playlist)
@@ -2014,11 +2179,16 @@ class ORISyncPlugin(PluginBase):
         :param data: Event tuple from the AnnotationsUI plugin events group.
             Shape: ``(event_atom, annotation_atom, JsonStore)``.
         """
-        if not (
+        # [TEST annotation_atom] Log every event from this subscription so we
+        # can see whether annotation_atom actually arrives in this xStudio build.
+        t1 = type(data[1]).__name__ if len(data) > 1 else "n/a"
+        matched = (
             len(data) >= 3
             and isinstance(data[0], event_atom)
             and isinstance(data[1], annotation_atom)
-        ):
+        )
+        _log(f"[TEST annotation_atom] event len={len(data)}, t1={t1}, matched={matched}")
+        if not matched:
             return
         if not self.manager or self.manager.status != STATE_SYNCED:
             return

@@ -14,6 +14,7 @@ import asyncio
 import json
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,6 @@ from otio_sync_core.manager import STATE_DISCOVERING
 
 # ── Global mutable state ───────────────────────────────────────────────────────
 
-app = FastAPI()
 _clients: set[WebSocket] = set()
 
 _manager: SyncManager | None = None
@@ -39,7 +39,54 @@ _DISCOVERY_TIMEOUT = 2.0
 _REDISCOVERY_INTERVAL = 5.0
 _JOINING_TIMEOUT = 10.0
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):  # noqa: ARG001
+    global _manager
+    cfg = _config
+    network = RabbitMQNetwork(
+        host=cfg.get("rmq_host", "localhost"),
+        port=cfg.get("rmq_port", 5672),
+        session_id=cfg.get("session", "otio-sync-demo"),
+    )
+    _manager = SyncManager(
+        session_id=cfg.get("session", "otio-sync-demo"),
+        network=network,
+    )
+    _manager.start_session()
+    print(
+        f"[viewer] Session '{cfg.get('session', 'otio-sync-demo')}' — "
+        f"peer {_manager.self_guid[:8]}",
+        flush=True,
+    )
+    asyncio.create_task(_poll_loop())
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
+
 # ── Serialisation helpers ──────────────────────────────────────────────────────
+
+
+def _safe_duration_seconds(item: Any) -> float:
+    """Return *item* duration in seconds.
+
+    Falls back gracefully when the clip has no ``source_range`` and its
+    ``ExternalReference`` carries no ``available_range`` — a valid state while
+    the master is still populating clip metadata.
+
+    :param item: Any OTIO composable (Clip, Gap, …).
+    :returns: Duration in seconds, or ``0.0`` when unavailable.
+    :rtype: float
+    """
+    try:
+        return item.duration().to_seconds()
+    except Exception:
+        sr = getattr(item, "source_range", None)
+        if sr is not None:
+            return sr.duration.to_seconds()
+        return 0.0
+
 
 def _serialize_timeline(tl: otio.schema.Timeline, guid: str) -> dict:
     # First pass: build clip_guid → timeline start (s) for all non-annotation items.
@@ -54,7 +101,7 @@ def _serialize_timeline(tl: otio.schema.Timeline, guid: str) -> dict:
             item_guid = item.metadata.get("sync", {}).get("guid", "")
             if item_guid:
                 clip_timeline_start[item_guid] = t
-            t += item.duration().to_seconds()
+            t += _safe_duration_seconds(item)
 
     tracks = []
     for track in tl.tracks:
@@ -62,7 +109,7 @@ def _serialize_timeline(tl: otio.schema.Timeline, guid: str) -> dict:
         t = 0.0
         is_ann = bool(track.name and track.name.startswith("Annotations"))
         for item in track:
-            dur = item.duration().to_seconds()
+            dur = _safe_duration_seconds(item)
             item_guid = item.metadata.get("sync", {}).get("guid", "")
             if is_ann and type(item).__name__ == "Gap":
                 # Gaps in annotation tracks are structural spacers — skip them.
@@ -127,6 +174,7 @@ def _build_state() -> dict:
         "self_guid": _manager.self_guid,
         "master_guid": _manager.master_guid,
         "active_timeline_guid": _manager.active_timeline_guid,
+        "selected_clip_guid": _manager.selected_clip_guid,
         "timelines": timelines,
         "playback": _manager.playback_state,
         "display": _manager.display_state,
@@ -185,34 +233,15 @@ async def _poll_loop() -> None:
             joining_start = None
 
         if changed:
-            await _push_state()
+            try:
+                await _push_state()
+            except Exception as e:
+                print(f"[viewer] push_state error: {e}", flush=True)
 
         await asyncio.sleep(0.1)
 
 
 # ── FastAPI routes ─────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def _startup() -> None:
-    global _manager
-    cfg = _config
-    network = RabbitMQNetwork(
-        host=cfg.get("rmq_host", "localhost"),
-        port=cfg.get("rmq_port", 5672),
-        session_id=cfg.get("session", "otio-sync-demo"),
-    )
-    _manager = SyncManager(
-        session_id=cfg.get("session", "otio-sync-demo"),
-        network=network,
-    )
-    _manager.start_session()
-    print(
-        f"[viewer] Session '{cfg.get('session', 'otio-sync-demo')}' — "
-        f"peer {_manager.self_guid[:8]}",
-        flush=True,
-    )
-    asyncio.create_task(_poll_loop())
-
 
 @app.get("/")
 async def _index() -> FileResponse:

@@ -1,7 +1,7 @@
 package: OTIO Sync Plugin
 author: Sam Richards
 organization: ASWF
-version: 1.0
+version: 1.1
 requires: ''
 rv: 2024
 openrv: 2.0.0

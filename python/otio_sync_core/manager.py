@@ -140,6 +140,9 @@ class SyncManager:
         #: Keys: ``pan`` ([x, y] normalised), ``zoom`` (float), ``exposure`` (stops),
         #: ``channel`` (``"RGBA"``, ``"R"``, ``"G"``, ``"B"``, or ``"A"``).
         self.display_state: dict[str, Any] = {}
+        #: GUID of the clip most recently selected by a remote peer via a
+        #: ``SELECTION`` broadcast.  ``None`` when the selection is cleared.
+        self.selected_clip_guid: str | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -1173,6 +1176,16 @@ class SyncManager:
 
             if command == "PLAYBACK_SETTINGS" and event == "SET":
                 self.playback_state = data
+                # Sync active_timeline_guid so passive peers (e.g. the sync
+                # viewer) automatically follow the master when it switches
+                # between sequences.  Skip clip-level timelines: those are
+                # single-clip artefacts that live alongside the sequence timeline
+                # and should not shadow the sequence view on passive peers.
+                tl_guid = data.get("timeline_guid")
+                if (tl_guid
+                        and tl_guid in self._timelines
+                        and tl_guid not in self._clip_timelines.values()):
+                    self.active_timeline_guid = tl_guid
                 for cb in self._playback_callbacks:
                     try:
                         cb(data)
@@ -1195,6 +1208,9 @@ class SyncManager:
                 return ("display_settings", data)
 
             if command == "SELECTION" and event == "SET":
+                # Track the clip the master has selected so the sync viewer
+                # can highlight it even when scrubbing is paused.
+                self.selected_clip_guid = data.get("clip_guid") or None
                 return ("selection_changed", data)
 
             if command == "ADD_TIMELINE":
