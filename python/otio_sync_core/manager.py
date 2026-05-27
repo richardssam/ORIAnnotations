@@ -133,6 +133,8 @@ class SyncManager:
         self.master_guid: str | None = None
         self._delta_buffer: list[dict[str, Any]] = []
         self._last_snapshot_time: float = 0
+        self._last_who_is_master_time: float | None = None
+        self._state_request_time: float | None = None
 
         #: Last received playback state dict; empty until the first playback message.
         self.playback_state: dict[str, Any] = {}
@@ -532,6 +534,7 @@ class SyncManager:
         """
         if self.master_guid:
             self._set_status(STATE_JOINING)
+            self._state_request_time = time.time()
             self._send_session_event("STATE_REQUEST", {
                 "target_guid": self.master_guid,
                 "requester_guid": self.self_guid,
@@ -1160,10 +1163,14 @@ class SyncManager:
         self._is_syncing = True
         try:
             if command == "SESSION":
-                if event == "WHO_IS_MASTER" and self.is_master:
-                    self.broadcast_master_response()
+                if event == "WHO_IS_MASTER":
+                    if self.is_master:
+                        self.broadcast_master_response()
+                    elif self.status == STATE_SYNCED:
+                        self._last_who_is_master_time = time.time()
                 elif event == "I_AM_MASTER":
                     self.master_guid = data.get("master_guid")
+                    self._last_who_is_master_time = None
                     if self.status == STATE_DISCOVERING:
                         return ("master_found", self.master_guid)
                 elif event == "STATE_REQUEST" and self.is_master:
@@ -1280,6 +1287,28 @@ class SyncManager:
                 app_events.extend(replay)
             else:
                 app_events.append((action, data))
+
+        # Check for master failover
+        if (not self.is_master 
+                and self.status == STATE_SYNCED 
+                and getattr(self, "_last_who_is_master_time", None) is not None):
+            if time.time() - self._last_who_is_master_time > 2.0:
+                _log("Master did not respond to WHO_IS_MASTER. Promoting self to master.")
+                self.is_master = True
+                self.master_guid = self.self_guid
+                self._last_who_is_master_time = None
+                self.broadcast_master_response()
+
+        # Check for state snapshot timeout
+        if (self.status == STATE_JOINING 
+                and getattr(self, "_state_request_time", None) is not None):
+            if time.time() - self._state_request_time > 5.0:
+                _log("STATE_REQUEST timed out. Reverting to DISCOVERING.")
+                self.master_guid = None
+                self._state_request_time = None
+                self._set_status(STATE_DISCOVERING)
+                app_events.append(("state_request_timeout", None))
+
         return app_events
 
     def receive_and_apply_all(self) -> list[tuple[str, Any]]:
@@ -1360,6 +1389,7 @@ class SyncManager:
                         replay_results.append(res)
 
             self._delta_buffer = []
+            self._state_request_time = None
             self._set_status(STATE_SYNCED)
             return replay_results
         finally:

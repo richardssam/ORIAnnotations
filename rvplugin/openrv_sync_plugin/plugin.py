@@ -702,6 +702,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self._apply_remove_child(data)
         elif action == "move_child":
             self._apply_move_child(data)
+        elif action == "state_request_timeout":
+            _log("State request timed out. Electing self as master.")
+            self._init_as_master()
         else:
             _log(f"RECV unhandled action={action}")
 

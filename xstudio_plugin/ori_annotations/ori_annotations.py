@@ -1,17 +1,22 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 
+import datetime
 import json
+import logging
 import os
 import shutil
 import sys
-import uuid
+import traceback
 from urllib.parse import urlsplit
 
-from xstudio.plugin import PluginBase
-from xstudio.core import serialise_atom
-
 import opentimelineio as otio
+from xstudio.core import (
+    BookmarkDetail,
+    bookmark_detail_atom,
+    serialise_atom,
+)
+from xstudio.plugin import PluginBase
 
 # Make the ORIAnnotations Python module importable from within this plugin's
 # package tree (../../python/ relative to this file).
@@ -35,21 +40,84 @@ if os.path.exists(_manifest_file):
 
 import ORIAnnotations
 
+from otio_sync_core.xs_annotation_codec import (  # noqa: E402
+    xs_strokes_to_sync_events,
+    xs_captions_to_sync_events,
+    sync_events_to_xs_strokes,
+    sync_events_to_xs_captions,
+)
+
 SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
 
-_DIALOG_QML = """
+# ── logging ────────────────────────────────────────────────────────────────────
+# Mirrors the pattern in ori_sync_plugin.py.
+# Set ORI_ANNOTATIONS_LOG_FILE=/path/to/file.log before launching xStudio to
+# get a persistent record alongside the console output.
+
+
+def _make_logger() -> logging.Logger:
+    logger = logging.getLogger("ori_annotations")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    log_file = os.environ.get("ORI_ANNOTATIONS_LOG_FILE")
+    if log_file:
+        fh = logging.FileHandler(log_file, mode="w")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+_logger = _make_logger()
+
+
+def _log(msg: str) -> None:
+    _logger.debug(msg)
+
+
+def _log_exc(msg: str) -> None:
+    _logger.exception(msg)
+
+
+_EXPORT_DIALOG_QML = """
 ORIAnnotationsExportDialog {
 }
 """
 
+_IMPORT_DIALOG_QML = """
+ORIAnnotationsImportDialog {
+}
+"""
 
-class ORIAnnotationsExporter(PluginBase):
+
+class ORIAnnotationsPlugin(PluginBase):
+    """xStudio plugin that exports and imports ORI annotation OTIO files.
+
+    Adds two entries to *File → Export / Import*:
+
+    * **Export Annotations (OTIO)…** — gathers xStudio bookmarks from the
+      current playlist and writes them to an OTIO file.
+    * **Import Annotations (OTIO)…** — reads a previously exported OTIO file
+      and recreates its annotations as xStudio bookmarks on the matching media.
+
+    Stroke and caption conversion between xStudio's native dict format and the
+    OTIO SyncEvent schema is handled by
+    :mod:`otio_sync_core.xs_annotation_codec`, which is also used by
+    :mod:`ori_sync_plugin` so the two plugins share identical conversion logic.
+
+    :param connection: xStudio connection object passed by the plugin loader.
+    """
 
     def __init__(self, connection):
         PluginBase.__init__(
             self,
             connection,
-            name="ORIAnnotationsExporter",
+            name="ORIAnnotationsPlugin",
             qml_folder="qml/ORIAnnotationsExporter.1",
         )
 
@@ -58,23 +126,43 @@ class ORIAnnotationsExporter(PluginBase):
             "Export Annotations (OTIO)...",
             "File|Export",
             0.6,
-            callback=self._menu_callback,
+            callback=self._export_menu_callback,
+        )
+        self.insert_menu_item(
+            "main menu bar",
+            "Import Annotations (OTIO)...",
+            "File|Import",
+            0.6,
+            callback=self._import_menu_callback,
         )
         self.connect_to_ui()
 
     # ------------------------------------------------------------------
-    # Menu / UI
+    # Menu / UI callbacks
     # ------------------------------------------------------------------
 
-    def _menu_callback(self):
-        self.create_qml_item(_DIALOG_QML)
+    def _export_menu_callback(self):
+        self.create_qml_item(_EXPORT_DIALOG_QML)
+
+    def _import_menu_callback(self):
+        self.create_qml_item(_IMPORT_DIALOG_QML)
 
     # ------------------------------------------------------------------
     # Export entry point — called from QML via python_callback
     # ------------------------------------------------------------------
 
     def do_export(self, output_folder, otio_name, include_media, include_images):
-        """Called from QML. Returns [True, message] on success, [False, message] on failure."""
+        """Export current playlist annotations to an OTIO file.
+
+        Called from ``ORIAnnotationsExportDialog.qml``.
+
+        :param output_folder: Destination folder path (may be a ``file://`` URI).
+        :param otio_name: Desired filename for the OTIO output.
+        :param include_media: Whether to copy media files into *output_folder*.
+        :param include_images: Whether to render annotation images as PNGs.
+        :returns: ``[True, message]`` on success, ``[False, message]`` on failure.
+        :rtype: list
+        """
         try:
             # QML's showFolderDialog returns a file:// URI; strip the scheme.
             output_folder = urlsplit(str(output_folder)).path or str(output_folder)
@@ -102,15 +190,155 @@ class ORIAnnotationsExporter(PluginBase):
 
             return [True, f"Exported {annotated_count} annotated frame(s).\n\nOutput: {output_path}"]
 
-        except Exception as exc:
-            import traceback
-            return [False, f"{exc}\n\n{traceback.format_exc()}"]
+        except Exception:
+            _log_exc("do_export failed")
+            return [False, traceback.format_exc()]
 
     # ------------------------------------------------------------------
-    # Bookmark collection
+    # Import entry point — called from QML via python_callback
+    # ------------------------------------------------------------------
+
+    def do_import(self, otio_file):
+        """Import annotations from an OTIO file into the current playlist.
+
+        Reads every annotation clip from the OTIO timeline, finds the
+        corresponding media in the currently inspected xStudio playlist by
+        name, and recreates the strokes/captions as xStudio bookmarks.
+
+        Frame numbering: the exporter stores ``xStudio_frame + 1`` in the
+        OTIO ``source_range.start_time``, so on import we subtract 1 to
+        recover the 0-based xStudio frame number.
+
+        Called from ``ORIAnnotationsImportDialog.qml``.
+
+        :param otio_file: Path to the ``.otio`` file (may be a ``file://`` URI).
+        :returns: ``[True, message]`` on success, ``[False, message]`` on failure.
+        :rtype: list
+        """
+        try:
+            otio_file = urlsplit(str(otio_file)).path or str(otio_file)
+            timeline = otio.adapters.read_from_file(otio_file)
+
+            playlist = self.connection.api.session.inspected_container
+            if playlist is None:
+                return [False, "No playlist is currently selected."]
+
+            # Build a name → media lookup for the current playlist.
+            media_by_name: dict = {}
+            for media in playlist.media:
+                name = media.name
+                media_by_name[name] = media
+                # Also index by basename stem so that xStudio playlists loaded
+                # via full path still match exported clip names.
+                stem = os.path.splitext(os.path.basename(name))[0]
+                media_by_name.setdefault(stem, media)
+
+            applied = 0
+            skipped = 0
+            warnings: list = []
+
+            # tracks[0] is the "Media" track; review/annotation tracks follow.
+            for track in timeline.tracks[1:]:
+                for clip in track:
+                    if not isinstance(clip, otio.schema.Clip):
+                        continue
+
+                    commands = clip.metadata.get("annotation_commands", [])
+                    note = clip.metadata.get("note", "")
+                    if not commands and not note:
+                        continue
+
+                    # annotated_clip_name names the media this annotation
+                    # belongs to; fall back to the clip name with its ".frame"
+                    # suffix removed.
+                    annotated_name = (
+                        clip.metadata.get("annotated_clip_name")
+                        or clip.name.rsplit(".", 1)[0]
+                    )
+
+                    media = media_by_name.get(annotated_name)
+                    if media is None:
+                        stem = os.path.splitext(os.path.basename(annotated_name))[0]
+                        media = media_by_name.get(stem)
+                    if media is None:
+                        warnings.append(f"No media match for '{annotated_name}'")
+                        skipped += 1
+                        continue
+
+                    # Recover frame number and timing.
+                    sr = clip.source_range
+                    if sr is None:
+                        skipped += 1
+                        continue
+                    otio_frame = int(sr.start_time.value)
+                    fps = float(sr.start_time.rate) if sr.start_time.rate else 24.0
+                    # Exporter stored xStudio_frame + 1; recover 0-based frame.
+                    xs_frame = max(0, otio_frame - 1)
+                    start_sec = xs_frame / fps
+
+                    aspect_half = self._aspect_half_for_media(media)
+                    pen_strokes = sync_events_to_xs_strokes(commands, aspect_half)
+                    captions = sync_events_to_xs_captions(commands, aspect_half)
+
+                    if not pen_strokes and not captions and not note:
+                        skipped += 1
+                        continue
+
+                    # Create a new bookmark at the target frame.
+                    bm = self.connection.api.session.bookmarks.add_bookmark(
+                        target=media
+                    )
+                    detail = BookmarkDetail()
+                    detail.start = datetime.timedelta(seconds=start_sec)
+                    # Duration < 1 frame so the bookmark displays on exactly
+                    # one frame (mirrors the approach in ori_sync_plugin.py).
+                    detail.duration = datetime.timedelta(seconds=0.9 / fps)
+                    if note:
+                        try:
+                            detail.note = note
+                        except AttributeError:
+                            pass  # older xStudio builds may not expose this field
+                    self.connection.request_receive(
+                        bm.remote, bookmark_detail_atom(), detail
+                    )
+
+                    if pen_strokes or captions:
+                        bm.set_annotation(strokes=pen_strokes, captions=captions)
+
+                    applied += 1
+
+            if applied == 0:
+                msg = "No annotations found to import."
+                if warnings:
+                    msg += "\n\nWarnings:\n" + "\n".join(warnings[:10])
+                return [False, msg]
+
+            msg = f"Imported {applied} annotated frame(s)."
+            if skipped:
+                msg += f"\n{skipped} frame(s) skipped."
+            if warnings:
+                msg += "\n\nWarnings:\n" + "\n".join(warnings[:10])
+            return [True, msg]
+
+        except Exception:
+            _log_exc("do_import failed")
+            return [False, traceback.format_exc()]
+
+    # ------------------------------------------------------------------
+    # Bookmark collection (export helper)
     # ------------------------------------------------------------------
 
     def _collect_bookmarks(self, playlist, output_dir, include_media, include_images):
+        """Collect all annotated bookmarks from *playlist* into ORIAnnotations objects.
+
+        :param playlist: xStudio playlist object (the inspected container).
+        :param output_dir: Directory into which media copies and PNG renders
+            will be written when *include_media* or *include_images* is set.
+        :param include_media: Copy source media files into *output_dir*.
+        :param include_images: Render annotation PNGs via the viewport snapshot API.
+        :returns: ``(media_list, review_items, annotated_count)`` tuple.
+        :rtype: tuple
+        """
         media_list = []
         review_items = []
         annotated_count = 0
@@ -129,17 +357,7 @@ class ORIAnnotationsExporter(PluginBase):
                 seconds_per_frame = rate.seconds() if rate else (1.0 / 24.0)
                 frame_count = mr.frame_count()
 
-                # xstudio stores annotations in W-normalised coords (X ∈ [-1,+1],
-                # Y ∈ [-H/W,+H/W]).  RV/OTIO paint nodes use H-normalised WCS
-                # (Y ∈ [-0.5,+0.5], X ∈ [-aspect/2,+aspect/2]).
-                # Scale factor to convert: W/(2H) = aspect/2.
-                try:
-                    streams = ms.image_streams
-                    res = streams[0].media_stream_detail.resolution() if streams else None
-                    img_w, img_h = (res[0], res[1]) if res and res[1] else (1920, 1080)
-                except Exception:
-                    img_w, img_h = 1920, 1080
-                aspect_half = img_w / (2.0 * img_h)
+                aspect_half = self._aspect_half_for_media(media)
 
                 media_path = urlsplit(str(mr.uri())).path
 
@@ -166,7 +384,8 @@ class ORIAnnotationsExporter(PluginBase):
 
                 bms = media.ordered_bookmarks()
                 for bookmark in bms:
-                    # xstudio frames are 0-based; RV paint nodes use 1-based frame numbers.
+                    # xStudio frames are 0-based; store as 1-based in the OTIO
+                    # clip so the annotation track aligns with the media track.
                     frame = int(round(bookmark.start.total_seconds() / seconds_per_frame)) + 1
                     note = bookmark.note or ""
                     events = self._bookmark_to_sync_events(bookmark, aspect_half)
@@ -192,13 +411,24 @@ class ORIAnnotationsExporter(PluginBase):
 
                 ri.review_frames = frames
 
-            except Exception as exc:
-                print(f"[ORIAnnotations] Warning: skipping '{media.name}': {exc}")
+            except Exception:
+                _log_exc(f"_collect_bookmarks: skipping '{media.name}'")
                 continue
 
         return media_list, review_items, annotated_count
 
     def _bookmark_to_sync_events(self, bookmark, aspect_half=0.8889):
+        """Read annotation data from *bookmark* and convert to SyncEvent objects.
+
+        Deserialises the bookmark's raw annotation JSON via ``serialise_atom``,
+        then delegates stroke and caption conversion to the shared codec in
+        :mod:`otio_sync_core.xs_annotation_codec`.
+
+        :param bookmark: xStudio ``Bookmark`` object.
+        :param aspect_half: ``W / (2H)`` coordinate scale factor.
+        :returns: List of SyncEvent objects, or an empty list on failure.
+        :rtype: list
+        """
         try:
             raw = self.connection.request_receive(bookmark.remote, serialise_atom())[0]
             ann = json.loads(raw.dump())
@@ -206,14 +436,23 @@ class ORIAnnotationsExporter(PluginBase):
             data = annotation.get("Data", {})
             strokes = data.get("pen_strokes", [])
             return (
-                self._strokes_to_sync_events(strokes, aspect_half)
-                + self._captions_to_sync_events(data.get("captions", []), aspect_half)
+                xs_strokes_to_sync_events(strokes, aspect_half)
+                + xs_captions_to_sync_events(data.get("captions", []), aspect_half)
             )
-        except Exception as exc:
-            print(f"[ORIAnnotations] Warning: could not read annotation data: {exc}")
+        except Exception:
+            _log_exc("_bookmark_to_sync_events: could not read annotation data")
             return []
 
     def _render_annotation_image(self, output_dir, media_name, frame, bookmark):
+        """Render the annotation overlay for *bookmark* as a PNG file.
+
+        :param output_dir: Directory in which to write the PNG.
+        :param media_name: Media display name (used to build the filename).
+        :param frame: 1-based frame number (used in the filename).
+        :param bookmark: xStudio ``Bookmark`` object whose annotation to render.
+        :returns: Absolute path to the rendered PNG, or ``None`` on failure.
+        :rtype: str or None
+        """
         safe_name = media_name.replace("/", "_").replace("\\", "_")
         img_path = os.path.join(output_dir, f"{safe_name}.{frame:05d}.png")
         try:
@@ -224,86 +463,36 @@ class ORIAnnotationsExporter(PluginBase):
                 include_drawings=True,
             )
             return img_path
-        except Exception as exc:
-            print(f"[ORIAnnotations] Warning: could not render annotation image: {exc}")
+        except Exception:
+            _log_exc(f"_render_annotation_image: failed for '{media_name}' frame {frame}")
             return None
 
     # ------------------------------------------------------------------
-    # Stroke / caption conversion
+    # Media helpers
     # ------------------------------------------------------------------
 
-    def _strokes_to_sync_events(self, pen_strokes, aspect_half=0.8889):
-        events = []
-        for stroke in pen_strokes:
-            stroke_uuid = str(uuid.uuid4())
-            r = stroke.get("r", 1.0)
-            g = stroke.get("g", 1.0)
-            b = stroke.get("b", 1.0)
-            opacity = stroke.get("opacity", 1.0)
-            thickness = stroke.get("thickness", 0.003)
-            is_erase = stroke.get("is_erase_stroke", False)
-            raw_pts = stroke.get("points", [])
+    def _aspect_half_for_media(self, media) -> float:
+        """Return ``W / (2H)`` for *media*'s first image stream.
 
-            # Convert from xstudio W-normalised (Y-down) to RV H-normalised (Y-up).
-            # Scale factor: W/(2H) = aspect/2 = aspect_half.
-            xs  = [x * aspect_half for x in raw_pts[0::4]]
-            ys  = [-y * aspect_half for y in raw_pts[1::4]]
-            sps = raw_pts[2::4]
+        Used to convert between xStudio's W-normalised coordinate space and
+        the H-normalised space used by OTIO SyncEvents / RV.
 
-            if xs and any(sp != 0.0 for sp in sps):
-                widths = [thickness * aspect_half * sp for sp in sps]
-            else:
-                widths = [thickness * aspect_half] * len(xs)
-
-            start_evt = SyncEvent.PaintStart(
-                brush="oval",
-                rgba=[r, g, b, opacity],
-                friendly_name="",
-                uuid=stroke_uuid,
-            )
-            if is_erase:
-                start_evt.type = "erase"
-            events.append(start_evt)
-
-            verts = SyncEvent.PaintVertices(list(xs), list(ys), widths)
-            events.append(SyncEvent.PaintPoints(uuid=stroke_uuid, points=verts))
-
-        return events
-
-    def _captions_to_sync_events(self, captions, aspect_half=0.8889):
-        events = []
-        for caption in captions:
-            caption_uuid = str(uuid.uuid4())
-
-            colour = caption.get("colour", ["colour", 1, 1.0, 1.0, 1.0])
-            if isinstance(colour, list) and len(colour) >= 5:
-                r, g, b = float(colour[2]), float(colour[3]), float(colour[4])
-            else:
-                r, g, b = 1.0, 1.0, 1.0
-            opacity = float(caption.get("opacity", 1.0))
-
-            pos = caption.get("position", ["vec2", 1, 0.0, 0.0])
-            if isinstance(pos, list) and len(pos) >= 4:
-                position = [float(pos[2]) * aspect_half, -float(pos[3]) * aspect_half]
-            else:
-                position = [0.0, 0.0]
-
-            event = SyncEvent.TextAnnotation(
-                rgba=[r, g, b, opacity],
-                position=position,
-                spacing=0.0,
-                friendly_name=caption.get("font_name", ""),
-                font_size=float(caption.get("font_size", 50.0)),
-                font=caption.get("font_name", ""),
-                text=caption.get("text", ""),
-                rotation=0.0,
-                scale=1.0,
-                uuid=caption_uuid,
-            )
-            events.append(event)
-
-        return events
+        :param media: xStudio ``Media`` object.
+        :returns: ``aspect_half`` value (e.g. ``0.8889`` for 16:9 1920×1080).
+            Falls back to ``0.8889`` on any error.
+        :rtype: float
+        """
+        try:
+            ms = media.media_source()
+            if ms is None:
+                return 0.8889
+            streams = ms.image_streams
+            res = streams[0].media_stream_detail.resolution() if streams else None
+            img_w, img_h = (res[0], res[1]) if res and res[1] else (1920, 1080)
+        except Exception:
+            img_w, img_h = 1920, 1080
+        return img_w / (2.0 * img_h)
 
 
 def create_plugin_instance(connection):
-    return ORIAnnotationsExporter(connection)
+    return ORIAnnotationsPlugin(connection)

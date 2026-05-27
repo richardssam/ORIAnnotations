@@ -24,13 +24,33 @@ xStudio playhead.  xStudio's actor-based attribute system routes those
 writes safely, but this should be verified against the installed version.
 """
 
+import sys
+import os
+
+# ── path setup ─────────────────────────────────────────────────────────────────
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_repo_root = os.path.dirname(os.path.dirname(_here))
+_python_dir = os.path.join(_repo_root, "python")
+_manifest_dir = os.path.join(_repo_root, "otio_event_plugin")
+_manifest_file = os.path.join(_manifest_dir, "plugin_manifest.json")
+
+for _p in (_python_dir, _manifest_dir):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+if os.path.exists(_manifest_file):
+    _existing = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
+    if _manifest_file not in _existing:
+        os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = (
+            _existing + os.pathsep + _manifest_file if _existing else _manifest_file
+        )
+
 import concurrent.futures
 import datetime
 import json
 import logging
-import os
 import queue
-import sys
 import threading
 import time
 import uuid
@@ -54,6 +74,7 @@ from xstudio.core import (
     selection_actor_atom,
     get_media_atom,
     attribute_value_atom,
+    JsonStore,
 )
 from xstudio.api.session.playhead import Playhead, PlayheadSelection
 from xstudio.api.intrinsic.viewport import Viewport
@@ -65,25 +86,6 @@ from xstudio.api.session.playlist.subset import Subset
 from xstudio.api.session.playlist.contact_sheet import ContactSheet
 from xstudio.api.session.media.media import Media
 
-# ── path setup ─────────────────────────────────────────────────────────────────
-
-_here = os.path.dirname(os.path.realpath(__file__))
-_repo_root = os.path.dirname(os.path.dirname(_here))
-_python_dir = os.path.join(_repo_root, "python")
-_manifest_dir = os.path.join(_repo_root, "otio_event_plugin")
-_manifest_file = os.path.join(_manifest_dir, "plugin_manifest.json")
-
-for _p in (_python_dir, _manifest_dir):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-if os.path.exists(_manifest_file):
-    _existing = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
-    if _manifest_file not in _existing:
-        os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = (
-            _existing + os.pathsep + _manifest_file if _existing else _manifest_file
-        )
-
 from otio_sync_core.manager import (  # noqa: E402
     STATE_DISCOVERING,
     STATE_SYNCED,
@@ -91,9 +93,13 @@ from otio_sync_core.manager import (  # noqa: E402
     sync_event_schema,
 )
 from otio_sync_core.rabbitmq_network import RabbitMQNetwork  # noqa: E402
+from otio_sync_core.xs_annotation_codec import (  # noqa: E402
+    xs_strokes_to_sync_events,
+    xs_captions_to_sync_events,
+    sync_events_to_xs_strokes,
+    sync_events_to_xs_captions,
+)
 from xstudio.plugin import PluginBase  # noqa: E402
-
-SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
 
 # ── logging ────────────────────────────────────────────────────────────────────
 
@@ -233,6 +239,11 @@ class ORISyncPlugin(PluginBase):
         # existing bookmark rather than creating a new one.
         self._annotation_bookmarks: dict[tuple, object] = {}
 
+        # Cache of parsed stroke and caption dicts (including their Python-side "uuid" keys)
+        # for each (clip_guid, frame) pair, allowing non-destructive partial updates.
+        self._bookmark_strokes_cache: dict[tuple, list] = {}
+        self._bookmark_captions_cache: dict[tuple, list] = {}
+
         # UUIDs of bookmarks we created from *remote* annotations.
         # show_atom scans skip these so we never re-broadcast them back.
         self._our_bookmark_uuids: set = set()
@@ -278,6 +289,7 @@ class ORISyncPlugin(PluginBase):
         self._hot_scan_active: bool = False
         self._hot_scan_frame: int | None = None
         self._hot_scan_stroke_counts: dict[str, int] = {}  # f"{clip}:{frame}" → last sent count
+        self._hot_scan_point_counts: dict[str, int] = {}  # f"{clip}:{frame}" → last sent point count
         self._hot_scan_last_change: float = 0.0
 
         # Polling-based scrub detection: last frame seen by the poll loop and
@@ -597,6 +609,15 @@ class ORISyncPlugin(PluginBase):
 
         elif action == "selection_changed":
             self._apply_selection(data)
+
+        elif action == "state_request_timeout":
+            _log("State request timed out. Electing self as master.")
+            for tl in self._build_otio_timelines():
+                self.manager.register_timeline(tl)
+            self.manager.is_master = True
+            self.manager.master_guid = self.manager.self_guid
+            self.manager.broadcast_master_response()
+            self.manager._set_status(STATE_SYNCED)
 
     def _on_synced(self) -> None:
         _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
@@ -960,7 +981,8 @@ class ORISyncPlugin(PluginBase):
         # show_atom: fires when a bookmark/annotation is shown or created,
         # or when the active on-screen media item changes.
         if isinstance(event[1], show_atom):
-            if len(event) >= 5 and hasattr(event[2], 'uuid'):
+            is_bookmark_shown = len(event) == 6 and isinstance(event[5], int)
+            if not is_bookmark_shown and len(event) >= 5 and hasattr(event[2], 'uuid'):
                 # On-screen media changed (selection change).
                 # Only broadcast selection from media change if we are viewing Playlist (source view).
                 # If we are viewing Timeline, playhead sync handles it, and we only want to broadcast
@@ -2231,7 +2253,22 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             return
         if clip_guid is None:
-            return
+            # Flat-playlist fallback: clips have no source_range so
+            # _resolve_clip_at_frame always returns None.  Use the last
+            # broadcast/received selection clip GUID; for flat playlists the
+            # user views one clip at a time so this is always the right clip.
+            fb = self._last_broadcast_clip_guid
+            if fb and fb in self._flat_clip_to_media:
+                clip_guid = fb
+                ph_fps = 25.0
+                if self.active_playhead:
+                    try:
+                        ph_fps = self.active_playhead.frame_rate.fps() or ph_fps
+                    except Exception:
+                        pass
+                clip_local_time = otio.opentime.RationalTime(frame, ph_fps)
+            else:
+                return
 
         local_frame = int(clip_local_time.value)
         fps = float(clip_local_time.rate) if clip_local_time.rate else 25.0
@@ -2278,12 +2315,17 @@ class ORISyncPlugin(PluginBase):
             return
 
         key = f"{clip_guid}:{local_frame}"
-        last_sent = self._hot_scan_stroke_counts.get(key, 0)
-        if len(all_strokes) <= last_sent:
-            return  # no new strokes since last hot broadcast
+        last_sent_strokes = self._hot_scan_stroke_counts.get(key, 0)
+        last_sent_points = self._hot_scan_point_counts.get(key, 0)
+
+        current_stroke_points = len(all_strokes[-1].get("points", [])) if all_strokes else 0
+
+        if len(all_strokes) == last_sent_strokes and current_stroke_points <= last_sent_points:
+            return  # no new strokes or points since last hot broadcast
 
         self._hot_scan_last_change = now
         self._hot_scan_stroke_counts[key] = len(all_strokes)
+        self._hot_scan_point_counts[key] = current_stroke_points
 
         # Ensure UUID cache covers all strokes (including pre-existing ones).
         if key not in self._stroke_uuid_cache:
@@ -2295,11 +2337,7 @@ class ORISyncPlugin(PluginBase):
         _, aspect_half = self._find_media_for_clip_guid(clip_guid)
 
         # Send ALL current strokes so peers can update from any starting point.
-        try:
-            otio.schema.schemadef.module_from_name("SyncEvent")
-        except Exception:
-            pass
-        events_obj = self._strokes_to_sync_events(all_strokes, aspect_half, uuid_list=cache)
+        events_obj = xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=cache)
         if not events_obj:
             return
 
@@ -2458,8 +2496,22 @@ class ORISyncPlugin(PluginBase):
                 return False
             clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
             if clip_guid is None:
-                _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
-                return False
+                # Flat-playlist fallback: clips have no source_range so
+                # _resolve_clip_at_frame always returns None.  Use the last
+                # broadcast/received selection clip GUID; for flat playlists
+                # the user views one clip at a time so this is always the
+                # right clip, and the bookmark frame is already clip-local.
+                fb = self._last_broadcast_clip_guid
+                if fb and fb in self._flat_clip_to_media:
+                    clip_guid = fb
+                    clip_local_time = otio.opentime.RationalTime(frame, fps)
+                    _log(
+                        f"_broadcast_local_bookmark: flat-playlist fallback"
+                        f" → clip {clip_guid[:8]} frame {frame}"
+                    )
+                else:
+                    _log(f"_broadcast_local_bookmark: no clip at frame {frame}")
+                    return False
 
         annotation_track_guid = self.manager.annotation_track_guid_for_clip(clip_guid)
         if annotation_track_guid is None:
@@ -2514,8 +2566,8 @@ class ORISyncPlugin(PluginBase):
                 if ann_clip_guid:
                     existing_uuids = self._extract_caption_uuids(ann_clip_guid)
                     all_events = (
-                        self._strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
-                        + self._captions_to_sync_events(all_captions, aspect_half, existing_uuids)
+                        xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
+                        + xs_captions_to_sync_events(all_captions, aspect_half, existing_uuids)
                     )
                     _log(
                         f"Broadcasting annotation replace: {len(all_events)} event(s)"
@@ -2526,8 +2578,8 @@ class ORISyncPlugin(PluginBase):
                     return True
 
         events = (
-            self._strokes_to_sync_events(new_strokes, aspect_half, uuid_list=delta_uuids)
-            + self._captions_to_sync_events(new_captions, aspect_half)
+            xs_strokes_to_sync_events(new_strokes, aspect_half, uuid_list=delta_uuids)
+            + xs_captions_to_sync_events(new_captions, aspect_half)
         )
         if not events:
             return False
@@ -2695,8 +2747,8 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 pass
 
-            pen_strokes = self._commands_to_xs_strokes(grp["commands"], aspect_half)
-            captions = self._commands_to_xs_captions(grp["commands"], aspect_half)
+            pen_strokes = sync_events_to_xs_strokes(grp["commands"], aspect_half)
+            captions = sync_events_to_xs_captions(grp["commands"], aspect_half)
             if not pen_strokes and not captions:
                 continue
 
@@ -2764,12 +2816,14 @@ class ORISyncPlugin(PluginBase):
             return
 
         all_commands = merged_clip.metadata.get("annotation_commands", [])
-        pen_strokes = self._commands_to_xs_strokes(all_commands, aspect_half)
-        captions = self._commands_to_xs_captions(all_commands, aspect_half)
+        pen_strokes = sync_events_to_xs_strokes(all_commands, aspect_half)
+        captions = sync_events_to_xs_captions(all_commands, aspect_half)
         if not pen_strokes and not captions:
             return
 
         try:
+            self._bookmark_strokes_cache[bm_key] = pen_strokes
+            self._bookmark_captions_cache[bm_key] = captions
             bm.set_annotation(strokes=pen_strokes, captions=captions)
             _log(
                 f"Refreshed annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
@@ -2804,8 +2858,11 @@ class ORISyncPlugin(PluginBase):
         for ev_dict in events_raw:
             try:
                 if isinstance(ev_dict, dict):
+                    # Use json.dumps → read_from_string (the correct round-trip for a
+                    # plain OTIO-JSON dict).  write_to_string expects a SerializableObject
+                    # and would fail on a plain Python dict.
                     ev_dict = otio.adapters.read_from_string(
-                        otio.adapters.write_to_string(ev_dict, "otio_json"), "otio_json"
+                        json.dumps(ev_dict), "otio_json"
                     )
                 commands.append(ev_dict)
             except Exception as e:
@@ -2856,8 +2913,9 @@ class ORISyncPlugin(PluginBase):
             )
             return
 
-        pen_strokes = self._commands_to_xs_strokes(commands, aspect_half)
-        captions = self._commands_to_xs_captions(commands, aspect_half)
+        pen_strokes = sync_events_to_xs_strokes(commands, aspect_half)
+        captions = sync_events_to_xs_captions(commands, aspect_half)
+        _log(f"DEBUG: parsed pen_strokes: {pen_strokes}")
         if not pen_strokes and not captions:
             _log("_apply_remote_annotation: no strokes or captions decoded — skipping")
             return
@@ -2866,19 +2924,63 @@ class ORISyncPlugin(PluginBase):
         existing_bm = self._annotation_bookmarks.get(bm_key)
         try:
             if existing_bm is not None:
-                existing_bm.set_annotation(strokes=pen_strokes, captions=captions)
+                # Retrieve existing strokes from cache, falling back to reading from bookmark.
+                cached_strokes = self._bookmark_strokes_cache.get(bm_key)
+                if cached_strokes is None:
+                    cached_strokes = []
+                    ann_data = existing_bm.annotation_data
+                    if ann_data:
+                        canvas = ann_data.get("Data", ann_data)
+                        cached_strokes = canvas.get("pen_strokes", [])
+
+                cached_captions = self._bookmark_captions_cache.get(bm_key)
+                if cached_captions is None:
+                    cached_captions = []
+                    ann_data = existing_bm.annotation_data
+                    if ann_data:
+                        canvas = ann_data.get("Data", ann_data)
+                        cached_captions = canvas.get("captions", [])
+
+                # Merge strokes: replace by UUID if matched, otherwise append.
+                merged_strokes = list(cached_strokes)
+                for new_s in pen_strokes:
+                    uuid_val = new_s.get("uuid")
+                    replaced = False
+                    if uuid_val:
+                        for idx, s in enumerate(merged_strokes):
+                            if s.get("uuid") == uuid_val:
+                                merged_strokes[idx] = new_s
+                                replaced = True
+                                break
+                    if not replaced:
+                        merged_strokes.append(new_s)
+
+                # Merge captions: replace by UUID if matched, otherwise append.
+                merged_captions = list(cached_captions)
+                for new_c in captions:
+                    uuid_val = new_c.get("uuid")
+                    replaced = False
+                    if uuid_val:
+                        for idx, c in enumerate(merged_captions):
+                            if c.get("uuid") == uuid_val:
+                                merged_captions[idx] = new_c
+                                replaced = True
+                                break
+                    if not replaced:
+                        merged_captions.append(new_c)
+
+                self._bookmark_strokes_cache[bm_key] = merged_strokes
+                self._bookmark_captions_cache[bm_key] = merged_captions
+
+                existing_bm.set_annotation(strokes=merged_strokes, captions=merged_captions)
                 _log(
-                    f"Updated annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
+                    f"Updated annotation bookmark (non-destructive): {len(merged_strokes)} stroke(s), {len(merged_captions)} caption(s)"
                     f" at frame {frame}"
                 )
                 target_bm = existing_bm
             else:
                 bm = self.connection.api.session.bookmarks.add_bookmark(target=media)
                 # Set start and duration in a single BookmarkDetail message.
-                # Doing them separately fires two bookmark_change_atom events and risks
-                # a full_bookmarks_update running between them with duration=k_flicks_max
-                # (which makes the annotation appear to hold for the whole media).
-                # Duration < 1 frame: floor(0.9) = 0 → end_frame = start_frame (1-frame display).
                 detail = BookmarkDetail()
                 detail.start = datetime.timedelta(seconds=frame / fps)
                 detail.duration = datetime.timedelta(seconds=0.9 / fps)
@@ -2891,6 +2993,10 @@ class ORISyncPlugin(PluginBase):
                     )
                 except Exception:
                     pass
+
+                self._bookmark_strokes_cache[bm_key] = pen_strokes
+                self._bookmark_captions_cache[bm_key] = captions
+
                 bm.set_annotation(strokes=pen_strokes, captions=captions)
                 self._annotation_bookmarks[bm_key] = bm
                 with self._our_bookmark_uuids_lock:
@@ -2902,7 +3008,6 @@ class ORISyncPlugin(PluginBase):
                 target_bm = bm
             self._our_bookmark_clip_frame[str(target_bm.uuid)] = (clip_guid, frame)
             # Pre-populate caption signature using xStudio's quantized readback
-            # so the next periodic scan doesn't re-broadcast these remote captions.
             if captions:
                 try:
                     rb = target_bm.annotation_data
@@ -3210,137 +3315,6 @@ class ORISyncPlugin(PluginBase):
                 if isinstance(c, otio.schema.Clip)
             ]
 
-    def _commands_to_xs_strokes(
-        self, commands: list, aspect_half: float
-    ) -> list:
-        """
-        Convert a PaintStart / PaintPoints command sequence to xStudio stroke dicts.
-
-        Inverts the H-normalised / Y-up (OTIO/RV) coordinate system to the
-        W-normalised / Y-down system that xStudio expects:
-
-        .. code-block:: text
-
-            x_xs = x_otio / aspect_half
-            y_xs = -y_otio / aspect_half
-
-        :param commands: Sequence of SyncEvent objects from the annotation clip.
-        :param aspect_half: ``W / (2H)`` derived from the target media resolution.
-        :returns: List of xStudio pen-stroke dicts suitable for
-            :meth:`Bookmark.set_annotation`.
-        :rtype: list
-        """
-        pen_strokes: list[dict] = []
-        current_stroke: dict | None = None
-
-        for cmd in commands:
-            schema = sync_event_schema(cmd)
-
-            if schema.startswith("PaintStart"):
-                rgba = getattr(cmd, "rgba", None) or [1.0, 1.0, 1.0, 1.0]
-                # PaintStart has no width field; thickness is set from PaintVertices.size.
-                is_erase = getattr(cmd, "type", "color") == "erase"
-                current_stroke = {
-                    "r": rgba[0] if len(rgba) > 0 else 1.0,
-                    "g": rgba[1] if len(rgba) > 1 else 1.0,
-                    "b": rgba[2] if len(rgba) > 2 else 1.0,
-                    "opacity": rgba[3] if len(rgba) > 3 else 1.0,
-                    "thickness": 0.003,
-                    "softness": 0.0,
-                    "size_sensitivity": 1.0,
-                    "opacity_sensitivity": 1.0,
-                    "is_erase_stroke": is_erase,
-                    "points": [],
-                }
-                pen_strokes.append(current_stroke)
-
-            # Python class is PaintPoints; serializable label is "PaintPoint.1".
-            elif schema.startswith("PaintPoint") and current_stroke is not None:
-                points_obj = getattr(cmd, "points", None)
-                if points_obj is None:
-                    continue
-                xs = list(getattr(points_obj, "x", []))
-                ys = list(getattr(points_obj, "y", []))
-                sizes = list(getattr(points_obj, "size", []))
-                raw_pts: list[float] = []
-                for x, y in zip(xs, ys):
-                    raw_pts.extend([
-                        x / aspect_half,
-                        -y / aspect_half,
-                        1.0,  # size_pressure — protocol has no per-point pressure
-                        1.0,  # opacity_pressure — 0.0 makes every point invisible
-                    ])
-                current_stroke["points"] = raw_pts
-                if sizes:
-                    current_stroke["thickness"] = sizes[0] / aspect_half
-
-        return pen_strokes
-
-    def _commands_to_xs_captions(
-        self, commands: list, aspect_half: float
-    ) -> list:
-        """
-        Convert a TextAnnotation command sequence to xStudio caption dicts.
-
-        Inverts coordinate systems and scales font size.
-
-        :param commands: Sequence of SyncEvent objects from the annotation clip.
-        :param aspect_half: ``W / (2H)`` derived from the target media resolution.
-        :returns: List of xStudio caption dicts suitable for
-            :meth:`Bookmark.set_annotation`.
-        :rtype: list
-        """
-        captions: list[dict] = []
-        for cmd in commands:
-            schema = sync_event_schema(cmd)
-
-            if schema.startswith("TextAnnotation"):
-                rgba = getattr(cmd, "rgba", None)
-                if rgba is None and isinstance(cmd, dict):
-                    rgba = cmd.get("rgba")
-                if not rgba:
-                    rgba = [1.0, 1.0, 1.0, 1.0]
-
-                position = getattr(cmd, "position", None)
-                if position is None and isinstance(cmd, dict):
-                    position = cmd.get("position")
-                if not position:
-                    position = [0.0, 0.0]
-
-                text = getattr(cmd, "text", None)
-                if text is None and isinstance(cmd, dict):
-                    text = cmd.get("text")
-                if not text:
-                    text = ""
-
-                font = getattr(cmd, "font", None)
-                if font is None and isinstance(cmd, dict):
-                    font = cmd.get("font")
-                if not font:
-                    font = ""
-
-                font_size = getattr(cmd, "font_size", None)
-                if font_size is None and isinstance(cmd, dict):
-                    font_size = cmd.get("font_size")
-                if font_size is None:
-                    font_size = 50.0
-
-                # Convert coordinates and values
-                x_xs = float(position[0]) / aspect_half
-                y_xs = -float(position[1]) / aspect_half
-
-                captions.append({
-                    "colour": ["colour", 1, rgba[0], rgba[1], rgba[2]],
-                    "opacity": rgba[3],
-                    "position": ["vec2", 1, x_xs, y_xs],
-                    "font_name": font,
-                    "font_size": float(font_size),
-                    "text": text,
-                    "wrap_width": 0.0,
-                    "justification": 0,
-                })
-        return captions
-
     # ── OTIO helpers ───────────────────────────────────────────────────────────
 
     def _resolve_clip_at_frame(
@@ -3378,119 +3352,6 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("_resolve_clip_at_frame error")
         return None, None
-
-    # ── stroke / caption conversion ────────────────────────────────────────────
-
-    def _strokes_to_sync_events(
-        self,
-        pen_strokes: list,
-        aspect_half: float = 0.8889,
-        uuid_list: "list[str] | None" = None,
-    ) -> list:
-        """
-        Convert xStudio pen_strokes to OTIO SyncEvent objects.
-
-        Mirrors ``ORIAnnotationsExporter._strokes_to_sync_events`` exactly so
-        that strokes broadcast here are readable by the existing RV plugin and
-        the OTIO export pipeline.
-
-        :param uuid_list: If supplied, use ``uuid_list[i]`` as the UUID for stroke *i*
-            instead of generating a fresh one.  Callers that need stable UUIDs across
-            repeated broadcasts of the same frame (partial + final) maintain this list
-            in ``_stroke_uuid_cache`` and pass the appropriate slice here.
-
-        Coordinate convention:
-        - xStudio: W-normalised, Y-down  (X ∈ [−1,+1])
-        - OTIO/RV: H-normalised, Y-up    (X ∈ [−aspect/2,+aspect/2])
-        Scale factor: ``aspect_half = W / (2H)``
-        """
-        events = []
-        for i, stroke in enumerate(pen_strokes):
-            stroke_uuid = (uuid_list[i] if uuid_list and i < len(uuid_list)
-                           else str(uuid.uuid4()))
-            rgba = [
-                stroke.get("r", 1.0),
-                stroke.get("g", 1.0),
-                stroke.get("b", 1.0),
-                stroke.get("opacity", 1.0),
-            ]
-            thickness = stroke.get("thickness", 0.003)
-            is_erase = stroke.get("is_erase_stroke", False)
-            raw_pts = stroke.get("points", [])
-
-            xs = [x * aspect_half for x in raw_pts[0::4]]
-            ys = [-y * aspect_half for y in raw_pts[1::4]]
-            sps = raw_pts[2::4]
-            widths = (
-                [thickness * aspect_half * sp for sp in sps]
-                if xs and any(sp != 0.0 for sp in sps)
-                else [thickness * aspect_half] * len(xs)
-            )
-
-            start_evt = SyncEvent.PaintStart(
-                brush="oval", rgba=rgba, friendly_name="", uuid=stroke_uuid
-            )
-            if is_erase:
-                start_evt.type = "erase"
-            events.append(start_evt)
-            events.append(
-                SyncEvent.PaintPoints(
-                    uuid=stroke_uuid,
-                    points=SyncEvent.PaintVertices(list(xs), list(ys), widths),
-                )
-            )
-        return events
-
-    def _captions_to_sync_events(
-        self,
-        captions: list,
-        aspect_half: float = 0.8889,
-        existing_uuids: "list[str] | None" = None,
-    ) -> list:
-        """Convert xStudio caption dicts to OTIO TextAnnotation SyncEvents.
-
-        :param captions: xStudio caption dicts from ``bm.annotation_data``.
-        :param aspect_half: ``W / (2H)`` coordinate scale factor.
-        :param existing_uuids: When provided, reuse these UUIDs (by index) instead
-            of generating new ones.  Pass the UUIDs from the OTIO clip when building
-            a replacement so that RV can update existing text nodes in place.
-        """
-        events = []
-        for i, caption in enumerate(captions):
-            caption_uuid = (
-                existing_uuids[i]
-                if existing_uuids and i < len(existing_uuids)
-                else str(uuid.uuid4())
-            )
-            colour = caption.get("colour", ["colour", 1, 1.0, 1.0, 1.0])
-            if isinstance(colour, list) and len(colour) >= 5:
-                r, g, b = float(colour[2]), float(colour[3]), float(colour[4])
-            else:
-                r, g, b = 1.0, 1.0, 1.0
-            opacity = float(caption.get("opacity", 1.0))
-            pos = caption.get("position", ["vec2", 1, 0.0, 0.0])
-            position = (
-                [float(pos[2]) * aspect_half, -float(pos[3]) * aspect_half]
-                if isinstance(pos, list) and len(pos) >= 4
-                else [0.0, 0.0]
-            )
-            fs = float(caption.get("font_size", 50.0))
-            _log(f"  caption font_size={fs!r} text={caption.get('text', '')!r}")
-            events.append(
-                SyncEvent.TextAnnotation(
-                    rgba=[r, g, b, opacity],
-                    position=position,
-                    spacing=0.0,
-                    friendly_name=caption.get("font_name", ""),
-                    font_size=fs,
-                    font=caption.get("font_name", ""),
-                    text=caption.get("text", ""),
-                    rotation=0.0,
-                    scale=1.0,
-                    uuid=caption_uuid,
-                )
-            )
-        return events
 
 
 # ── xStudio entry points ───────────────────────────────────────────────────────
