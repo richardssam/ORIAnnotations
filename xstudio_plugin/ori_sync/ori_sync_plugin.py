@@ -46,7 +46,6 @@ if os.path.exists(_manifest_file):
             _existing + os.pathsep + _manifest_file if _existing else _manifest_file
         )
 
-import concurrent.futures
 import datetime
 import json
 import logging
@@ -61,6 +60,7 @@ from xstudio.core import (
     BookmarkDetail,
     LoopMode,
     annotation_atom,
+    annotation_data_atom,
     bookmark_detail_atom,
     change_atom,
     event_atom,
@@ -69,6 +69,7 @@ from xstudio.core import (
     show_atom,
     viewport_playhead_atom,
     viewport_active_media_container_atom,
+    item_atom,
     item_selection_atom,
     item_type_atom,
     selection_actor_atom,
@@ -111,17 +112,19 @@ def _make_logger() -> logging.Logger:
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
-    # Always attach a console handler so output is visible in xStudio's Python output.
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    # ORI_SYNC_LOG_FILE adds a persistent file alongside the console output,
-    # mirroring the RV_OTIO_SYNC_LOG_FILE pattern in the RV plugin.
     log_file = os.environ.get("ORI_SYNC_LOG_FILE")
     if log_file:
         fh = logging.FileHandler(log_file, mode="w")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
+        # Mirror to stderr so logs appear in the terminal that launched xStudio.
+        # Use sys.__stderr__ to bypass xStudio's internal capture of sys.stderr.
+        import sys as _sys
+        raw_stderr = getattr(_sys, "__stderr__", None) or _sys.stderr
+        if raw_stderr is not None:
+            eh = logging.StreamHandler(raw_stderr)
+            eh.setFormatter(fmt)
+            logger.addHandler(eh)
     return logger
 
 
@@ -300,29 +303,21 @@ class ORISyncPlugin(PluginBase):
         self._last_applied_frame: int | None = None
         self._last_polled_playing: bool | None = None
 
-        # Last clip GUID broadcast as selection; compared each poll tick to avoid
-        # redundant selection broadcasts when the playhead is within the same clip.
-        # Also set to the received clip_guid on _apply_selection to prevent echoing
-        # a received selection back to the sender.
-        self._last_broadcast_clip_guid: str | None = None
-        # Caches to track the last polled container UUID and clip GUID to prevent
-        # feedback loops caused by broadcasting selections/clears when no local changes occurred.
-        self._last_polled_container_uuid: str | None = None
-        self._last_polled_clip_guid: str | None = None
-        # After a remote "selection clear" the playhead is still positioned on
-        # the previously-selected clip.  _poll_and_broadcast_selection would
-        # immediately re-broadcast that clip via playhead_selection, toggling RV
-        # back to clip view.  We suppress re-broadcasting this specific guid
-        # until the playhead moves to a DIFFERENT clip.
-        self._suppress_rebroadcast_clip_guid: str | None = None
-        # Suppress frame/selection broadcasts until this monotonic timestamp.
-        # Set to now+5 at connect time; also set to now+1 in _apply_selection to
-        # let the viewport settle before resuming position broadcasts.
-        self._selection_suppress_until: float = 0.0
-        # Monotonic timestamp until which Form-2 events must NOT overwrite
-        # active_playhead.  Set after a position write to block the spurious
-        # second Form-2 (~200 ms later) that fires for the other loaded playlist.
-        self._playhead_lock_until: float = 0.0
+        # Last-logged container UUID / selection state; used by
+        # _poll_and_broadcast_selection to suppress duplicate log lines.
+        self._last_logged_container_uuid: str | None = None
+        self._last_logged_clip_name: str | None = None
+        # Last clip GUID seen in the viewport (playlist selection or show_atom).
+        # Used as a fallback in the annotation broadcast path for flat playlists,
+        # where _resolve_clip_at_frame returns None.
+        self._last_viewed_clip_guid: str | None = None
+        # Deferred seek: when a multi-clip sequence selection is received,
+        # the target frame and its deadline are stored here.  Both Form-2
+        # viewport_playhead_atom events fire within ~200 ms of the source
+        # switch and update active_playhead; the poll loop applies the seek
+        # once the deadline passes and the playhead has settled.
+        self._pending_seek_frame: int | None = None
+        self._pending_seek_deadline: float = 0.0
 
         # Last display state broadcast; compared each poll tick to detect changes.
         self._last_display_state: dict = {}
@@ -366,6 +361,14 @@ class ORISyncPlugin(PluginBase):
         self._viewport_container_is_timeline: bool = False
         # [TEST] subscription ID returned by subscribe_to_event_group for change_atom probe
         self._test_container_sub_id = None
+
+        # [2F] Event-driven clip insertion: subscription IDs keyed by tl_guid.
+        # When item_atom fires on a Timeline's event group, tl_guid is added to
+        # _timeline_item_dirty so the poll thread can call _poll_sequence_new_media
+        # for just that timeline without waiting for the next 0.5 s scan.
+        self._timeline_item_sub_ids: dict = {}
+        self._timeline_item_dirty: set = set()
+        self._timeline_item_lock = threading.Lock()
 
         # Auto-connect on startup using the current preference values.
         _log("Plugin loaded — auto-connecting to session")
@@ -431,6 +434,18 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("Could not subscribe to AnnotationsUI events")
 
+        # [2C] Subscribe to AnnotationsCore's plugin_events_ group to receive
+        # (event_atom, annotation_data_atom, user_id, stroke_completed) events.
+        # stroke_completed=True fires at PaintEnd (pen-up); False fires at
+        # PaintStart/PaintPoint (mid-stroke).  This replaces the show_atom
+        # hot-scan activation and the 33 ms poll as the primary annotation trigger.
+        try:
+            ann_core_plugin = self.get_plugin("AnnotationsCore")
+            self.subscribe_to_plugin_events(ann_core_plugin, self._on_core_annotation_event)
+            _log("Subscribed to AnnotationsCore plugin events [2C]")
+        except Exception:
+            _log_exc("Could not subscribe to AnnotationsCore events")
+
         # [TEST change_atom] Subscribe to the current viewed container's event
         # group.  If change_atom fires reliably here we can replace the
         # _poll_sequence_new_media poll with an event-driven path.
@@ -458,8 +473,6 @@ class ORISyncPlugin(PluginBase):
         # Suppress selection broadcasts for 5 s after connect so the initial
         # playhead position doesn't immediately drive RV's view before the user
         # has intentionally navigated anywhere.
-        self._selection_suppress_until = time.monotonic() + 5.0
-
         _log(f"Connecting: session={session!r} mq={host}:{port}")
 
     def disconnect(self) -> None:
@@ -479,12 +492,14 @@ class ORISyncPlugin(PluginBase):
         self._xs_flat_playlists.clear()
         self._xs_sequence_playlists.clear()
         self._flat_clip_to_media.clear()
-        self._last_broadcast_clip_guid = None
-        self._last_polled_container_uuid = None
-        self._last_polled_clip_guid = None
-        self._suppress_rebroadcast_clip_guid = None
-        self._selection_suppress_until = 0.0
-        self._playhead_lock_until = 0.0
+        self._timeline_item_sub_ids.clear()
+        with self._timeline_item_lock:
+            self._timeline_item_dirty.clear()
+        self._last_logged_container_uuid = None
+        self._last_logged_clip_name = None
+        self._last_viewed_clip_guid = None
+        self._pending_seek_frame = None
+        self._pending_seek_deadline = 0.0
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -521,7 +536,15 @@ class ORISyncPlugin(PluginBase):
                 self._hot_scan_active_annotation()
                 self._flush_pending_annotations()
                 self._poll_and_broadcast_frame()
-                
+                self._apply_pending_seek()
+
+                # [2F] Event-driven clip insertion: drain timelines flagged by item_atom.
+                with self._timeline_item_lock:
+                    _dirty_tl_guids = self._timeline_item_dirty.copy()
+                    self._timeline_item_dirty.clear()
+                for _tl_guid in _dirty_tl_guids:
+                    self._poll_sequence_new_media(only_guid=_tl_guid)
+
                 now = time.monotonic()
                 if now - self._last_selection_scan >= 0.2:
                     self._poll_and_broadcast_selection()
@@ -846,6 +869,7 @@ class ORISyncPlugin(PluginBase):
                         # Store for master-side new-clip polling and _apply_selection.
                         self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
                         self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                        self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     except Exception:
                         _log_exc(f"Could not export Timeline {getattr(xs_tl, 'name', '?')!r}")
             else:
@@ -1003,65 +1027,58 @@ class ORISyncPlugin(PluginBase):
         # show_atom: fires when a bookmark/annotation is shown or created,
         # or when the active on-screen media item changes.
         if isinstance(event[1], show_atom):
+            _shape = f"len={len(event)} types=[{', '.join(type(e).__name__ for e in event)}]"
             is_bookmark_shown = len(event) == 6 and isinstance(event[5], int)
             if not is_bookmark_shown and len(event) >= 5 and hasattr(event[2], 'uuid'):
-                # On-screen media changed (selection change).
-                # Only broadcast selection from media change if we are viewing Playlist (source view).
-                # If we are viewing Timeline, playhead sync handles it, and we only want to broadcast
-                # selections made explicitly via timeline selection widget.
+                # On-screen media changed
+                media_ua = event[2]
+                media_uuid_str = str(media_ua.uuid)
                 is_playlist = getattr(self, "_viewport_container_is_playlist", False)
-                
-                if is_playlist:
-                    media_ua = event[2]
-                    media_uuid_str = str(media_ua.uuid)
-                    _log(f"show_atom (media change) fired: media_uuid={media_uuid_str}")
-                    
-                    # Suppress if we are within the suppression window
-                    if time.monotonic() < self._selection_suppress_until:
-                        return
-                    
-                    # Find the media name by searching our sync playlists
-                    media_name = None
-                    for playlist, _ in self._sync_playlists.values():
-                        try:
-                            for m in playlist.media:
-                                if str(m.uuid) == media_uuid_str:
-                                    media_name = m.name
-                                    break
-                            if media_name:
+                is_timeline = getattr(self, "_viewport_container_is_timeline", False)
+                _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
+                _media_name_hint = None
+                for _pl, _ in self._sync_playlists.values():
+                    try:
+                        for _m in _pl.media:
+                            if str(_m.uuid) == media_uuid_str:
+                                _media_name_hint = _m.name
                                 break
-                        except Exception:
-                            pass
-                    
-                    if media_name:
-                        clip_guid = self._clip_guid_for_media_name(media_name) if self.manager else None
-                        
-                        if clip_guid and clip_guid != self._last_broadcast_clip_guid:
-                            _log(f"show_atom media change → broadcasting selection clip_guid={clip_guid[:8]} ({media_name})")
-                            self._last_broadcast_clip_guid = clip_guid
-                            clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
-                            if clip_tl_guid:
-                                self.manager.active_timeline_guid = clip_tl_guid
-                            view_mode = "sequence" if self._viewport_container_is_timeline else "source"
-                            self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
-                            self._broadcast_play_state_for_selection(clip_tl_guid)
+                    except Exception:
+                        pass
+                    if _media_name_hint:
+                        break
+                _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
+                if (_media_name_hint and self.manager
+                        and self.manager.status == STATE_SYNCED):
+                    clip_guid = self._clip_guid_for_media_name(_media_name_hint)
+                    if clip_guid:
+                        self._last_viewed_clip_guid = clip_guid
+                        clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+                        if clip_tl_guid:
+                            self.manager.active_timeline_guid = clip_tl_guid
+                        self.manager.broadcast_selection(clip_guid, view_mode="source")
+                        _log(f"[SEL] → broadcast clip {clip_guid[:8]}")
+                    else:
+                        _log(f"[SEL] → no clip_guid found for {_media_name_hint!r}")
                 return
 
             if time.monotonic() < self._reload_suppress_until:
                 return
-            _log("show_atom fired — queuing annotation flush + activating hot scan")
+            _log(f"[SEL] show_atom (annotation/bookmark): {_shape} — queuing annotation flush")
             if self.manager and self.manager.status == STATE_SYNCED:
                 self._annotation_pending_time = time.monotonic()
-                # Start hot-scanning the current frame on every poll tick so that
-                # partial strokes are streamed before pen-up.
-                try:
-                    if self.active_playhead:
-                        self._hot_scan_frame = self.active_playhead.position
-                        self._hot_scan_active = True
-                        self._hot_scan_last_change = time.monotonic()
-                        _log(f"Hot scan activated at frame {self._hot_scan_frame}")
-                except Exception:
-                    pass
+                # [2C] Hot scan is now activated by _on_core_annotation_event
+                # (PaintStart/PaintPoint events from AnnotationsCore).  Keep this
+                # as a fallback for builds that don't have the [2C] broadcast.
+                if not self._hot_scan_active:
+                    try:
+                        if self.active_playhead:
+                            self._hot_scan_frame = self.active_playhead.position
+                            self._hot_scan_active = True
+                            self._hot_scan_last_change = time.monotonic()
+                            _log(f"Hot scan activated at frame {self._hot_scan_frame} (show_atom fallback)")
+                    except Exception:
+                        pass
             return
 
         if not isinstance(event[1], viewport_playhead_atom):
@@ -1070,17 +1087,12 @@ class ORISyncPlugin(PluginBase):
         # viewport_name, playhead_actor).  Form 1 (len==3) omits the viewport name and
         # its playhead actor may differ from the one the user is actually scrubbing.
         if len(event) <= 3:
+            _log(f"viewport_playhead_atom Form-1 (ignored): len={len(event)}")
             return
         ph_remote = event[3]
-        # After a position write in _apply_selection the viewport switch fires
-        # Form-2 once per loaded playlist (~200 ms apart).  Block updates for
-        # 500 ms so the second spurious event does not clobber active_playhead.
-        if time.monotonic() < self._playhead_lock_until:
-            _log("Form-2 suppressed — playhead locked after navigation")
-            return
         try:
             self.active_playhead = Playhead(self.connection, ph_remote)
-            _log("Active playhead updated (form=2)")
+            _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
         except Exception:
             _log_exc("_on_global_playhead_event: failed to update playhead")
 
@@ -1107,6 +1119,46 @@ class ORISyncPlugin(PluginBase):
         t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
         is_change = len(event) > 1 and isinstance(event[1], change_atom)
         _log(f"[TEST change_atom] event: len={len(event)}, t1={t1}, is_change_atom={is_change}")
+
+    def _subscribe_timeline_item_events(self, tl_guid: str, xs_tl) -> None:
+        """Subscribe to *xs_tl*'s event group to receive item_atom notifications.
+
+        Called whenever a new sequence Timeline is registered.  Stores the
+        subscription ID in ``_timeline_item_sub_ids`` so duplicates are skipped.
+
+        :param tl_guid: Sync GUID identifying the timeline in the manager.
+        :param xs_tl: The xStudio Timeline object whose event group to join.
+        """
+        if tl_guid in self._timeline_item_sub_ids:
+            return
+        try:
+            import functools
+            cb = functools.partial(self._on_timeline_item_event, tl_guid)
+            sub_id = self.subscribe_to_event_group(xs_tl, cb)
+            self._timeline_item_sub_ids[tl_guid] = sub_id
+            _log(f"[2F] subscribed to item_atom events for timeline {tl_guid[:8]}")
+        except Exception:
+            _log_exc(f"[2F] subscribe_to_event_group failed for timeline {tl_guid[:8]}")
+
+    def _on_timeline_item_event(self, tl_guid: str, event) -> None:
+        """Handle item_atom events from a tracked Timeline's event group.
+
+        Marks *tl_guid* as dirty so the next poll-thread tick calls
+        ``_poll_sequence_new_media`` for that timeline immediately rather than
+        waiting for the next 0.5 s fallback scan.
+
+        :param tl_guid: Sync GUID of the timeline that fired the event.
+        :param event: Event tuple from xStudio's CAF message bus.
+        """
+        if not (len(event) > 1 and isinstance(event[0], event_atom)
+                and isinstance(event[1], item_atom)):
+            return
+        hidden = event[3] if len(event) > 3 else False
+        if hidden:
+            return
+        _log(f"[2F] item_atom fired for timeline {tl_guid[:8]} — queuing clip check")
+        with self._timeline_item_lock:
+            self._timeline_item_dirty.add(tl_guid)
 
     def _poll_and_broadcast_frame(self) -> None:
         """Broadcast the local playhead position when the user scrubs.
@@ -1153,11 +1205,6 @@ class ORISyncPlugin(PluginBase):
         if not playing and not playing_changed:
             if frame == self._last_polled_frame:
                 return
-            # Suppress while waiting for xStudio to settle after _apply_selection.
-            # Without this, the poll may fire before position reaches start_frame and
-            # broadcast a negative clip-local frame (e.g. 99 - 400 = -301).
-            if time.monotonic() < self._selection_suppress_until:
-                return
             self._last_polled_frame = frame
             if frame == self._last_applied_frame:
                 # This change was caused by _apply_playback_state — skip re-broadcast.
@@ -1186,13 +1233,33 @@ class ORISyncPlugin(PluginBase):
         _log(f"Poll: broadcasting playback playing={playing} frame={frame} fps={fps}")
         self.manager.broadcast_playback_state(state)
 
-    def _poll_and_broadcast_selection(self) -> None:
-        """Poll xStudio selection/view state and broadcast changes to the session."""
-        if not self.manager or self.manager.status != STATE_SYNCED:
+    def _apply_pending_seek(self) -> None:
+        """Apply a deferred sequence-playhead seek once its deadline has passed.
+
+        After a remote clip-selection triggers ``set_on_screen_source``, xStudio
+        fires two ``viewport_playhead_atom`` Form-2 events roughly 200 ms apart.
+        Each one updates ``active_playhead`` via ``_on_global_playhead_event``.
+        By waiting 300 ms before seeking we ensure the final, settled playhead
+        actor is in place and its duration has been resolved — without needing a
+        separate thread, a blocking timeout, or a retry loop.
+        """
+        if self._pending_seek_frame is None:
             return
-        
+        if time.monotonic() < self._pending_seek_deadline:
+            return
+        frame = self._pending_seek_frame
+        self._pending_seek_frame = None
+        if not self.active_playhead:
+            return
         try:
-            # 1. Get current viewed container (with timeout)
+            self.active_playhead.position = frame
+            _log(f"Deferred seek: applied frame {frame}")
+        except Exception:
+            _log_exc(f"Deferred seek: failed at frame {frame}")
+
+    def _poll_and_broadcast_selection(self) -> None:
+        """Log xStudio viewport container and selection state on every change."""
+        try:
             session_actor = self.connection.api.session.remote
             result = self.connection.request_receive_timeout(
                 100, session_actor, viewport_active_media_container_atom()
@@ -1203,7 +1270,6 @@ class ORISyncPlugin(PluginBase):
                 c_type = c.type
             except RuntimeError as re:
                 if "invalid_argument" in str(re):
-                    # No active container in viewport (e.g. startup / no image viewed)
                     return
                 raise
 
@@ -1216,139 +1282,53 @@ class ORISyncPlugin(PluginBase):
             else:
                 container = Playlist(self.connection, result.actor, result.uuid)
 
-            if container is None:
-                return
-            
-            clip_guid = None
             is_timeline = isinstance(container, Timeline)
             is_playlist = isinstance(container, Playlist)
-
-            # Cache the viewport container type for playhead event handlers
             self._viewport_container_is_playlist = is_playlist
             self._viewport_container_is_timeline = is_timeline
-            
+
+            clip_name = None
             if is_timeline:
-                # Viewing Timeline: check its timeline item selection.
                 try:
                     selected_items = container.selection
-                    sel_names = [f"{getattr(item, 'name', '')} ({type(item).__name__})" for item in selected_items]
+                    sel_names = [f"{getattr(i, 'name', '')} ({type(i).__name__})" for i in selected_items]
                     if getattr(self, "_last_sel_names", None) != sel_names:
-                        _log(f"Timeline selection changed: {sel_names}")
+                        _log(f"[SEL] Timeline.selection changed: {sel_names}")
                         self._last_sel_names = sel_names
+                    for item in selected_items:
+                        if type(item).__name__ == "Clip":
+                            clip_name = getattr(item, "name", None)
+                            break
                 except Exception:
-                    _log_exc("Timeline selection poll failed")
-                    selected_items = []
-
-                media = None
-                clip_item = None
-                for item in selected_items:
-                    if type(item).__name__ == "Clip":
-                        clip_item = item
-                        break
-                if clip_item:
-                    media = clip_item.media
-
-                if media:
-                    clip_guid = self._clip_guid_for_media_name(media.name)
-
+                    _log_exc("[SEL] Timeline.selection poll failed")
             elif is_playlist:
-                # Viewing Playlist: check playhead selection.
                 try:
                     sel = container.playhead_selection
                     selected_sources = sel.selected_sources
                     src_names = [s.name for s in selected_sources]
                     if getattr(self, "_last_src_names", None) != src_names:
-                        _log(f"Playlist selection changed: {src_names}")
+                        _log(f"[SEL] Playlist.playhead_selection changed: {src_names}")
                         self._last_src_names = src_names
+                    if selected_sources:
+                        clip_name = selected_sources[0].name
                 except Exception:
-                    _log_exc("Playlist selection poll failed")
-                    selected_sources = []
+                    _log_exc("[SEL] Playlist.playhead_selection poll failed")
 
-                if len(selected_sources) >= 1:
-                    clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
-            
-            # Calculate local changes against cache
-            container_changed = (container_uuid != self._last_polled_container_uuid)
-            selection_changed = (clip_guid != self._last_polled_clip_guid)
+            if (container_uuid != self._last_logged_container_uuid
+                    or clip_name != self._last_logged_clip_name):
+                _log(f"[SEL] container={c_type} uuid={container_uuid[:8]} clip={clip_name!r}")
+                self._last_logged_container_uuid = container_uuid
+                self._last_logged_clip_name = clip_name
 
-            # Update cache with current polled values
-            self._last_polled_container_uuid = container_uuid
-            self._last_polled_clip_guid = clip_guid
+            # Update annotation fallback: flat-playlist path needs to know what clip
+            # is currently viewed when _resolve_clip_at_frame returns None.
+            if clip_name and self.manager:
+                cg = self._clip_guid_for_media_name(clip_name)
+                if cg:
+                    self._last_viewed_clip_guid = cg
 
-            # Suppress broadcasts for a short window after applying a remote update.
-            # We do this after updating the cache to absorb remote-triggered updates.
-            if time.monotonic() < self._selection_suppress_until:
-                return
-                
-            # If nothing changed locally, do not broadcast (echo prevention)
-            if not (container_changed or selection_changed):
-                return
-
-            view_mode = "sequence" if is_timeline else "source"
-
-            # Handle broadcast if selection changed
-            if clip_guid:
-                if clip_guid == self._suppress_rebroadcast_clip_guid:
-                    # This is the clip that was active when we received a remote
-                    # "selection clear".  The playhead is still on it, so the
-                    # poll keeps seeing it — but broadcasting it would toggle RV
-                    # back to clip view.  Skip until the user moves to a different clip.
-                    pass
-                elif clip_guid != self._last_broadcast_clip_guid or container_changed:
-                    # User moved to a new clip; clear the post-clear suppression.
-                    self._suppress_rebroadcast_clip_guid = None
-                    _log(f"Poll selection: broadcasting selection clip_guid={clip_guid[:8]} view_mode={view_mode}")
-                    self._last_broadcast_clip_guid = clip_guid
-                    clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
-                    if clip_tl_guid:
-                        self.manager.active_timeline_guid = clip_tl_guid
-                    self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
-                    self._broadcast_play_state_for_selection(clip_tl_guid)
-            else:
-                # No selection found (clear or container switch)
-                if self._last_broadcast_clip_guid is not None or container_changed:
-                    _log(f"Poll selection: broadcasting selection clear/switch (view_mode={view_mode})")
-                    self._last_broadcast_clip_guid = None
-                    if self.manager:
-                        seq_tl_guid = self.manager.sequence_timeline_guid
-                        if seq_tl_guid:
-                            self.manager.active_timeline_guid = seq_tl_guid
-                    self.manager.broadcast_selection("", view_mode=view_mode)
         except Exception as e:
-            _log_exc(f"Selection poll failed: {e}")
-
-    def _broadcast_play_state_for_selection(self, clip_tl_guid: str) -> None:
-        """Broadcast playing=True state when a clip is selected, ensuring RV also starts playback."""
-        if not self.manager:
-            return
-        try:
-            if self.active_playhead:
-                try:
-                    frame = self.active_playhead.position
-                    fps = self.active_playhead.frame_rate.fps() or 25.0
-                except RuntimeError:
-                    # Playhead actor is stale (e.g. switched to flat playlist view).
-                    # Reset so the poll loop re-acquires it on the next tick.
-                    self.active_playhead = None
-                    return
-            else:
-                frame = 0
-                fps = 25.0
-
-            _log(f"Broadcasting play state True for timeline {clip_tl_guid[:8]}")
-            state = {
-                "playing": True,
-                "current_time": {
-                    "OTIO_SCHEMA": "RationalTime.1",
-                    "value": float(frame),
-                    "rate": fps,
-                },
-                "looping": False,
-                "timeline_guid": clip_tl_guid,
-            }
-            self.manager.broadcast_playback_state(state)
-        except Exception:
-            _log_exc("Failed to broadcast play state for selection")
+            _log_exc(f"[SEL] poll failed: {e}")
 
     def _current_playback_state(self) -> dict | None:
         """Return the local playback state dict for inclusion in a state snapshot."""
@@ -1621,13 +1601,7 @@ class ORISyncPlugin(PluginBase):
 
         if not clip_guid:
             # Clear / container switch.
-            _log(f"RECV selection clear/switch (view_mode={view_mode})")
-            # Remember which clip was active so the poll won't re-broadcast it
-            # while the playhead is still positioned there.
-            self._suppress_rebroadcast_clip_guid = self._last_broadcast_clip_guid
-            self._last_broadcast_clip_guid = None
-            # Also suppress the poll for 1 s to let the viewport switch settle.
-            self._selection_suppress_until = time.monotonic() + 1.0
+            _log(f"RECV selection: clear → {'sequence' if view_mode == 'sequence' else 'source/playlist'} view (mode={view_mode})")
             if self.manager:
                 seq_tl_guid = self.manager.sequence_timeline_guid
                 if seq_tl_guid:
@@ -1656,48 +1630,23 @@ class ORISyncPlugin(PluginBase):
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container")
                         
-                        # Refresh active_playhead
-                        _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                        try:
-                            fut = _ex.submit(self.current_playhead)
-                            new_ph = fut.result(timeout=3.0)
-                            self.active_playhead = new_ph
-                            _log("RECV selection clear: refreshed active_playhead")
-                        except concurrent.futures.TimeoutError:
-                            _log("RECV selection clear: current_playhead() timed out")
-                        except Exception:
-                            _log_exc("RECV selection clear: could not refresh active_playhead")
-                        finally:
-                            _ex.shutdown(wait=False)
+                        # active_playhead is refreshed by the Form-2 viewport_playhead_atom
+                        # event that fires after set_on_screen_source completes.
             return
 
         # Skip if we already broadcast this same clip — this is an echo from RV
-        # confirming a selection we initiated.
-        if clip_guid == self._last_broadcast_clip_guid:
-            _log(f"RECV selection clip_guid={clip_guid[:8]} — same as last broadcast, skipping echo")
-            return
-
         if not self.manager:
             return
         clip = self.manager._object_map.get(clip_guid)
         if clip is None or not isinstance(clip, otio.schema.Clip):
-            _log(f"RECV selection: clip_guid={clip_guid} not found")
+            _log(f"RECV selection: guid={clip_guid} not found in object_map")
             return
+        _log(f"RECV selection: clip '{clip.name}' guid={clip_guid[:8]} mode={view_mode}")
 
         # Switch active_timeline_guid to the clip's own single-clip timeline.
         clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
         if clip_tl_guid:
             self.manager.active_timeline_guid = clip_tl_guid
-
-        # Mark the received clip as "already handled" so the selection poll does
-        # not echo it back to the sender.
-        self._last_broadcast_clip_guid = clip_guid
-        # A new inbound selection overrides any post-clear suppression.
-        self._suppress_rebroadcast_clip_guid = None
-        # Suppress selection-broadcast poll for 1 s to let the viewport settle.
-        self._selection_suppress_until = time.monotonic() + 1.0
-        # Block updates to active_playhead from Form-2 events during the transition.
-        self._playhead_lock_until = time.monotonic() + 1.0
 
         # Find the best playlist to use for switching the viewport.
         # Strategy:
@@ -1811,7 +1760,9 @@ class ORISyncPlugin(PluginBase):
                     _log(f"RECV selection: set_on_screen_source (sequence) → "
                          f"{getattr(playlist_xs_tl, 'name', '?')!r}")
 
+                    # Defer the seek until Form-2 events have settled the playhead (~200 ms).
                     self._pending_seek_frame = start_frame
+                    self._pending_seek_deadline = time.monotonic() + 0.300
 
                     # Programmatically select/highlight the clip in the timeline track.
                     if otio_tl:
@@ -1851,36 +1802,10 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 _log_exc("RECV selection: container switch or selection failed")
 
-            _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                fut = _ex.submit(self.current_playhead)
-                new_ph = fut.result(timeout=3.0)
-                self.active_playhead = new_ph
-                _log("RECV selection: refreshed active_playhead after switch")
-
-                # Apply sequence playhead seek now that the source switch is complete
-                # and the correct playhead actor is active.
-                # If the playhead actor returns invalid_request, it might still be
-                # resolving its duration asynchronously. Retry up to 5 times with a 100ms sleep.
-                if is_multi_clip and self.active_playhead and hasattr(self, "_pending_seek_frame"):
-                    seek_frame = self._pending_seek_frame
-                    delattr(self, "_pending_seek_frame")
-                    for attempt in range(5):
-                        try:
-                            self.active_playhead.position = seek_frame
-                            _log(f"RECV selection: seeked playhead to {seek_frame} (attempt {attempt+1})")
-                            break
-                        except Exception as seek_err:
-                            if attempt == 4:
-                                raise seek_err
-                            _log(f"RECV selection: seek attempt {attempt+1} failed: {seek_err}, retrying in 100ms...")
-                            time.sleep(0.1)
-            except concurrent.futures.TimeoutError:
-                _log("RECV selection: current_playhead() timed out, using existing playhead")
-            except Exception:
-                _log_exc("RECV selection: could not refresh active_playhead after switch")
-            finally:
-                _ex.shutdown(wait=False)
+            # active_playhead is refreshed by Form-2 viewport_playhead_atom events
+            # that fire as the source switch completes (~200 ms).  _apply_pending_seek
+            # then applies the deferred seek once the deadline passes.
+            _log("RECV selection: source switch dispatched")
         else:
             _log(f"RECV selection: no playlist found for clip")
 
@@ -2167,6 +2092,7 @@ class ORISyncPlugin(PluginBase):
                     self.manager.register_timeline(tl)
                     self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
                     self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                    self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     self.manager.broadcast_add_timeline(tl_guid)
                     _log(
                         f"New sequence timeline {xs_tl.name!r} "
@@ -2238,18 +2164,26 @@ class ORISyncPlugin(PluginBase):
             return False
         return True
 
-    def _poll_sequence_new_media(self) -> None:
+    def _poll_sequence_new_media(self, only_guid: str | None = None) -> None:
         """Detect and broadcast clips added to sequence Timelines.
 
         Only runs on the master.  Re-exports each tracked xStudio Timeline via
         ``to_otio_string()`` and compares the clip sequence against the stored
         OTIO track using an index-based alignment loop. New clips are broadcast
         via ``manager.insert_child``.
+
+        :param only_guid: When given, only checks the timeline with this sync
+            GUID (used by the [2F] event-driven path to avoid re-scanning all
+            timelines on every item_atom event).
         """
         if not self.manager or not self.manager.is_master:
             return
 
-        for tl_guid, (_, xs_tl) in list(self._xs_sequence_playlists.items()):
+        items = list(self._xs_sequence_playlists.items())
+        if only_guid is not None:
+            items = [(g, v) for g, v in items if g == only_guid]
+
+        for tl_guid, (_, xs_tl) in items:
             otio_tl = self.manager.timelines.get(tl_guid)
             if otio_tl is None:
                 continue
@@ -2389,6 +2323,45 @@ class ORISyncPlugin(PluginBase):
         _log("Annotation event from AnnotationsUI — scheduling broadcast scan")
         self._annotation_pending_time = time.monotonic()
 
+    def _on_core_annotation_event(self, data) -> None:
+        """[2C] Called when AnnotationsCore broadcasts a live stroke event.
+
+        Fired on every PaintStart/PaintPoint/PaintEnd via the simplified
+        Python-accessible broadcast added to ``broadcast_live_stroke``.
+
+        Shape: ``(event_atom, annotation_data_atom, user_id, stroke_completed)``
+
+        ``stroke_completed=True`` at PaintEnd (pen-up): schedule annotation flush.
+        ``stroke_completed=False`` at PaintStart/PaintPoint: activate hot scan.
+
+        :param data: Event tuple from AnnotationsCore plugin_events_.
+        """
+        if not (len(data) >= 4
+                and isinstance(data[0], event_atom)
+                and isinstance(data[1], annotation_data_atom)):
+            return
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+        stroke_completed = bool(data[3])
+        if stroke_completed:
+            _log("[2C] AnnotationsCore: pen-up (stroke_completed=True) — scheduling flush")
+            self._annotation_pending_time = time.monotonic()
+            # Deactivate hot scan; final stroke will be picked up by flush
+            self._hot_scan_active = False
+        else:
+            # Mid-stroke: ensure hot scan is running on the current frame
+            if not self._hot_scan_active:
+                if self.active_playhead:
+                    try:
+                        self._hot_scan_frame = self.active_playhead.position
+                        self._hot_scan_active = True
+                        self._hot_scan_last_change = time.monotonic()
+                        _log(f"[2C] AnnotationsCore: mid-stroke — hot scan at frame {self._hot_scan_frame}")
+                    except Exception:
+                        pass
+            else:
+                self._hot_scan_last_change = time.monotonic()
+
     def _hot_scan_active_annotation(self) -> None:
         """Poll the active drawing frame every tick to stream partial strokes.
 
@@ -2429,7 +2402,7 @@ class ORISyncPlugin(PluginBase):
             # _resolve_clip_at_frame always returns None.  Use the last
             # broadcast/received selection clip GUID; for flat playlists the
             # user views one clip at a time so this is always the right clip.
-            fb = self._last_broadcast_clip_guid
+            fb = self._last_viewed_clip_guid
             if fb and fb in self._flat_clip_to_media:
                 clip_guid = fb
                 ph_fps = 25.0
@@ -2670,10 +2643,10 @@ class ORISyncPlugin(PluginBase):
             if clip_guid is None:
                 # Flat-playlist fallback: clips have no source_range so
                 # _resolve_clip_at_frame always returns None.  Use the last
-                # broadcast/received selection clip GUID; for flat playlists
-                # the user views one clip at a time so this is always the
-                # right clip, and the bookmark frame is already clip-local.
-                fb = self._last_broadcast_clip_guid
+                # viewed clip GUID; for flat playlists the user views one
+                # clip at a time so this is always the right clip, and the
+                # bookmark frame is already clip-local.
+                fb = self._last_viewed_clip_guid
                 if fb and fb in self._flat_clip_to_media:
                     clip_guid = fb
                     clip_local_time = otio.opentime.RationalTime(frame, fps)

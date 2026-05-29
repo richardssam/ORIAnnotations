@@ -27,6 +27,11 @@ def _make_otio_logger():
         fh = _logging.FileHandler(log_file)
         fh.setFormatter(ts_fmt)
         logger.addHandler(fh)
+        # Mirror to stderr so the log is visible in the terminal alongside the file.
+        import sys as _sys
+        eh = _logging.StreamHandler(_sys.stderr)
+        eh.setFormatter(ts_fmt)
+        logger.addHandler(eh)
     return logger
 
 
@@ -1645,7 +1650,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if media_path:
                 clip_guid = self._clip_guid_for_media_path(media_path)
                 if clip_guid and clip_guid != self._last_broadcast_clip_guid:
-                    _log(f"SEND selection (view change) clip_guid={clip_guid} view={view}")
+                    _clip_obj = self.sync_manager._object_map.get(clip_guid)
+                    _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
+                    _log(f"SEND selection [view-change]: clip '{_clip_label}' guid={clip_guid[:8]} view={view}")
                     is_new = clip_guid not in self.sync_manager._clip_timelines
                     clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
                     if clip_tl_guid:
@@ -1657,7 +1664,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         elif view in self._rv_node_to_timeline_guid and self._last_broadcast_clip_guid:
             # Returned to sequence/timeline view — restore sequence active_timeline_guid
             # and broadcast clear so peers exit single-clip mode.
-            _log(f"SEND selection clear (back to sequence) view={view}")
+            _tl_guid = self._rv_node_to_timeline_guid.get(view)
+            _tl = self.sync_manager.timelines.get(_tl_guid) if _tl_guid else None
+            _tl_name = getattr(_tl, "name", None) or view
+            _log(f"SEND selection [view-change]: clear → sequence '{_tl_name}' (view={view})")
             seq_tl_guid = self._rv_node_to_timeline_guid.get(view)
             if seq_tl_guid:
                 self.sync_manager.active_timeline_guid = seq_tl_guid
@@ -1704,7 +1714,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if media_path:
                 clip_guid = self._clip_guid_for_media_path(media_path)
                 if clip_guid:
-                    _log(f"SEND selection clip_guid={clip_guid} (node={node})")
+                    _clip_obj = self.sync_manager._object_map.get(clip_guid)
+                    _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
+                    _log(f"SEND selection [selection-change]: clip '{_clip_label}' guid={clip_guid[:8]} node={node}")
                     self.sync_manager.broadcast_selection(clip_guid)
                     break
         event.reject()
@@ -2190,9 +2202,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _apply_selection(self, data):
         clip_guid = data.get("clip_guid", "")
 
+        view_mode = data.get("view_mode", "source")
         if not clip_guid:
             # Clear: return to sequence/timeline view.
-            _log("RECV selection clear → returning to sequence view")
+            _log(f"RECV selection: clear → sequence view (mode={view_mode})")
             self._last_broadcast_clip_guid = None
             seq_node = next(
                 (n for n in self._rv_node_to_timeline_guid
@@ -2223,7 +2236,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if not source_group:
             _log(f"RECV selection: no source group for {media_path}")
             return
-        _log(f"RECV selection clip_guid={clip_guid} → source_group={source_group}")
+        _log(f"RECV selection: clip '{clip.name}' guid={clip_guid[:8]} mode={view_mode} → source_group={source_group}")
 
         # Switch active_timeline_guid to the clip's own timeline.
         clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
