@@ -108,9 +108,9 @@ def xs_strokes_to_sync_events(
         ys_coords = [-y * aspect_half for y in raw_pts[1::4]]
         sps = raw_pts[2::4]
         widths = (
-            [thickness * aspect_half * sp for sp in sps]
+            [2.0 * thickness * aspect_half * sp for sp in sps]
             if xs_coords and any(sp != 0.0 for sp in sps)
-            else [thickness * aspect_half] * len(xs_coords)
+            else [2.0 * thickness * aspect_half] * len(xs_coords)
         )
 
         start_evt = se.PaintStart(
@@ -279,17 +279,30 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
                 ys_in = list(getattr(points_obj, "y", []))
                 sizes = list(getattr(points_obj, "size", []))
 
+            # Base thickness T
+            if sizes:
+                base_size = max(sizes)
+                thickness = base_size / (2.0 * aspect_half)
+            else:
+                base_size = 0.0
+                thickness = 0.003 / 2.0
+
+            current_stroke["thickness"] = thickness if thickness > 0.0 else 0.003 / 2.0
+
             raw_pts: list = []
-            for x, y in zip(xs_in, ys_in):
+            for idx, (x, y) in enumerate(zip(xs_in, ys_in)):
+                if base_size > 0.0 and idx < len(sizes):
+                    size_pressure = sizes[idx] / base_size
+                else:
+                    size_pressure = 1.0
+
                 raw_pts.extend([
                     x / aspect_half,
                     -y / aspect_half,
-                    1.0,  # size_pressure — protocol has no per-point pressure
-                    1.0,  # opacity_pressure — 0.0 makes every point invisible
+                    size_pressure,
+                    1.0,  # opacity_pressure
                 ])
             current_stroke["points"] = raw_pts
-            if sizes:
-                current_stroke["thickness"] = sizes[0] / aspect_half
 
     return pen_strokes
 

@@ -64,6 +64,7 @@ from xstudio.core import (
     bookmark_detail_atom,
     change_atom,
     event_atom,
+    join_broadcast_atom,
     position_atom,
     serialise_atom,
     show_atom,
@@ -181,9 +182,10 @@ class ORISyncPlugin(PluginBase):
     POLL_INTERVAL = 0.033
     #: How long to wait for a master before self-electing (seconds).
     DISCOVERY_TIMEOUT = 2.0
-    #: Periodic fallback scan interval (seconds).  show_atom fires when a NEW
-    #: bookmark is created but not when the user adds strokes to an existing one
-    #: on the same frame.  This scan catches those missed updates.
+    #: Fallback scan interval (seconds).  AnnotationsCore plugin_events_ events
+    #: (stroke_completed=True) are the preferred pen-up signal when they fire.
+    #: This scan catches strokes in builds where those events are absent.
+    #: Set to 1.0 until AnnotationsCore events are confirmed in the target build.
     ANNOTATION_SCAN_INTERVAL = 1.0
 
     def __init__(self, connection):
@@ -282,11 +284,17 @@ class ORISyncPlugin(PluginBase):
         # annotation_data hasn't been committed yet (reads stale stroke count).
         # Reset to 0 after a successful broadcast or when no bookmarks are pending.
         self._annotation_flush_retries: int = 0
+        # Count of AnnotationsCore plugin_events_ events received this session.
+        # Used to log the first arrival and confirm the [2C] subscription is live.
+        self._core_events_received: int = 0
 
         # Stable UUID cache: maps f"{clip_guid}:{frame}" → [uuid_for_stroke_0, ...]
         # Used so that partial and final broadcasts for the same frame share UUIDs,
         # enabling receivers to update in-place rather than duplicate strokes.
         self._stroke_uuid_cache: dict[str, list] = {}
+        # Tracks the f"{clip}:{frame}" key of the stroke currently being drawn.
+        # Reset to None at PaintEnd so the next gesture gets a fresh UUID slot.
+        self._live_stroke_current_key: str | None = None
         # Hot-scan state: after show_atom fires the poll loop scans the active frame
         # on every tick to detect mid-stroke data as soon as xStudio exposes it.
         self._hot_scan_active: bool = False
@@ -591,6 +599,12 @@ class ORISyncPlugin(PluginBase):
             try:
                 if cmd == "load_timelines":
                     self._do_load_timelines()
+                elif cmd == "hot_scan":
+                    self._hot_scan_active_annotation()
+                elif cmd == "live_stroke":
+                    self._broadcast_live_stroke_from_json(payload)
+                elif cmd == "clear_live_stroke":
+                    self._live_stroke_current_key = None
             except Exception:
                 _log_exc(f"Command {cmd!r} failed")
 
@@ -1098,7 +1112,7 @@ class ORISyncPlugin(PluginBase):
                             self._hot_scan_frame = self.active_playhead.position
                             self._hot_scan_active = True
                             self._hot_scan_last_change = time.monotonic()
-                            _log(f"Hot scan activated at frame {self._hot_scan_frame} (show_atom fallback)")
+                            _log(f"[fallback] Hot scan activated at frame {self._hot_scan_frame} via show_atom")
                     except Exception:
                         pass
             return
@@ -2389,41 +2403,79 @@ class ORISyncPlugin(PluginBase):
     def _on_core_annotation_event(self, data) -> None:
         """[2C] Called when AnnotationsCore broadcasts a live stroke event.
 
-        Fired on every PaintStart/PaintPoint/PaintEnd via the simplified
-        Python-accessible broadcast added to ``broadcast_live_stroke``.
+        Fired on every PaintStart/PaintPoint/PaintEnd via ``broadcast_live_stroke``.
 
-        Shape: ``(event_atom, annotation_data_atom, user_id, stroke_completed)``
+        New shape (post C++ serialisation fix):
+        ``(event_atom, annotation_data_atom, JsonStore, user_id, stroke_completed)``
+
+        Legacy shape (pre-fix builds, no stroke data):
+        ``(event_atom, annotation_data_atom, user_id, stroke_completed)``
 
         ``stroke_completed=True`` at PaintEnd (pen-up): schedule annotation flush.
-        ``stroke_completed=False`` at PaintStart/PaintPoint: activate hot scan.
+        ``stroke_completed=False`` at PaintStart/PaintPoint: broadcast partial stroke
+        directly from the live JSON data (no bookmark scan needed).
 
         :param data: Event tuple from AnnotationsCore plugin_events_.
         """
+        # Raw invocation counter — logged before any guard so we can tell if
+        # the callback fires but the guard rejects it.
+        self._core_events_received += 1
+        if self._core_events_received <= 3:
+            types = [type(d).__name__ for d in data]
+            _log(
+                f"[2C] raw event #{self._core_events_received}:"
+                f" len={len(data)} types={types}"
+            )
         if not (len(data) >= 4
                 and isinstance(data[0], event_atom)
                 and isinstance(data[1], annotation_data_atom)):
+            _log(f"[2C] guard rejected event #{self._core_events_received}")
             return
         if not self.manager or self.manager.status != STATE_SYNCED:
             return
-        stroke_completed = bool(data[3])
-        if stroke_completed:
-            _log("[2C] AnnotationsCore: pen-up (stroke_completed=True) — scheduling flush")
-            self._annotation_pending_time = time.monotonic()
-            # Deactivate hot scan; final stroke will be picked up by flush
-            self._hot_scan_active = False
+
+        # Discriminate by tuple length, NOT by data[2] type.
+        # 5-element (new shape): data[2]=JsonStore/None, data[3]=user_id, data[4]=bool
+        # 4-element (legacy):    data[2]=user_id, data[3]=bool
+        is_new_shape = len(data) >= 5
+        if is_new_shape:
+            stroke_completed = bool(data[4])
+            # data[2] may be JsonStore, dict, or None (if serialise threw and
+            # anno_json was default-constructed to null)
+            raw_json = data[2]
+            has_json = isinstance(raw_json, (JsonStore, dict)) and bool(raw_json)
         else:
-            # Mid-stroke: ensure hot scan is running on the current frame
+            stroke_completed = bool(data[3])
+            has_json = False
+            raw_json = None
+
+        if stroke_completed:
+            _log("[2C] AnnotationsCore: pen-up — scheduling flush")
+            self._annotation_pending_time = time.monotonic()
+            self._hot_scan_active = False
+            # Signal poll thread to clear the live-stroke key so the next
+            # paint gesture gets a fresh UUID slot in _stroke_uuid_cache.
+            self._cmd_queue.put_nowait(("clear_live_stroke", None))
+        elif has_json:
+            # New path: broadcast the live stroke directly from the event JSON.
+            self._cmd_queue.put_nowait(("live_stroke", raw_json))
+        else:
+            # Legacy path (old build without JSON): fall back to hot-scan.
             if not self._hot_scan_active:
                 if self.active_playhead:
                     try:
                         self._hot_scan_frame = self.active_playhead.position
                         self._hot_scan_active = True
                         self._hot_scan_last_change = time.monotonic()
-                        _log(f"[2C] AnnotationsCore: mid-stroke — hot scan at frame {self._hot_scan_frame}")
+                        _log(
+                            f"[2C] mid-stroke (legacy) — hot scan at frame"
+                            f" {self._hot_scan_frame}"
+                        )
                     except Exception:
                         pass
             else:
                 self._hot_scan_last_change = time.monotonic()
+            self._cmd_queue.put_nowait(("hot_scan", None))
 
     def _hot_scan_active_annotation(self) -> None:
         """Poll the active drawing frame every tick to stream partial strokes.
@@ -2563,6 +2615,112 @@ class ORISyncPlugin(PluginBase):
         _log(
             f"Hot scan: broadcasting {len(all_strokes)} stroke(s) as partial"
             f" at frame={frame} clip={clip_guid[:8]}"
+        )
+        self.manager.broadcast_partial_annotation(
+            clip_guid=clip_guid,
+            frame=float(local_frame),
+            fps=fps,
+            events=events_dicts,
+        )
+
+    def _broadcast_live_stroke_from_json(self, anno_json) -> None:
+        """Broadcast a partial annotation from a live-stroke JSON payload.
+
+        Called on every PaintPoint by ``_drain_cmd_queue`` when the
+        AnnotationsCore ``plugin_events_`` broadcast includes a ``JsonStore``
+        (post C++ serialisation fix).  The JSON contains exactly one pen stroke
+        representing the in-progress drawing.
+
+        Resolves the current clip/frame from the active playhead, assigns a
+        stable UUID (so peers can update in-place on subsequent PaintPoints),
+        converts the stroke to a SyncEvent, and broadcasts as a partial
+        annotation.
+
+        :param anno_json: ``JsonStore``/dict from AnnotationsCore — shape
+            ``{"Annotation Serialiser Version": N, "Data": {"pen_strokes": [...]}}``.
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+
+        # Resolve current frame and clip from playhead.
+        frame = None
+        if self.active_playhead:
+            try:
+                frame = self.active_playhead.position
+            except Exception:
+                return
+        if frame is None:
+            return
+
+        tl = self.manager.root_timeline
+        if tl is None:
+            return
+
+        try:
+            clip_guid, clip_local_time = self._resolve_clip_at_frame(tl, frame)
+        except Exception:
+            return
+        if clip_guid is None:
+            fb = self._last_viewed_clip_guid
+            if fb and fb in self._flat_clip_to_media:
+                clip_guid = fb
+                ph_fps = 25.0
+                if self.active_playhead:
+                    try:
+                        ph_fps = self.active_playhead.frame_rate.fps() or ph_fps
+                    except Exception:
+                        pass
+                clip_local_time = otio.opentime.RationalTime(frame, ph_fps)
+            else:
+                return
+
+        local_frame = int(clip_local_time.value)
+        fps = float(clip_local_time.rate) if clip_local_time.rate else 25.0
+
+        # Extract the pen_strokes list from the serialised JSON.
+        canvas = anno_json.get("Data", anno_json) if isinstance(anno_json, dict) else {}
+        live_strokes = canvas.get("pen_strokes", [])
+        if not live_strokes:
+            return
+
+        # Assign a stable UUID for the live stroke so the receiver can update
+        # in-place on subsequent PaintPoints for the same gesture.
+        key = f"{clip_guid}:{local_frame}"
+        if key not in self._stroke_uuid_cache:
+            self._stroke_uuid_cache[key] = []
+        cache = self._stroke_uuid_cache[key]
+
+        if self._live_stroke_current_key != key:
+            # New stroke gesture (different key or first PaintPoint after PaintEnd).
+            # Append a fresh UUID at the next free slot so _flush reuses it.
+            self._live_stroke_current_key = key
+            cache.append(str(uuid.uuid4()))
+
+        # The live stroke always occupies the last slot in the cache.
+        stroke_idx = len(cache) - 1
+
+        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+
+        events_obj = xs_strokes_to_sync_events(
+            live_strokes, aspect_half, uuid_list=[cache[stroke_idx]]
+        )
+        if not events_obj:
+            return
+
+        events_dicts = []
+        for e in events_obj:
+            try:
+                events_dicts.append(
+                    json.loads(otio.adapters.write_to_string(e, "otio_json", indent=-1))
+                )
+            except Exception:
+                pass
+        if not events_dicts:
+            return
+
+        _log(
+            f"[2C] Live stroke: broadcasting partial at frame={local_frame}"
+            f" clip={clip_guid[:8]} points={len(live_strokes[0].get('points', []))}"
         )
         self.manager.broadcast_partial_annotation(
             clip_guid=clip_guid,
