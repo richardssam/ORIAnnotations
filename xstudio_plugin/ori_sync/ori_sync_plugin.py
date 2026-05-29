@@ -325,6 +325,18 @@ class ORISyncPlugin(PluginBase):
         # to normalise state_.scale_ (which is image_pixels/viewport_pixels, not
         # a zoom multiplier) to RV's convention (1.0 = fit-to-window).
         self._xs_base_scale: float | None = None
+        # Last read value of the playhead "Pinned Source Mode" attribute.
+        # True = full timeline/sequence view; False = single selected-media view.
+        # None on first read (no broadcast on initialisation).
+        self._last_pinned_source_mode: bool | None = None
+        # Set to True while _apply_selection is writing Pinned Source Mode so
+        # the poll loop ignores the resulting attribute-change echo.
+        self._applying_pinned_mode: bool = False
+        # Monotonic deadline before which show_atom clip-selection broadcasts are
+        # suppressed.  Set after _apply_selection calls select_all() to prevent
+        # the resulting show_atom burst from echoing individual clip selections
+        # back to remote peers.
+        self._selection_broadcast_suppress_until: float = 0.0
         # Cached Viewport object; created lazily, cleared on disconnect.
         self._viewport: "Viewport | None" = None
         # Timeline to set as on-screen source once the viewport is ready.
@@ -500,6 +512,9 @@ class ORISyncPlugin(PluginBase):
         self._last_viewed_clip_guid = None
         self._pending_seek_frame = None
         self._pending_seek_deadline = 0.0
+        self._last_pinned_source_mode = None
+        self._applying_pinned_mode = False
+        self._selection_broadcast_suppress_until = 0.0
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -1048,6 +1063,13 @@ class ORISyncPlugin(PluginBase):
                     if _media_name_hint:
                         break
                 _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
+                # Suppress clip broadcasts while the viewport is confirmed to be
+                # showing a Timeline.  In Timeline mode the playhead fires show_atom
+                # as it scans through clips in the sequence; broadcasting those would
+                # push RV out of sequence view on every frame advance.
+                if is_timeline or time.monotonic() < self._selection_broadcast_suppress_until:
+                    _log(f"[SEL] → suppressed (timeline/sequence mode)")
+                    return
                 if (_media_name_hint and self.manager
                         and self.manager.status == STATE_SYNCED):
                     clip_guid = self._clip_guid_for_media_name(_media_name_hint)
@@ -1326,6 +1348,31 @@ class ORISyncPlugin(PluginBase):
                 cg = self._clip_guid_for_media_name(clip_name)
                 if cg:
                     self._last_viewed_clip_guid = cg
+
+            # Detect Pinned Source Mode transitions: False→True means the user
+            # returned to sequence/timeline view without going through RV.
+            if (self.active_playhead
+                    and not self._applying_pinned_mode
+                    and self.manager
+                    and self.manager.status == STATE_SYNCED):
+                try:
+                    psm_attr = self.active_playhead.get_attribute("Pinned Source Mode")
+                    if psm_attr is not None:
+                        psm = psm_attr.value()
+                        if (self._last_pinned_source_mode is not None
+                                and psm != self._last_pinned_source_mode):
+                            _log(f"[SEL] Pinned Source Mode: {self._last_pinned_source_mode} → {psm}")
+                            if psm is True:
+                                # User re-pinned to the timeline — broadcast clear so
+                                # peers exit single-clip mode too.
+                                seq_tl_guid = self.manager.sequence_timeline_guid
+                                if seq_tl_guid:
+                                    self.manager.active_timeline_guid = seq_tl_guid
+                                self.manager.broadcast_selection("")
+                                _log("[SEL] → broadcast selection clear (returned to sequence view)")
+                        self._last_pinned_source_mode = psm
+                except Exception:
+                    _log_exc("[SEL] Pinned Source Mode poll failed")
 
         except Exception as e:
             _log_exc(f"[SEL] poll failed: {e}")
@@ -1622,14 +1669,30 @@ class ORISyncPlugin(PluginBase):
                                     self.connection.send(tl.remote, item_selection_atom(), UuidActorVec())
                                 except Exception:
                                     pass
+                                # Restore sequence view: pinnedSourceMode=True pins the playhead
+                                # to the full timeline rather than any single selected media item.
+                                if self.active_playhead:
+                                    try:
+                                        self._applying_pinned_mode = True
+                                        self.active_playhead.set_attribute("Pinned Source Mode", True)
+                                        self._last_pinned_source_mode = True
+                                        _log("RECV selection clear: set Pinned Source Mode = True")
+                                    except Exception:
+                                        _log_exc("RECV selection: failed to set Pinned Source Mode")
+                                    finally:
+                                        self._applying_pinned_mode = False
                             else:
                                 self.connection.api.session.set_on_screen_source(pl)
                                 _log("RECV selection clear: set_on_screen_source to playlist (Source)")
-                            
+
                             pl.playhead_selection.select_all()
+                            # select_all() fires show_atom for every media item in the
+                            # playlist.  Suppress those for 2 s so the echo doesn't
+                            # push peers back into single-clip mode.
+                            self._selection_broadcast_suppress_until = time.monotonic() + 2.0
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container")
-                        
+
                         # active_playhead is refreshed by the Form-2 viewport_playhead_atom
                         # event that fires after set_on_screen_source completes.
             return

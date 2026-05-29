@@ -1671,7 +1671,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             seq_tl_guid = self._rv_node_to_timeline_guid.get(view)
             if seq_tl_guid:
                 self.sync_manager.active_timeline_guid = seq_tl_guid
-            self.sync_manager.broadcast_selection("")
+            self.sync_manager.broadcast_selection("", view_mode="sequence")
             self._last_broadcast_clip_guid = None
         event.reject()
 
