@@ -5,8 +5,10 @@ import datetime
 import json
 import logging
 import os
+import queue
 import shutil
 import sys
+import threading
 import traceback
 from urllib.parse import urlsplit
 
@@ -162,6 +164,12 @@ class ORIAnnotationsPlugin(PluginBase):
         )
         self.connect_to_ui()
 
+        self._work_queue: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(
+            target=self._worker_loop, name="ori_ann_worker", daemon=True
+        )
+        self._worker.start()
+
     # ------------------------------------------------------------------
     # Menu / UI callbacks
     # ------------------------------------------------------------------
@@ -248,11 +256,16 @@ class ORIAnnotationsPlugin(PluginBase):
     def do_export(self, output_folder, otio_name, include_media, include_images):
         """Export current playlist annotations to an OTIO file.
 
-        Called from ``ORIAnnotationsExportDialog.qml``.
+        Called from ``ORIAnnotationsExportDialog.qml``.  Posts the work to the
+        persistent worker thread for the same reason as :meth:`do_import`.
+
+        :returns: ``[True, message]`` immediately; completion is reported via a
+            popup message box shown by the worker thread.
+        :rtype: list
         """
         try:
-            success, msg = self.export_annotations(output_folder, otio_name, include_media, include_images)
-            return [success, msg]
+            self._work_queue.put(("export", (output_folder, otio_name, include_media, include_images)))
+            return [True, "Export started. A notification will appear when complete."]
         except Exception:
             _log_exc("do_export failed")
             return [False, traceback.format_exc()]
@@ -410,33 +423,84 @@ class ORIAnnotationsPlugin(PluginBase):
     def do_import(self, otio_file):
         """Import annotations from an OTIO file into the current playlist.
 
-        Called from ``ORIAnnotationsImportDialog.qml``.
+        Called from ``ORIAnnotationsImportDialog.qml``.  Posts the work to the
+        persistent worker thread so that ``request_receive`` calls happen
+        outside the ``python_callback`` context (which blocks the Qt main
+        thread and causes a deadlock when bookmark actors try to update the UI).
+
+        :param otio_file: Path to the ``.otio`` file (may be a ``file://`` URI).
+        :returns: ``[True, message]`` immediately; completion is reported via a
+            popup message box shown by the worker thread.
+        :rtype: list
         """
         try:
-            import threading
             otio_file_path = urlsplit(str(otio_file)).path or str(otio_file)
-
-            playlist = self._resolve_playlist()
-            if playlist is None:
-                return [False, "No playlist is currently selected or available in xStudio. Please select or create a playlist first."]
-
-            # Start thread to do the actual import asynchronously to avoid deadlocks on main UI thread.
-            t = threading.Thread(target=self._async_import_worker, args=(otio_file_path, playlist))
-            t.daemon = True
-            t.start()
-
-            return [True, "Import started in background. You will receive a popup notification when complete."]
-
+            if not otio_file_path:
+                return [False, "No file path provided."]
+            self._work_queue.put(("import", otio_file_path))
+            return [True, "Import started. A notification will appear when complete."]
         except Exception:
             _log_exc("do_import failed")
-            tb = traceback.format_exc()
+            return [False, traceback.format_exc()]
+
+    # ------------------------------------------------------------------
+    # Persistent worker thread
+    # ------------------------------------------------------------------
+
+    def _worker_loop(self) -> None:
+        """Long-lived daemon thread that processes queued import jobs.
+
+        All ``request_receive`` calls that write to xStudio (creating
+        bookmarks, setting annotation data) must happen on this thread rather
+        than inside a ``python_callback`` handler.  The ``python_callback``
+        mechanism blocks the Qt main thread; certain actors need to signal
+        the UI to update, so calling them from the blocked main-thread context
+        causes a deadlock.  This thread is the sole user of the connection for
+        write operations, matching the pattern used by ``ori_sync_plugin``.
+        """
+        while True:
             try:
-                sys.__stderr__.write(f"\n[ORI Annotations Error] do_import failed:\n{tb}\n")
-                sys.__stderr__.flush()
+                item = self._work_queue.get()
+                if item is None:
+                    break
+                kind, payload = item
+                if kind == "import":
+                    self._import_worker(payload)
+                elif kind == "export":
+                    self._export_worker(*payload)
+                else:
+                    _log(f"_worker_loop: unknown work item kind '{kind}'")
             except Exception:
-                pass
-            print(f"do_import failed:\n{tb}", file=sys.stderr)
-            return [False, tb]
+                _log_exc("_worker_loop: unhandled exception")
+
+    def _import_worker(self, otio_file_path: str) -> None:
+        """Execute a single import job on the worker thread.
+
+        :param otio_file_path: Absolute path to the ``.otio`` file.
+        """
+        try:
+            success, msg = self.import_annotations(otio_file_path)
+            title = "Import Complete" if success else "Import Annotations"
+            self.popup_message_box(title, msg)
+        except Exception:
+            _log_exc("_import_worker failed")
+            self.popup_message_box("Import Failed", traceback.format_exc())
+
+    def _export_worker(self, output_folder, otio_name, include_media, include_images) -> None:
+        """Execute a single export job on the worker thread.
+
+        :param output_folder: Destination folder path.
+        :param otio_name: Desired filename for the OTIO output.
+        :param include_media: Whether to copy media files.
+        :param include_images: Whether to render annotation PNGs.
+        """
+        try:
+            success, msg = self.export_annotations(output_folder, otio_name, include_media, include_images)
+            title = "Export Complete" if success else "Export Annotations"
+            self.popup_message_box(title, msg)
+        except Exception:
+            _log_exc("_export_worker failed")
+            self.popup_message_box("Export Failed", traceback.format_exc())
 
     def _safe_add_media(self, playlist, path):
         """Add media to playlist using request_receive to bypass xStudio's add_media API bug."""
@@ -454,24 +518,6 @@ class ORIAnnotationsPlugin(PluginBase):
         except Exception:
             _log_exc(f"_safe_add_media failed for path: {path}")
         return None
-
-    def _async_import_worker(self, otio_file_path, playlist):
-        try:
-            success, msg = self.import_annotations(otio_file_path, playlist)
-            if success:
-                self.popup_message_box("Import Annotations Complete", msg)
-            else:
-                self.popup_message_box("Import Annotations", msg)
-        except Exception:
-            _log_exc("do_import async worker failed")
-            tb = traceback.format_exc()
-            try:
-                sys.__stderr__.write(f"\n[ORI Annotations Error] Async import worker failed:\n{tb}\n")
-                sys.__stderr__.flush()
-            except Exception:
-                pass
-            print(f"Async import worker failed:\n{tb}", file=sys.stderr)
-            self.popup_message_box("Import Annotations Failed", tb)
 
     # ------------------------------------------------------------------
     # Bookmark collection (export helper)
