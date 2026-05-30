@@ -646,7 +646,7 @@ def vector_thickness_annotations():
 
     # Trace all 8 Gaussian Soft Lines in red gaussian brush
     for th, y in zip(thicknesses, y_pos):
-        ev += make_stroke([(700, y), (1100, y)], W, H, rgba=[1.0, 0.24, 0.24, 0.8], brush_size=th / H, brush="gaussian")
+        ev += make_stroke(line_pts(700, y, 1100, y, 400), W, H, rgba=[1.0, 0.24, 0.24, 0.8], brush_size=th / H, brush="gaussian")
 
     # Trace all 5 Tapered Profiles
     taper_y = [220, 370, 520, 670, 820]
@@ -684,117 +684,178 @@ def join_segments(segs):
             res.extend(s[:-1])
     return res
 
-
 def get_calligraphy_paths(W, H):
-    # Returns a list of dicts: {"points": [(x, y), ...], "widths": [w, ...], "base_w": float, "rgba": [r, g, b, a], "name": str}
-    # Coordinates are defined for reference 1920x1080 and then scaled by W/1920 and H/1080.
-    
+    """Generate variable-width brush strokes for the test chart.
+
+    Returns a list of dicts with keys:
+        points   – list of (x, y) tuples (already scaled to W×H)
+        widths   – list of per-point width multipliers (0..1)
+        base_w   – base brush diameter in pixels (at 1920×1080)
+        rgba     – [r, g, b, a]
+        name     – descriptive label
+    """
+
     def scale_pts(pts):
         return [(pt[0] * W / 1920.0, pt[1] * H / 1080.0) for pt in pts]
 
-    def calligraphy_width(idx, total, pts, taper_start=True, taper_end=True):
-        if idx == 0 and taper_start:
-            return 0.1
-        if idx == total - 1 and taper_end:
-            return 0.1
-        p0 = pts[idx - 1] if idx > 0 else pts[0]
-        p1 = pts[idx] if idx > 0 else pts[1]
-        dx = p1[0] - p0[0]
-        dy = p1[1] - p0[1]
-        angle = math.atan2(dy, dx)
-        pen_angle = math.pi / 4
-        diff = abs(angle - pen_angle)
-        factor = abs(math.sin(diff))
-        # Edge taper
-        edge_taper = 1.0
-        if taper_start and idx < 15:
-            edge_taper = 0.1 + 0.9 * (idx / 15.0)
-        elif taper_end and idx > total - 15:
-            edge_taper = 0.1 + 0.9 * ((total - 1 - idx) / 15.0)
-        return edge_taper * (0.2 + 0.8 * factor)
+    def brush_width(idx, total, taper_start=True, taper_end=True, min_w=0.1, max_w=1.0, pulses=1):
+        progress = idx / max(1, total - 1)
+        taper_len = min(20, total // 4)
+        
+        taper = 1.0
+        if taper_start and idx < taper_len:
+            taper = idx / float(taper_len)
+        elif taper_end and total - 1 - idx < taper_len:
+            taper = (total - 1 - idx) / float(taper_len)
+            
+        if pulses == 1:
+            swell = math.sin(progress * math.pi)
+        else:
+            swell = 0.5 - 0.5 * math.cos(progress * math.pi * 2 * pulses)
+            
+        return min_w + (max_w - min_w) * swell * taper
 
-    # 1. S-curve (Left)
-    c1_pts = []
-    n_pts = 240
-    for k in range(n_pts):
-        t = k / (n_pts - 1)
-        cx1 = 350 + 150 * math.sin(2.0 * math.pi * t)
-        cy1 = 250 + 550 * t
-        c1_pts.append((cx1, cy1))
-    c1_pts = scale_pts(c1_pts)
-    c1_widths = [0.2 + 0.8 * math.sin(math.pi * idx / (n_pts - 1)) for idx in range(n_pts)]
-    
-    # 2. Spiral (Right)
-    c2_pts = []
-    n_pts2 = 480
-    for k in range(n_pts2):
-        t = k / (n_pts2 - 1)
-        theta = t * 4.5 * math.pi
-        r_dist = 40 + 200 * t
-        cx2 = 1570 + r_dist * math.cos(theta)
-        cy2 = 550 + r_dist * math.sin(theta)
-        c2_pts.append((cx2, cy2))
-    c2_pts = scale_pts(c2_pts)
-    c2_widths = [calligraphy_width(i, n_pts2, c2_pts) for i in range(n_pts2)]
-    
-    # 3. Calligraphic Arrow (Middle Upper)
-    arrow_stem = scale_pts(bezier_curve((860, 480), (920, 430), (1000, 330), (1060, 280), 120))
-    arrow_stem_widths = [calligraphy_width(i, len(arrow_stem), arrow_stem) for i in range(len(arrow_stem))]
-    
-    barb1 = scale_pts(bezier_curve((1060, 280), (1035, 270), (995, 280), (955, 310), 60))
-    barb1_widths = [calligraphy_width(i, len(barb1), barb1, taper_start=False) for i in range(len(barb1))]
-    
-    barb2 = scale_pts(bezier_curve((1060, 280), (1070, 305), (1060, 345), (1030, 385), 60))
-    barb2_widths = [calligraphy_width(i, len(barb2), barb2, taper_start=False) for i in range(len(barb2))]
-    
-    barb3 = scale_pts(bezier_curve((860, 480), (850, 455), (860, 415), (890, 375), 60))
-    barb3_widths = [calligraphy_width(i, len(barb3), barb3, taper_start=False) for i in range(len(barb3))]
-    
-    barb4 = scale_pts(bezier_curve((860, 480), (885, 490), (925, 480), (965, 450), 60))
-    barb4_widths = [calligraphy_width(i, len(barb4), barb4, taper_start=False) for i in range(len(barb4))]
-    
-    # 4. Cursive letters y, j, z (Middle Lower)
-    y1 = bezier_curve((700, 730), (715, 630), (745, 630), (770, 740), 30)
-    y2 = bezier_curve((770, 740), (785, 780), (800, 700), (810, 640), 30)
-    y3 = bezier_curve((810, 640), (810, 700), (810, 760), (810, 810), 35)
-    y4 = bezier_curve((810, 810), (810, 910), (740, 910), (740, 840), 40)
-    y5 = bezier_curve((740, 840), (740, 790), (810, 760), (860, 730), 40)
-    y_loop = scale_pts(join_segments([y1, y2, y3, y4, y5]))
-    y_loop_widths = [calligraphy_width(i, len(y_loop), y_loop) for i in range(len(y_loop))]
+    paths = []
 
-    j1 = bezier_curve((860, 730), (870, 670), (885, 650), (890, 640), 30)
-    j2 = bezier_curve((890, 640), (890, 700), (890, 760), (890, 810), 35)
-    j3 = bezier_curve((890, 810), (890, 910), (820, 910), (820, 840), 40)
-    j4 = bezier_curve((820, 840), (820, 790), (890, 720), (950, 680), 40)
-    j_body = scale_pts(join_segments([j1, j2, j3, j4]))
-    j_body_widths = [calligraphy_width(i, len(j_body), j_body) for i in range(len(j_body))]
+    # ── Colour palette ────────────────────────────────────────────────
+    magenta = [0.72, 0.18, 0.52, 1.0]
+    dark_ink = [0.18, 0.16, 0.22, 1.0]
+    orange = [0.86, 0.42, 0.12, 1.0]
+    teal = [0.12, 0.62, 0.62, 1.0]
 
-    j_dot = scale_pts(bezier_curve((888, 595), (889, 590), (891, 585), (892, 580), 15))
-    j_dot_widths = [calligraphy_width(i, len(j_dot), j_dot) for i in range(len(j_dot))]
+    # ==================================================================
+    # GROUP 1 — Variable Thickness Swirls (Left)
+    # ==================================================================
+    swirl_pts = []
+    for i in range(200):
+        t = i / 199.0
+        angle = t * math.pi * 5
+        radius = 20 + t * 250
+        x = 350 + math.cos(angle) * radius
+        y = 500 + math.sin(angle) * radius
+        swirl_pts.append((x, y))
 
-    z1 = bezier_curve((950, 680), (955, 630), (990, 620), (1010, 640), 35)
-    z2 = bezier_curve((1010, 640), (1010, 680), (995, 710), (975, 730), 35)
-    z3 = bezier_curve((975, 730), (990, 720), (990, 740), (975, 750), 30)
-    z4 = bezier_curve((975, 750), (973, 770), (971, 790), (970, 810), 25)
-    z5 = bezier_curve((970, 810), (970, 910), (900, 910), (900, 840), 40)
-    z6 = bezier_curve((900, 840), (900, 790), (970, 780), (1030, 750), 40)
-    z_body = scale_pts(join_segments([z1, z2, z3, z4, z5, z6]))
-    z_body_widths = [calligraphy_width(i, len(z_body), z_body) for i in range(len(z_body))]
+    swirl_widths = [brush_width(i, len(swirl_pts), pulses=2.5, min_w=0.15, max_w=1.0) for i in range(len(swirl_pts))]
+    paths.append({"points": scale_pts(swirl_pts), "widths": swirl_widths, "base_w": 35.0, "rgba": teal, "name": "Swirl"})
+
+    swirl2_pts = []
+    for i in range(150):
+        t = i / 149.0
+        angle = -t * math.pi * 4
+        radius = 10 + t * 150
+        x = 350 + math.cos(angle) * radius
+        y = 800 + math.sin(angle) * radius
+        swirl2_pts.append((x, y))
+
+    swirl2_widths = [brush_width(i, len(swirl2_pts), pulses=2, min_w=0.1, max_w=0.8) for i in range(len(swirl2_pts))]
+    paths.append({"points": scale_pts(swirl2_pts), "widths": swirl2_widths, "base_w": 25.0, "rgba": magenta, "name": "Swirl 2"})
+
+    # ==================================================================
+    # GROUP 2 — Variable Thickness Curves (Center)
+    # ==================================================================
+    curve1 = bezier_curve((800, 200), (1000, 200), (700, 500), (900, 500), 80)
+    c1_widths = [brush_width(i, len(curve1), max_w=1.0, pulses=1) for i in range(len(curve1))]
+    paths.append({"points": scale_pts(curve1), "widths": c1_widths, "base_w": 40.0, "rgba": orange, "name": "Curve 1"})
+
+    curve2 = bezier_curve((800, 400), (1100, 400), (600, 700), (900, 700), 80)
+    c2_widths = [brush_width(i, len(curve2), max_w=1.0, pulses=2) for i in range(len(curve2))]
+    paths.append({"points": scale_pts(curve2), "widths": c2_widths, "base_w": 30.0, "rgba": dark_ink, "name": "Curve 2"})
+
+    curve3 = bezier_curve((800, 600), (1200, 600), (500, 900), (900, 900), 80)
+    c3_widths = [brush_width(i, len(curve3), max_w=1.0, pulses=3) for i in range(len(curve3))]
+    paths.append({"points": scale_pts(curve3), "widths": c3_widths, "base_w": 20.0, "rgba": magenta, "name": "Curve 3"})
+
+    # ==================================================================
+    # GROUP 3 — Arrows (Top/Mid Right)
+    # ==================================================================
+    arrow_shaft = bezier_curve((1400, 700), (1200, 500), (1300, 200), (1600, 300), 100)
+    def shaft_width(idx, total):
+        progress = idx / max(1, total - 1)
+        w = 0.1 + 0.9 * math.pow(progress, 2)
+        # taper at the very end to match barb start thickness (0.2)
+        if progress > 0.9:
+            t = (1.0 - progress) / 0.1
+            w = 0.2 + (w - 0.2) * t
+        return max(0.0, w)
+
+    def barb_width(idx, total):
+        progress = idx / max(1, total - 1)
+        if progress < 0.5:
+            t = progress / 0.5
+            return 0.2 * (1 - t) + 0.33 * t
+        else:
+            t = (progress - 0.5) / 0.5
+            return 0.33 * (1 - t) + 0.0 * t
+
+    a_widths = [shaft_width(i, len(arrow_shaft)) for i in range(len(arrow_shaft))]
+    paths.append({"points": scale_pts(arrow_shaft), "widths": a_widths, "base_w": 25.0, "rgba": dark_ink, "name": "Arrow Shaft"})
+
+    head_tip = arrow_shaft[-1]
+    dx = arrow_shaft[-1][0] - arrow_shaft[-5][0]
+    dy = arrow_shaft[-1][1] - arrow_shaft[-5][1]
+    ang = math.atan2(dy, dx)
     
-    paths = [
-        {"points": c1_pts, "widths": c1_widths, "base_w": 30.0, "rgba": [0.82, 0.24, 0.82, 1.0], "name": "S-Curve"},
-        {"points": c2_pts, "widths": c2_widths, "base_w": 30.0, "rgba": [0.24, 0.82, 0.82, 1.0], "name": "Calligraphy Spiral"},
-        {"points": arrow_stem, "widths": arrow_stem_widths, "base_w": 25.0, "rgba": [0.86, 0.47, 0.16, 1.0], "name": "Arrow Stem"},
-        {"points": barb1, "widths": barb1_widths, "base_w": 25.0, "rgba": [0.86, 0.47, 0.16, 1.0], "name": "Arrow Barb 1"},
-        {"points": barb2, "widths": barb2_widths, "base_w": 25.0, "rgba": [0.86, 0.47, 0.16, 1.0], "name": "Arrow Barb 2"},
-        {"points": barb3, "widths": barb3_widths, "base_w": 25.0, "rgba": [0.86, 0.47, 0.16, 1.0], "name": "Arrow Barb 3"},
-        {"points": barb4, "widths": barb4_widths, "base_w": 25.0, "rgba": [0.86, 0.47, 0.16, 1.0], "name": "Arrow Barb 4"},
-        {"points": y_loop, "widths": y_loop_widths, "base_w": 20.0, "rgba": [0.31, 0.31, 0.35, 1.0], "name": "y loop"},
-        {"points": j_body, "widths": j_body_widths, "base_w": 20.0, "rgba": [0.31, 0.31, 0.35, 1.0], "name": "j body"},
-        {"points": j_dot, "widths": j_dot_widths, "base_w": 20.0, "rgba": [0.31, 0.31, 0.35, 1.0], "name": "j dot"},
-        {"points": z_body, "widths": z_body_widths, "base_w": 20.0, "rgba": [0.31, 0.31, 0.35, 1.0], "name": "z body"},
-    ]
+    barb_len = 80
+    
+    ang1_start = ang + math.pi * 0.95
+    ang1_mid = ang + math.pi * 0.90
+    ang1_end = ang + math.pi * 0.85
+    barb1 = bezier_curve(
+        head_tip,
+        (head_tip[0] + math.cos(ang1_start)*barb_len*0.3, head_tip[1] + math.sin(ang1_start)*barb_len*0.3),
+        (head_tip[0] + math.cos(ang1_mid)*barb_len*0.7, head_tip[1] + math.sin(ang1_mid)*barb_len*0.7),
+        (head_tip[0] + math.cos(ang1_end)*barb_len, head_tip[1] + math.sin(ang1_end)*barb_len),
+        20)
+    b1_widths = [barb_width(i, len(barb1)) for i in range(len(barb1))]
+    paths.append({"points": scale_pts(barb1), "widths": b1_widths, "base_w": 20.0, "rgba": dark_ink, "name": "Arrow Barb 1"})
+
+    ang2_start = ang - math.pi * 0.95
+    ang2_mid = ang - math.pi * 0.90
+    ang2_end = ang - math.pi * 0.85
+    barb2 = bezier_curve(
+        head_tip,
+        (head_tip[0] + math.cos(ang2_start)*barb_len*0.3, head_tip[1] + math.sin(ang2_start)*barb_len*0.3),
+        (head_tip[0] + math.cos(ang2_mid)*barb_len*0.7, head_tip[1] + math.sin(ang2_mid)*barb_len*0.7),
+        (head_tip[0] + math.cos(ang2_end)*barb_len, head_tip[1] + math.sin(ang2_end)*barb_len),
+        20)
+    b2_widths = [barb_width(i, len(barb2)) for i in range(len(barb2))]
+    paths.append({"points": scale_pts(barb2), "widths": b2_widths, "base_w": 20.0, "rgba": dark_ink, "name": "Arrow Barb 2"})
+
+    arrow2_shaft = bezier_curve((1350, 400), (1500, 400), (1700, 600), (1500, 800), 100)
+    a2_widths = [shaft_width(i, len(arrow2_shaft)) for i in range(len(arrow2_shaft))]
+    paths.append({"points": scale_pts(arrow2_shaft), "widths": a2_widths, "base_w": 20.0, "rgba": teal, "name": "Arrow 2 Shaft"})
+
+    head2_tip = arrow2_shaft[-1]
+    dx2 = arrow2_shaft[-1][0] - arrow2_shaft[-5][0]
+    dy2 = arrow2_shaft[-1][1] - arrow2_shaft[-5][1]
+    ang_2 = math.atan2(dy2, dx2)
+    
+    ang2_1_start = ang_2 + math.pi * 0.95
+    ang2_1_mid = ang_2 + math.pi * 0.90
+    ang2_1_end = ang_2 + math.pi * 0.85
+    barb2_1 = bezier_curve(
+        head2_tip,
+        (head2_tip[0] + math.cos(ang2_1_start)*barb_len*0.3, head2_tip[1] + math.sin(ang2_1_start)*barb_len*0.3),
+        (head2_tip[0] + math.cos(ang2_1_mid)*barb_len*0.7, head2_tip[1] + math.sin(ang2_1_mid)*barb_len*0.7),
+        (head2_tip[0] + math.cos(ang2_1_end)*barb_len, head2_tip[1] + math.sin(ang2_1_end)*barb_len),
+        20)
+    b3_widths = [barb_width(i, len(barb2_1)) for i in range(len(barb2_1))]
+    paths.append({"points": scale_pts(barb2_1), "widths": b3_widths, "base_w": 15.0, "rgba": teal, "name": "Arrow 2 Barb 1"})
+
+    ang2_2_start = ang_2 - math.pi * 0.95
+    ang2_2_mid = ang_2 - math.pi * 0.90
+    ang2_2_end = ang_2 - math.pi * 0.85
+    barb2_2 = bezier_curve(
+        head2_tip,
+        (head2_tip[0] + math.cos(ang2_2_start)*barb_len*0.3, head2_tip[1] + math.sin(ang2_2_start)*barb_len*0.3),
+        (head2_tip[0] + math.cos(ang2_2_mid)*barb_len*0.7, head2_tip[1] + math.sin(ang2_2_mid)*barb_len*0.7),
+        (head2_tip[0] + math.cos(ang2_2_end)*barb_len, head2_tip[1] + math.sin(ang2_2_end)*barb_len),
+        20)
+    b4_widths = [barb_width(i, len(barb2_2)) for i in range(len(barb2_2))]
+    paths.append({"points": scale_pts(barb2_2), "widths": b4_widths, "base_w": 15.0, "rgba": teal, "name": "Arrow 2 Barb 2"})
+
     return paths
+
 
 
 def create_vector_calligraphy_image(path, is_uhd=False):
@@ -810,11 +871,10 @@ def create_vector_calligraphy_image(path, is_uhd=False):
     title_text = "CALLIGRAPHY & VARIABLE WIDTH TEST CHART  3840×2160" if is_uhd else "CALLIGRAPHY & VARIABLE WIDTH TEST CHART  1920×1080"
     d.text((50*scale, 40*scale), title_text, fill=(40, 40, 50), font=title_f)
 
-    # Column titles
-    d.text((220*scale, 120*scale), "Modulated Width S-Curve", fill=(60, 60, 70), font=section_f)
-    d.text((780*scale, 120*scale), "Double-headed Calligraphic Arrow", fill=(60, 60, 70), font=section_f)
-    d.text((840*scale, 570*scale), "Cursive Letters y j z", fill=(60, 60, 70), font=section_f)
-    d.text((1300*scale, 120*scale), "Calligraphic Brush (Directional Width)", fill=(60, 60, 70), font=section_f)
+    # Section titles
+    d.text((100*scale, 100*scale), "Variable Thickness Swirls", fill=(60, 60, 70), font=section_f)
+    d.text((800*scale, 100*scale), "Variable Thickness Curves", fill=(60, 60, 70), font=section_f)
+    d.text((1400*scale, 100*scale), "Artistic Arrows", fill=(60, 60, 70), font=section_f)
 
     paths = get_calligraphy_paths(LAND_W, LAND_H)
     for p in paths:

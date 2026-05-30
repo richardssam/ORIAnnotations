@@ -33,74 +33,59 @@ import math
 import numpy as np
 from PIL import Image
 
-# ── Reference line definitions ────────────────────────────────────────────────
-# Each entry: (label, (x0,y0), (x1,y1), channel_weights)
+# ── Reference arch definitions ────────────────────────────────────────────────
+# Each entry: (label, radius, channel_weights)
 # channel_weights are [R, G, B] weights used to score the annotation colour.
 
-LANDSCAPE_LINES = [
-    ("RED diagonal",       (200, 200), (1720, 880), [1.0, -0.3, -0.3]),
-    ("BLUE horizontal",    (100, 360), (1820, 360), [-0.3, -0.1, 1.0]),
-    ("GREEN vertical",    (1440, 100), (1440, 980), [-0.3, 1.0, -0.3]),
-    ("YELLOW anti-diag",  (1720, 200),  (200, 880), [0.7, 0.7, -0.5]),
-]
-
-PORTRAIT_LINES = [
-    ("CYAN horizontal",    (60,  480), (1020,  480), [-0.3, 0.7, 0.7]),
-    ("MAGENTA vertical",  (360,  100),  (360, 1820), [0.7, -0.3, 0.7]),
-    ("ORANGE diagonal",   (100,  200),  (980, 1720), [0.8, 0.3, -0.4]),
-    ("WHITE anti-diag",   (980,  200),  (100, 1720), [0.5, 0.5, 0.5]),
+COLOR_ARCHES = [
+    ("RED arch",       150, [1.0, -0.3, -0.3]),
+    ("GREEN arch",     200, [-0.3, 1.0, -0.3]),
+    ("BLUE arch",      250, [-0.3, -0.1, 1.0]),
+    ("YELLOW arch",    300, [0.7, 0.7, -0.5]),
+    ("CYAN arch",      350, [-0.3, 0.7, 0.7]),
+    ("MAGENTA arch",   400, [0.7, -0.3, 0.7]),
+    ("ORANGE arch",    450, [0.8, 0.3, -0.4]),
+    ("GREY arch",      500, [0.3, 0.3, 0.3]),
 ]
 
 PASS_THRESHOLD_PX = 3.0   # offsets below this are considered passing
 HALF_WIDTH        = 20    # pixels either side of line to sample
-N_SAMPLES         = 30    # cross-sections per line
+N_SAMPLES         = 40    # cross-sections per arch
 
 
-# ── Geometry helpers ──────────────────────────────────────────────────────────
+# ── Per-arch analysis ─────────────────────────────────────────────────────────
 
-def unit(v):
-    n = math.hypot(*v)
-    return (v[0] / n, v[1] / n) if n > 0 else (0.0, 0.0)
-
-
-def perp(v):
-    """90-degree clockwise rotation."""
-    return (v[1], -v[0])
-
-
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-
-# ── Per-line analysis ─────────────────────────────────────────────────────────
-
-def analyse_line(img_arr, p0, p1, weights, n_samples=N_SAMPLES, half_width=HALF_WIDTH):
+def analyse_arch(img_arr, center, r, weights, n_samples=N_SAMPLES, half_width=HALF_WIDTH):
     """
-    Return an array of signed lateral offsets (px) at n_samples points along
-    the line from p0 to p1.
+    Return an array of signed radial offsets (px) at n_samples points along
+    the arch centered at center with radius r.
 
-    Positive = offset toward the perpendicular direction (clockwise from line).
+    Positive = offset outward (away from center).
     """
-    x0, y0 = p0
-    x1, y1 = p1
+    cx, cy = center
     h, w = img_arr.shape[:2]
-
-    along = unit((x1 - x0, y1 - y0))
-    across = perp(along)           # unit vector perpendicular to line
 
     weights = np.array(weights, dtype=float)
 
     offsets = []
     for i in range(n_samples):
-        t = (i + 0.5) / n_samples
-        cx = lerp(x0, x1, t)
-        cy = lerp(y0, y1, t)
+        # Sample angles from 10% to 90% of the semi-circle to avoid text / borders
+        t = 0.1 + 0.8 * (i / max(n_samples - 1, 1))
+        theta = math.pi * t
+        
+        # Base point on the arch
+        ax = cx + r * math.cos(theta)
+        ay = cy - r * math.sin(theta)
+        
+        # Radial unit vector (outward from center)
+        rx = math.cos(theta)
+        ry = -math.sin(theta)
 
         # Build pixel positions for the cross-section profile
         positions = []
         for d in range(-half_width, half_width + 1):
-            px = cx + d * across[0]
-            py = cy + d * across[1]
+            px = ax + d * rx
+            py = ay + d * ry
             ipx, ipy = int(round(px)), int(round(py))
             if 0 <= ipx < w and 0 <= ipy < h:
                 positions.append((d, ipx, ipy))
@@ -130,9 +115,7 @@ def analyse_line(img_arr, p0, p1, weights, n_samples=N_SAMPLES, half_width=HALF_
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("rendered", help="Rendered PNG from RV with annotations baked in")
-    parser.add_argument("--chart", choices=["landscape", "portrait"], default=None,
-                        help="Which chart to compare against (auto-detected from image size if omitted)")
+    parser.add_argument("rendered", help="Rendered PNG with annotations baked in")
     parser.add_argument("--threshold", type=float, default=PASS_THRESHOLD_PX,
                         help=f"Pass/fail threshold in pixels (default {PASS_THRESHOLD_PX})")
     args = parser.parse_args()
@@ -163,18 +146,10 @@ def main():
         img_arr = arr_full
 
     h, w = img_arr.shape[:2]
+    expected_size = (1920, 1080)
+    center_ref = (960.0, 800.0)
 
-    if args.chart:
-        chart = args.chart
-    elif w > h:
-        chart = "landscape"
-    else:
-        chart = "portrait"
-
-    lines = LANDSCAPE_LINES if chart == "landscape" else PORTRAIT_LINES
-    expected_size = (1920, 1080) if chart == "landscape" else (1080, 1920)
-
-    print(f"\nTest chart : {chart}  ({w}×{h})")
+    print(f"\nTest chart : Color Curves  ({w}×{h})")
     print(f"Expected   : {expected_size[0]}×{expected_size[1]}")
 
     if (w, h) != expected_size:
@@ -184,17 +159,19 @@ def main():
     else:
         sx, sy = 1.0, 1.0
 
+    center_scaled = (center_ref[0] * sx, center_ref[1] * sy)
+    # Radial scaling factor uses height scale to ensure aspect ratio consistency
+    sr = sy
+
     print(f"\nThreshold  : ±{args.threshold:.1f} px\n")
-    print(f"{'Line':<22}  {'Mean':>7}  {'Std':>7}  {'Max':>7}  {'Result'}")
+    print(f"{'Arch':<22}  {'Mean':>7}  {'Std':>7}  {'Max':>7}  {'Result'}")
     print("─" * 60)
 
     all_pass = True
-    for label, p0, p1 in [(l[0], l[1], l[2]) for l in lines]:
-        weights = next(l[3] for l in lines if l[0] == label)
-        p0s = (p0[0] * sx, p0[1] * sy)
-        p1s = (p1[0] * sx, p1[1] * sy)
+    for label, r_ref, weights in COLOR_ARCHES:
+        r_scaled = r_ref * sr
 
-        offsets = analyse_line(img_arr, p0s, p1s, weights)
+        offsets = analyse_arch(img_arr, center_scaled, r_scaled, weights)
         # Reject outliers beyond 2 std-devs (cross-stroke interference)
         med = np.median(offsets)
         sd  = np.std(offsets)

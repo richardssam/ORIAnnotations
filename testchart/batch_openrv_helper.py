@@ -220,9 +220,10 @@ def _run_batch_impl():
                         pen_node = f"{rv_node}.pen:{strokeid}:{int(frame.frame)}:{stroke['user']}"
                         frame_node = f"{rv_node}.frame:{int(frame.frame)}"
 
+                        brush_name = "gauss" if stroke['brush'] in ["gauss", "gaussian"] else "circle"
                         if not commands.propertyExists(f"{pen_node}.brush"):
                             commands.newProperty(f"{pen_node}.brush", commands.StringType, 1)
-                        commands.setStringProperty(f"{pen_node}.brush", [stroke['brush']], True)
+                        commands.setStringProperty(f"{pen_node}.brush", [brush_name], True)
 
                         if not commands.propertyExists(f"{pen_node}.color"):
                             commands.newProperty(f"{pen_node}.color", commands.FloatType, 4)
@@ -242,7 +243,7 @@ def _run_batch_impl():
 
                         if not commands.propertyExists(f"{pen_node}.splat"):
                             commands.newProperty(f"{pen_node}.splat", commands.IntType, 1)
-                        commands.setIntProperty(f"{pen_node}.splat", [0], True)
+                        commands.setIntProperty(f"{pen_node}.splat", [1 if brush_name == "gauss" else 0], True)
 
                         if stroke['type'] == 'erase':
                             if not commands.propertyExists(f"{pen_node}.mode"):
@@ -308,6 +309,12 @@ def _run_batch_impl():
                     source_frame = extra_commands.sourceFrame(globalframe)
                     uiname = extra_commands.uiName(source_group)
                     outputuiname = uiname.replace("@", "").replace("/", "_").replace("\\", "_")
+                    for char in [" ", "(", ")", "[", "]"]:
+                        outputuiname = outputuiname.replace(char, "_")
+                    while "__" in outputuiname:
+                        outputuiname = outputuiname.replace("__", "_")
+                    outputuiname = outputuiname.strip("_")
+
                     
                     src_file = os.path.join(output_dir, f"export.{globalframe}.png")
                     dest_file = os.path.join(output_dir, f"{outputuiname}.{source_frame:05d}.png")

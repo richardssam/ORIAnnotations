@@ -117,19 +117,20 @@ def main():
                 # Background image (green lines)
                 by = int(round(cy_bg + d))
                 bx = int(round(cx_bg))
+                pix_bg = np.array([0.96, 0.96, 0.94])  # Fallback to canvas color
                 if 0 <= bx < bg_w and 0 <= by < bg_h:
-                    pix = bg_arr[by, bx, :3] / 255.0
+                    pix_bg = bg_arr[by, bx, :3] / 255.0
                     # Green score: G - R
-                    score_g = max(0.0, pix[1] - pix[0])
+                    score_g = max(0.0, pix_bg[1] - pix_bg[0])
                     bg_profile.append((d, score_g))
 
                 # Composite image (red lines)
                 cy = int(round(cy_c + d))
                 cx = int(round(cx_c))
                 if 0 <= cx < comp_w and 0 <= cy < comp_h:
-                    pix = comp_arr[cy, cx, :3] / 255.0
-                    # Red score: R - G
-                    score_r = max(0.0, pix[0] - pix[1])
+                    pix_comp = comp_arr[cy, cx, :3] / 255.0
+                    # Robust red score: (R_comp - G_comp) - (R_bg - G_bg)
+                    score_r = max(0.0, (pix_comp[0] - pix_comp[1]) - (pix_bg[0] - pix_bg[1]))
                     comp_profile.append((d, score_r))
 
             centroid_bg, width_bg = get_profile_stats(bg_profile)
