@@ -233,6 +233,16 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
                 cmd_type = cmd.get("type", "color")
             is_erase = (cmd_type or "color") == "erase"
 
+            # Read the brush field to determine if this is a Gaussian soft brush.
+            # A brush of "gaussian" or "gauss" maps to xStudio softness=1.0,
+            # which drives soft_edge = thickness * softness in the stroke shader.
+            brush_name = getattr(cmd, "brush", None)
+            if brush_name is None and isinstance(cmd, dict):
+                brush_name = cmd.get("brush", "oval")
+            brush_name = (brush_name or "oval").lower()
+            is_gaussian = brush_name in ("gaussian", "gauss")
+            softness = 1.0 if is_gaussian else 0.0
+
             r_val = rgba[0] if len(rgba) > 0 else 1.0
             g_val = rgba[1] if len(rgba) > 1 else 1.0
             b_val = rgba[2] if len(rgba) > 2 else 1.0
@@ -246,7 +256,7 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
                 "b": b_val,
                 "opacity": rgba[3] if len(rgba) > 3 else 1.0,
                 "thickness": 0.003,
-                "softness": 0.0,
+                "softness": softness,
                 "size_sensitivity": 1.0,
                 "opacity_sensitivity": 1.0,
                 "type": "Erase" if is_erase else "Brush",
@@ -286,6 +296,10 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
             else:
                 base_size = 0.0
                 thickness = 0.003 / 2.0
+
+            if is_gaussian:
+                # Scale down xStudio gaussian brush to better match RV's apparent soft stroke size
+                thickness *= 0.75
 
             current_stroke["thickness"] = thickness if thickness > 0.0 else 0.003 / 2.0
 
