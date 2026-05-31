@@ -329,7 +329,21 @@ class ORISyncPlugin(PluginBase):
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
         self._last_polled_playing: bool | None = None
+        # Monotonic timestamp of when playback last transitioned False→True.
+        # Used to allow the first show_atom after play-start to broadcast even
+        # though _last_polled_playing is already True (race-condition guard).
         self._playing_started_at: float = 0.0
+        # Timestamp of the last remote playing=False; used to ignore rapid
+        # stop→start (loop restart) events from the peer so they don't flip
+        # _last_polled_playing back to True and suppress show_atom broadcasts.
+        self._last_remote_stop_at: float = 0.0
+
+        # Most recent show_atom media — tracked unconditionally so the PSM
+        # True→False handler can broadcast mode=source even when the show_atom
+        # itself was NOT suppressed (e.g. at play-start within the 0.3 s window).
+        self._last_show_atom_media: str | None = None
+        self._last_show_atom_seq_tl_guid: str | None = None
+        self._last_show_atom_at: float = 0.0
 
         # Last-logged container UUID / selection state; used by
         # _poll_and_broadcast_selection to suppress duplicate log lines.
@@ -1291,24 +1305,48 @@ class ORISyncPlugin(PluginBase):
                     if _media_name_hint:
                         break
                 _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
+                # Determine view_mode by checking whether this media UUID belongs
+                # to a tracked sequence (Timeline) playlist rather than using the
+                # cached _viewport_container_is_timeline poll value.  The cached
+                # value goes False once xStudio enters single-clip/Pinned-Source
+                # mode after the first double-click, breaking all subsequent
+                # sequence-clip selections.
+                _seq_tl_guid: str | None = None
+                for _tg, (_seq_pl, _xs_tl, _kn) in self._xs_sequence_playlists.items():
+                    try:
+                        for _m in _seq_pl.media:
+                            if str(_m.uuid) == media_uuid_str:
+                                _seq_tl_guid = _tg
+                                break
+                    except Exception:
+                        pass
+                    if _seq_tl_guid:
+                        break
+                _is_seq_media = _seq_tl_guid is not None
+                # When xStudio is already in single-clip mode (PSM=False), any
+                # show_atom is a deliberate user click — use source mode regardless
+                # of whether the media belongs to a sequence playlist.
+                _in_single_clip = (self._last_pinned_source_mode is False)
+                view_mode = "source" if _in_single_clip else ("sequence" if _is_seq_media else "source")
+                # Track unconditionally — PSM True→False handler reads this to
+                # broadcast mode=source even when the show_atom was not suppressed.
+                if _media_name_hint:
+                    self._last_show_atom_media = _media_name_hint
+                    self._last_show_atom_seq_tl_guid = _seq_tl_guid
+                    self._last_show_atom_at = time.monotonic()
+                # Echo guard: suppress the show_atom burst fired after we call
+                # select_all() / set_on_screen_source in _apply_selection.
                 if time.monotonic() < self._selection_broadcast_suppress_until:
                     _log(f"[SEL] → suppressed (echo guard)")
                     return
-                # In Timeline/sequence mode, suppress during active playback only —
-                # the playhead fires show_atom for every clip it scans through, and
-                # broadcasting those would spam RV on every frame advance.  When
-                # paused, the event is a deliberate manual click so we broadcast it
-                # as view_mode="sequence" so RV can follow without leaving its own
-                # sequence view.
-                # Allow through if playing JUST started (within 300 ms) — that is a
-                # user-initiated "start playback from this clip" action, not a scan.
-                # The race between the poll thread setting _last_polled_playing=True
-                # and the show_atom arriving means we cannot rely on _last_polled_playing
-                # alone to distinguish the two cases.
-                _playing_just_started = (
-                    time.monotonic() - self._playing_started_at < 0.3
-                )
-                if is_timeline and self._last_polled_playing and not _playing_just_started:
+                # Suppress show_atoms fired while xStudio's sequence is playing
+                # through clips — those aren't user selections, they're scan-through
+                # events.  But allow the first one after play starts (race guard:
+                # poll may have already set _last_polled_playing before this fires).
+                # Never suppress when already in single-clip mode: those are always
+                # deliberate user clip-switches, not playback scan-through events.
+                _playing_just_started = (time.monotonic() - self._playing_started_at < 0.3)
+                if _is_seq_media and self._last_polled_playing and not _playing_just_started and not _in_single_clip:
                     _log(f"[SEL] → suppressed (playing through sequence)")
                     return
                 if (_media_name_hint and self.manager
@@ -1316,27 +1354,9 @@ class ORISyncPlugin(PluginBase):
                     clip_guid = self._clip_guid_for_media_name(_media_name_hint)
                     if clip_guid:
                         self._last_viewed_clip_guid = clip_guid
-                        view_mode = "sequence" if is_timeline else "source"
-                        if view_mode == "sequence":
-                            # Keep active_timeline_guid on the sequence so that the
-                            # accompanying playback broadcast carries the sequence
-                            # timeline GUID and frame — not a virtual clip timeline
-                            # that would confuse the receiver.
-                            seq_tl_guid = None
-                            for _tg in self._xs_sequence_playlists:
-                                _otio_tl = self.manager.timelines.get(_tg)
-                                if _otio_tl is None:
-                                    continue
-                                if any(
-                                    child.metadata.get("sync", {}).get("guid") == clip_guid
-                                    for track in _otio_tl.tracks
-                                    for child in track
-                                ):
-                                    seq_tl_guid = _tg
-                                    break
-                            if seq_tl_guid:
-                                self.manager.active_timeline_guid = seq_tl_guid
-                        else:
+                        if view_mode == "sequence" and _seq_tl_guid:
+                            self.manager.active_timeline_guid = _seq_tl_guid
+                        elif view_mode == "source":
                             clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
                             if clip_tl_guid:
                                 self.manager.active_timeline_guid = clip_tl_guid
@@ -1480,6 +1500,9 @@ class ORISyncPlugin(PluginBase):
             return
 
         playing_changed = (playing != self._last_polled_playing)
+        if playing_changed and playing:
+            self._playing_started_at = time.monotonic()
+
         if playing_changed and playing:
             self._playing_started_at = time.monotonic()
 
@@ -1634,6 +1657,28 @@ class ORISyncPlugin(PluginBase):
                                     self.manager.active_timeline_guid = seq_tl_guid
                                 self.manager.broadcast_selection("")
                                 _log("[SEL] → broadcast selection clear (returned to sequence view)")
+                            elif psm is False:
+                                # User double-clicked a clip — xStudio enters single-clip
+                                # mode.  The show_atom fired ~80 ms ago (suppressed or not);
+                                # use _last_show_atom_media to broadcast mode=source so RV
+                                # also switches to single-clip view for that clip.
+                                _atom_age = time.monotonic() - self._last_show_atom_at
+                                _media_h = self._last_show_atom_media if _atom_age < 2.0 else None
+                                if not _media_h:
+                                    _media_h = clip_name  # fallback: current poll value
+                                if _media_h:
+                                    _cg = self._clip_guid_for_media_name(_media_h)
+                                    if _cg:
+                                        self._last_viewed_clip_guid = _cg
+                                        _ctg = self.manager.get_or_create_clip_timeline(_cg)
+                                        if _ctg:
+                                            self.manager.active_timeline_guid = _ctg
+                                        self.manager.broadcast_selection(_cg, view_mode="source")
+                                        _log(f"[SEL] PSM True→False: broadcast {_cg[:8]} mode=source")
+                                    else:
+                                        _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
+                                else:
+                                    _log("[SEL] PSM True→False: no media hint available")
                         self._last_pinned_source_mode = psm
                 except Exception:
                     _log_exc("[SEL] Pinned Source Mode poll failed")
@@ -1744,14 +1789,26 @@ class ORISyncPlugin(PluginBase):
         # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
         frame = max(0, int(current_time.get("value", 0)))
 
+        if not playing:
+            self._last_remote_stop_at = time.monotonic()
+        else:
+            # Guard against rapid stop→start loop restarts (e.g. RV looping a
+            # single-clip source group sends playing=False then playing=True within
+            # milliseconds).  A genuine user press-play always follows a stop by
+            # more than 300 ms.
+            _loop_gap = time.monotonic() - self._last_remote_stop_at
+            if _loop_gap < 0.3:
+                _log(f"RECV playback: ignoring rapid play-after-stop ({_loop_gap*1000:.0f} ms) — loop restart")
+                return
+
         playing_changed = (playing != self.active_playhead.playing)
 
-        # Update cache to prevent poll loop from echoing back this change
-        self._last_polled_playing = playing
-        if playing_changed and playing:
-            self._playing_started_at = time.monotonic()
-
         if playing_changed:
+            # Update cache only when we actually change xStudio's play state so
+            # the poll does not mistake a no-op remote event for a local change.
+            self._last_polled_playing = playing
+            if playing:
+                self._playing_started_at = time.monotonic()
             self.active_playhead.playing = playing
 
         # Apply position if we are paused, or if the play/pause state has transitioned
@@ -1953,9 +2010,9 @@ class ORISyncPlugin(PluginBase):
 
                             pl.playhead_selection.select_all()
                             # select_all() fires show_atom for every media item in the
-                            # playlist.  Suppress those for 2 s so the echo doesn't
-                            # push peers back into single-clip mode.
-                            self._selection_broadcast_suppress_until = time.monotonic() + 2.0
+                            # playlist.  Suppress those for 0.5 s — in practice all
+                            # echo show_atoms arrive within 150 ms.
+                            self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container")
 
@@ -2122,7 +2179,7 @@ class ORISyncPlugin(PluginBase):
                     # Flat playlist: viewed_container + set_on_screen_source + set_selection.
                     # Suppress the show_atom that fires from set_selection so it doesn't
                     # echo back to the peer that just sent us this selection.
-                    self._selection_broadcast_suppress_until = time.monotonic() + 1.5
+                    self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self.connection.api.session.set_on_screen_source(playlist)
                     media, _ = self._find_media_for_clip_guid(clip_guid)
                     if media:

@@ -2324,6 +2324,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         seq_sel_age = time.monotonic() - self._sequence_selection_applied_at
         if tl_is_real_node and rv.commands.frame() != target_frame and seq_sel_age > 0.5:
             rv.commands.setFrame(target_frame)
+        elif not tl_is_real_node and rv.commands.frame() != target_frame:
+            rv.commands.setFrame(target_frame)
         is_playing = rv.commands.isPlaying()
         if playing and not is_playing:
             rv.commands.play()
@@ -2387,9 +2389,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                             start_frame = elapsed + 1  # RV frames are 1-indexed
                             found = True
                             break
-                        sr = getattr(child, "source_range", None)
-                        if sr is not None:
-                            elapsed += int(sr.duration.value)
+                        try:
+                            elapsed += int(child.trimmed_range().duration.value)
+                        except Exception:
+                            pass
                     if found:
                         break
                 if found:
@@ -2435,7 +2438,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 _log("RECV selection seq: no seq_node found — cannot seek")
             return
 
-        # Switch active_timeline_guid to the clip's own timeline.
+        # source mode: switch active_timeline_guid to the clip's own timeline.
         clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
         if clip_tl_guid:
             self.sync_manager.active_timeline_guid = clip_tl_guid
