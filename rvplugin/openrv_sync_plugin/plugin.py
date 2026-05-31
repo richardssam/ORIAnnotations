@@ -85,31 +85,62 @@ except ImportError:
         QtCore = None
 
 SYNC_DEMO_TRACK_UUID = "otio-sync-demo-track-0"
-SYNC_SESSION_ID = "otio-sync-demo"
+
+
+def _show_warning(msg):
+    """Display a warning popup in RV (thread-safe, fire-and-forget)."""
+    try:
+        if QtCore:
+            QtCore.QTimer.singleShot(0, lambda: _show_warning_main(msg))
+        else:
+            _log(f"WARNING: {msg}")
+    except Exception:
+        _log(f"WARNING: {msg}")
+
+
+def _show_warning_main(msg):
+    """Show the warning on the main thread."""
+    try:
+        from PySide2.QtWidgets import QMessageBox
+    except ImportError:
+        try:
+            from PySide6.QtWidgets import QMessageBox
+        except ImportError:
+            _log(f"WARNING: {msg}")
+            return
+    try:
+        mb = QMessageBox()
+        mb.setWindowTitle("OTIOSync")
+        mb.setText(msg)
+        mb.setIcon(QMessageBox.Warning)
+        mb.exec_()
+    except Exception as e:
+        _log(f"_show_warning_main failed: {e}")
+
+
+def _parse_ori_session(env_val):
+    """Parse ``[host:]session_name`` from an env-var string.
+
+    :param env_val: Raw value of ``ORI_SESSION``.
+    :returns: ``(host, session_name)`` tuple; host defaults to ``localhost``
+        (or ``ORI_RMQ_HOST`` if set) when no colon is present.
+    :rtype: tuple
+    """
+    default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+    if ":" in env_val:
+        host, name = env_val.split(":", 1)
+        return (host or default_host, name)
+    return (default_host, env_val)
+
 
 class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
+    #: Mode name passed to init() and used as the key in defineModeMenu().
+    MENU_NAME = "openrv_sync_plugin"
+    #: Display title for the top-level menu entry.
+    MENU_TITLE = "OTIO Sync"
+
     def __init__(self):
         rv.rvtypes.MinorMode.__init__(self)
-
-        menus = [
-            ("OTIO Sync", [
-                ("Add Clip to Timeline...", self.do_add_clip, None, lambda: rv.commands.NeutralMenuState),
-                ("_", None),
-                ("Sync Status", self.do_show_status, None, lambda: rv.commands.NeutralMenuState),
-            ])
-        ]
-
-        self.init("openrv_sync_plugin", [
-            ("play-start", self.on_rv_play_start, "Broadcast Play"),
-            ("play-stop", self.on_rv_play_stop, "Broadcast Stop"),
-            ("frame-changed", self.on_rv_frame_changed, "Broadcast Frame"),
-            ("selection-changed", self.on_rv_selection_changed, "Broadcast Selection"),
-            ("graph-state-change", self.on_rv_graph_state_change, "Broadcast Annotation"),
-            ("after-graph-view-change", self.on_rv_view_changed, "Broadcast View"),
-            ("pointer-1--release",      self.on_rv_pen_up, "Pen up (release)"),
-            ("pointer--leave",          self.on_rv_pen_up, "Pen up (leave viewport)"),
-            ("pointer--control--leave", self.on_rv_pen_up, "Pen up (leave control)"),
-        ], None, menus)
 
         self.sync_manager = None
         self._rv_updating = False
@@ -128,27 +159,93 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._last_partial_point_count = 0
         self._partial_pen_nodes = {}  # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
         self._last_display_state = {}  # last state broadcast to detect changes
+        self._current_session_name = None
+        self._current_host = None
+        self._pending_create_check = False
+        self._sequence_selection_applied_at = 0.0  # monotonic time of last remote sequence-mode selection
 
-        if SyncManager and RabbitMQNetwork:
-            self._setup_sync()
-        else:
+        self.init(self.MENU_NAME, [
+            ("play-start", self.on_rv_play_start, "Broadcast Play"),
+            ("play-stop", self.on_rv_play_stop, "Broadcast Stop"),
+            ("frame-changed", self.on_rv_frame_changed, "Broadcast Frame"),
+            ("selection-changed", self.on_rv_selection_changed, "Broadcast Selection"),
+            ("graph-state-change", self.on_rv_graph_state_change, "Broadcast Annotation"),
+            ("after-graph-view-change", self.on_rv_view_changed, "Broadcast View"),
+            ("pointer-1--release",      self.on_rv_pen_up, "Pen up (release)"),
+            ("pointer--leave",          self.on_rv_pen_up, "Pen up (leave viewport)"),
+            ("pointer--control--leave", self.on_rv_pen_up, "Pen up (leave control)"),
+        ], None, self._build_menu())
+
+        ori_session = os.environ.get("ORI_SESSION")
+        if ori_session and SyncManager and RabbitMQNetwork and QtCore:
+            host, name = _parse_ori_session(ori_session)
+            QtCore.QTimer.singleShot(0, lambda: self.connect_to_session(host, name))
+        elif not SyncManager or not RabbitMQNetwork:
             _log("SyncManager/RabbitMQNetwork not available")
 
-    def _setup_sync(self):
-        # Create manager first to get a GUID
-        self.sync_manager = SyncManager(session_id=SYNC_SESSION_ID)
+    @property
+    def _in_session(self):
+        return self.sync_manager is not None
 
-        # Pass that GUID to the network
-        network = RabbitMQNetwork(host='localhost', session_id=SYNC_SESSION_ID, self_guid=self.sync_manager.self_guid)
+    def _build_menu(self):
+        """Return the menu list for the current session state."""
+        if self._in_session:
+            return [
+                (self.MENU_TITLE, [
+                    (f"Leave Session ({self._current_session_name})", self.do_leave_session, None,
+                     lambda: rv.commands.NeutralMenuState),
+                    ("_", None),
+                    ("Add Clip to Timeline...", self.do_add_clip, None,
+                     lambda: rv.commands.NeutralMenuState),
+                    ("Sync Status", self.do_show_status, None,
+                     lambda: rv.commands.NeutralMenuState),
+                ])
+            ]
+        return [
+            (self.MENU_TITLE, [
+                ("Create Session...", self.do_create_session, None,
+                 lambda: rv.commands.NeutralMenuState),
+                ("Join Session...", self.do_join_session, None,
+                 lambda: rv.commands.NeutralMenuState),
+                ("_", None),
+                ("Add Clip to Timeline...", self.do_add_clip, None,
+                 lambda: rv.commands.DisabledMenuState),
+                ("Sync Status", self.do_show_status, None,
+                 lambda: rv.commands.NeutralMenuState),
+            ])
+        ]
+
+    def _rebuild_menu(self):
+        """Rebuild the OTIO Sync menu to reflect current connection state."""
+        try:
+            rv.commands.defineModeMenu(self.MENU_NAME, self._build_menu(), True)
+        except Exception as e:
+            _log(f"_rebuild_menu failed: {e}")
+
+    def connect_to_session(self, host, session_name):
+        """Create a SyncManager and join the named session.
+
+        :param host: RabbitMQ hostname.
+        :param session_name: Exchange / session name.
+        """
+        if not SyncManager or not RabbitMQNetwork:
+            _log("SyncManager/RabbitMQNetwork not available — cannot connect")
+            return
+        self.disconnect_from_session()
+        self._current_host = host
+        self._current_session_name = session_name
+
+        self.sync_manager = SyncManager(session_id=session_name)
+        network = RabbitMQNetwork(
+            host=host,
+            session_id=session_name,
+            self_guid=self.sync_manager.self_guid,
+        )
         self.sync_manager.network = network
 
-        # Wait for the consumer queue to be bound before broadcasting
-        # WHO_IS_MASTER so the I_AM_MASTER response is not lost.
         if not network.wait_until_ready(timeout=5.0):
             _log("Warning: RabbitMQ consumer did not become ready within 5 s")
         _log(f"Starting Master Discovery (ID: {self.sync_manager.self_guid})...")
-        self.sync_manager.start_session()
-        self._discovery_start_time = time.time()
 
         @self.sync_manager.on_property_changed
         def _on_property_changed(target_uuid, path, new_value):
@@ -157,9 +254,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         @self.sync_manager.on_hierarchy_changed
         def _on_hierarchy_changed(parent_uuid, action, child_uuid):
-            # Only call addSource for remote inserts; local callers (do_add_clip)
-            # already called addSource before insert_child.
-            # Skip addSource for duplicate paths — the source group already exists.
             if action == "insert_child" and self.sync_manager.is_syncing:
                 child = self.sync_manager._object_map.get(child_uuid)
                 if isinstance(child, otio.schema.Clip):
@@ -170,9 +264,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         @self.sync_manager.on_synced
         def _on_synced():
-            # Rebuild the RV session from the received snapshot when joining
-            # an existing session.  Self-elected masters skip this because
-            # they already have the correct RV state.
             if not self.sync_manager.is_master:
                 self._rv_updating = True
                 try:
@@ -183,11 +274,39 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         self._apply_display_state(self.sync_manager.display_state)
                 finally:
                     self._rv_updating = False
+            if self._pending_create_check:
+                self._pending_create_check = False
+                if not self.sync_manager.is_master:
+                    name = self._current_session_name or ""
+                    _show_warning(
+                        f"Session '{name}' already exists. "
+                        "You have joined as a peer rather than creating a new session."
+                    )
 
-        if QtCore:
+        self.sync_manager.start_session()
+        self._discovery_start_time = time.time()
+
+        if QtCore and not self._timer:
             self._timer = QtCore.QTimer()
             self._timer.timeout.connect(self.poll_network)
             self._timer.start(33)
+
+        self._rebuild_menu()
+        _log(f"Connecting to session '{session_name}' on {host}")
+
+    def disconnect_from_session(self):
+        """Stop the poll timer, shut down the network, and return to disconnected state."""
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        if self.sync_manager:
+            self.sync_manager.close()
+            self.sync_manager = None
+        self._current_session_name = None
+        self._current_host = None
+        self._pending_create_check = False
+        self._rebuild_menu()
+        _log("Disconnected from session")
 
     def _init_as_master(self):
         """Initialise the session as the first participant (Master)."""
@@ -782,7 +901,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         # tick() handles master_found → request_state and
         # state_snapshot_received → apply_snapshot internally.
-        # on_synced callback (registered in _setup_sync) rebuilds the RV
+        # on_synced callback (registered in connect_to_session) rebuilds the RV
         # session when we join an existing master.
         for action, data in self.sync_manager.tick():
             self._rv_updating = True
@@ -2175,6 +2294,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         timeline_guid = data.get("timeline_guid")
         _log(f"RECV playback playing={playing} frame={target_frame} tl={timeline_guid}")
 
+        # Determine whether this timeline_guid corresponds to a real RV node.
+        # Virtual clip timelines (created by get_or_create_clip_timeline on the
+        # sender side) have no RV node — they carry clip-local frame numbers
+        # that must not overwrite a sequence-level frame set by _apply_selection.
+        known_tl_guids = set(self._rv_node_to_timeline_guid.values())
+        tl_is_real_node = (not timeline_guid or timeline_guid in known_tl_guids)
+
         if timeline_guid:
             current_view = rv.commands.viewNode()
             # Only switch timeline view when the current node is already a known
@@ -2184,14 +2310,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             current_is_source_group = (
                 rv.commands.nodeType(current_view) == "RVSourceGroup"
             )
-            if not current_is_source_group:
+            if not current_is_source_group and tl_is_real_node:
                 for rv_node, tl_guid in self._rv_node_to_timeline_guid.items():
                     if tl_guid == timeline_guid and current_view != rv_node:
                         _log(f"RECV view_change to {rv_node}")
                         rv.commands.setViewNode(rv_node)
                         break
 
-        if rv.commands.frame() != target_frame:
+        # Don't override a sequence-selection frame that was just applied — the
+        # sender broadcasts source-local frame=0 immediately after selecting a clip
+        # in sequence mode, which would reset RV to frame 1 instead of the clip's
+        # sequence-global start frame.
+        seq_sel_age = time.monotonic() - self._sequence_selection_applied_at
+        if tl_is_real_node and rv.commands.frame() != target_frame and seq_sel_age > 0.5:
             rv.commands.setFrame(target_frame)
         is_playing = rv.commands.isPlaying()
         if playing and not is_playing:
@@ -2237,6 +2368,72 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             _log(f"RECV selection: no source group for {media_path}")
             return
         _log(f"RECV selection: clip '{clip.name}' guid={clip_guid[:8]} mode={view_mode} → source_group={source_group}")
+
+        # sequence mode: stay in the sequence view and seek to the clip's start frame.
+        if view_mode == "sequence":
+            # Walk all OTIO timelines to find which one contains this clip and at
+            # what frame offset.  Track the timeline GUID so we can pick the
+            # matching RVSequenceGroup instead of arbitrarily grabbing the first one.
+            start_frame = 1
+            target_tl_guid = None
+            for tl_guid_iter, tl in self.sync_manager.timelines.items():
+                found = False
+                for track in tl.tracks:
+                    if track.kind != otio.schema.TrackKind.Video:
+                        continue
+                    elapsed = 0
+                    for child in track:
+                        if child.metadata.get("sync", {}).get("guid") == clip_guid:
+                            start_frame = elapsed + 1  # RV frames are 1-indexed
+                            found = True
+                            break
+                        sr = getattr(child, "source_range", None)
+                        if sr is not None:
+                            elapsed += int(sr.duration.value)
+                    if found:
+                        break
+                if found:
+                    target_tl_guid = tl_guid_iter
+                    break
+
+            # Resolve the RVSequenceGroup that owns this timeline.
+            seq_node = None
+            if target_tl_guid:
+                for rv_node, tl_guid_map in self._rv_node_to_timeline_guid.items():
+                    if (tl_guid_map == target_tl_guid
+                            and rv.commands.nodeType(rv_node) != "RVSourceGroup"):
+                        seq_node = rv_node
+                        break
+            if seq_node is None:
+                # Fallback: first non-source-group node (single-sequence sessions).
+                seq_node = next(
+                    (n for n in self._rv_node_to_timeline_guid
+                     if rv.commands.nodeType(n) != "RVSourceGroup"),
+                    None
+                )
+
+            _log(
+                f"RECV selection seq: seq_node={seq_node} start_frame={start_frame}"
+                f" target_tl={target_tl_guid[:8] if target_tl_guid else None}"
+            )
+            if seq_node:
+                seq_tl_guid = self._rv_node_to_timeline_guid.get(seq_node)
+                if seq_tl_guid:
+                    self.sync_manager.active_timeline_guid = seq_tl_guid
+                self._last_broadcast_clip_guid = clip_guid
+                self._sequence_selection_applied_at = time.monotonic()
+                self._rv_updating = True
+                try:
+                    rv.commands.setViewNode(seq_node)
+                    rv.commands.setFrame(start_frame)
+                    _log(f"RECV selection seq: applied setViewNode={seq_node} setFrame={start_frame}")
+                except Exception as e:
+                    _log(f"RECV selection seq: error applying setViewNode/setFrame: {e}")
+                finally:
+                    self._rv_updating = False
+            else:
+                _log("RECV selection seq: no seq_node found — cannot seek")
+            return
 
         # Switch active_timeline_guid to the clip's own timeline.
         clip_tl_guid = self.sync_manager.get_or_create_clip_timeline(clip_guid)
@@ -2465,9 +2662,87 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if isinstance(ref, otio.schema.ExternalReference):
             rv.commands.addSource(self._media_path(ref.target_url))
 
+    def _session_dialog(self, title):
+        """Show a two-field dialog for MQ Host and Session Name.
+
+        :param title: Dialog window title (e.g. "Create Session").
+        :returns: ``(host, name)`` or ``(None, None)`` on cancel.
+        :rtype: tuple
+        """
+        try:
+            from PySide2.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+        except ImportError:
+            try:
+                from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+            except ImportError:
+                _log("PySide not available — cannot show session dialog")
+                return None, None
+
+        default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+        dlg = QDialog()
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(360)
+        layout = QFormLayout(dlg)
+        host_edit = QLineEdit(default_host)
+        name_edit = QLineEdit()
+        layout.addRow(QLabel("MQ Host:"), host_edit)
+        layout.addRow(QLabel("Session Name:"), name_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        host_edit.returnPressed.connect(name_edit.setFocus)
+        name_edit.returnPressed.connect(dlg.accept)
+        layout.addRow(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return None, None
+        host = host_edit.text().strip() or default_host
+        name = name_edit.text().strip()
+        if not name:
+            return None, None
+        return host, name
+
+    def do_create_session(self, event=None):
+        """Prompt for host/name and create a new session (with master-check warning)."""
+        if self._in_session:
+            _show_warning(
+                f"Already connected to '{self._current_session_name}'. "
+                "Leave the current session first."
+            )
+            if event: event.reject()
+            return
+        host, name = self._session_dialog("Create Session")
+        if name:
+            self._pending_create_check = True
+            self.connect_to_session(host, name)
+        if event: event.reject()
+
+    def do_join_session(self, event=None):
+        """Prompt for host/name and join an existing session."""
+        if self._in_session:
+            _show_warning(
+                f"Already connected to '{self._current_session_name}'. "
+                "Leave the current session first."
+            )
+            if event: event.reject()
+            return
+        host, name = self._session_dialog("Join Session")
+        if name:
+            self.connect_to_session(host, name)
+        if event: event.reject()
+
+    def do_leave_session(self, event=None):
+        """Disconnect from the active session."""
+        self.disconnect_from_session()
+        if event: event.reject()
+
     def do_add_clip(self, event=None):
+        if not self.sync_manager:
+            if event: event.reject()
+            return
         paths = rv.commands.openFileDialog(False, False, False, "mp4|Movie Files|mov|Movie Files|m4v|Movie Files|mkv|Movie Files|avi|Movie Files", "")
-        if not paths: return
+        if not paths:
+            if event: event.reject()
+            return
         path = paths[0] if isinstance(paths, (list, tuple)) else paths
 
         rv.commands.addSource(path)
@@ -2495,8 +2770,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if event: event.reject()
 
     def deactivate(self):
-        if self._timer: self._timer.stop()
-        if self.sync_manager: self.sync_manager.close()
+        self.disconnect_from_session()
         rv.rvtypes.MinorMode.deactivate(self)
 
 def createMode():

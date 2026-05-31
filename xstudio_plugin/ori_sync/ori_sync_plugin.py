@@ -165,9 +165,28 @@ def _uri_to_posix_path(uri: str) -> str:
     return uri
 
 
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+
+def _parse_ori_session(env_val: str) -> tuple:
+    """Parse ``[host:]session_name`` from an env-var string.
+
+    :param env_val: Raw value of ``ORI_SESSION``.
+    :returns: ``(host, session_name)`` tuple; host defaults to ``localhost``
+        (or ``ORI_RMQ_HOST`` if set) when no colon is present.
+    :rtype: tuple
+    """
+    default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+    if ":" in env_val:
+        host, name = env_val.split(":", 1)
+        return (host or default_host, name)
+    return (default_host, env_val)
+
+
 # ── QML folder ─────────────────────────────────────────────────────────────────
 
 _QML_FOLDER = "qml/ORISyncPlugin.1"
+_SESSION_DIALOG_QML = "SessionDialog {}"
 
 
 # ── plugin ─────────────────────────────────────────────────────────────────────
@@ -310,6 +329,7 @@ class ORISyncPlugin(PluginBase):
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
         self._last_polled_playing: bool | None = None
+        self._playing_started_at: float = 0.0
 
         # Last-logged container UUID / selection state; used by
         # _poll_and_broadcast_selection to suppress duplicate log lines.
@@ -390,43 +410,101 @@ class ORISyncPlugin(PluginBase):
         self._timeline_item_dirty: set = set()
         self._timeline_item_lock = threading.Lock()
 
-        # Auto-connect on startup using the current preference values.
-        _log("Plugin loaded — auto-connecting to session")
-        try:
-            self.connect_to_session()
-        except Exception:
-            _log_exc("connect_to_session failed")
+        self._pending_create_check: bool = False
+
+        # Add session management menu items.
+        self.insert_menu_item(
+            "main menu bar",
+            "Create Session...",
+            "Session|Connect",
+            0.1,
+            callback=self._menu_create_session,
+        )
+        self.insert_menu_item(
+            "main menu bar",
+            "Join Session...",
+            "Session|Connect",
+            0.2,
+            callback=self._menu_join_session,
+        )
+        self.insert_menu_item(
+            "main menu bar",
+            "Leave Session",
+            "Session|Connect",
+            0.3,
+            callback=self._menu_leave_session,
+        )
+
+        self.connect_to_ui()
+
+        ori_session = os.environ.get("ORI_SESSION")
+        if ori_session:
+            host, name = _parse_ori_session(ori_session)
+            # Override the stored preference so it reflects what we used.
+            self.mq_host_attr.set_value(host)
+            self.session_id_attr.set_value(name)
+            _log(f"ORI_SESSION set — auto-connecting to '{name}' on {host}")
+            try:
+                self.connect_to_session(host, name)
+            except Exception:
+                _log_exc("ORI_SESSION auto-connect failed")
+        else:
+            _log("Plugin loaded — no ORI_SESSION set, starting disconnected")
 
     # ── connection lifecycle ───────────────────────────────────────────────────
 
-    def connect_to_session(self) -> None:
+    def connect_to_session(self, host: str | None = None, session_name: str | None = None) -> None:
         """Connect to RabbitMQ and join the sync session.
 
-        Safe to call from the xStudio UI thread.
+        :param host: RabbitMQ hostname; falls back to ``mq_host_attr`` if ``None``.
+        :param session_name: Session / exchange name; falls back to ``session_id_attr``
+            if ``None``.
         """
         self.disconnect()
         self._poll_stop.clear()
 
-        host = self.mq_host_attr.value()
+        if host is None:
+            host = self.mq_host_attr.value()
+        else:
+            self.mq_host_attr.set_value(host)
+        if session_name is None:
+            session_name = self.session_id_attr.value()
+        else:
+            self.session_id_attr.set_value(session_name)
+
         port = int(self.mq_port_attr.value())
-        session = self.session_id_attr.value()
 
         network = RabbitMQNetwork(
             host=host,
             port=port,
-            session_id=session,
+            session_id=session_name,
             self_guid=str(self.uuid),
         )
         self.manager = SyncManager(
-            session_id=session,
+            session_id=session_name,
             self_guid=str(self.uuid),
             network=network,
         )
         self.manager.on_playback_changed(self._apply_playback_state)
-        self.manager.on_synced(self._on_synced)
         self.manager.on_status_changed(
             lambda s: self.status_attr.set_value(s)
         )
+
+        # Register on_synced here so the pending_create_check flag is captured
+        # correctly for this connect call.
+        _pending = self._pending_create_check
+
+        @self.manager.on_synced
+        def _on_synced_once():
+            self._on_synced()
+            if _pending and not self.manager.is_master:
+                name = session_name or ""
+                self.popup_message_box(
+                    "Session Already Exists",
+                    f"Session '{name}' already exists. "
+                    "You have joined as a peer rather than creating a new session.",
+                )
+            self._pending_create_check = False
 
         # Wait for the consumer queue to be bound before broadcasting
         # WHO_IS_MASTER.  Without this, the I_AM_MASTER response from an
@@ -478,6 +556,11 @@ class ORISyncPlugin(PluginBase):
                 f"[TEST change_atom] subscribed to viewed_container events"
                 f" (type={type(container).__name__})"
             )
+        except RuntimeError as e:
+            if "invalid_argument" in str(e):
+                _log("[TEST change_atom] no viewed_container yet (session empty at connect time)")
+            else:
+                _log_exc("[TEST change_atom] subscribe_to_event_group failed")
         except Exception:
             _log_exc("[TEST change_atom] subscribe_to_event_group failed")
 
@@ -490,15 +573,16 @@ class ORISyncPlugin(PluginBase):
             target=self._poll_loop, name="ori_sync_poll", daemon=True
         )
         self._poll_thread.start()
-        # Suppress selection broadcasts for 5 s after connect so the initial
-        # playhead position doesn't immediately drive RV's view before the user
-        # has intentionally navigated anywhere.
-        _log(f"Connecting: session={session!r} mq={host}:{port}")
+        _log(f"Connecting: session={session_name!r} mq={host}:{port}")
 
     def disconnect(self) -> None:
         """Disconnect from the session and stop all background threads."""
         self._poll_stop.set()
-        if self._poll_thread and self._poll_thread.is_alive():
+        # Never join the current thread (e.g. when called from the poll thread
+        # itself via the leave_session cmd_queue path).
+        if (self._poll_thread
+                and self._poll_thread.is_alive()
+                and self._poll_thread is not threading.current_thread()):
             self._poll_thread.join(timeout=1.0)
         self._poll_thread = None
         if self.manager:
@@ -528,6 +612,69 @@ class ORISyncPlugin(PluginBase):
     def cleanup(self) -> None:
         """Called by xStudio when the plugin is unloaded."""
         self.disconnect()
+
+    # ── session menu callbacks ─────────────────────────────────────────────────
+
+    def _menu_create_session(self) -> None:
+        """Open SessionDialog in 'create' mode."""
+        if self.manager is not None:
+            name = self.session_id_attr.value() or "current"
+            self.popup_message_box(
+                "Already Connected",
+                f"Already connected to '{name}'. Leave the current session first.",
+            )
+            return
+        self._pending_create_check = True
+        self.create_qml_item(_SESSION_DIALOG_QML)
+
+    def _menu_join_session(self) -> None:
+        """Open SessionDialog in 'join' mode."""
+        if self.manager is not None:
+            name = self.session_id_attr.value() or "current"
+            self.popup_message_box(
+                "Already Connected",
+                f"Already connected to '{name}'. Leave the current session first.",
+            )
+            return
+        self._pending_create_check = False
+        self.create_qml_item(_SESSION_DIALOG_QML)
+
+    def _menu_leave_session(self) -> None:
+        """Disconnect from the active session."""
+        if self.manager is None:
+            return
+        self._cmd_queue.put(("leave_session", {}))
+
+    def do_session_connect(self, data) -> list:
+        """Called from QML SessionDialog via python_callback.
+
+        Spawns a background thread to perform the connection so that the
+        python_callback (which blocks xStudio's Qt main thread) returns
+        immediately.  connect_to_session() does blocking RabbitMQ I/O and
+        calls disconnect() internally, which joins the poll thread — that join
+        must not happen on the poll thread itself.
+
+        :param data: Dict with ``host`` and ``name`` keys.
+        :returns: ``[True, "Connecting…"]`` immediately.
+        :rtype: list
+        """
+        host = (data.get("host") or "").strip() or os.environ.get("ORI_RMQ_HOST", "localhost")
+        name = (data.get("name") or "").strip()
+        if not name:
+            return [False, "Session name cannot be empty."]
+        threading.Thread(
+            target=self._session_connect_worker,
+            args=(host, name),
+            daemon=True,
+        ).start()
+        return [True, "Connecting…"]
+
+    def _session_connect_worker(self, host: str, name: str) -> None:
+        """Background thread that calls connect_to_session safely off the poll thread."""
+        try:
+            self.connect_to_session(host, name)
+        except Exception:
+            _log_exc("session connect worker failed")
 
     # ── discovery ──────────────────────────────────────────────────────────────
 
@@ -605,6 +752,8 @@ class ORISyncPlugin(PluginBase):
                     self._broadcast_live_stroke_from_json(payload)
                 elif cmd == "clear_live_stroke":
                     self._live_stroke_current_key = None
+                elif cmd == "leave_session":
+                    self.disconnect()
             except Exception:
                 _log_exc(f"Command {cmd!r} failed")
 
@@ -795,6 +944,13 @@ class ORISyncPlugin(PluginBase):
                                 except Exception:
                                     _log_exc(f"  Could not add {path!r}")
                     self._sync_playlists[guid] = (playlist, None)
+                    # Register in _xs_flat_playlists so _poll_flat_playlist_new_media
+                    # can detect clips added by the local user (even as a client).
+                    try:
+                        current_media = playlist.media
+                        self._xs_flat_playlists[guid] = (playlist, [m.name for m in current_media])
+                    except Exception:
+                        _log_exc("Could not init _xs_flat_playlists entry from load")
                     if first_xs_timeline is None:
                         first_xs_timeline = playlist
                     _log(f"Created flat playlist {playlist_name!r} from OTIO timeline {guid[:8]}")
@@ -804,10 +960,51 @@ class ORISyncPlugin(PluginBase):
             else:
                 try:
                     playlist = self.connection.api.session.create_playlist(playlist_name)[1]
+                    # Add all media to the playlist bin BEFORE loading the timeline
+                    # so xStudio can assign media to sequence clips on export.
+                    for _track in otio_tl.tracks:
+                        if _track.name == "Annotations":
+                            continue
+                        if _track.kind != otio.schema.TrackKind.Video:
+                            continue
+                        for _clip in _track:
+                            if not isinstance(_clip, otio.schema.Clip):
+                                continue
+                            _mr = _clip.media_reference
+                            if not isinstance(_mr, otio.schema.ExternalReference):
+                                continue
+                            _path = _uri_to_posix_path(_mr.target_url or "")
+                            if _path:
+                                try:
+                                    playlist.add_media(_path)
+                                except Exception:
+                                    pass
                     xs_timeline = playlist.create_timeline(timeline_name)[1]
                     otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
                     self._sync_playlists[guid] = (playlist, xs_timeline)
+                    # Register in _xs_sequence_playlists so _poll_sequence_new_media
+                    # can detect clips added by the local user (even as a client).
+                    # Use clip names from the snapshot OTIO's Media track so that
+                    # to_otio_string() comparisons start with no false positives.
+                    _media_tr = next(
+                        (t for t in otio_tl.tracks
+                         if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                        next(
+                            (t for t in otio_tl.tracks
+                             if t.kind == otio.schema.TrackKind.Video),
+                            None,
+                        ),
+                    )
+                    _known = {
+                        c.name for c in (_media_tr or [])
+                        if isinstance(c, otio.schema.Clip)
+                    }
+                    try:
+                        _known |= {m.name for m in playlist.media}
+                    except Exception:
+                        pass
+                    self._xs_sequence_playlists[guid] = (playlist, xs_timeline, _known)
                     # Record the OTIO Media-track clip-GUID order so move_children
                     # calls can find the current index without querying xStudio clip actors.
                     media_track = next(
@@ -896,7 +1093,24 @@ class ORISyncPlugin(PluginBase):
                         _log(f"Built OTIO timeline: {tl.name!r} (parent playlist: {playlist.name!r})")
                         result.append(tl)
                         # Store for master-side new-clip polling and _apply_selection.
-                        self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
+                        _media_tr_m = next(
+                            (t for t in tl.tracks
+                             if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                            next(
+                                (t for t in tl.tracks
+                                 if t.kind == otio.schema.TrackKind.Video),
+                                None,
+                            ),
+                        )
+                        _known_seq = {
+                            c.name for c in (_media_tr_m or [])
+                            if isinstance(c, otio.schema.Clip)
+                        }
+                        try:
+                            _known_seq |= {m.name for m in playlist.media}
+                        except Exception:
+                            pass
+                        self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_seq)
                         self._sync_playlists[tl_guid] = (playlist, xs_tl)
                         self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     except Exception:
@@ -1077,23 +1291,57 @@ class ORISyncPlugin(PluginBase):
                     if _media_name_hint:
                         break
                 _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
-                # Suppress clip broadcasts while the viewport is confirmed to be
-                # showing a Timeline.  In Timeline mode the playhead fires show_atom
-                # as it scans through clips in the sequence; broadcasting those would
-                # push RV out of sequence view on every frame advance.
-                if is_timeline or time.monotonic() < self._selection_broadcast_suppress_until:
-                    _log(f"[SEL] → suppressed (timeline/sequence mode)")
+                if time.monotonic() < self._selection_broadcast_suppress_until:
+                    _log(f"[SEL] → suppressed (echo guard)")
+                    return
+                # In Timeline/sequence mode, suppress during active playback only —
+                # the playhead fires show_atom for every clip it scans through, and
+                # broadcasting those would spam RV on every frame advance.  When
+                # paused, the event is a deliberate manual click so we broadcast it
+                # as view_mode="sequence" so RV can follow without leaving its own
+                # sequence view.
+                # Allow through if playing JUST started (within 300 ms) — that is a
+                # user-initiated "start playback from this clip" action, not a scan.
+                # The race between the poll thread setting _last_polled_playing=True
+                # and the show_atom arriving means we cannot rely on _last_polled_playing
+                # alone to distinguish the two cases.
+                _playing_just_started = (
+                    time.monotonic() - self._playing_started_at < 0.3
+                )
+                if is_timeline and self._last_polled_playing and not _playing_just_started:
+                    _log(f"[SEL] → suppressed (playing through sequence)")
                     return
                 if (_media_name_hint and self.manager
                         and self.manager.status == STATE_SYNCED):
                     clip_guid = self._clip_guid_for_media_name(_media_name_hint)
                     if clip_guid:
                         self._last_viewed_clip_guid = clip_guid
-                        clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
-                        if clip_tl_guid:
-                            self.manager.active_timeline_guid = clip_tl_guid
-                        self.manager.broadcast_selection(clip_guid, view_mode="source")
-                        _log(f"[SEL] → broadcast clip {clip_guid[:8]}")
+                        view_mode = "sequence" if is_timeline else "source"
+                        if view_mode == "sequence":
+                            # Keep active_timeline_guid on the sequence so that the
+                            # accompanying playback broadcast carries the sequence
+                            # timeline GUID and frame — not a virtual clip timeline
+                            # that would confuse the receiver.
+                            seq_tl_guid = None
+                            for _tg in self._xs_sequence_playlists:
+                                _otio_tl = self.manager.timelines.get(_tg)
+                                if _otio_tl is None:
+                                    continue
+                                if any(
+                                    child.metadata.get("sync", {}).get("guid") == clip_guid
+                                    for track in _otio_tl.tracks
+                                    for child in track
+                                ):
+                                    seq_tl_guid = _tg
+                                    break
+                            if seq_tl_guid:
+                                self.manager.active_timeline_guid = seq_tl_guid
+                        else:
+                            clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+                            if clip_tl_guid:
+                                self.manager.active_timeline_guid = clip_tl_guid
+                        self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
+                        _log(f"[SEL] → broadcast clip {clip_guid[:8]} mode={view_mode}")
                     else:
                         _log(f"[SEL] → no clip_guid found for {_media_name_hint!r}")
                 return
@@ -1232,6 +1480,8 @@ class ORISyncPlugin(PluginBase):
             return
 
         playing_changed = (playing != self._last_polled_playing)
+        if playing_changed and playing:
+            self._playing_started_at = time.monotonic()
 
         # Skip polling frame updates while actively playing if there's no state transition
         if playing and not playing_changed:
@@ -1498,6 +1748,8 @@ class ORISyncPlugin(PluginBase):
 
         # Update cache to prevent poll loop from echoing back this change
         self._last_polled_playing = playing
+        if playing_changed and playing:
+            self._playing_started_at = time.monotonic()
 
         if playing_changed:
             self.active_playhead.playing = playing
@@ -1867,7 +2119,10 @@ class ORISyncPlugin(PluginBase):
                             except Exception:
                                 _log_exc("RECV selection: failed to set timeline item selection")
                 else:
-                    # Flat playlist: viewed_container + set_on_screen_source + set_selection
+                    # Flat playlist: viewed_container + set_on_screen_source + set_selection.
+                    # Suppress the show_atom that fires from set_selection so it doesn't
+                    # echo back to the peer that just sent us this selection.
+                    self._selection_broadcast_suppress_until = time.monotonic() + 1.5
                     self.connection.api.session.set_on_screen_source(playlist)
                     media, _ = self._find_media_for_clip_guid(clip_guid)
                     if media:
@@ -1991,12 +2246,12 @@ class ORISyncPlugin(PluginBase):
     def _poll_flat_playlist_new_media(self) -> None:
         """Detect and broadcast media items added to flat Playlists.
 
-        Only runs on the master.  Compares the current media count against the
-        stored order; when new items are found it builds OTIO Clips from their
-        media references and calls ``manager.insert_child`` so all peers receive
-        the new clip via INSERT_CHILD.
+        Runs on both master and client.  Compares the current media count
+        against the stored order; when new items are found it builds OTIO Clips
+        from their media references and calls ``manager.insert_child`` so all
+        peers receive the new clip via INSERT_CHILD.
         """
-        if not self.manager or not self.manager.is_master:
+        if not self.manager:
             return
 
         for tl_guid, (xs_playlist, stored_order) in list(self._xs_flat_playlists.items()):
@@ -2167,7 +2422,24 @@ class ORISyncPlugin(PluginBase):
                     if tl is None:
                         continue
                     self.manager.register_timeline(tl)
-                    self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl)
+                    _media_tr_np = next(
+                        (t for t in tl.tracks
+                         if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                        next(
+                            (t for t in tl.tracks
+                             if t.kind == otio.schema.TrackKind.Video),
+                            None,
+                        ),
+                    )
+                    _known_np = {
+                        c.name for c in (_media_tr_np or [])
+                        if isinstance(c, otio.schema.Clip)
+                    }
+                    try:
+                        _known_np |= {m.name for m in playlist.media}
+                    except Exception:
+                        pass
+                    self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_np)
                     self._sync_playlists[tl_guid] = (playlist, xs_tl)
                     self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     self.manager.broadcast_add_timeline(tl_guid)
@@ -2218,54 +2490,37 @@ class ORISyncPlugin(PluginBase):
                 )
                 self.manager.broadcast_timeline_rename(tl_guid, current_name)
 
-    @staticmethod
-    def _clips_match(c1: "otio.schema.Clip", c2: "otio.schema.Clip") -> bool:
-        """Check if two OTIO Clips refer to the same media item.
-
-        Compares the names and target URLs (if present) of the two clips.
-
-        :param c1: The first clip to compare.
-        :type c1: otio.schema.Clip
-        :param c2: The second clip to compare.
-        :type c2: otio.schema.Clip
-        :return: True if they refer to the same media, False otherwise.
-        :rtype: bool
-        """
-        if c1.name != c2.name:
-            return False
-        mr1 = getattr(c1, "media_reference", None)
-        mr2 = getattr(c2, "media_reference", None)
-        url1 = getattr(mr1, "target_url", None) if mr1 else None
-        url2 = getattr(mr2, "target_url", None) if mr2 else None
-        if url1 and url2 and url1 != url2:
-            return False
-        return True
-
     def _poll_sequence_new_media(self, only_guid: str | None = None) -> None:
         """Detect and broadcast clips added to sequence Timelines.
 
-        Only runs on the master.  Re-exports each tracked xStudio Timeline via
-        ``to_otio_string()`` and compares the clip sequence against the stored
-        OTIO track using an index-based alignment loop. New clips are broadcast
-        via ``manager.insert_child``.
+        Iterates ``playlist.media`` (same approach as flat playlists) instead
+        of calling ``to_otio_string()``, which returns MissingReference for
+        client-side timelines loaded via ``load_otio()``.  Builds OTIO Clips
+        from ``media.media_source()`` and broadcasts via ``insert_child``.
 
         :param only_guid: When given, only checks the timeline with this sync
-            GUID (used by the [2F] event-driven path to avoid re-scanning all
+            GUID (used by the event-driven path to avoid re-scanning all
             timelines on every item_atom event).
         """
-        if not self.manager or not self.manager.is_master:
+        if not self.manager:
             return
 
         items = list(self._xs_sequence_playlists.items())
         if only_guid is not None:
             items = [(g, v) for g, v in items if g == only_guid]
 
-        for tl_guid, (_, xs_tl) in items:
+        for tl_guid, (xs_playlist, xs_tl, known_names) in items:
             otio_tl = self.manager.timelines.get(tl_guid)
             if otio_tl is None:
                 continue
             video_track = next(
-                (t for t in otio_tl.tracks if t.kind == otio.schema.TrackKind.Video), None
+                (t for t in otio_tl.tracks
+                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                next(
+                    (t for t in otio_tl.tracks
+                     if t.kind == otio.schema.TrackKind.Video),
+                    None,
+                ),
             )
             if video_track is None:
                 continue
@@ -2274,54 +2529,60 @@ class ORISyncPlugin(PluginBase):
                 continue
 
             try:
-                fresh_otio_str = xs_tl.to_otio_string()
-                fresh_tl = otio.adapters.read_from_string(fresh_otio_str)
+                current_media = xs_playlist.media
             except Exception:
                 continue
 
-            for fresh_track in fresh_tl.tracks:
-                if fresh_track.kind != otio.schema.TrackKind.Video:
+            for media in current_media:
+                if media.name in known_names:
                     continue
-                fresh_clips = [c for c in fresh_track if isinstance(c, otio.schema.Clip)]
-                stored_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
-
-                fresh_idx = 0
-                stored_idx = 0
-                while fresh_idx < len(fresh_clips):
-                    fresh_clip = fresh_clips[fresh_idx]
-
-                    # Check if it matches the current stored clip
-                    match = False
-                    if stored_idx < len(stored_clips):
-                        if self._clips_match(fresh_clip, stored_clips[stored_idx]):
-                            match = True
-
-                    if match:
-                        fresh_idx += 1
-                        stored_idx += 1
-                    else:
-                        # Check if fresh_clip matches any later stored clip
-                        found_later = False
-                        for temp_idx in range(stored_idx + 1, len(stored_clips)):
-                            if self._clips_match(fresh_clip, stored_clips[temp_idx]):
-                                stored_idx = temp_idx
-                                found_later = True
+                # Also check basename so full-path entries for known clips are skipped.
+                _bn = os.path.basename(media.name)
+                if _bn in known_names:
+                    known_names = known_names | {media.name}
+                    continue
+                try:
+                    ms = media.media_source()
+                    uri = str(ms.media_reference.uri())
+                    fps = 25.0
+                    rate_obj = ms.rate
+                    if rate_obj:
+                        fps = rate_obj.fps() or fps
+                    frame_count = None
+                    try:
+                        info = media.display_info
+                        for key in ("frames", "Frames", "frame_count", "num_frames"):
+                            v = info.get(key)
+                            if v:
+                                frame_count = int(v)
                                 break
+                    except Exception:
+                        pass
+                    if frame_count:
+                        sr = otio.opentime.TimeRange(
+                            otio.opentime.RationalTime(0, fps),
+                            otio.opentime.RationalTime(frame_count, fps),
+                        )
+                        clip = otio.schema.Clip(
+                            name=_bn,
+                            media_reference=otio.schema.ExternalReference(
+                                target_url=uri, available_range=sr
+                            ),
+                            source_range=sr,
+                        )
+                    else:
+                        clip = otio.schema.Clip(
+                            name=_bn,
+                            media_reference=otio.schema.ExternalReference(target_url=uri),
+                        )
+                    new_index = len([c for c in video_track if isinstance(c, otio.schema.Clip)])
+                    self.manager.insert_child(track_guid, clip, new_index)
+                    _log(f"sequence new media: {_bn!r} at index {new_index}")
+                    known_names = known_names | {media.name, _bn}
+                except Exception:
+                    _log_exc(f"sequence new media: failed for {media.name!r}")
 
-                        if found_later:
-                            # Now fresh_clip matches stored_clips[stored_idx]
-                            fresh_idx += 1
-                            stored_idx += 1
-                        else:
-                            # Truly a new clip insert
-                            # Deep-copy the clip using serialization to avoid ValueError: child already has a parent
-                            from otio_sync_core.patcher import _otio_to_dict, _dict_to_otio
-                            clip_copy = _dict_to_otio(_otio_to_dict(fresh_clip))
-                            self.manager.insert_child(track_guid, clip_copy, fresh_idx)
-                            _log(f"sequence new clip: {fresh_clip.name!r} at index {fresh_idx}")
-                            stored_clips.insert(fresh_idx, clip_copy)
-                            fresh_idx += 1
-                            stored_idx += 1
+            self._xs_sequence_playlists[tl_guid] = (xs_playlist, xs_tl, known_names)
 
     def _apply_remote_clip_insert(self, clip_obj: "otio.schema.Clip") -> None:
         """Route a received non-annotation INSERT_CHILD clip to the right handler.
@@ -2347,8 +2608,28 @@ class ORISyncPlugin(PluginBase):
                     if child.metadata.get("sync", {}).get("guid") == clip_guid:
                         if otio_tl.metadata.get("xs_flat_playlist"):
                             self._apply_flat_playlist_insert(clip_obj, pl, xs_tl)
+                            # Keep stored_order in sync so the next poll tick
+                            # doesn't re-broadcast this remote-received clip.
+                            if tl_guid in self._xs_flat_playlists:
+                                try:
+                                    cur_pl, stored = self._xs_flat_playlists[tl_guid]
+                                    if clip_obj.name not in stored:
+                                        self._xs_flat_playlists[tl_guid] = (cur_pl, stored + [clip_obj.name])
+                                except Exception:
+                                    pass
                         else:
                             self._apply_sequence_insert(tl_guid, otio_tl, xs_tl)
+                            # Keep known_names in sync so next poll doesn't
+                            # re-broadcast this remote-received clip.
+                            if tl_guid in self._xs_sequence_playlists:
+                                try:
+                                    _sq_pl, _sq_tl, _sq_known = self._xs_sequence_playlists[tl_guid]
+                                    if clip_obj.name not in _sq_known:
+                                        self._xs_sequence_playlists[tl_guid] = (
+                                            _sq_pl, _sq_tl, _sq_known | {clip_obj.name}
+                                        )
+                                except Exception:
+                                    pass
                         return
 
     def _poll_and_broadcast_display(self) -> None:
@@ -3400,15 +3681,15 @@ class ORISyncPlugin(PluginBase):
         :returns: GUID string, or ``None`` if not found.
         :rtype: str or None
         """
-        import os
-        stem = os.path.splitext(os.path.basename(media_name))[0]
+        bn = os.path.basename(media_name)
+        stem = os.path.splitext(bn)[0]
         for otio_tl in self.manager.timelines.values():
             for track in otio_tl.tracks:
                 for child in track:
                     if not isinstance(child, otio.schema.Clip):
                         continue
                     cname = child.name or ""
-                    if cname == media_name or cname == stem:
+                    if cname == media_name or cname == bn or cname == stem:
                         return child.metadata.get("sync", {}).get("guid")
         return None
 
