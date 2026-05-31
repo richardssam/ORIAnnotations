@@ -39,4 +39,6 @@ If you need to rebuild the oriannotations.zip package, the script "makepackage.c
 
 For details on connecting to running review instances, configuring ports, and using the active viewport inspection utilities, see the [debug directory README](file:///Users/sam/git/ORIAnnotations/debug/README.md).
 
+## UI Sync Testing
 
+To run automated integration tests that launch real application instances (XStudio, OpenRV) and verify their synchronization states, see the [sync_test directory README](file:///Users/sam/git/ORIAnnotations/sync_test/README.md).
