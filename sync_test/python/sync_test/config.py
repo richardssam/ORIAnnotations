@@ -3,8 +3,9 @@ import os
 import logging
 
 class SyncTestConfig:
-    def __init__(self, tests):
+    def __init__(self, tests, settings=None):
         self.tests = tests
+        self.settings = settings or {}
 
     @classmethod
     def from_file(cls, path):
@@ -17,6 +18,8 @@ class SyncTestConfig:
         if not data or 'tests' not in data:
             raise ValueError(f"Invalid configuration format in {path}. Expected a 'tests' key.")
             
+        settings = data.get('settings', {})
+        
         parsed_tests = []
         for t in data['tests']:
             name = t.get('name')
@@ -33,7 +36,7 @@ class SyncTestConfig:
                 "apps": apps
             })
             
-        return cls(tests=parsed_tests)
+        return cls(tests=parsed_tests, settings=settings)
         
     def get_test(self, name):
         for t in self.tests:

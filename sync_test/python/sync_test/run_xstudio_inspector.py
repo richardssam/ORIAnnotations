@@ -17,6 +17,8 @@ def main():
         sys.path.insert(0, base_dir)
         
     from sync_test.xstudio_hook import start_xstudio_inspector
+    import logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
     
     print(f"Starting XStudio Inspector Server on HTTP port {http_port}, bridging to XStudio port {xstudio_port}...")
     server = start_xstudio_inspector(http_port, xstudio_port)

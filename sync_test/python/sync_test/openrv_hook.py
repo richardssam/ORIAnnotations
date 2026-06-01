@@ -27,6 +27,24 @@ def get_openrv_state():
         view_node = rv.commands.viewNode()
         state["clip"] = view_node
         
+        state["media_path"] = None
+        state["media_exists"] = False
+        
+        # Check if media actually exists on disk
+        import os
+        sources = rv.commands.sourcesAtFrame(rv.commands.frame())
+        if sources:
+            media_info = rv.commands.sourceMedia(sources[0])
+            if media_info and len(media_info) > 0:
+                path = media_info[0]
+                state["media_path"] = path
+                if path.startswith("file://"):
+                    path = path[7:]
+                state["media_exists"] = os.path.exists(path)
+        else:
+            # If no sources, we don't treat media as "missing" (just empty)
+            state["media_exists"] = True
+        
         # To get annotations, we check for RVPaint nodes in the graph
         paint_nodes = rv.commands.nodesOfType("RVPaint")
         total_strokes = 0

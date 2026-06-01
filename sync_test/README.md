@@ -26,20 +26,20 @@ tests:
 
 ## Running Tests
 
-You can run the full suite or a specific test using the CLI entry point:
+You can run the full suite or a specific test using the `run_tests.sh` wrapper script. This script automatically configures the `PYTHONPATH` so the testing modules can be imported correctly.
 
 ```bash
 # Run all tests using the default sync_tests.yaml
-python -m sync_test.cli run
+./run_tests.sh run
 
 # Run a specific test
-python -m sync_test.cli run --test xstudio_vs_openrv_demo
+./run_tests.sh run --test xstudio_vs_openrv_demo
 
 # Run with custom config
-python -m sync_test.cli run --config my_tests.yaml
+./run_tests.sh run --config my_tests.yaml
 
 # Enable verbose logging
-python -m sync_test.cli run -v
+./run_tests.sh run -v
 ```
 
 ## Isolated Logging

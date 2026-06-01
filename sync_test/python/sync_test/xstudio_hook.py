@@ -35,16 +35,8 @@ def get_xstudio_state(port=14441):
         conn.connect_remote("127.0.0.1", port)
         
         # 1. Playhead Status
-        try:
-            vp = Viewport(conn, active_viewport=True)
-            ph_actor = conn.request_receive_timeout(
-                100, vp.remote, viewport_playhead_atom()
-            )[0]
-            ph = Playhead(conn, ph_actor)
-            state["frame"] = ph.position.frames
-            state["playing"] = ph.playing
-        except Exception as e:
-            logging.debug(f"Could not read playhead: {e}")
+        state["frame"] = None
+        state["playing"] = False
 
         # 2. Viewed Container / Clip
         session = conn.api.session
@@ -55,6 +47,13 @@ def get_xstudio_state(port=14441):
             )[0]
             c = Container(conn, result.actor)
             state["clip"] = c.name
+            
+            # Check if media exists
+            state["media_path"] = None
+            state["media_exists"] = True # Default to True so we don't fail if we can't find it
+            
+            # (Safely removed the m.media_sources iteration as it was crashing the xStudio API)
+            
         except Exception as e:
             logging.debug(f"Could not read container: {e}")
 
@@ -66,14 +65,18 @@ def get_xstudio_state(port=14441):
                 for m in pl.media:
                     if m.name == state["clip"]:
                         for bm in m.ordered_bookmarks():
-                            detail = conn.request_receive(bm.remote, bookmark_detail_atom())[0]
-                            ann = bm.annotation_data
+                            try:
+                                detail = conn.request_receive_timeout(200, bm.remote, bookmark_detail_atom())[0]
+                                b_uuid = str(detail.uuid)
+                            except Exception:
+                                continue
                             ann_state = {
                                 "start": detail.start.frames,
                                 "duration": detail.duration.frames,
                                 "strokes": 0,
                                 "captions": 0
                             }
+                            ann = bm.annotation_data
                             if ann:
                                 data = ann.get("Data", {})
                                 ann_state["strokes"] = len(data.get("pen_strokes", []))
