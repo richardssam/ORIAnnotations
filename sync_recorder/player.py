@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import pathlib
 import sys
 import time
@@ -79,10 +80,13 @@ class SyncPlayer:
                             raise ValueError(
                                 f"Event on line {line_num} is missing required fields"
                             )
-                        self.events.append(event)
                         p = event.get("payload", {})
-                        if p.get("command") == "SESSION" and p.get("event") == "STATE_SNAPSHOT":
-                            self._recorded_snapshot = p
+                        if p.get("command") == "SESSION":
+                            if p.get("event") == "STATE_SNAPSHOT":
+                                self._recorded_snapshot = p
+                            continue
+                        
+                        self.events.append(event)
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Failed to parse line {line_num}: {e}")
         except FileNotFoundError:
@@ -318,7 +322,9 @@ class SyncPlayer:
                         snapshot["payload"]["target_guid"] = requester
                         current_now = time.time()
                         snapshot = self._update_timestamps(snapshot, current_now)
+                        snapshot = self._resolve_target_urls(snapshot)
                         snapshot["source_guid"] = self.network.self_guid
+                        snapshot["session_id"] = self.session_id
                         self.network.send_payload(snapshot)
                         # Record that a peer has loaded state; the peer-join
                         # gate in tick() and play() watches this timestamp.
@@ -339,11 +345,52 @@ class SyncPlayer:
 
         # Update all internal timestamp fields in payload
         payload = self._update_timestamps(payload, current_now)
+        payload = self._resolve_target_urls(payload)
 
         if replace_source_guid:
             payload["source_guid"] = self.network.self_guid
+            
+        payload["session_id"] = self.session_id
 
         self.network.send_payload(payload)
+
+    def _resolve_target_urls(self, payload: Any) -> Any:
+        """Recursively find 'target_url' and resolve to absolute paths if they are relative and exist.
+        
+        :param payload: Dict or list representing the message payload.
+        :returns: The updated payload copy.
+        """
+        import sys
+        if isinstance(payload, dict):
+            new_dict = {}
+            for k, v in payload.items():
+                if k == "target_url" and isinstance(v, str):
+                    print(f"[DEBUG] Found target_url: {v} in cwd: {os.getcwd()}")
+                    sys.stdout.flush()
+                    if not os.path.isabs(v):
+                        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        abs_path = os.path.normpath(os.path.join(project_root, v))
+                        print(f"[DEBUG] Resolving to: {abs_path}")
+                        sys.stdout.flush()
+                        if os.path.exists(abs_path):
+                            new_val = "file://" + abs_path if not abs_path.startswith("file://") else abs_path
+                            print(f"[DEBUG] File exists. Replaced with: {new_val}")
+                            sys.stdout.flush()
+                            new_dict[k] = new_val
+                        else:
+                            print(f"[Warning] target_url '{v}' not found relative to project root {project_root}")
+                            sys.stdout.flush()
+                            new_dict[k] = v
+                    else:
+                        print(f"[DEBUG] target_url is already absolute: {v}")
+                        sys.stdout.flush()
+                        new_dict[k] = v
+                else:
+                    new_dict[k] = self._resolve_target_urls(v)
+            return new_dict
+        elif isinstance(payload, list):
+            return [self._resolve_target_urls(x) for x in payload]
+        return payload
 
     def _update_timestamps(self, payload: Any, current_time: float) -> Any:
         """Recursively update any key containing 'timestamp' to the current_time.
@@ -363,7 +410,6 @@ class SyncPlayer:
         elif isinstance(payload, list):
             return [self._update_timestamps(x, current_time) for x in payload]
         return payload
-
 
 def main() -> None:
     """Entry point for running the player from the command line."""

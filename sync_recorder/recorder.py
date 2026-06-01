@@ -72,10 +72,10 @@ class SyncRecorder:
                 return
 
             self.output_file = output_file
+            self._file_handle = None
             if self.output_file:
-                # Truncate/initialize the file
-                with open(self.output_file, "w", encoding="utf-8") as f:
-                    pass
+                # Open the file for writing and keep it open
+                self._file_handle = open(self.output_file, "w", encoding="utf-8")
 
             if self.network is None:
                 # We generate a unique GUID so we don't drop messages from any peer
@@ -119,6 +119,14 @@ class SyncRecorder:
             self._poll_thread = None
 
         with self._lock:
+            if self._file_handle:
+                try:
+                    self._file_handle.flush()
+                    self._file_handle.close()
+                except Exception as e:
+                    print(f"[recorder] Error closing file: {e}", file=sys.stderr)
+                self._file_handle = None
+
             if self._own_network and self.network is not None:
                 try:
                     self.network.stop()
@@ -199,7 +207,7 @@ class SyncRecorder:
                     "payload": p,
                 }
                 self.events.append(event)
-                if self.output_file:
+                if self._file_handle:
                     self._write_event_to_file(event)
                 new_events.append(event)
             return new_events
@@ -231,11 +239,11 @@ class SyncRecorder:
 
     def _write_event_to_file(self, event: dict[str, Any]) -> None:
         """Internal helper to append an event to the output file."""
-        if not self.output_file:
+        if not self._file_handle:
             return
         try:
-            with open(self.output_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event) + "\n")
+            self._file_handle.write(json.dumps(event) + "\n")
+            self._file_handle.flush()
         except Exception as e:
             print(f"[recorder] Failed to write event to file: {e}", file=sys.stderr)
 
