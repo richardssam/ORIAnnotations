@@ -1,0 +1,102 @@
+globals:
+  framerate: 25
+  width: 1920
+  height: 1080
+  output_codec: h264_hq
+  font_size: 30
+  font:
+    darwin: /System/Library/Fonts/Helvetica.ttc
+    linux: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+    win32: C:/Windows/Fonts/arial.ttf
+  vf: scale=in_color_matrix=bt709:out_color_matrix=bt709
+  args:
+    - -color_primaries
+    - bt709
+    - -color_trc
+    - iec61966-2-1
+    - -colorspace
+    - bt709
+
+output_codecs:
+  h264_hq:
+    codec: libx264
+    crf: 18
+    preset: slow
+    pix_fmt: yuv420p10le
+
+metadata:
+  Show Title: "ORIAnnotations Test Media"
+  Vendor Name: "ORI"
+  Notes: "Source: Netflix Chimera (display-ready sRGB PNG)"
+
+dynamic_metadata:
+  enabled: true
+  rules:
+    - target: Shot
+      source: File Name
+      regex: ^([A-Za-z0-9_]+)
+    - target: Version
+      source: File Name
+      regex: (v\d+)
+
+slate:
+  enabled: true
+  thumbnail_enabled: true
+  thumbnail_width: 640
+  thumbnail_x: 1230
+  thumbnail_y: 80
+  fields:
+    Show:
+      text: "{Show Title}"
+      x: 80
+      y: 80
+      font_size: 52
+      align: left
+      max_width: 1100
+      max_height: 0
+    Shot:
+      text: "{Shot}"
+      x: 80
+      y: 180
+      font_size: 72
+      align: left
+      max_width: 1100
+      max_height: 0
+    FrameRange:
+      text: "Frames: {Frame Range}"
+      x: 80
+      y: 320
+      font_size: 36
+      align: left
+      max_width: 1100
+      max_height: 0
+    Date:
+      text: "{Date Delivered}"
+      x: 80
+      y: 400
+      font_size: 30
+      align: left
+      max_width: 1100
+      max_height: 0
+    Notes:
+      text: "{Notes}"
+      x: 80
+      y: 500
+      font_size: 26
+      align: left
+      max_width: 1100
+      max_height: 120
+
+burnins:
+  font_size: 36
+  font_color: white
+  background_color: "black@0.5"
+  layout:
+    lower_left: "{Shot}"
+    lower_center: "{Show Title}"
+    lower_right: "{timecode} {frame}"
+    top_left: "{File Name}"
+    top_right: "{Date Delivered}"
+
+ocio:
+  enabled: false
