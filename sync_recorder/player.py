@@ -33,7 +33,7 @@ class SyncPlayer:
     def __init__(
         self,
         session_id: str = "otio-sync-demo",
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         port: int = 5672,
         network: Any | None = None,
     ) -> None:
@@ -415,7 +415,7 @@ def main() -> None:
     """Entry point for running the player from the command line."""
     p = argparse.ArgumentParser(description="OTIO Sync Session Player")
     p.add_argument("--session", default="otio-sync-demo", help="Session ID to replay to")
-    p.add_argument("--host", default="localhost", help="RabbitMQ host")
+    p.add_argument("--host", default="127.0.0.1", help="RabbitMQ host")
     p.add_argument("--port", type=int, default=5672, help="RabbitMQ port")
     p.add_argument("-i", "--input", required=True, help="Input recording file path")
     p.add_argument(

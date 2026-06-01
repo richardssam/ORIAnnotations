@@ -32,7 +32,7 @@ class SyncRecorder:
     def __init__(
         self,
         session_id: str = "otio-sync-demo",
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         port: int = 5672,
         network: Any | None = None,
         capture_initial_state: bool = True,
@@ -252,7 +252,7 @@ def main() -> None:
     """Entry point for running the recorder from the command line."""
     p = argparse.ArgumentParser(description="OTIO Sync Session Recorder")
     p.add_argument("--session", default="otio-sync-demo", help="Session ID to record")
-    p.add_argument("--host", default="localhost", help="RabbitMQ host")
+    p.add_argument("--host", default="127.0.0.1", help="RabbitMQ host")
     p.add_argument("--port", type=int, default=5672, help="RabbitMQ port")
     p.add_argument("-o", "--output", required=True, help="Output file path (.json or .jsonl)")
     p.add_argument(

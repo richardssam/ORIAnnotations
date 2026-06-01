@@ -176,7 +176,7 @@ def _parse_ori_session(env_val: str) -> tuple:
         (or ``ORI_RMQ_HOST`` if set) when no colon is present.
     :rtype: tuple
     """
-    default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+    default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
     if ":" in env_val:
         host, name = env_val.split(":", 1)
         return (host or default_host, name)
@@ -217,7 +217,7 @@ class ORISyncPlugin(PluginBase):
 
         # ── connection preferences exposed to the UI ───────────────────────
         self.mq_host_attr = self.add_attribute(
-            "MQ Host", "localhost", register_as_preference=True
+            "MQ Host", "127.0.0.1", register_as_preference=True
         )
         self.mq_host_attr.expose_in_ui_attrs_group("ori_sync_conn")
 
@@ -672,7 +672,7 @@ class ORISyncPlugin(PluginBase):
         :returns: ``[True, "Connecting…"]`` immediately.
         :rtype: list
         """
-        host = (data.get("host") or "").strip() or os.environ.get("ORI_RMQ_HOST", "localhost")
+        host = (data.get("host") or "").strip() or os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
         name = (data.get("name") or "").strip()
         if not name:
             return [False, "Session name cannot be empty."]

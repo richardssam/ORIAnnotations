@@ -52,7 +52,7 @@ class RabbitMQNetwork:
 
     def __init__(
         self,
-        host: str = 'localhost',
+        host: str = '127.0.0.1',
         port: int = 5672,
         session_id: str = 'otio-sync-default',
         self_guid: str | None = None,

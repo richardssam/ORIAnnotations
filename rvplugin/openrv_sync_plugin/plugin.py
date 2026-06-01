@@ -126,7 +126,7 @@ def _parse_ori_session(env_val):
         (or ``ORI_RMQ_HOST`` if set) when no colon is present.
     :rtype: tuple
     """
-    default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+    default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
     if ":" in env_val:
         host, name = env_val.split(":", 1)
         return (host or default_host, name)
@@ -2681,7 +2681,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 _log("PySide not available — cannot show session dialog")
                 return None, None
 
-        default_host = os.environ.get("ORI_RMQ_HOST", "localhost")
+        default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
         dlg = QDialog()
         dlg.setWindowTitle(title)
         dlg.setMinimumWidth(360)
