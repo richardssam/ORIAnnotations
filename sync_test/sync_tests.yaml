@@ -28,6 +28,19 @@ tests:
       #- "openrv"
   - name: "add_media"
     recording: "recordings/add_media.jsonl"
+    script_driven: true
     apps:
       - "xstudio"
       - "openrv"
+  - name: "reorder"
+    recording: "recordings/reorder.jsonl"
+    script_driven: true
+    apps:
+      - "xstudio"
+      - "openrv"
+  - name: "xstudio_selects"
+    recording: "recordings/xstudio_selects.jsonl"
+    script_driven: true
+    apps:
+      - "openrv"
+      - "xstudio"
