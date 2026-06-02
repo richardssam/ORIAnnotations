@@ -9,26 +9,56 @@ class InspectionServer:
     A lightweight HTTP server meant to be injected into target applications
     (like XStudio or OpenRV) to expose their true internal state for testing.
     """
-    def __init__(self, port, get_state_callback):
+    def __init__(self, port, get_state_callback, execute_command_callback=None):
         self.port = port
         self.get_state_callback = get_state_callback
+        self.execute_command_callback = execute_command_callback
         self.server = None
         self.thread = None
 
     def start(self):
-        callback = self.get_state_callback
+        get_callback = self.get_state_callback
+        exec_callback = self.execute_command_callback
 
         class Handler(http.server.SimpleHTTPRequestHandler):
             def do_GET(self):
                 if self.path == '/state':
                     try:
-                        state = callback()
+                        state = get_callback()
                         self.send_response(200)
                         self.send_header('Content-type', 'application/json')
                         self.end_headers()
                         self.wfile.write(json.dumps(state).encode('utf-8'))
                     except Exception as e:
                         logging.error(f"Error getting state: {e}")
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        error_res = {"error": str(e)}
+                        self.wfile.write(json.dumps(error_res).encode('utf-8'))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == '/command':
+                    if not exec_callback:
+                        self.send_response(501)
+                        self.end_headers()
+                        return
+                        
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        post_data = self.rfile.read(content_length)
+                        payload = json.loads(post_data.decode('utf-8'))
+                        
+                        result = exec_callback(payload)
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ok", "result": result}).encode('utf-8'))
+                    except Exception as e:
+                        logging.error(f"Error executing command: {e}")
                         self.send_response(500)
                         self.send_header('Content-type', 'application/json')
                         self.end_headers()
@@ -45,7 +75,8 @@ class InspectionServer:
         class ReusableTCPServer(socketserver.TCPServer):
             allow_reuse_address = True
 
-        self.server = ReusableTCPServer(("localhost", self.port), Handler)
+        # Use 127.0.0.1 to avoid IPv6 resolution issues locally
+        self.server = ReusableTCPServer(("127.0.0.1", self.port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         logging.info(f"Inspection server started on port {self.port}")

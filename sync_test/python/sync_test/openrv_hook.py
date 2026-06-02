@@ -62,10 +62,91 @@ def get_openrv_state():
 
     return state
 
+def execute_openrv_command(payload):
+    if rv is None:
+        raise RuntimeError("rv python API not found.")
+        
+    action = payload.get("action")
+    if action == "add_media":
+        url = payload.get("url")
+        rv.commands.addSourceVerbose([url])
+        return {"action": action, "status": "success"}
+        
+    elif action == "set_selection":
+        name = payload.get("name")
+        # First check sequences
+        seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+        for seq_group in seq_groups:
+            try:
+                seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
+                if seq_name == name or name in ["Default Sequence", "Sequence"]:
+                    rv.commands.setViewNode(seq_group)
+                    return {"action": action, "status": "success"}
+            except Exception:
+                if seq_group == name or name in ["Default Sequence", "Sequence"]:
+                    rv.commands.setViewNode(seq_group)
+                    return {"action": action, "status": "success"}
+                    
+        # Then check individual clips (sources)
+        import os
+        for source_group in rv.commands.nodesOfType("RVSourceGroup"):
+            for n in rv.commands.nodesInGroup(source_group):
+                if rv.commands.nodeType(n) == "RVFileSource":
+                    try:
+                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                        base = os.path.basename(path)
+                        stem = os.path.splitext(base)[0]
+                        if base == name or stem == name:
+                            rv.commands.setViewNode(source_group)
+                            return {"action": action, "status": "success"}
+                    except Exception:
+                        pass
+                        
+        raise ValueError(f"Could not find sequence or clip matching name: {name}")
+
+    raise ValueError(f"Unknown action: {action}")
+
 def start_openrv_inspector(http_port):
-    def callback():
-        return get_openrv_state()
+    import queue
+    try:
+        from PySide6 import QtCore
+    except ImportError:
+        from PySide2 import QtCore
+
+    class MainThreadExecutor(QtCore.QObject):
+        execute_signal = QtCore.Signal(object)
+        
+        def __init__(self):
+            super().__init__()
+            self.execute_signal.connect(self.execute)
+            self.q = queue.Queue()
+            
+        def execute(self, func):
+            try:
+                res = func()
+                self.q.put(("ok", res))
+            except Exception as e:
+                self.q.put(("error", e))
+                
+        def run_sync(self, func, timeout=5.0):
+            self.execute_signal.emit(func)
+            try:
+                status, res = self.q.get(timeout=timeout)
+                if status == "error":
+                    raise res
+                return res
+            except queue.Empty:
+                raise RuntimeError("Timeout waiting for main thread execution")
+
+    # This is called from the main thread when the plugin loads/rvpush executes
+    executor = MainThreadExecutor()
+
+    def get_state_callback():
+        return executor.run_sync(get_openrv_state)
+        
+    def execute_callback(payload):
+        return executor.run_sync(lambda: execute_openrv_command(payload))
     
-    server = InspectionServer(http_port, callback)
+    server = InspectionServer(http_port, get_state_callback, execute_command_callback=execute_callback)
     server.start()
     return server

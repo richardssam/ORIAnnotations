@@ -7,6 +7,7 @@ def main():
     parser.add_argument("command", choices=["run"], help="Command to execute")
     parser.add_argument("--config", default="sync_tests.yaml", help="Path to test suite configuration file")
     parser.add_argument("--test", help="Run a specific test by name")
+    parser.add_argument("--script-driven", action="store_true", help="Run the test using script-driven UI commands instead of JSONL replay")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -28,9 +29,9 @@ def main():
             sys.exit(1)
             
         if args.test:
-            success = runner.run_test(args.test)
+            success = runner.run_test(args.test, script_driven=args.script_driven)
         else:
-            success = runner.run_all()
+            success = runner.run_all(script_driven=args.script_driven)
             
         sys.exit(0 if success else 1)
         

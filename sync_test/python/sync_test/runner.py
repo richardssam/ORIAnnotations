@@ -25,13 +25,25 @@ except ImportError:
 
 class TestRunner:
     def __init__(self, config_path="sync_tests.yaml"):
+        self.config_path = config_path
         self.config = SyncTestConfig.from_file(config_path)
 
     def fetch_state(self, port):
-        url = f"http://localhost:{port}/state"
+        url = f"http://127.0.0.1:{port}/state"
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=2.0) as response:
+                data = response.read()
+                return json.loads(data.decode('utf-8'))
+        except Exception as e:
+            return {"error": str(e)}
+
+    def send_command(self, port, payload):
+        url = f"http://127.0.0.1:{port}/command"
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), method='POST')
+            req.add_header('Content-Type', 'application/json')
+            with urllib.request.urlopen(req, timeout=5.0) as response:
                 data = response.read()
                 return json.loads(data.decode('utf-8'))
         except Exception as e:
@@ -62,13 +74,17 @@ class TestRunner:
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
             
-            # Normalize clip names (e.g. "Default Sequence" vs "defaultSequence")
+            # Normalize clip names (e.g. "Default Sequence" vs "defaultSequence" vs "Sequence")
             if s1.get("clip") and s2.get("clip"):
-                c1 = str(s1["clip"]).replace(" ", "").lower()
-                c2 = str(s2["clip"]).replace(" ", "").lower()
+                def normalize(name):
+                    n = str(name).replace(" ", "").lower().replace("sequence", "")
+                    return "" if n == "default" else n
+                    
+                c1 = normalize(s1["clip"])
+                c2 = normalize(s2["clip"])
+                
                 if c1 == c2:
-                    s1["clip"] = c1
-                    s2["clip"] = c1
+                    s1["clip"] = s2["clip"]  # make them identical for comparison
                     
             if s1 != s2:
                 diff_msg = f"Mismatch between {app_names[0]} and {app_names[i]}:\n"
@@ -78,39 +94,51 @@ class TestRunner:
                 
         return True, ""
 
-    def run_test(self, test_name):
+    def run_test(self, test_name, script_driven=False):
         if SyncPlayer is None:
             raise RuntimeError("Cannot import sync_recorder.player.SyncPlayer")
 
         test_data = self.config.get_test(test_name)
         if not test_data:
-            raise ValueError(f"Test '{test_name}' not found in config.")
-
-        recording_path = os.path.join(sync_test_dir, test_data['recording'])
+            logging.error(f"Test '{test_name}' not found in configuration.")
+            return False
+            
+        recording_path = os.path.join(os.path.dirname(self.config_path), test_data['recording'])
         apps = test_data['apps']
+        
+        # Override with test config if the global flag is false
+        script_driven = script_driven or test_data.get('script_driven', False)
         
         logging.info(f"Starting test '{test_name}' with apps: {apps}")
         
         executables = self.config.settings.get('executables', {})
         with AppSpawner(test_name, executables) as spawner:
-            player = SyncPlayer(session_id="otio-sync-demo")
-            player.load_recording(recording_path)
-            logging.info("Starting playback (waiting for peer)...")
-            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=2.0)
-            
-            # Start player ticking in a background thread so it can respond to WHO_IS_MASTER
-            # while apps are launching (since spawner.launch blocks).
-            import threading
+            player = None
+            player_thread = None
             playing_state = {"playing": True}
             
-            def player_thread_func():
-                while playing_state["playing"]:
-                    if not player.tick():
-                        playing_state["playing"] = False
-                    time.sleep(0.01)
-                    
-            player_thread = threading.Thread(target=player_thread_func, daemon=True)
-            player_thread.start()
+            if script_driven:
+                logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")
+                commands = derive_commands_from_recording(recording_path)
+                logging.info(f"Derived {len(commands)} commands.")
+            else:
+                player = SyncPlayer(session_id="otio-sync-demo")
+                player.load_recording(recording_path)
+                logging.info("Starting playback (waiting for peer)...")
+                player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=2.0)
+                
+                # Start player ticking in a background thread so it can respond to WHO_IS_MASTER
+                # while apps are launching (since spawner.launch blocks).
+                import threading
+                
+                def player_thread_func():
+                    while playing_state["playing"]:
+                        if not player.tick():
+                            playing_state["playing"] = False
+                        time.sleep(0.01)
+                        
+                player_thread = threading.Thread(target=player_thread_func, daemon=True)
+                player_thread.start()
             
             app_ports = []
             base_port = 9000
@@ -128,6 +156,23 @@ class TestRunner:
             last_check_time = time.time()
             mismatch_start_time = None
             MAX_DIVERGENCE_TIME = 10.0
+            
+            if script_driven:
+                # Drive the UI by sending the derived commands to the first app
+                driver_app = app_ports[0]
+                logging.info(f"Driving {driver_app[0]} via commands...")
+                for cmd in commands:
+                    logging.info(f"  -> Sending command: {cmd}")
+                    res = self.send_command(driver_app[1], cmd)
+                    if "error" in res:
+                        logging.error(f"Command execution failed: {res['error']}")
+                        failed = True
+                        break
+                    time.sleep(1.0)
+                    
+                logging.info("Command sequence completed. Waiting for convergence...")
+                time.sleep(3.0)
+                playing_state["playing"] = False
             
             while playing_state["playing"]:
                 # Check state occasionally (e.g. every 0.5 seconds)
@@ -161,10 +206,21 @@ class TestRunner:
                             logging.info("✅ States have converged again.")
                             mismatch_start_time = None
                 
-                time.sleep(0.01)
+                time.sleep(0.5)
                 
-            player.stop_playback()
-            player_thread.join(timeout=1.0)
+            if player:
+                player.stop_playback()
+                player_thread.join(timeout=1.0)
+            else:
+                # Script-driven convergence check at the end
+                states = []
+                for name, port in app_ports:
+                    st = self.fetch_state(port)
+                    states.append(st)
+                match, diff = self.compare_states(states, [a[0] for a in app_ports])
+                if not match:
+                    logging.error(f"❌ FAIL: Final state mismatch in test '{test_name}'!\n{diff}")
+                    failed = True
                 
             if failed:
                 logging.error(f"Test '{test_name}' FAILED.")
@@ -173,10 +229,100 @@ class TestRunner:
                 logging.info(f"✅ Test '{test_name}' PASSED.")
                 return True
 
-    def run_all(self):
+    def run_all(self, script_driven=False):
         all_passed = True
         for t in self.config.tests:
-            if not self.run_test(t['name']):
+            if not self.run_test(t['name'], script_driven=script_driven):
                 all_passed = False
                 
         return all_passed
+
+def derive_commands_from_recording(jsonl_path):
+    """
+    Parses an OTIO Sync Session recording and translates it back into high-level
+    commands (e.g., 'add_media', 'set_selection') for script-driven tests.
+    """
+    commands = []
+    guid_to_name = {}
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            try:
+                row = json.loads(line.strip())
+                payload = row.get("payload", {})
+                command_type = payload.get("command")
+                inner = payload.get("payload", {})
+                
+                if command_type == "OTIO_SESSION" and payload.get("event") == "INSERT_CHILD":
+                    child = inner.get("child_data", {})
+                    schema = child.get("OTIO_SCHEMA", "")
+                    name = child.get("name", "")
+                    guid = child.get("metadata", {}).get("sync", {}).get("guid")
+                    if guid and name:
+                        guid_to_name[guid] = name
+                    
+                    if schema.startswith("Clip."):
+                        refs = child.get("media_references", {})
+                        default_ref = refs.get("DEFAULT_MEDIA", {})
+                        if default_ref.get("OTIO_SCHEMA", "").startswith("ExternalReference"):
+                            url = default_ref.get("target_url")
+                            if url:
+                                import os
+                                if url.startswith("file://"):
+                                    abs_url = url.replace("file://localhost", "").replace("file://", "")
+                                elif not os.path.isabs(url):
+                                    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                                    abs_url = os.path.join(repo_root, url)
+                                else:
+                                    abs_url = url
+                                if not any(c.get("action") == "add_media" and c.get("url") == abs_url for c in commands):
+                                    commands.append({"action": "add_media", "url": abs_url})
+                
+                elif command_type == "SESSION" and payload.get("event") == "STATE_SNAPSHOT":
+                    timelines = inner.get("timelines", {})
+                    for tl_guid, tl in timelines.items():
+                        tl_name = tl.get("name", "")
+                        guid_to_name[tl_guid] = tl_name
+                        for track in tl.get("tracks", {}).get("children", []):
+                            for clip in track.get("children", []):
+                                c_guid = clip.get("metadata", {}).get("sync", {}).get("guid")
+                                c_name = clip.get("name", "")
+                                if c_guid and c_name:
+                                    guid_to_name[c_guid] = c_name
+                                    
+                                refs = clip.get("media_references", {})
+                                default_ref = refs.get("DEFAULT_MEDIA", {})
+                                if default_ref.get("OTIO_SCHEMA", "").startswith("ExternalReference"):
+                                    url = default_ref.get("target_url")
+                                    if url:
+                                        import os
+                                        if url.startswith("file://"):
+                                            abs_url = url.replace("file://localhost", "").replace("file://", "")
+                                        elif not os.path.isabs(url):
+                                            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                                            abs_url = os.path.join(repo_root, url)
+                                        else:
+                                            abs_url = url
+                                        if not any(c.get("action") == "add_media" and c.get("url") == abs_url for c in commands):
+                                            commands.append({"action": "add_media", "url": abs_url})
+                                    
+                elif command_type == "PLAYBACK_SETTINGS" and payload.get("event") == "SET":
+                    tl_guid = inner.get("timeline_guid")
+                    if tl_guid:
+                        name = guid_to_name.get(tl_guid)
+                        if name:
+                            last_sel = next((c for c in reversed(commands) if c.get("action") == "set_selection"), None)
+                            if not last_sel or last_sel.get("name") != name:
+                                commands.append({"action": "set_selection", "name": name})
+                                
+                elif command_type == "SELECTION" and payload.get("event") == "SET":
+                    clip_guid = inner.get("clip_guid")
+                    if clip_guid:
+                        name = guid_to_name.get(clip_guid)
+                        if name:
+                            last_sel = next((c for c in reversed(commands) if c.get("action") == "set_selection"), None)
+                            if not last_sel or last_sel.get("name") != name:
+                                commands.append({"action": "set_selection", "name": name})
+                                
+            except Exception:
+                continue
+    return commands
