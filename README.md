@@ -27,18 +27,19 @@ make html
    * [examples/testexport/annotationreview.otio](https://github.com/richardssam/ORIAnnotations/tree/main/examples) is an example OTIO annotation file.
    * [examples/testsession.rv](https://github.com/richardssam/ORIAnnotations/blob/main/examples/testsession.rv) is the rv-session file that was used to generate this file, and the media is in that folder.
 
-## Sample RV plugin exporter/importer
+## Sync Plugins
 
-The directory rvplugin contains a plugin for OpenRV and RV, which allows the user to load a number of clips and export them with their annotations as a custom OTIO file. And similarly be able to reload the OTIO file back into OpenRV re-creating the annotations.
+The toolkit includes plugins that enable real-time synchronization between different review applications using RabbitMQ and OTIO.
 
-The plugin can be loaded using the OpenRV package manager by loading in the [oriannotations.zip](https://github.com/richardssam/ORIAnnotations/blob/main/rvplugin/oriannotations.zip) package.
+* **OpenRV Sync Plugin (`rvplugin/openrv_sync_plugin`)**: Enables OpenRV to join sync sessions, broadcasting and receiving playhead, display, and annotation changes. See the [rvplugin README](rvplugin/openrv_sync_plugin/README.md) for details.
+* **xStudio Sync Plugin (`xstudio_plugin/ori_sync`)**: Enables xStudio to join sync sessions. See the [xStudio plugin README](xstudio_plugin/README.md) for installation and usage.
+* **Legacy OpenRV Exporter/Importer (`rvplugin`)**: Contains a plugin for OpenRV to export and import annotations as custom OTIO files. Load `oriannotations.zip` via the OpenRV package manager.
 
-If you need to rebuild the oriannotations.zip package, the script "makepackage.csh" should re-create the package given the files in the git repo.
+## Sync Tools
 
-## Debugging & State Inspection
+A suite of tools is provided to interact with, record, and test the sync protocol:
 
-For details on connecting to running review instances, configuring ports, and using the active viewport inspection utilities, see the [debug directory README](file:///Users/sam/git/ORIAnnotations/debug/README.md).
-
-## UI Sync Testing
-
-To run automated integration tests that launch real application instances (XStudio, OpenRV) and verify their synchronization states, see the [sync_test directory README](file:///Users/sam/git/ORIAnnotations/sync_test/README.md).
+* **Sync Viewer (`sync_viewer`)**: A lightweight, web-based viewer that joins a sync session as a passive observer to display the live timeline state in the browser. See the [sync_viewer README](sync_viewer/README.md).
+* **Sync Recorder (`sync_recorder`)**: A tool to record live sync session events into JSONL files and replay them later. Useful for debugging and creating test cases. See the [sync_recorder README](sync_recorder/README.md).
+* **UI Sync Testing (`sync_test`)**: An automated end-to-end integration test framework that launches actual application binaries (xStudio, OpenRV) and uses recorded events to verify state synchronization. See the [sync_test README](sync_test/README.md).
+* **Debugging & State Inspection (`debug`)**: Utilities for connecting to running review instances, configuring ports, and inspecting active viewport state. See the [debug README](debug/README.md).
