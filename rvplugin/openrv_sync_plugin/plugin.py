@@ -666,7 +666,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         if not all_paths:
             _log(f"_create_rv_sequence_for_timeline: no media in '{tl.name}'")
-            return
+            # Do not return early; we must create the empty sequence and register its GUID
+            # so that subsequent insert_child broadcasts have a valid target.
 
         # Load any sources not yet present in the RV session.
         already = set(self._path_to_source_group_map())

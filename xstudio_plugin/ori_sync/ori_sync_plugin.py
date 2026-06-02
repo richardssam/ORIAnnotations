@@ -1189,7 +1189,9 @@ class ORISyncPlugin(PluginBase):
             return None
 
         if not media_list:
-            return None
+            # DO NOT return None; we must build and broadcast the empty timeline
+            # so that peers can register the GUID for subsequent insert_child commands.
+            pass
 
         name = getattr(playlist, "name", "Playlist")
         tl = otio.schema.Timeline(name=name)
@@ -2404,6 +2406,11 @@ class ORISyncPlugin(PluginBase):
             tl_guid = str(xs_tl.uuid)
             tl.metadata.setdefault("sync", {})["guid"] = tl_guid
             tl.metadata["xs_playlist_name"] = playlist.name
+            
+            if not any(t.kind == otio.schema.TrackKind.Video for t in tl.tracks):
+                video_track = otio.schema.Track(name="Video", kind=otio.schema.TrackKind.Video)
+                tl.tracks.append(video_track)
+
             import hashlib
             for track_idx, track in enumerate(tl.tracks):
                 track_seed = f"{tl_guid}:{track.kind}:{track_idx}:{track.name}"
