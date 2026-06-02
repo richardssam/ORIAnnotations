@@ -157,10 +157,15 @@ class SyncRecorder:
                 if self._handshake_state == "DISCOVERING":
                     if now - self._handshake_sent_discover > 1.0:
                         self.network.send_payload({
-                            "command": "SESSION",
-                            "event": "WHO_IS_MASTER",
-                            "session_id": self.session_id,
-                            "payload": {"requester_guid": self.network.self_guid}
+                            "session": self.session_id,
+                            "source_guid": self.network.self_guid,
+                            "payload": {
+                                "command_schema": "LiveSession.1",
+                                "command": {
+                                    "event": "WHO_IS_MASTER",
+                                    "payload": {"requester_guid": self.network.self_guid}
+                                }
+                            }
                         })
                         self._handshake_sent_discover = now
                 elif self._handshake_state == "REQUESTING_STATE":
@@ -170,12 +175,17 @@ class SyncRecorder:
                         self._handshake_master = None
                     elif now - self._handshake_sent_request > 2.0:
                         self.network.send_payload({
-                            "command": "SESSION",
-                            "event": "STATE_REQUEST",
-                            "session_id": self.session_id,
+                            "session": self.session_id,
+                            "source_guid": self.network.self_guid,
                             "payload": {
-                                "target_guid": self._handshake_master,
-                                "requester_guid": self.network.self_guid
+                                "command_schema": "LiveSession.1",
+                                "command": {
+                                    "event": "STATE_REQUEST",
+                                    "payload": {
+                                        "target_guid": self._handshake_master,
+                                        "requester_guid": self.network.self_guid
+                                    }
+                                }
                             }
                         })
                         self._handshake_sent_request = now
@@ -183,19 +193,20 @@ class SyncRecorder:
             payloads = self.network.receive_payloads()
             new_events = []
             for p in payloads:
-                cmd = p.get("command")
-                evt = p.get("event")
-                payload_data = p.get("payload", {})
+                inner = p.get("payload", {})
+                cmd = inner.get("command_schema")
+                evt = inner.get("command", {}).get("event")
+                payload_data = inner.get("command", {}).get("payload", {})
 
                 # Update handshake state machine based on received payloads
                 if self.capture_initial_state and not self._snapshot_captured:
-                    if (self._handshake_state == "DISCOVERING" or self._handshake_state == "RECORDING") and cmd == "SESSION" and evt == "I_AM_MASTER":
+                    if (self._handshake_state == "DISCOVERING" or self._handshake_state == "RECORDING") and cmd == "LiveSession.1" and evt == "I_AM_MASTER":
                         self._handshake_master = payload_data.get("master_guid")
                         if self._handshake_master:
                             self._handshake_state = "REQUESTING_STATE"
                             self._handshake_sent_request = 0.0  # Force immediate request
                             self._handshake_state_request_start = now
-                    elif self._handshake_state == "REQUESTING_STATE" and cmd == "SESSION" and evt == "STATE_SNAPSHOT":
+                    elif self._handshake_state == "REQUESTING_STATE" and cmd == "LiveSession.1" and evt == "STATE_SNAPSHOT":
                         if payload_data.get("target_guid") == self.network.self_guid:
                             self._handshake_state = "RECORDING"
                             self._snapshot_captured = True

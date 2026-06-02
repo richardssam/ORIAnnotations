@@ -115,18 +115,16 @@ class SyncManager:
         @self.patcher.on_property_changed
         def _on_local_property_changed(target_uuid: str, path: str, value: Any) -> None:
             if not self._is_syncing and self.network:
-                self.network.send_payload({
-                    "command": "OTIO_SESSION",
-                    "event": "SET_PROPERTY",
-                    "session_id": self.session_id,
-                    "source_guid": self.self_guid,
-                    "payload": {
+                self._send_event(
+                    "OTIO_SESSION_1.0",
+                    "SET_PROPERTY",
+                    {
                         "target_uuid": target_uuid,
                         "path": path,
                         "value": value,
                         "sync_timestamp": time.time(),
-                    },
-                })
+                    }
+                )
 
         self.status: str = STATE_NONE
         self.is_master: bool = False
@@ -335,16 +333,15 @@ class SyncManager:
         tl = self._timelines.get(tl_guid)
         if tl is None:
             return
-        self.network.send_payload({
-            "command": "ADD_TIMELINE",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
+        self._send_event(
+            "TIMELINE_1.0",
+            "ADD_TIMELINE",
+            {
                 "timeline_guid": tl_guid,
                 "timeline": _otio_to_dict(tl),
                 "sync_timestamp": time.time(),
-            },
-        })
+            }
+        )
 
     def broadcast_clip_timeline(self, tl_guid: str) -> None:
         """Broadcast a clip timeline to all peers so they can register its annotation track.
@@ -377,16 +374,15 @@ class SyncManager:
             _log(f"broadcast_timeline_rename: unknown timeline {tl_guid}")
             return
         tl.name = new_name
-        self.network.send_payload({
-            "command": "RENAME_TIMELINE",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
+        self._send_event(
+            "TIMELINE_1.0",
+            "RENAME_TIMELINE",
+            {
                 "timeline_guid": tl_guid,
                 "name": new_name,
                 "sync_timestamp": time.time(),
-            },
-        })
+            }
+        )
 
     def reset_timelines(self) -> None:
         """Clear all registered timelines, the object map, and the active GUID.
@@ -614,6 +610,28 @@ class SyncManager:
             payload["display_state"] = self.display_state
         self._send_session_event("STATE_SNAPSHOT", payload)
 
+
+    def _send_event(
+        self, command_schema: str, event_name: str, payload_data: dict[str, Any]
+    ) -> None:
+        """Wrap *payload_data* in a nested envelope and send it."""
+        if not self.network:
+            return
+        envelope: dict[str, Any] = {
+            "session": self.session_id,
+            "source_guid": self.self_guid,
+            "payload": {
+                "command_schema": command_schema,
+                "command": {
+                    "event": event_name,
+                    "payload": payload_data,
+                }
+            }
+        }
+        if event_name == "I_AM_MASTER":
+            envelope["schema"] = "SYNC_REVIEW_1.0"
+        self.network.send_payload(envelope)
+
     def _send_session_event(
         self, event_name: str, payload_data: dict[str, Any]
     ) -> None:
@@ -622,15 +640,7 @@ class SyncManager:
         :param event_name: Session event type (e.g. ``"WHO_IS_MASTER"``).
         :param payload_data: Event-specific payload dict.
         """
-        if not self.network:
-            return
-        self.network.send_payload({
-            "command": "SESSION",
-            "event": event_name,
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": payload_data,
-        })
+        self._send_event("LiveSession.1", event_name, payload_data)
 
     # ------------------------------------------------------------------
     # Data Mutations
@@ -670,13 +680,11 @@ class SyncManager:
                 f"insert_child broadcasting: parent={parent_uuid} index={index} "
                 f"child={getattr(child_obj, 'name', '?')}"
             )
-            self.network.send_payload({
-                "command": "OTIO_SESSION",
-                "event": "INSERT_CHILD",
-                "session_id": self.session_id,
-                "source_guid": self.self_guid,
-                "payload": payload,
-            })
+            self._send_event(
+                "OTIO_SESSION_1.0",
+                "INSERT_CHILD",
+                payload,
+            )
 
     def broadcast_playback_state(
         self,
@@ -695,13 +703,11 @@ class SyncManager:
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
-        self.network.send_payload({
-            "command": "PLAYBACK_SETTINGS",
-            "event": "SET",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": inner,
-        })
+        self._send_event(
+            "PLAYBACK_SETTINGS_1.0",
+            "SET",
+            inner,
+        )
 
     def broadcast_display_state(self, state_dict: dict[str, Any]) -> None:
         """Broadcast the current display state to all peers and persist it.
@@ -730,13 +736,11 @@ class SyncManager:
             tl.metadata["display_settings"] = {
                 k: v for k, v in inner.items() if k != "sync_timestamp"
             }
-        self.network.send_payload({
-            "command": "DISPLAY_SETTINGS",
-            "event": "SET",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": inner,
-        })
+        self._send_event(
+            "DISPLAY_SETTINGS_1.0",
+            "SET",
+            inner,
+        )
 
     @staticmethod
     def _annotation_track_end(track: otio.schema.Track) -> int:
@@ -996,18 +1000,16 @@ class SyncManager:
             existing.metadata["annotation_commands"].extend(otio_events)
             delta_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
             self._ensure_guid_and_map(delta_clip)
-            self.network.send_payload({
-                "command": "OTIO_SESSION",
-                "event": "INSERT_CHILD",
-                "session_id": self.session_id,
-                "source_guid": self.self_guid,
-                "payload": {
+            self._send_event(
+                "OTIO_SESSION_1.0",
+                "INSERT_CHILD",
+                {
                     "parent_uuid": annotation_track_guid,
                     "index": -1,
                     "child_data": _otio_to_dict(delta_clip),
                     "sync_timestamp": time.time(),
                 },
-            })
+            )
         else:
             # New frame — insert a Gap to reach it (if needed) then the clip.
             track_end = self._annotation_track_end(annotation_track)
@@ -1042,17 +1044,16 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return
-        self.network.send_payload({
-            "command": "PARTIAL_ANNOTATION",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
+        self._send_event(
+            "Annotation.1",
+            "PARTIAL",
+            {
                 "clip_guid": clip_guid,
                 "frame": frame,
                 "fps": fps,
                 "events": [_otio_to_dict(e) if not isinstance(e, dict) else e for e in events],
             },
-        })
+        )
 
     def broadcast_replace_annotation_commands(
         self,
@@ -1086,17 +1087,15 @@ class SyncManager:
 
         clip.metadata["annotation_commands"] = otio_events
 
-        self.network.send_payload({
-            "command": "OTIO_SESSION",
-            "event": "REPLACE_ANNOTATION_COMMANDS",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {
+        self._send_event(
+            "OTIO_SESSION_1.0",
+            "REPLACE_ANNOTATION_COMMANDS",
+            {
                 "annotation_clip_guid": annotation_clip_guid,
                 "commands": [_otio_to_dict(e) for e in otio_events],
                 "sync_timestamp": time.time(),
             },
-        })
+        )
 
     def broadcast_selection(self, clip_guid: str, view_mode: str = "source") -> None:
         """Broadcast the selected clip GUID to all peers.
@@ -1109,13 +1108,11 @@ class SyncManager:
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return
-        self.network.send_payload({
-            "command": "SELECTION",
-            "event": "SET",
-            "session_id": self.session_id,
-            "source_guid": self.self_guid,
-            "payload": {"clip_guid": clip_guid, "view_mode": view_mode, "sync_timestamp": time.time()},
-        })
+        self._send_event(
+            "SELECTION_1.0",
+            "SET",
+            {"clip_guid": clip_guid, "view_mode": view_mode, "sync_timestamp": time.time()},
+        )
 
     def broadcast_move_child(
         self, parent_uuid: str, child_uuid: str, to_index: int
@@ -1141,13 +1138,11 @@ class SyncManager:
 
         payload = self.patcher.move_child(parent_uuid, child_uuid, to_index)
         if payload:
-            self.network.send_payload({
-                "command": "OTIO_SESSION",
-                "event": "MOVE_CHILD",
-                "session_id": self.session_id,
-                "source_guid": self.self_guid,
-                "payload": payload,
-            })
+            self._send_event(
+                "OTIO_SESSION_1.0",
+                "MOVE_CHILD",
+                payload,
+            )
 
     def broadcast_remove_child(self, parent_uuid: str, child_uuid: str) -> None:
         """Remove *child_uuid* from its parent and broadcast the change.
@@ -1163,13 +1158,11 @@ class SyncManager:
         payload = self.patcher.remove_child(parent_uuid, child_uuid)
         if payload:
             _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
-            self.network.send_payload({
-                "command": "OTIO_SESSION",
-                "event": "REMOVE_CHILD",
-                "session_id": self.session_id,
-                "source_guid": self.self_guid,
-                "payload": payload,
-            })
+            self._send_event(
+                "OTIO_SESSION_1.0",
+                "REMOVE_CHILD",
+                payload,
+            )
 
     # ------------------------------------------------------------------
     # Message Handling
@@ -1178,7 +1171,7 @@ class SyncManager:
     def apply_patch(self, payload: dict[str, Any]) -> tuple[str, Any] | None:
         """Apply a single incoming message from the network.
 
-        Dispatches on ``command`` and ``event`` fields.  Returns an
+        Dispatches on ``command_schema`` and ``event`` fields.  Returns an
         ``(action, data)`` tuple when the caller needs to act (e.g. to update RV
         state), or ``None`` when the message was fully handled internally.
 
@@ -1189,23 +1182,27 @@ class SyncManager:
         :param payload: Parsed message envelope received from the network.
         :returns: ``(action_name, action_data)`` or ``None``.
         """
-        command = payload.get("command")
-        event = payload.get("event")
-        data = payload.get("payload", {})
         source = payload.get("source_guid", "unknown")
 
         if source == self.self_guid:
             return None
 
-        _log(f"apply_patch: command={command} event={event} source={source[:8]}")
+        inner_payload = payload.get("payload", {})
+        command_schema = inner_payload.get("command_schema")
+        command_block = inner_payload.get("command", {})
+        
+        event = command_block.get("event")
+        data = command_block.get("payload", {})
 
-        if self.status == STATE_JOINING and command != "SESSION":
+        _log(f"apply_patch: command_schema={command_schema} event={event} source={source[:8]}")
+
+        if self.status == STATE_JOINING and command_schema != "LiveSession.1":
             self._delta_buffer.append(payload)
             return None
 
         self._is_syncing = True
         try:
-            if command == "SESSION":
+            if command_schema == "LiveSession.1":
                 if event == "WHO_IS_MASTER":
                     if self.is_master:
                         self.broadcast_master_response()
@@ -1224,7 +1221,7 @@ class SyncManager:
                     return ("state_snapshot_received", data)
                 return None
 
-            if command == "PLAYBACK_SETTINGS" and event == "SET":
+            if command_schema == "PLAYBACK_SETTINGS_1.0" and event == "SET":
                 self.playback_state = data
                 # Sync active_timeline_guid so passive peers (e.g. the sync
                 # viewer) automatically follow the master when it switches
@@ -1243,7 +1240,7 @@ class SyncManager:
                         _log(f"on_playback_changed callback error: {e}")
                 return ("playback_settings", data)
 
-            if command == "DISPLAY_SETTINGS" and event == "SET":
+            if command_schema == "DISPLAY_SETTINGS_1.0" and event == "SET":
                 self.display_state = data
                 tl = self.root_timeline
                 if tl is not None:
@@ -1257,13 +1254,13 @@ class SyncManager:
                         _log(f"on_display_changed callback error: {e}")
                 return ("display_settings", data)
 
-            if command == "SELECTION" and event == "SET":
+            if command_schema == "SELECTION_1.0" and event == "SET":
                 # Track the clip the master has selected so the sync viewer
                 # can highlight it even when scrubbing is paused.
                 self.selected_clip_guid = data.get("clip_guid") or None
                 return ("selection_changed", data)
 
-            if command == "ADD_TIMELINE":
+            if command_schema == "TIMELINE_1.0" and event == "ADD_TIMELINE":
                 tl_guid = data.get("timeline_guid")
                 tl_dict = data.get("timeline")
                 if tl_guid and tl_dict and tl_guid not in self._timelines:
@@ -1291,7 +1288,7 @@ class SyncManager:
                         return ("add_timeline", tl)
                 return None
 
-            if command == "RENAME_TIMELINE":
+            if command_schema == "TIMELINE_1.0" and event == "RENAME_TIMELINE":
                 tl_guid = data.get("timeline_guid")
                 new_name = data.get("name", "")
                 tl = self._timelines.get(tl_guid)
@@ -1300,10 +1297,10 @@ class SyncManager:
                     _log(f"RENAME_TIMELINE: {tl_guid[:8]} → {new_name!r}")
                 return ("timeline_renamed", data)
 
-            if command == "PARTIAL_ANNOTATION":
+            if command_schema == "Annotation.1" and event == "PARTIAL":
                 return ("partial_annotation", data)
 
-            if command != "OTIO_SESSION":
+            if command_schema != "OTIO_SESSION_1.0":
                 return None
 
             return self.patcher.apply_patch(event, data)

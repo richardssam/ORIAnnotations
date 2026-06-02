@@ -79,11 +79,11 @@ def execute_openrv_command(payload):
         for seq_group in seq_groups:
             try:
                 seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
-                if seq_name == name or name in ["Default Sequence", "Sequence"]:
+                if seq_name == name or name in ["Default Sequence", "Sequence", "Default"]:
                     rv.commands.setViewNode(seq_group)
                     return {"action": action, "status": "success"}
             except Exception:
-                if seq_group == name or name in ["Default Sequence", "Sequence"]:
+                if seq_group == name or name in ["Default Sequence", "Sequence", "Default"]:
                     rv.commands.setViewNode(seq_group)
                     return {"action": action, "status": "success"}
                     

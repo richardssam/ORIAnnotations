@@ -248,11 +248,13 @@ def derive_commands_from_recording(jsonl_path):
         for line in f:
             try:
                 row = json.loads(line.strip())
-                payload = row.get("payload", {})
-                command_type = payload.get("command")
-                inner = payload.get("payload", {})
+                envelope = row.get("payload", {})
+                p = envelope.get("payload", {})
+                command_schema = p.get("command_schema")
+                event = p.get("command", {}).get("event")
+                inner = p.get("command", {}).get("payload", {})
                 
-                if command_type == "OTIO_SESSION" and payload.get("event") == "INSERT_CHILD":
+                if command_schema == "OTIO_SESSION_1.0" and event == "INSERT_CHILD":
                     child = inner.get("child_data", {})
                     schema = child.get("OTIO_SCHEMA", "")
                     name = child.get("name", "")
@@ -277,7 +279,7 @@ def derive_commands_from_recording(jsonl_path):
                                 if not any(c.get("action") == "add_media" and c.get("url") == abs_url for c in commands):
                                     commands.append({"action": "add_media", "url": abs_url})
                 
-                elif command_type == "SESSION" and payload.get("event") == "STATE_SNAPSHOT":
+                elif command_schema == "LiveSession.1" and event == "STATE_SNAPSHOT":
                     timelines = inner.get("timelines", {})
                     for tl_guid, tl in timelines.items():
                         tl_name = tl.get("name", "")
@@ -304,8 +306,8 @@ def derive_commands_from_recording(jsonl_path):
                                             abs_url = url
                                         if not any(c.get("action") == "add_media" and c.get("url") == abs_url for c in commands):
                                             commands.append({"action": "add_media", "url": abs_url})
-                                    
-                elif command_type == "PLAYBACK_SETTINGS" and payload.get("event") == "SET":
+                                            
+                elif command_schema == "PLAYBACK_SETTINGS_1.0" and event == "SET":
                     tl_guid = inner.get("timeline_guid")
                     if tl_guid:
                         name = guid_to_name.get(tl_guid)
@@ -314,9 +316,10 @@ def derive_commands_from_recording(jsonl_path):
                             if not last_sel or last_sel.get("name") != name:
                                 commands.append({"action": "set_selection", "name": name})
                                 
-                elif command_type == "SELECTION" and payload.get("event") == "SET":
-                    clip_guid = inner.get("clip_guid")
-                    if clip_guid:
+                elif command_schema == "SELECTION_1.0" and event == "SET":
+                    selected_guids = inner.get("selected_guids", [])
+                    if selected_guids:
+                        clip_guid = selected_guids[0]
                         name = guid_to_name.get(clip_guid)
                         if name:
                             last_sel = next((c for c in reversed(commands) if c.get("action") == "set_selection"), None)
@@ -326,3 +329,6 @@ def derive_commands_from_recording(jsonl_path):
             except Exception:
                 continue
     return commands
+
+
+

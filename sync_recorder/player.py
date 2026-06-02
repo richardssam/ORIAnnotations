@@ -80,10 +80,11 @@ class SyncPlayer:
                             raise ValueError(
                                 f"Event on line {line_num} is missing required fields"
                             )
-                        p = event.get("payload", {})
-                        if p.get("command") == "SESSION":
-                            if p.get("event") == "STATE_SNAPSHOT":
-                                self._recorded_snapshot = p
+                        envelope = event.get("payload", {})
+                        p = envelope.get("payload", {})
+                        if p.get("command_schema") == "LiveSession.1":
+                            if p.get("command", {}).get("event") == "STATE_SNAPSHOT":
+                                self._recorded_snapshot = envelope
                             continue
                         
                         self.events.append(event)
@@ -302,29 +303,37 @@ class SyncPlayer:
 
         payloads = self.network.receive_payloads()
         for p in payloads:
-            cmd = p.get("command")
-            evt = p.get("event")
-            data = p.get("payload", {})
+            inner = p.get("payload", {})
+            schema = inner.get("command_schema")
+            cmd = inner.get("command", {})
+            evt = cmd.get("event")
+            data = cmd.get("payload", {})
             source = p.get("source_guid")
 
-            if cmd == "SESSION":
+            if schema == "LiveSession.1":
                 if evt == "WHO_IS_MASTER":
                     self.network.send_payload({
-                        "command": "SESSION",
-                        "event": "I_AM_MASTER",
-                        "session_id": self.session_id,
-                        "payload": {"master_guid": self.network.self_guid}
+                        "session": self.session_id,
+                        "source_guid": self.network.self_guid,
+                        "schema": "SYNC_REVIEW_1.0",
+                        "payload": {
+                            "command_schema": "LiveSession.1",
+                            "command": {
+                                "event": "I_AM_MASTER",
+                                "payload": {"master_guid": self.network.self_guid}
+                            }
+                        }
                     })
                 elif evt == "STATE_REQUEST" and data.get("target_guid") == self.network.self_guid:
                     requester = data.get("requester_guid") or source
                     if requester and self._recorded_snapshot:
                         snapshot = copy.deepcopy(self._recorded_snapshot)
-                        snapshot["payload"]["target_guid"] = requester
+                        snapshot["payload"]["command"]["payload"]["target_guid"] = requester
                         current_now = time.time()
                         snapshot = self._update_timestamps(snapshot, current_now)
                         snapshot = self._resolve_target_urls(snapshot)
                         snapshot["source_guid"] = self.network.self_guid
-                        snapshot["session_id"] = self.session_id
+                        snapshot["session"] = self.session_id
                         self.network.send_payload(snapshot)
                         # Record that a peer has loaded state; the peer-join
                         # gate in tick() and play() watches this timestamp.
@@ -350,7 +359,7 @@ class SyncPlayer:
         if replace_source_guid:
             payload["source_guid"] = self.network.self_guid
             
-        payload["session_id"] = self.session_id
+        payload["session"] = self.session_id
 
         self.network.send_payload(payload)
 

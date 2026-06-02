@@ -121,7 +121,7 @@ def execute_xstudio_command(payload, port):
             
             # Check playlists
             for i, pl in enumerate(conn.api.session.playlists):
-                if pl.name == name or (name in ["Default Sequence", "Sequence"] and i == 0):
+                if pl.name == name or (name in ["Default Sequence", "Sequence", "Default"] and i == 0):
                     conn.api.session.set_on_screen_source(pl)
                     return {"action": action, "status": "success"}
                     
