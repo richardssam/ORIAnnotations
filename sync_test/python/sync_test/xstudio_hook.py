@@ -63,9 +63,29 @@ def get_xstudio_state(port=14441):
                 state["clip"] = c.name
                 logging.info(f"Container name: {c.name}")
             
-            # Check if media exists
+            # Check if media exists via active playhead
             state["media_path"] = None
-            state["media_exists"] = True # Default to True so we don't fail if we can't find it
+            state["media_exists"] = False
+            try:
+                from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+                from xstudio.api.session.playhead import Playhead
+                gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+                ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+                if ph_actor:
+                    ph = Playhead(conn, ph_actor)
+                    ms = ph.on_screen_media
+                    if ms:
+                        ms_src = ms.media_source()
+                        if ms_src and ms_src.media_reference:
+                            uri_str = str(ms_src.media_reference.uri())
+                        state["media_path"] = uri_str
+                        if uri_str.startswith("file://"):
+                            local_path = uri_str.replace("file://localhost", "").replace("file://", "")
+                            state["media_exists"] = os.path.exists(local_path)
+                        else:
+                            state["media_exists"] = os.path.exists(uri_str)
+            except Exception as e:
+                logging.debug(f"Could not check playhead media: {e}")
             
         except Exception as e:
             logging.debug(f"Could not read container: {e}")
@@ -133,6 +153,24 @@ def execute_xstudio_command(payload, port):
                         return {"action": action, "status": "success"}
                         
             raise ValueError(f"Could not find sequence or media matching name: {name}")
+
+        elif action == "save_session":
+            path = payload.get("filepath")
+            if not path.startswith("file://"):
+                path = "file://" + path
+            from xstudio.core import URI
+            conn.api.session.save_as(URI(path))
+            return {"action": action, "status": "success"}
+
+        elif action == "delete_media":
+            name = payload.get("name")
+            for pl in conn.api.session.playlists:
+                for m in pl.media:
+                    import os
+                    if m.name == name or os.path.basename(m.name) == name:
+                        pl.remove_media(m)
+                        return {"action": action, "status": "success"}
+            raise ValueError(f"Could not find media matching name: {name}")
 
         raise ValueError(f"Unknown action: {action}")
     except Exception as e:

@@ -21,11 +21,11 @@ media:
     graphic:  "test_media/source/frames/graphic/graphic_ACES2065-1.%08d.exr"
 
 tests:
-  - name: "xstudio_vs_openrv_basic_annotation"
-    recording: "recordings/single_clip_annotation.jsonl"
+  - name: "xstudio_vs_openrv_basic_annotation_notc"
+    recording: "recordings/single_clip_annotation_notc.jsonl"
     apps:
       - "xstudio"
-      #- "openrv"
+      - "openrv"
   - name: "add_media"
     recording: "recordings/add_media_notc.jsonl"
     script_driven: true
@@ -40,7 +40,7 @@ tests:
       - "openrv"
   - name: "reorder_media"
     recording: "recordings/reorder_media_notc.jsonl"
-    script_driven: true
+    script_driven: false
     apps:
       - "xstudio"
       - "openrv"
@@ -56,8 +56,8 @@ tests:
   #  apps:
   #    - "openrv"
   #    - "xstudio"
-  - name: "text_annotations"
-    recording: "recordings/text_annotations.jsonl"
+  - name: "text_annotations_notc"
+    recording: "recordings/text_annotations_notc.jsonl"
     script_driven: false
     apps:
       - "openrv"

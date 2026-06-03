@@ -104,6 +104,28 @@ def execute_openrv_command(payload):
                         
         raise ValueError(f"Could not find sequence or clip matching name: {name}")
 
+    elif action == "save_session":
+        path = payload.get("filepath")
+        rv.commands.saveSession(path)
+        return {"action": action, "status": "success"}
+
+    elif action == "delete_media":
+        name = payload.get("name")
+        import os
+        for source_group in rv.commands.nodesOfType("RVSourceGroup"):
+            for n in rv.commands.nodesInGroup(source_group):
+                if rv.commands.nodeType(n) == "RVFileSource":
+                    try:
+                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                        base = os.path.basename(path)
+                        stem = os.path.splitext(base)[0]
+                        if base == name or stem == name:
+                            rv.commands.deleteNode(source_group)
+                            return {"action": action, "status": "success"}
+                    except Exception:
+                        pass
+        raise ValueError(f"Could not find sequence or clip matching name to delete: {name}")
+
     raise ValueError(f"Unknown action: {action}")
 
 def start_openrv_inspector(http_port):

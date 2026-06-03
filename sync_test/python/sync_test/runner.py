@@ -109,6 +109,9 @@ class TestRunner:
         # Override with test config if the global flag is false
         script_driven = script_driven or test_data.get('script_driven', False)
         
+        print(f"\n{'='*70}")
+        print(f"  ▶ RUNNING TEST: {test_name}")
+        print(f"{'='*70}")
         logging.info(f"Starting test '{test_name}' with apps: {apps}")
         
         executables = self.config.settings.get('executables', {})
@@ -118,9 +121,13 @@ class TestRunner:
             playing_state = {"playing": True}
             
             if script_driven:
-                logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")
-                commands = derive_commands_from_recording(recording_path)
-                logging.info(f"Derived {len(commands)} commands.")
+                if 'commands' in test_data:
+                    logging.info(f"Running in script-driven mode. Using {len(test_data['commands'])} commands from config.")
+                    commands = test_data['commands']
+                else:
+                    logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")
+                    commands = derive_commands_from_recording(recording_path)
+                    logging.info(f"Derived {len(commands)} commands.")
             else:
                 player = SyncPlayer(session_id="otio-sync-demo")
                 player.load_recording(recording_path)
@@ -222,6 +229,20 @@ class TestRunner:
                     logging.error(f"❌ FAIL: Final state mismatch in test '{test_name}'!\n{diff}")
                     failed = True
                 
+            # Save session states
+            for name, port in app_ports:
+                try:
+                    ext = ".xst" if name == "xstudio" else ".rv"
+                    session_file = os.path.join(spawner.logs_dir, f"{name}_{port}{ext}")
+                    session_file = os.path.abspath(session_file)
+                    res = self.send_command(port, {"action": "save_session", "filepath": session_file})
+                    if "error" in res:
+                        logging.error(f"Error saving {name} session: {res['error']}")
+                    else:
+                        logging.info(f"Saved {name} session to {session_file}")
+                except Exception as e:
+                    logging.error(f"Failed to save {name} session: {e}")
+
             if failed:
                 logging.error(f"Test '{test_name}' FAILED.")
                 return False
@@ -230,10 +251,22 @@ class TestRunner:
                 return True
 
     def run_all(self, script_driven=False):
-        all_passed = True
+        results = {}
         for t in self.config.tests:
-            if not self.run_test(t['name'], script_driven=script_driven):
+            test_name = t['name']
+            success = self.run_test(test_name, script_driven=script_driven)
+            results[test_name] = success
+            
+        print("\n" + "="*70)
+        print("  SYNC TEST SUMMARY")
+        print("="*70)
+        all_passed = True
+        for test_name, success in results.items():
+            status = "✅ PASSED" if success else "❌ FAILED"
+            print(f"  {status}  |  {test_name}")
+            if not success:
                 all_passed = False
+        print("="*70 + "\n")
                 
         return all_passed
 
@@ -278,6 +311,13 @@ def derive_commands_from_recording(jsonl_path):
                                     abs_url = url
                                 if not any(c.get("action") == "add_media" and c.get("url") == abs_url for c in commands):
                                     commands.append({"action": "add_media", "url": abs_url})
+
+                elif command_schema == "OTIO_SESSION_1.0" and event == "REMOVE_CHILD":
+                    child_guid = inner.get("child_uuid")
+                    if child_guid:
+                        name = guid_to_name.get(child_guid)
+                        if name:
+                            commands.append({"action": "delete_media", "name": name})
                 
                 elif command_schema == "LiveSession.1" and event == "STATE_SNAPSHOT":
                     timelines = inner.get("timelines", {})
