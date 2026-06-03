@@ -8,11 +8,11 @@ settings:
 # Run that script once before executing tests that reference these paths.
 media:
   encoded:
-    sparks:   "test_media/source/encoded/sparks.mov"
-    laser:    "test_media/source/encoded/laser_ACES_sRGB.mov"
-    car:      "test_media/source/encoded/car_ACES_sRGB.mov"
-    warp:     "test_media/source/encoded/warp_ACES_sRGB.mov"
-    graphic:  "test_media/source/encoded/graphic_ACES_sRGB.mov"
+    sparks:   "test_media/source/encoded_notc/sparks.mov"
+    laser:    "test_media/source/encoded_notc/laser_ACES_sRGB.mov"
+    car:      "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+    warp:     "test_media/source/encoded_notc/warp_ACES_sRGB.mov"
+    graphic:  "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"
   frames:
     sparks:   "test_media/source/frames/sparks/sparks_ACES2065-1.%05d.exr"
     laser:    "test_media/source/frames/laser/laser_ACES2065-1.%08d.exr"
@@ -27,13 +27,19 @@ tests:
       - "xstudio"
       #- "openrv"
   - name: "add_media"
-    recording: "recordings/add_media.jsonl"
+    recording: "recordings/add_media_notc.jsonl"
     script_driven: true
     apps:
       - "xstudio"
       - "openrv"
-  - name: "reorder"
-    recording: "recordings/reorder.jsonl"
+  - name: "delete_media"
+    recording: "recordings/delete_media_notc.jsonl"
+    script_driven: true
+    apps:
+      - "xstudio"
+      - "openrv"
+  - name: "reorder_media"
+    recording: "recordings/reorder_media_notc.jsonl"
     script_driven: true
     apps:
       - "xstudio"
@@ -41,6 +47,18 @@ tests:
   - name: "xstudio_selects"
     recording: "recordings/xstudio_selects.jsonl"
     script_driven: true
+    apps:
+      - "openrv"
+      - "xstudio"
+  #- name: "missing_media"
+  #  recording: "recordings/missing_media.jsonl"
+  #  script_driven: true
+  #  apps:
+  #    - "openrv"
+  #    - "xstudio"
+  - name: "text_annotations"
+    recording: "recordings/text_annotations.jsonl"
+    script_driven: false
     apps:
       - "openrv"
       - "xstudio"
