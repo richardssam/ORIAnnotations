@@ -47,6 +47,7 @@ if os.path.exists(_manifest_file):
         )
 
 import datetime
+from collections import Counter
 import json
 import logging
 import queue
@@ -434,6 +435,11 @@ class ORISyncPlugin(PluginBase):
         # as the media name after add_media(path).
         self._flat_clip_to_media: dict = {}
 
+        # Maps tl_guid → set of media names last seen in xs_playlist.media for
+        # sequence Timelines.  Used by _poll_sequence_new_media to detect deletions:
+        # names present here but absent in the current poll are broadcast as REMOVE_CHILD.
+        self._xs_sequence_media_names: dict[str, set] = {}
+
         # Viewport container tracking state: caches whether the active viewport
         # container is a Playlist or Timeline to avoid synchronous API calls in
         # playhead event handlers.
@@ -451,6 +457,15 @@ class ORISyncPlugin(PluginBase):
         self._timeline_item_lock = threading.Lock()
 
         self._pending_create_check: bool = False
+
+        # Requester GUIDs that sent STATE_REQUEST when we had no timelines yet.
+        # On each poll tick we retry send_state_snapshot until it succeeds.
+        self._pending_snapshot_requesters: list[str] = []
+
+        # Last-observed xStudio track clip name list per sequence timeline.
+        # None = not yet recorded (e.g. just after load_otio); the next poll
+        # records without comparing.  Only the poll AFTER that can detect real deletions.
+        self._xs_sequence_track_names: dict[str, list | None] = {}
 
         # Add session management menu items.
         self.insert_menu_item(
@@ -636,6 +651,7 @@ class ORISyncPlugin(PluginBase):
         self._sync_playlists.clear()
         self._xs_flat_playlists.clear()
         self._xs_sequence_playlists.clear()
+        self._xs_sequence_media_names.clear()
         self._flat_clip_to_media.clear()
         self._timeline_item_sub_ids.clear()
         with self._timeline_item_lock:
@@ -648,6 +664,8 @@ class ORISyncPlugin(PluginBase):
         self._last_pinned_source_mode = None
         self._applying_pinned_mode = False
         self._selection_broadcast_suppress_until = 0.0
+        self._pending_snapshot_requesters.clear()
+        self._xs_sequence_track_names.clear()
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -755,6 +773,7 @@ class ORISyncPlugin(PluginBase):
                     self._timeline_item_dirty.clear()
                 for _tl_guid in _dirty_tl_guids:
                     self._poll_sequence_new_media(only_guid=_tl_guid)
+                    self._poll_sequence_track_deletions(only_guid=_tl_guid)
 
                 now = time.monotonic()
                 if now - self._last_selection_scan >= 0.2:
@@ -765,10 +784,22 @@ class ORISyncPlugin(PluginBase):
                     self._poll_and_broadcast_display()
                     self._last_display_scan = now
 
+                # Retry deferred STATE_SNAPSHOT responses (requests that arrived
+                # before any timelines were registered).
+                if self._pending_snapshot_requesters and self.manager and self.manager._timelines:
+                    for _req_guid in list(self._pending_snapshot_requesters):
+                        _log(f"Deferred snapshot: sending to {_req_guid[:8]}")
+                        self.manager.send_state_snapshot(
+                            _req_guid,
+                            playback_state=self._current_playback_state(),
+                        )
+                    self._pending_snapshot_requesters.clear()
+
                 if now - self._last_flat_playlist_scan >= 0.5:
-                    self._poll_flat_playlist_reorders()
                     self._poll_flat_playlist_new_media()
+                    self._poll_flat_playlist_reorders()
                     self._poll_sequence_new_media()
+                    self._poll_sequence_track_deletions()
                     self._poll_new_playlists()
                     self._poll_playlist_renames()
                     self._last_flat_playlist_scan = now
@@ -813,10 +844,17 @@ class ORISyncPlugin(PluginBase):
             current_display = self._read_xs_display_state()
             self.manager.display_state = current_display
             self._last_display_state = dict(current_display)
-            self.manager.send_state_snapshot(
-                requester_guid,
-                playback_state=self._current_playback_state(),
-            )
+            if self.manager._timelines:
+                self.manager.send_state_snapshot(
+                    requester_guid,
+                    playback_state=self._current_playback_state(),
+                )
+            else:
+                # No timelines yet (session still loading) — defer until the
+                # poll loop has built and registered them.
+                _log(f"No timelines yet — deferring snapshot for {requester_guid[:8]}")
+                if requester_guid not in self._pending_snapshot_requesters:
+                    self._pending_snapshot_requesters.append(requester_guid)
 
         elif action == "partial_annotation":
             self._apply_partial_annotation_xs(data)
@@ -847,6 +885,9 @@ class ORISyncPlugin(PluginBase):
 
         elif action == "move_child":
             self._apply_remote_move_child(data)
+
+        elif action == "remove_child":
+            self._apply_remote_remove_child(data)
 
         elif action == "display_settings":
             self._apply_display_state(data)
@@ -1028,6 +1069,7 @@ class ORISyncPlugin(PluginBase):
                     xs_timeline = playlist.create_timeline(timeline_name)[1]
                     otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
+                    self._xs_sequence_track_names[guid] = None
                     self._sync_playlists[guid] = (playlist, xs_timeline)
                     # Register in _xs_sequence_playlists so _poll_sequence_new_media
                     # can detect clips added by the local user (even as a client).
@@ -1051,6 +1093,10 @@ class ORISyncPlugin(PluginBase):
                     except Exception:
                         pass
                     self._xs_sequence_playlists[guid] = (playlist, xs_timeline, _known)
+                    try:
+                        self._xs_sequence_media_names[guid] = {m.name for m in playlist.media}
+                    except Exception:
+                        self._xs_sequence_media_names[guid] = set()
                     # Record the OTIO Media-track clip-GUID order so move_children
                     # calls can find the current index without querying xStudio clip actors.
                     media_track = next(
@@ -1158,6 +1204,10 @@ class ORISyncPlugin(PluginBase):
                             pass
                         self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_seq)
                         self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                        try:
+                            self._xs_sequence_media_names[tl_guid] = {m.name for m in playlist.media}
+                        except Exception:
+                            self._xs_sequence_media_names[tl_guid] = set()
                         self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     except Exception:
                         _log_exc(f"Could not export Timeline {getattr(xs_tl, 'name', '?')!r}")
@@ -2335,12 +2385,11 @@ class ORISyncPlugin(PluginBase):
                     break
 
     def _poll_flat_playlist_new_media(self) -> None:
-        """Detect and broadcast media items added to flat Playlists.
+        """Detect and broadcast media additions and deletions in flat Playlists.
 
-        Runs on both master and client.  Compares the current media count
-        against the stored order; when new items are found it builds OTIO Clips
-        from their media references and calls ``manager.insert_child`` so all
-        peers receive the new clip via INSERT_CHILD.
+        Runs on both master and client.  Compares the current media list
+        against the stored order; broadcasts INSERT_CHILD for additions and
+        REMOVE_CHILD for deletions so all peers stay in sync.
         """
         if not self.manager:
             return
@@ -2350,7 +2399,9 @@ class ORISyncPlugin(PluginBase):
                 current_media = xs_playlist.media
             except Exception:
                 continue
-            if len(current_media) <= len(stored_order):
+
+            current_order = [m.name for m in current_media]
+            if current_order == stored_order:
                 continue
 
             otio_tl = self.manager.timelines.get(tl_guid)
@@ -2366,11 +2417,23 @@ class ORISyncPlugin(PluginBase):
                 continue
 
             stored_names = set(stored_order)
-            current_order = [m.name for m in current_media]
+            current_names = set(current_order)
+
+            # Broadcast removals first so the OTIO track stays consistent when
+            # inserts arrive immediately after (e.g. replace = delete + add).
+            removed_names = stored_names - current_names
+            if removed_names:
+                for clip in list(video_track):
+                    if isinstance(clip, otio.schema.Clip) and clip.name in removed_names:
+                        child_guid = clip.metadata.get("sync", {}).get("guid")
+                        if child_guid:
+                            self.manager.broadcast_remove_child(track_guid, child_guid)
+                            _log(f"flat playlist deleted media: {clip.name!r} removed")
+
+            # Broadcast additions.
             for media in current_media:
                 if media.name in stored_names:
                     continue
-                # New media item — build an OTIO Clip and broadcast.
                 try:
                     ms = media.media_source()
                     uri = str(ms.media_reference.uri())
@@ -2537,6 +2600,10 @@ class ORISyncPlugin(PluginBase):
                         pass
                     self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_np)
                     self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                    try:
+                        self._xs_sequence_media_names[tl_guid] = {m.name for m in playlist.media}
+                    except Exception:
+                        self._xs_sequence_media_names[tl_guid] = set()
                     self._subscribe_timeline_item_events(tl_guid, xs_tl)
                     self.manager.broadcast_add_timeline(tl_guid)
                     _log(
@@ -2629,6 +2696,25 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 continue
 
+            current_media_name_set = {m.name for m in current_media}
+
+            # --- Deletions: broadcast REMOVE_CHILD for media removed from the bin ---
+            prev_media_names = self._xs_sequence_media_names.get(tl_guid, set())
+            removed_media_names = prev_media_names - current_media_name_set
+            if removed_media_names:
+                removed_basenames = {os.path.basename(n) for n in removed_media_names}
+                for clip in list(video_track):
+                    if not isinstance(clip, otio.schema.Clip):
+                        continue
+                    if clip.name in removed_media_names or clip.name in removed_basenames:
+                        child_guid = clip.metadata.get("sync", {}).get("guid")
+                        if child_guid:
+                            self.manager.broadcast_remove_child(track_guid, child_guid)
+                            _log(f"sequence deleted media: {clip.name!r} removed")
+                            known_names = known_names - {clip.name}
+            self._xs_sequence_media_names[tl_guid] = current_media_name_set
+
+            # --- Additions ---
             for media in current_media:
                 if media.name in known_names:
                     continue
@@ -2679,6 +2765,100 @@ class ORISyncPlugin(PluginBase):
                     _log_exc(f"sequence new media: failed for {media.name!r}")
 
             self._xs_sequence_playlists[tl_guid] = (xs_playlist, xs_tl, known_names)
+
+    def _poll_sequence_track_deletions(self, only_guid: str | None = None) -> None:
+        """Detect clips removed from xStudio sequence Timeline tracks and broadcast REMOVE_CHILD.
+
+        Removing a clip from an xStudio Timeline track does NOT remove the media
+        from the playlist bin, so _poll_sequence_new_media (which watches the bin)
+        misses these deletions.  This method compares the live xStudio track clip
+        names against the OTIO manager track and broadcasts REMOVE_CHILD for any
+        clip that has disappeared from xStudio but still exists in the OTIO state.
+
+        :param only_guid: When set, only checks the named timeline (used by the
+            event-driven path after an item_atom fires).
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+
+        items = list(self._xs_sequence_playlists.items())
+        if only_guid is not None:
+            items = [(g, v) for g, v in items if g == only_guid]
+
+        for tl_guid, tl_entry in items:
+            xs_tl = tl_entry[1]
+            if xs_tl is None:
+                continue
+            otio_tl = self.manager.timelines.get(tl_guid)
+            if otio_tl is None:
+                continue
+            video_track = next(
+                (t for t in otio_tl.tracks
+                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                next(
+                    (t for t in otio_tl.tracks
+                     if t.kind == otio.schema.TrackKind.Video),
+                    None,
+                ),
+            )
+            if video_track is None:
+                continue
+            track_guid = video_track.metadata.get("sync", {}).get("guid")
+            if not track_guid:
+                continue
+
+            # Read live clip names by re-serialising the xStudio timeline to OTIO.
+            # to_otio_string() returns MissingReference for media but preserves clip
+            # names, which is all we need for deletion detection.
+            try:
+                xs_otio_str = xs_tl.to_otio_string()
+                xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
+                xs_video_track = next(
+                    (t for t in xs_tl_parsed.tracks
+                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                    next(
+                        (t for t in xs_tl_parsed.tracks
+                         if t.kind == otio.schema.TrackKind.Video),
+                        None,
+                    ),
+                )
+                xs_clip_names = (
+                    [c.name for c in xs_video_track if isinstance(c, otio.schema.Clip)]
+                    if xs_video_track is not None else []
+                )
+            except Exception:
+                _log_exc(f"_poll_sequence_track_deletions: to_otio_string failed for {tl_guid[:8]}")
+                continue
+
+            _log(f"track_deletions {tl_guid[:8]}: xs={xs_clip_names} stored={self._xs_sequence_track_names.get(tl_guid)}")
+
+            stored = self._xs_sequence_track_names.get(tl_guid)
+            if stored is None:
+                # First observation — record baseline and skip comparison.
+                _log(f"track_deletions {tl_guid[:8]}: first observation, baseline={xs_clip_names}")
+                self._xs_sequence_track_names[tl_guid] = xs_clip_names
+                continue
+
+            if xs_clip_names == stored:
+                continue
+
+            # Diff: names in stored but gone from current → deleted.
+            stored_counts = Counter(stored)
+            current_counts = Counter(xs_clip_names)
+            for clip_name, count in stored_counts.items():
+                removed = count - current_counts.get(clip_name, 0)
+                for _ in range(removed):
+                    # Find the OTIO clip with this name to get its GUID.
+                    for otio_clip in list(video_track):
+                        if (isinstance(otio_clip, otio.schema.Clip)
+                                and otio_clip.name == clip_name):
+                            child_guid = otio_clip.metadata.get("sync", {}).get("guid")
+                            if child_guid:
+                                self.manager.broadcast_remove_child(track_guid, child_guid)
+                                _log(f"sequence track: deleted {clip_name!r} from xStudio timeline")
+                            break
+
+            self._xs_sequence_track_names[tl_guid] = xs_clip_names
 
     def _apply_remote_clip_insert(self, clip_obj: "otio.schema.Clip") -> None:
         """Route a received non-annotation INSERT_CHILD clip to the right handler.
@@ -4017,6 +4197,7 @@ class ORISyncPlugin(PluginBase):
             self._fill_source_ranges(otio_tl)
             otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
             self._reload_suppress_until = time.monotonic() + 2.0
+            self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
             try:
                 self.connection.api.session.set_on_screen_source(xs_timeline)
@@ -4026,6 +4207,110 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             self._reload_suppress_until = 0.0
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")
+
+    def _apply_remote_remove_child(self, data: dict) -> None:
+        """Apply a REMOVE_CHILD event from a remote peer to the local xStudio session.
+
+        The manager has already removed the clip from the OTIO track before this
+        is called.
+
+        * **Flat playlists**: removes the media from the playlist bin using the
+          ``_flat_clip_to_media`` mapping, then refreshes the stored name list so
+          the next poll tick does not re-broadcast the removal.
+        * **Sequence timelines**: reloads the updated OTIO via ``load_otio(clear=True)``
+          (the same approach used for INSERT_CHILD and MOVE_CHILD).  The media item
+          is left in the playlist bin so the user can re-add it if needed.
+
+        :param data: Payload dict with keys ``parent_uuid`` and ``child_uuid``.
+        """
+        parent_uuid = data.get("parent_uuid")
+        child_uuid = data.get("child_uuid")
+        if not parent_uuid or not child_uuid:
+            return
+
+        # Identify the owning timeline by its track GUID.
+        tl_guid = None
+        for guid, tl in self.manager.timelines.items():
+            for track in tl.tracks:
+                if track.metadata.get("sync", {}).get("guid") == parent_uuid:
+                    tl_guid = guid
+                    break
+            if tl_guid:
+                break
+
+        if tl_guid is None:
+            _log(f"remote remove_child: no timeline for track {parent_uuid[:8]}")
+            return
+
+        playlist_tuple = self._sync_playlists.get(tl_guid)
+        if playlist_tuple is None:
+            _log(f"remote remove_child: no xStudio playlist for timeline {tl_guid[:8]}")
+            return
+        xs_playlist, xs_timeline = playlist_tuple
+
+        otio_tl = self.manager.timelines.get(tl_guid)
+
+        # --- Flat playlist: remove the media object from the bin ---
+        if xs_timeline is None or (otio_tl and otio_tl.metadata.get("xs_flat_playlist")):
+            media_obj = self._flat_clip_to_media.pop(child_uuid, None)
+            if media_obj is not None:
+                try:
+                    xs_playlist.remove_media(media_obj)
+                    _log(f"remote remove_child: removed media {child_uuid[:8]} from flat playlist")
+                except Exception:
+                    _log_exc(f"remote remove_child: remove_media failed for {child_uuid[:8]}")
+            else:
+                _log(f"remote remove_child: media not found for child_guid={child_uuid[:8]}")
+            # Refresh stored order so the next poll does not re-fire.
+            if tl_guid in self._xs_flat_playlists:
+                try:
+                    cur_pl, _ = self._xs_flat_playlists[tl_guid]
+                    self._xs_flat_playlists[tl_guid] = (cur_pl, [m.name for m in xs_playlist.media])
+                except Exception:
+                    pass
+            return
+
+        # --- Sequence timeline: reload OTIO to reflect the removal ---
+        if otio_tl is None:
+            return
+        try:
+            self._fill_source_ranges(otio_tl)
+            otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+            self._reload_suppress_until = time.monotonic() + 2.0
+            self._xs_sequence_track_names[tl_guid] = None
+            xs_timeline.load_otio(otio_str, clear=True)
+            _log(f"remote remove_child: reloaded sequence timeline {tl_guid[:8]}")
+            try:
+                self.connection.api.session.set_on_screen_source(xs_timeline)
+            except Exception:
+                pass
+        except Exception:
+            self._reload_suppress_until = 0.0
+            _log_exc(f"remote remove_child: reload failed for timeline {tl_guid[:8]}")
+            return
+
+        # Sync known_names and media-name tracking so the next poll does not
+        # re-detect the now-absent media as a deletion and re-broadcast it.
+        if tl_guid in self._xs_sequence_playlists:
+            try:
+                _sq_pl, _sq_tl, _ = self._xs_sequence_playlists[tl_guid]
+                current_names: set = set()
+                for _t in otio_tl.tracks:
+                    for _c in _t:
+                        if isinstance(_c, otio.schema.Clip):
+                            current_names.add(_c.name)
+                try:
+                    current_names |= {m.name for m in xs_playlist.media}
+                except Exception:
+                    pass
+                self._xs_sequence_playlists[tl_guid] = (_sq_pl, _sq_tl, current_names)
+            except Exception:
+                pass
+        if tl_guid in self._xs_sequence_media_names:
+            try:
+                self._xs_sequence_media_names[tl_guid] = {m.name for m in xs_playlist.media}
+            except Exception:
+                pass
 
     def _apply_remote_move_child(self, data: dict) -> None:
         """Reorder a media clip in the xStudio timeline to match a remote MOVE_CHILD event.
@@ -4090,6 +4375,7 @@ class ORISyncPlugin(PluginBase):
             # Suppress show_atom bursts that xStudio fires when it re-triggers
             # existing bookmarks after the timeline is rebuilt.
             self._reload_suppress_until = time.monotonic() + 2.0
+            self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
             # Re-activate the timeline in the UI — load_otio does not restore
             # the viewed source automatically.

@@ -30,13 +30,9 @@ class SyncTestConfig:
                 logging.warning("Skipping test with missing 'name' or 'recording'")
                 continue
                 
-            script_driven = t.get('script_driven', False)
-                
             parsed_tests.append({
-                "name": name,
-                "recording": recording,
-                "apps": apps,
-                "script_driven": script_driven
+                **t,
+                "script_driven": t.get('script_driven', False),
             })
             
         return cls(tests=parsed_tests, settings=settings)

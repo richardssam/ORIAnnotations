@@ -23,9 +23,33 @@ def get_openrv_state():
         state["frame"] = rv.commands.frame()
         state["playing"] = rv.commands.isPlaying()
         
-        # Get the currently viewed node (could be a sequence or a source)
+        # Report the first non-empty sequence's human-readable name regardless
+        # of what RV's view node is.  After addSource or a SELECTION event RV
+        # often switches the view to a raw source-group node ("sourceGroup000000"),
+        # but xStudio always reports its playlist/timeline name ("Default").
+        # Anchoring both sides to the sequence level makes the comparison robust.
         view_node = rv.commands.viewNode()
-        state["clip"] = view_node
+        clip_name = None
+        try:
+            seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+            logging.debug(f"get_openrv_state: viewNode={view_node!r} seqGroups={seq_groups}")
+            for seq_grp in seq_groups:
+                try:
+                    conns = rv.commands.nodeConnections(seq_grp)
+                    inputs = list(conns[0]) if conns and conns[0] else []
+                except Exception:
+                    inputs = []
+                if not inputs:
+                    continue
+                try:
+                    clip_name = rv.commands.getStringProperty(f"{seq_grp}.ui.name")[0]
+                except Exception:
+                    clip_name = seq_grp
+                logging.debug(f"get_openrv_state: using seq={seq_grp!r} ui.name={clip_name!r}")
+                break
+        except Exception as e:
+            logging.error(f"get_openrv_state: clip lookup failed: {e}", exc_info=True)
+        state["clip"] = clip_name if clip_name else view_node
         
         state["media_path"] = None
         state["media_exists"] = False
@@ -70,6 +94,17 @@ def execute_openrv_command(payload):
     if action == "add_media":
         url = payload.get("url")
         rv.commands.addSourceVerbose([url])
+        # Switch view to the first sequence that has sources so the state
+        # comparison sees a sequence name rather than a raw source-group node.
+        for seq_grp in rv.commands.nodesOfType("RVSequenceGroup"):
+            try:
+                conns = rv.commands.nodeConnections(seq_grp)
+                has_inputs = conns and conns[0]
+            except Exception:
+                has_inputs = False
+            if has_inputs:
+                rv.commands.setViewNode(seq_grp)
+                break
         return {"action": action, "status": "success"}
         
     elif action == "set_selection":
@@ -128,6 +163,22 @@ def execute_openrv_command(payload):
 
     raise ValueError(f"Unknown action: {action}")
 
+
+def _execute_openrv_command_inner(payload):
+    """Thin wrapper so execute_openrv_command can catch and log all errors."""
+    return execute_openrv_command(payload)
+
+
+# Public entry-point used by start_openrv_inspector; mirrors execute_xstudio_command
+# in that it never raises — exceptions are returned as error dicts so the inspector
+# returns HTTP 200 with a status/error payload instead of an opaque 500.
+def execute_openrv_command_safe(payload):
+    try:
+        return execute_openrv_command(payload)
+    except Exception as e:
+        logging.error(f"execute_openrv_command failed: {e}", exc_info=True)
+        return {"action": payload.get("action"), "status": "error", "error": str(e)}
+
 def start_openrv_inspector(http_port):
     import queue
     try:
@@ -167,7 +218,9 @@ def start_openrv_inspector(http_port):
         return executor.run_sync(get_openrv_state)
         
     def execute_callback(payload):
-        return executor.run_sync(lambda: execute_openrv_command(payload))
+        # Use a longer timeout for commands that load media (addSourceVerbose can
+        # take several seconds on first load).
+        return executor.run_sync(lambda: execute_openrv_command_safe(payload), timeout=30.0)
     
     server = InspectionServer(http_port, get_state_callback, execute_command_callback=execute_callback)
     server.start()

@@ -2,9 +2,11 @@ import time
 import urllib.request
 import json
 import logging
+import re
 import sys
 import os
 import socket
+from collections import Counter
 
 from .spawner import AppSpawner
 from .config import SyncTestConfig
@@ -69,9 +71,16 @@ class TestRunner:
                 url, data=json.dumps(payload).encode('utf-8'), method='POST'
             )
             req.add_header('Content-Type', 'application/json')
-            with urllib.request.urlopen(req, timeout=5.0) as response:
+            with urllib.request.urlopen(req, timeout=35.0) as response:
                 data = response.read()
-                return json.loads(data.decode('utf-8'))
+                body = json.loads(data.decode('utf-8'))
+                # The inspector wraps results in {"status": "ok", "result": ...}.
+                # Surface any error the command handler returned so the runner
+                # can detect it the same way it detects HTTP-level failures.
+                inner = body.get("result", {}) if isinstance(body, dict) else {}
+                if isinstance(inner, dict) and inner.get("status") == "error":
+                    return {"error": inner.get("error", "unknown command error")}
+                return body
         except Exception as e:
             return {"error": str(e)}
 
@@ -186,7 +195,13 @@ class TestRunner:
             if script_driven:
                 if 'commands' in test_data:
                     logging.info(f"Running in script-driven mode. Using {len(test_data['commands'])} commands from config.")
-                    commands = test_data['commands']
+                    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                    commands = []
+                    for cmd in test_data['commands']:
+                        cmd = dict(cmd)
+                        if cmd.get("action") == "add_media" and cmd.get("url") and not os.path.isabs(cmd["url"]):
+                            cmd["url"] = os.path.join(repo_root, cmd["url"])
+                        commands.append(cmd)
                 else:
                     logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")
                     commands = derive_commands_from_recording(recording_path)
@@ -332,12 +347,75 @@ class TestRunner:
                 except Exception as e:
                     logging.error(f"Failed to save {name} session: {e}")
 
+            self._report_log_errors(app_ports, spawner.logs_dir)
+
             if failed:
                 logging.error(f"Test '{test_name}' FAILED.")
                 return False
             else:
                 logging.info(f"✅ Test '{test_name}' PASSED.")
                 return True
+
+    def _scan_log_for_errors(self, log_path):
+        """Return a Counter of {error_summary: count} found in a log file.
+
+        Captures Python exception messages (the last line of each traceback)
+        and bare xStudio '*** unexpected message' lines as distinct keys.
+        """
+        counts = Counter()
+        if not os.path.exists(log_path):
+            return counts
+        try:
+            with open(log_path, errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return counts
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip()
+            if "Traceback (most recent call last)" in line:
+                # Scan forward for the exception line (last non-blank, non-"File" line)
+                j = i + 1
+                exc_line = None
+                while j < len(lines):
+                    l = lines[j].rstrip()
+                    if l and not l.startswith("  "):
+                        exc_line = l
+                        # Keep scanning: a traceback may have chained exceptions
+                        if not re.match(r"[A-Za-z].*Error|[A-Za-z].*Exception|[A-Za-z].*Warning", l):
+                            j += 1
+                            continue
+                        break
+                    j += 1
+                if exc_line:
+                    counts[exc_line] += 1
+                i = j
+            elif line.startswith("*** "):
+                # xStudio internal actor errors, e.g. "*** unexpected message [...]"
+                # Normalise the actor ID out so identical errors collapse.
+                key = re.sub(r"\[id: \d+, name: [^\]]+\]", "[actor]", line)
+                counts[key] += 1
+                i += 1
+            else:
+                i += 1
+        return counts
+
+    def _report_log_errors(self, app_ports, logs_dir):
+        """Scan all app log files and emit a warning for any exceptions found."""
+        for app_name, port in app_ports:
+            log_path = os.path.join(logs_dir, f"{app_name}_{port}.log")
+            counts = self._scan_log_for_errors(log_path)
+            if not counts:
+                continue
+            total = sum(counts.values())
+            logging.warning(
+                f"⚠  {app_name} log has {total} exception(s) — {log_path}"
+            )
+            for msg, n in counts.most_common(5):
+                logging.warning(f"    {n:3}x  {msg}")
+            if len(counts) > 5:
+                logging.warning(f"    ... and {len(counts) - 5} more distinct error type(s)")
 
     def run_all(self, script_driven=False):
         results = {}

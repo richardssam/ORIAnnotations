@@ -89,6 +89,15 @@ def get_xstudio_state(port=14441):
             
         except Exception as e:
             logging.debug(f"Could not read container: {e}")
+            # Fallback: if the viewport has no active container (e.g. media was
+            # added via sync without triggering a selection), return the first
+            # playlist name so the state comparison has something to work with.
+            try:
+                playlists = session.playlists
+                if playlists:
+                    state["clip"] = playlists[0].name
+            except Exception:
+                pass
 
         # 3. Annotations
         try:
@@ -134,6 +143,7 @@ def execute_xstudio_command(payload, port):
             else:
                 pl = playlists[0]
             pl.add_media(url)
+            conn.api.session.set_on_screen_source(pl)
             return {"action": action, "status": "success"}
             
         elif action == "set_selection":

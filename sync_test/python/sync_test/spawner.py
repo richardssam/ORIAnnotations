@@ -102,6 +102,7 @@ class AppSpawner:
             plugin_log_path = os.path.join(self.logs_dir, f"openrv_plugin.log")
             env["RV_OTIO_SYNC_LOG_FILE"] = plugin_log_path
             env["ORI_SESSION"] = "otio-sync-demo"
+            env["RV_NO_CONSOLE_REDIRECT"] = "1"
             
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             self.processes.append((app_name, p))

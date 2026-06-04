@@ -32,9 +32,43 @@ tests:
     apps:
       - "xstudio"
       - "openrv"
-  - name: "delete_media"
+  - name: "delete_media_openrv_noscript"
     recording: "recordings/delete_media_notc.jsonl"
+    script_driven: false
+    apps:
+      - "openrv"
+      - "openrv"
+  - name: "delete_media_openrv"
+    #recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"
+      - action: 'set_selection'
+        name: "car_ACES_sRGB.mov"
+      - action: "delete_media"
+        name: "graphic_ACES_sRGB.mov"
+      - action: 'set_selection'
+        name: "car_ACES_sRGB.mov"
+    apps:
+      - "openrv"
+      - "openrv"
+  - name: "delete_media_xstudio"
+    #recording: "recordings/delete_media_notc.jsonl"
+    script_driven: true
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"
+      - action: 'set_selection'
+        name: "car_ACES_sRGB.mov"
+      - action: "delete_media"
+        name: "graphic_ACES_sRGB.mov"
+      - action: 'set_selection'
+        name: "car_ACES_sRGB.mov"
     apps:
       - "xstudio"
       - "openrv"

@@ -148,6 +148,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._active_media_track_guid = None
         self._rv_node_to_timeline_guid = {}  # RV node name → timeline GUID
         self._sequence_input_order = {}      # RV node name → [source_group, ...]
+        self._sg_to_path_cache = {}          # source_group → media path (survives deletion)
         self._timer = None
         self._last_broadcast_frame = -1
         self._last_selection = []
@@ -303,6 +304,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if self.sync_manager:
             self.sync_manager.close()
             self.sync_manager = None
+        self._sg_to_path_cache.clear()
         self._current_session_name = None
         self._current_host = None
         self._pending_create_check = False
@@ -360,6 +362,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.sync_manager.reset_timelines()
         self._rv_node_to_timeline_guid.clear()
         self._sequence_input_order.clear()
+        self._sg_to_path_cache.clear()
         self._active_media_track_guid = None
         self._track = None
 
@@ -486,13 +489,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 seq_name = seq_group
 
             timeline = otio.schema.Timeline(seq_name)
-            stack = otio.schema.Stack("tracks")
-            timeline.tracks = stack
+            timeline.tracks = otio.schema.Stack("tracks")
 
             media_track = otio.schema.Track("Media")
-            stack.append(media_track)
+            timeline.tracks.append(media_track)
             annotations_track = otio.schema.Track("Annotations")
-            stack.append(annotations_track)
+            timeline.tracks.append(annotations_track)
+            _log(f"init tracks for {seq_group}: {[t.name for t in timeline.tracks]}")
 
             edl_counts = self._edl_frame_counts(seq_group)
             _log(f"EDL frame counts for {seq_group}: {edl_counts}")
@@ -527,13 +530,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _init_single_timeline(self, fps):
         """Fallback: one timeline containing all open RVFileSource nodes."""
         timeline = otio.schema.Timeline("Sync Demo Timeline")
-        stack = otio.schema.Stack("tracks")
-        timeline.tracks = stack
+        timeline.tracks = otio.schema.Stack("tracks")
 
         media_track = otio.schema.Track("Media")
-        stack.append(media_track)
+        timeline.tracks.append(media_track)
         annotations_track = otio.schema.Track("Annotations")
-        stack.append(annotations_track)
+        timeline.tracks.append(annotations_track)
 
         for source_node in rv.commands.nodesOfType("RVFileSource"):
             clip = self._make_clip(source_node, fps)
@@ -585,12 +587,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             except Exception:
                 seq_name = seq_group
             timeline = otio.schema.Timeline(seq_name)
-            stack = otio.schema.Stack("tracks")
-            timeline.tracks = stack
+            timeline.tracks = otio.schema.Stack("tracks")
             media_track = otio.schema.Track("Media")
-            stack.append(media_track)
+            timeline.tracks.append(media_track)
             ann_track = otio.schema.Track("Annotations")
-            stack.append(ann_track)
+            timeline.tracks.append(ann_track)
             seq_sources = self._source_groups_for_sequences([seq_group])
             edl_counts = self._edl_frame_counts(seq_group)
             for idx, sg in enumerate(seq_sources.get(seq_group, [])):
@@ -715,23 +716,44 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         """Detect clip deletions and reorders in any tracked sequence and broadcast patches."""
         if not self.sync_manager or self.sync_manager.status != STATE_SYNCED:
             return
-        sg_to_path = {v: k for k, v in self._path_to_source_group_map().items()}
+        path_to_sg = self._path_to_source_group_map()
+        for path, sg in path_to_sg.items():
+            self._sg_to_path_cache[sg] = path
+        sg_to_path = {v: k for k, v in path_to_sg.items()}
         for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
             current = self._source_groups_for_sequences([seq_group]).get(seq_group, [])
             stored = self._sequence_input_order.get(seq_group)
             if stored is None or current == stored:
                 continue
             _log(f"Sequence changed in {seq_group}: {stored} -> {current}")
+
+            # If any newly-added source groups aren't in sg_to_path yet their
+            # media hasn't finished loading (media.movie not set).  Defer the
+            # stored-order update so the change re-fires on the next tick once
+            # the path is readable, rather than silently dropping the broadcast.
+            stored_set = set(stored or [])
+            new_sgs = [sg for sg in current if sg not in stored_set]
+            unresolved = [sg for sg in new_sgs if sg not in sg_to_path]
+            if unresolved:
+                _log(f"Sequence {seq_group}: {len(unresolved)} source(s) still loading, deferring")
+                continue
+
             self._sequence_input_order[seq_group] = current
 
             timeline = self.sync_manager._timelines.get(tl_guid)
             if not timeline:
+                _log(f"Sequence {seq_group}: no timeline for tl_guid={tl_guid[:8] if tl_guid else None} (timelines={list(self.sync_manager._timelines.keys())[:3]})")
                 continue
-            media_track = next((t for t in timeline.tracks if self._is_media_track(t)), None)
-            if not media_track:
+            all_tracks = list(timeline.tracks)
+            track_info = [(t.name, repr(t.kind), type(t.kind).__name__, self._is_media_track(t)) for t in all_tracks]
+            _log(f"Sequence {seq_group}: tracks+check = {track_info}")
+            media_track = next((t for t in all_tracks if self._is_media_track(t)), None)
+            if media_track is None:
+                _log(f"Sequence {seq_group}: no media track in timeline")
                 continue
             track_guid = media_track.metadata.get("sync", {}).get("guid")
             if not track_guid:
+                _log(f"Sequence {seq_group}: media track has no sync guid")
                 continue
 
             def _build_path_to_guid():
@@ -746,7 +768,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             current_set = set(current)
             for sg in stored:
                 if sg not in current_set:
-                    path = sg_to_path.get(sg)
+                    path = self._sg_to_path_cache.get(sg)
                     if not path:
                         continue
                     child_guid = _build_path_to_guid().get(path)
@@ -776,10 +798,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 seen_counts[path] += 1
                 if seen_counts[path] > otio_path_counts[path]:
                     clip = self._make_otio_clip_for_sg(sg)
-                    clip = self._make_otio_clip_for_sg(sg)
                     if clip:
-                        _log(f"Add: broadcasting insert_child sg={sg} at index={valid_sgs_before}")
+                        _log(f"Add: broadcasting insert_child sg={sg} at index={valid_sgs_before} track={track_guid[:8]}")
                         self.sync_manager.insert_child(track_guid, clip, valid_sgs_before)
+                        _log(f"Add: insert_child done (object_map has track: {track_guid in self.sync_manager.patcher.object_map})")
                     else:
                         _log(f"Add: FAILED to make otio clip for sg={sg}")
                         otio_path_counts[path] += 1
@@ -810,6 +832,52 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self.sync_manager.broadcast_move_child(track_guid, child_guid, target_idx)
                     current_order.pop(cur_idx)
                     current_order.insert(target_idx, child_guid)
+
+    def _align_rv_sequences_to_otio(self):
+        """For client peers: align local RV sequence node inputs with the shared OTIO timelines."""
+        if not self.sync_manager or self.sync_manager.is_master or self.sync_manager.status != STATE_SYNCED:
+            return
+        
+        path_to_sg = self._path_to_source_group_map()
+        for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
+            timeline = self.sync_manager._timelines.get(tl_guid)
+            if not timeline:
+                continue
+            media_track = next((t for t in timeline.tracks if self._is_media_track(t)), None)
+            if media_track is None:
+                continue
+            
+            # Resolve all clips in the track to their corresponding RV source groups
+            expected_inputs = []
+            unresolved = False
+            for clip in media_track:
+                ref = clip.media_reference
+                if hasattr(ref, "target_url") and ref.target_url:
+                    path = self._media_path(ref.target_url)
+                    sg = path_to_sg.get(path)
+                    if sg:
+                        expected_inputs.append(sg)
+                    else:
+                        unresolved = True
+                        break
+            
+            if unresolved:
+                # Some clips are still loading or not yet present, wait
+                continue
+            
+            current_inputs = self._get_sequence_inputs(seq_group)
+            if current_inputs != expected_inputs:
+                _log(f"Aligning sequence '{seq_group}' to match OTIO: {current_inputs} -> {expected_inputs}")
+                try:
+                    self._rv_updating = True
+                    try:
+                        rv.commands.setNodeInputs(seq_group, expected_inputs)
+                        self._sequence_input_order[seq_group] = list(expected_inputs)
+                        rv.commands.redraw()
+                    finally:
+                        self._rv_updating = False
+                except Exception as e:
+                    _log(f"Failed to align sequence inputs for '{seq_group}': {e}")
 
     def _apply_insert_child(self, clip_obj):
         """Connect a newly-received source group to the right sequence group."""
@@ -949,6 +1017,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             except Exception as e:
                 import traceback
                 _log(f"ERROR in _check_sequence_reorders: {e}\n{traceback.format_exc()}")
+            try:
+                self._align_rv_sequences_to_otio()
+            except Exception as e:
+                import traceback
+                _log(f"ERROR in _align_rv_sequences_to_otio: {e}\n{traceback.format_exc()}")
             self._poll_new_sequences()
             self._poll_sequence_renames()
             self._broadcast_display_state()
@@ -1576,7 +1649,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         Audio tracks (``kind != Video``) and the ``"Annotations"`` overlay
         track are explicitly excluded.
         """
-        if track.kind != otio.schema.TrackKind.Video:
+        # Compare kind as string to handle both enum and plain-string representations
+        # across different OTIO versions (OpenRV's bundled OTIO stores kind as 'Video').
+        if track.kind not in (otio.schema.TrackKind.Video, "Video"):
             return False
         name = track.name or ""
         return not name.startswith("Annotations")
@@ -1659,6 +1734,23 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         _log(f"Created sequence '{timeline.name}' with {len(timeline_sgs)} sources")
                     except Exception as e:
                         _log(f"Could not create sequence '{timeline.name}': {e}")
+        elif len(timelines) == 1:
+            timeline = timelines[0]
+            tl_guid = timeline.metadata.get("sync", {}).get("guid")
+            if tl_guid:
+                view = None
+                try:
+                    view = rv.commands.viewNode()
+                except Exception:
+                    pass
+                if not view or rv.commands.nodeType(view) != "RVSequenceGroup":
+                    seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+                    if seq_groups:
+                        view = seq_groups[0]
+                if view:
+                    self._rv_node_to_timeline_guid[view] = tl_guid
+                    self._sequence_input_order[view] = self._get_sequence_inputs(view)
+                    _log(f"Rebuild: mapped existing view '{view}' to timeline {tl_guid[:8]}")
 
         # Pass 4: replay annotations.
         for timeline in timelines:
