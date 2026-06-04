@@ -2830,12 +2830,9 @@ class ORISyncPlugin(PluginBase):
                 _log_exc(f"_poll_sequence_track_deletions: to_otio_string failed for {tl_guid[:8]}")
                 continue
 
-            _log(f"track_deletions {tl_guid[:8]}: xs={xs_clip_names} stored={self._xs_sequence_track_names.get(tl_guid)}")
-
             stored = self._xs_sequence_track_names.get(tl_guid)
             if stored is None:
                 # First observation — record baseline and skip comparison.
-                _log(f"track_deletions {tl_guid[:8]}: first observation, baseline={xs_clip_names}")
                 self._xs_sequence_track_names[tl_guid] = xs_clip_names
                 continue
 
