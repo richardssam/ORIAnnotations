@@ -956,7 +956,7 @@ class SyncManager:
         clip_guid: str,
         clip_local_time: otio.opentime.RationalTime,
         events: list[dict[str, Any]],
-    ) -> None:
+    ) -> "str | None":
         """Build an annotation clip and insert it via the standard patch path.
 
         Annotations are expressed as ``insert_child`` patches so that all peers
@@ -975,6 +975,9 @@ class SyncManager:
         :param clip_local_time: 0-indexed time within the clip's source range.
         :param events: Serialised OTIO SyncEvent dicts (``PaintStart.1``,
             ``PaintPoints.1``) as produced by ``otio.adapters.write_to_string``.
+        :returns: The sync GUID of the annotation clip that was created or
+            merged into, or ``None`` if the operation could not be completed.
+        :rtype: str or None
         """
         if not self.network or self.status != STATE_SYNCED:
             return
@@ -1010,6 +1013,7 @@ class SyncManager:
                     "sync_timestamp": time.time(),
                 },
             )
+            return existing.metadata.get("sync", {}).get("guid")
         else:
             # New frame — insert a Gap to reach it (if needed) then the clip.
             track_end = self._annotation_track_end(annotation_track)
@@ -1023,6 +1027,7 @@ class SyncManager:
                 self.insert_child(annotation_track_guid, gap)
             ann_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
             self.insert_child(annotation_track_guid, ann_clip)
+            return ann_clip.metadata.get("sync", {}).get("guid")
 
     def broadcast_partial_annotation(
         self,

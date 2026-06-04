@@ -24,7 +24,7 @@ def _make_otio_logger():
         logger.addHandler(sh)
     log_file = os.environ.get("RV_OTIO_SYNC_LOG_FILE")
     if log_file:
-        fh = _logging.FileHandler(log_file)
+        fh = _logging.FileHandler(log_file, mode='w')
         fh.setFormatter(ts_fmt)
         logger.addHandler(fh)
         # Mirror to stderr so the log is visible in the terminal alongside the file.
@@ -159,6 +159,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._last_partial_point_count = 0
         self._partial_pen_nodes = {}  # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
         self._last_display_state = {}  # last state broadcast to detect changes
+        self._last_sent_replace_sig: dict = {}  # ann_clip_guid → JSON sig of last broadcast
         self._current_session_name = None
         self._current_host = None
         self._pending_create_check = False
@@ -383,6 +384,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             path = rv.commands.getStringProperty(f"{file_source_node}.media.movie")[0]
             if not path:
                 return None
+            if not path.startswith(("http://", "https://", "file://")) and not os.path.isabs(path):
+                path = os.path.abspath(path)
             # Prefer the fps stored in the media itself over the session fps;
             # rv.commands.fps() can return 24 at init time before media is read.
             try:
@@ -714,7 +717,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             return
         sg_to_path = {v: k for k, v in self._path_to_source_group_map().items()}
         for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
-            current = self._get_sequence_inputs(seq_group)
+            current = self._source_groups_for_sequences([seq_group]).get(seq_group, [])
             stored = self._sequence_input_order.get(seq_group)
             if stored is None or current == stored:
                 continue
@@ -773,9 +776,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 seen_counts[path] += 1
                 if seen_counts[path] > otio_path_counts[path]:
                     clip = self._make_otio_clip_for_sg(sg)
+                    clip = self._make_otio_clip_for_sg(sg)
                     if clip:
                         _log(f"Add: broadcasting insert_child sg={sg} at index={valid_sgs_before}")
                         self.sync_manager.insert_child(track_guid, clip, valid_sgs_before)
+                    else:
+                        _log(f"Add: FAILED to make otio clip for sg={sg}")
                         otio_path_counts[path] += 1
                 valid_sgs_before += 1  # only increment for resolved source groups
 
@@ -938,7 +944,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 self._rv_updating = False
 
         if not self._rv_updating:
-            self._check_sequence_reorders()
+            try:
+                self._check_sequence_reorders()
+            except Exception as e:
+                import traceback
+                _log(f"ERROR in _check_sequence_reorders: {e}\n{traceback.format_exc()}")
             self._poll_new_sequences()
             self._poll_sequence_renames()
             self._broadcast_display_state()
@@ -961,16 +971,31 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # data is (merged_clip, delta_clip); render only the delta so we
             # don't duplicate strokes that RV already painted.
             _merged_clip, delta_clip = data
-            self._apply_annotation_render(delta_clip)
+            self._rv_updating = True
+            try:
+                self._apply_annotation_render(delta_clip)
+            finally:
+                self._rv_updating = False
         elif action == "annotation_commands_replaced":
             # Full annotation_commands replacement (e.g. text edit or drag-move).
             # Update existing paint nodes in place instead of adding duplicates.
-            self._apply_annotation_replace(data)
+            self._ignore_annotations_until = time.time() + 0.5
+            self._rv_updating = True
+            try:
+                self._apply_annotation_replace(data)
+            finally:
+                self._rv_updating = False
         elif action == "partial_annotation":
+            self._ignore_annotations_until = time.time() + 0.5
             self._apply_partial_annotation(data)
         elif action == "insert_child":
             if isinstance(data, otio.schema.Clip) and "annotation_commands" in data.metadata:
-                self._apply_annotation_render(data)
+                self._ignore_annotations_until = time.time() + 0.5
+                self._rv_updating = True
+                try:
+                    self._apply_annotation_render(data)
+                finally:
+                    self._rv_updating = False
             else:
                 self._apply_insert_child(data)
         elif action == "remove_child":
@@ -1006,11 +1031,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
     def _clip_guid_for_media_path(self, media_path):
         """Return the OTIO GUID of the Clip whose ExternalReference matches media_path."""
+        import os
+        norm_media_path = os.path.abspath(self._media_path(media_path))
+        _log(f"LOOKUP CLIP: media_path='{media_path}' -> norm='{norm_media_path}'")
         for guid, obj in self.sync_manager._object_map.items():
             if isinstance(obj, otio.schema.Clip):
                 ref = obj.media_reference
-                if isinstance(ref, otio.schema.ExternalReference) and ref.target_url == media_path:
-                    return guid
+                if isinstance(ref, otio.schema.ExternalReference):
+                    ref_norm = os.path.abspath(self._media_path(ref.target_url))
+                    _log(f"  Checking clip {guid}: target_url='{ref.target_url}' -> norm='{ref_norm}'")
+                    if ref.target_url == media_path or ref_norm == norm_media_path:
+                        _log(f"  -> MATCHED clip {guid}")
+                        return guid
+        _log("LOOKUP CLIP: NO MATCH FOUND")
         return None
 
     def _resolve_media_path_for_paint_node(self, node_name):
@@ -1256,13 +1289,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     ev = otio.adapters.read_from_string(otio.adapters.write_to_string(ev, "otio_json"), "otio_json")
                 if isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
                     uuid_val = ev.uuid or ""
+                    text_val = ev.text or ""
                     # Snapshot replay sends the full clip as insert_child; if the
                     # node was already painted by _rebuild_rv_session, skip it.
                     if _paint_node_cache and self._text_uuid_exists_in_rv(_paint_node_cache, rv_frame, uuid_val):
-                        text_val = ev.text or ""
                         position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
                         color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
-                        rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+                        rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
                         order_prop = f"{_paint_node_cache}.frame:{rv_frame}.order"
                         updated = False
                         if rv.commands.propertyExists(order_prop):
@@ -1287,7 +1320,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         else:
                             _log(f"RECV annotation: skip dup text uuid={uuid_val[:8]!r} (already in RV, but could not update)")
                         continue
-                    rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+                    rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
                     _log(f"RECV TextAnnotation font_size={getattr(ev, 'font_size', None)!r} → rv_size={rv_size!r}")
                     self._apply_text_annotation({
                         "media_path": media_path,
@@ -1378,6 +1411,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         events_data = ann_clip.metadata.get("annotation_commands", [])
         rv_frame = (int(ann_clip.source_range.start_time.value) + 1
                     if ann_clip.source_range else 1)
+        
+        incoming_text_uuids = set()
 
         media_clip = self.sync_manager._object_map.get(clip_guid) if clip_guid else None
         if not isinstance(media_clip, otio.schema.Clip):
@@ -1410,7 +1445,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             text_val = ev.text or ""
             position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
             color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
-            rv_size = float(ev.font_size) / 15000.0 if getattr(ev, "font_size", None) else 0.01
+            rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
+            
+            incoming_text_uuids.add(uuid_val)
 
             # Scan the frame's draw-order list for a text node with this UUID.
             found = False
@@ -1424,11 +1461,15 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     existing_uuid = rv.commands.getStringProperty(uuid_prop)
                     if not existing_uuid or existing_uuid[0] != uuid_val:
                         continue
-                    rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
+                    current_text = rv.commands.getStringProperty(f"{node}.{item}.text")
+                    if not current_text or current_text[0] != text_val:
+                        rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
+                    
+                    # For simplicity, we just overwrite floats since they don't crash the text editor
                     rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
                     rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
                     rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
-                    _log(f"RECV annotation replace: updated {item} text={text_val!r}")
+                    _log(f"RECV annotation replace: updated {item} text={text_val!r} uuid={uuid_val[:8]!r}")
                     found = True
                     break
 
@@ -1444,7 +1485,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     ]
                     if len(text_items) == 1:
                         item = text_items[0]
-                        rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
+                        current_text = rv.commands.getStringProperty(f"{node}.{item}.text")
+                        if not current_text or current_text[0] != text_val:
+                            rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
                         rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
                         rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
                         rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
@@ -1469,11 +1512,28 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         "uuid": uuid_val,
                     })
 
+        if rv.commands.propertyExists(order_prop):
+            old_order = rv.commands.getStringProperty(order_prop) or []
+            new_order = []
+            for item in old_order:
+                if item.startswith("text:"):
+                    uuid_prop = f"{node}.{item}.uuid"
+                    existing_uuid = ""
+                    if rv.commands.propertyExists(uuid_prop):
+                        eu = rv.commands.getStringProperty(uuid_prop)
+                        existing_uuid = eu[0] if eu else ""
+                    if existing_uuid and existing_uuid not in incoming_text_uuids:
+                        _log(f"RECV annotation replace: removing deleted text {item} uuid={existing_uuid[:8]!r}")
+                        continue
+                new_order.append(item)
+            if new_order != old_order:
+                rv.commands.setStringProperty(order_prop, new_order, True)
+
         QtCore.QTimer.singleShot(0, rv.commands.redraw)
 
     @staticmethod
     def _media_path(url: str) -> str:
-        """Normalise a ``file://`` URL (any variant) to a canonical POSIX path.
+        """Normalise a ``file://`` URL (any variant) or local path to a canonical absolute POSIX path.
 
         Delegates to :func:`opentimelineio.url_utils.filepath_from_url` for
         correct handling of percent-encoding and Windows UNC paths, then
@@ -1481,16 +1541,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         OTIO returns for the ``file://localhost//path`` form emitted by
         xStudio's flat-playlist exporter.
 
-        Non-``file://`` strings (plain absolute paths, relative paths, URIs
-        with other schemes) are returned unchanged.
+        Non-``file://`` strings (plain absolute paths, relative paths) are
+        resolved to absolute paths based on the current working directory.
 
         :param url: A media URL or path string.
         :returns: A normalised absolute path suitable for use as a dict key
             or as an argument to ``rv.commands.addSource``.
         :rtype: str
         """
-        if not url or not url.startswith('file://'):
+        import os
+        if not url:
             return url
+        if not url.startswith('file://'):
+            return os.path.abspath(os.path.normpath(url))
         try:
             import opentimelineio.url_utils as _url_utils
             path = _url_utils.filepath_from_url(url)
@@ -1501,7 +1564,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         # OTIO returns '//path' for file://localhost//path — collapse to '/path'.
         while path.startswith('//'):
             path = path[1:]
-        return path
+        path = os.path.normpath(path)
+        return os.path.abspath(path)
 
     @staticmethod
     def _is_media_track(track) -> bool:
@@ -1643,7 +1707,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                     except Exception:
                                         pass
                                 if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
-                                    rv_size = float(event.font_size) / 15000.0 if getattr(event, "font_size", None) else 0.01
+                                    rv_size = float(event.font_size) / 5000.0 if getattr(event, "font_size", None) else 0.01
                                     uuid_val = event.uuid or ""
                                     # Guard against duplicates when INSERT_CHILD already painted
                                     # this node before the snapshot arrived.
@@ -1843,6 +1907,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
     def on_rv_graph_state_change(self, event):
         contents = event.contents()
+        if getattr(self, "_ignore_annotations_until", 0) > time.time():
+            event.reject()
+            return
         if self._rv_updating or not self.sync_manager or self.sync_manager.status != STATE_SYNCED:
             event.reject()
             return
@@ -1865,16 +1932,27 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             event.reject()
             return
 
-        # Pen point or text change: node.pen:N:F:user.points / node.text:N:F:user.text
+        # Pen point or text change: node.pen:N:F:user.points / node.text:N:F:user.prop
         is_pen = ".pen:" in contents and contents.endswith(".points")
-        is_text = ".text:" in contents and contents.endswith(".text")
-        if is_pen or is_text:
+        is_text = ".text:" in contents and not contents.endswith(".order")
+        
+        if is_text:
             parts = contents.split(".")
-            if len(parts) == 3:
+            if len(parts) >= 2:
                 node_name, component = parts[0], parts[1]
-                _log(f"annotation updated: {node_name}.{component}")
-                # Consume the UUID prepared by paint.nextId (or fall back for
-                # text strokes which don't trigger nextId).
+                try:
+                    frame = int(component.split(":")[2])
+                    self._broadcast_frame_annotations_replace(node_name, frame)
+                except Exception as e:
+                    _log_exc(f"Failed to parse frame from text update: {contents}")
+            event.reject()
+            return
+            
+        if is_pen:
+            parts = contents.split(".")
+            if len(parts) >= 2:
+                node_name, component = parts[0], parts[1]
+                # Consume the UUID prepared by paint.nextId
                 stroke_uuid = self._next_stroke_uuid or str(uuid.uuid4())
                 self._next_stroke_uuid = None
                 self._pending_stroke = (node_name, component, stroke_uuid)
@@ -1919,121 +1997,180 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._pending_stroke = None
         self._broadcast_annotation(node_name, component, partial=False, stroke_uuid=stroke_uuid)
 
+    def _construct_annotation_events(self, node_name, component, stroke_uuid=None):
+        full_prop = f"{node_name}.{component}"
+        is_text = component.startswith("text:")
+        events = []
+        
+        if is_text:
+            text_prop = f"{full_prop}.text"
+            if not rv.commands.propertyExists(text_prop):
+                return []
+            text = rv.commands.getStringProperty(text_prop)
+            text_val = text[0] if text else ""
+            text_val = text_val.replace("\x01", "")
+            
+            color = rv.commands.getFloatProperty(f"{full_prop}.color")
+            position = rv.commands.getFloatProperty(f"{full_prop}.position")
+            size = rv.commands.getFloatProperty(f"{full_prop}.size")
+            spacing = rv.commands.getFloatProperty(f"{full_prop}.spacing")
+            scale = rv.commands.getFloatProperty(f"{full_prop}.scale")
+            rotation = rv.commands.getFloatProperty(f"{full_prop}.rotation")
+            font = rv.commands.getStringProperty(f"{full_prop}.font")
+            
+            # Check for uuid or generate one
+            uuid_prop = f"{full_prop}.uuid"
+            if rv.commands.propertyExists(uuid_prop):
+                ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
+            else:
+                ann_uuid = str(uuid.uuid4())
+                rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
+                rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
+
+            if not text_val.strip():
+                return []
+
+            # Map size: font_size in xstudio is around 50.0, RV size is around 0.01.
+            # So: font_size = size[0] * 5000.0 if size else 50.0.
+            r_size = size[0] if size else 0.01
+            font_size = r_size * 5000.0
+            
+            try:
+                otio.schema.schemadef.module_from_name('SyncEvent')
+                text_event = otio.schemadef.SyncEvent.TextAnnotation(
+                    rgba=list(color) if color else [1.0, 1.0, 1.0, 1.0],
+                    position=list(position) if position else [0.0, 0.0],
+                    spacing=spacing[0] if spacing else 0.0,
+                    friendly_name=font[0] if font else "",
+                    font_size=float(font_size),
+                    font=font[0] if font else "",
+                    text=text_val,
+                    rotation=rotation[0] if rotation else 0.0,
+                    scale=scale[0] if scale else 1.0,
+                    uuid=ann_uuid
+                )
+                event_data = json.loads(otio.adapters.write_to_string(text_event, "otio_json", indent=-1))
+                events = [event_data]
+            except Exception as e:
+                _log(f"SEND annotation skipped: SyncEvent TextAnnotation serialisation failed: {e}")
+                return []
+        else:
+            points = rv.commands.getFloatProperty(f"{full_prop}.points")
+            if not points:
+                return []
+            color = rv.commands.getFloatProperty(f"{full_prop}.color")
+            brush = rv.commands.getStringProperty(f"{full_prop}.brush")[0]
+            width = rv.commands.getFloatProperty(f"{full_prop}.width")
+            
+            try:
+                otio.schema.schemadef.module_from_name('SyncEvent')
+                penuuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
+
+                def _int_prop(prop, default=0):
+                    try:
+                        return rv.commands.getIntProperty(prop)[0]
+                    except Exception:
+                        return default
+
+                hold         = bool(_int_prop(f"{full_prop}.hold"))
+                ghost        = bool(_int_prop(f"{full_prop}.ghost"))
+                ghost_before = _int_prop(f"{full_prop}.ghostBefore")
+                ghost_after  = _int_prop(f"{full_prop}.ghostAfter")
+
+                start_event = otio.schemadef.SyncEvent.PaintStart(
+                    brush=brush,
+                    rgba=list(color),
+                    friendly_name=component.split(':')[-1],
+                    uuid=penuuid,
+                    hold=hold,
+                    ghost=ghost,
+                    ghost_before=ghost_before,
+                    ghost_after=ghost_after,
+                )
+                mode_prop = f"{full_prop}.mode"
+                if rv.commands.propertyExists(mode_prop) and rv.commands.getIntProperty(mode_prop)[0] == 1:
+                    start_event.type = 'erase'
+
+                x = [i for i in points[::2]]
+                y = [i for i in points[1::2]]
+                if len(width) == 1:
+                    w = [width[0]] * (len(points) // 2)
+                else:
+                    w = [i for i in width]
+                p = otio.schemadef.SyncEvent.PaintVertices(x, y, w)
+                points_event = otio.schemadef.SyncEvent.PaintPoints(uuid=penuuid, points=p)
+
+                start_event_data = json.loads(otio.adapters.write_to_string(start_event, "otio_json", indent=-1))
+                points_event_data = json.loads(otio.adapters.write_to_string(points_event, "otio_json", indent=-1))
+                events = [start_event_data, points_event_data]
+            except Exception as e:
+                _log(f"SEND annotation skipped: SyncEvent serialisation failed: {e}")
+                return []
+        
+        return events
+
+    def _broadcast_frame_annotations_replace(self, node_name, frame):
+        try:
+            order_prop = f"{node_name}.frame:{frame}.order"
+            _log(f"REPLACE TEXT: node={node_name} frame={frame} order_prop={order_prop}")
+            if not rv.commands.propertyExists(order_prop):
+                _log("REPLACE TEXT: order_prop does not exist!")
+                return
+            items = rv.commands.getStringProperty(order_prop)
+            _log(f"REPLACE TEXT: items={items}")
+            all_events = []
+            for component in items:
+                events = self._construct_annotation_events(node_name, component)
+                if events:
+                    all_events.extend(events)
+            
+            _log(f"REPLACE TEXT: all_events count = {len(all_events)}")
+            if not all_events:
+                return
+
+            media_path = self._resolve_media_path_for_paint_node(node_name)
+            if not media_path:
+                _log("REPLACE TEXT: no media_path")
+                return
+            clip_guid = self._clip_guid_for_media_path(media_path)
+            if not clip_guid:
+                _log("REPLACE TEXT: no clip_guid")
+                return
+            
+            otio_frame = frame - 1 if frame > 0 else 0
+            ann_clip_guid = self.sync_manager.annotation_clip_guid_at(clip_guid, otio_frame)
+            _log(f"REPLACE TEXT: ann_clip_guid={ann_clip_guid}")
+            if ann_clip_guid:
+                current_sig = json.dumps(all_events, sort_keys=True)
+                if self._last_sent_replace_sig.get(ann_clip_guid) == current_sig:
+                    return
+                self._last_sent_replace_sig[ann_clip_guid] = current_sig
+                self.sync_manager.broadcast_replace_annotation_commands(ann_clip_guid, all_events)
+            else:
+                annotation_track_guid = self.sync_manager.annotation_track_guid_for_clip(
+                    clip_guid, preferred_timeline_guid=self.sync_manager.active_timeline_guid
+                )
+                if annotation_track_guid:
+                    fps = rv.commands.fps()
+                    clip_local_time = otio.opentime.RationalTime(otio_frame, fps)
+                    _log("REPLACE TEXT: broadcast_add_annotation (new clip)")
+                    self.sync_manager.broadcast_add_annotation(
+                        annotation_track_guid=annotation_track_guid,
+                        clip_guid=clip_guid,
+                        clip_local_time=clip_local_time,
+                        events=all_events,
+                    )
+        except Exception as e:
+            _log_exc(f"Failed to broadcast text replace: {e}")
+
     def _broadcast_annotation(self, node_name, component, partial=False, stroke_uuid=None):
         _log(f"SEND annotation node={node_name} component={component} partial={partial}")
         try:
-            full_prop = f"{node_name}.{component}"
-            is_text = component.startswith("text:")
-            events = []
+            events = self._construct_annotation_events(node_name, component, stroke_uuid)
+            if not events:
+                return
             
-            if is_text:
-                text_prop = f"{full_prop}.text"
-                if not rv.commands.propertyExists(text_prop):
-                    _log(f"SEND annotation skipped: no text property on {full_prop}")
-                    return
-                text = rv.commands.getStringProperty(text_prop)
-                text_val = text[0] if text else ""
-                color = rv.commands.getFloatProperty(f"{full_prop}.color")
-                position = rv.commands.getFloatProperty(f"{full_prop}.position")
-                size = rv.commands.getFloatProperty(f"{full_prop}.size")
-                spacing = rv.commands.getFloatProperty(f"{full_prop}.spacing")
-                scale = rv.commands.getFloatProperty(f"{full_prop}.scale")
-                rotation = rv.commands.getFloatProperty(f"{full_prop}.rotation")
-                font = rv.commands.getStringProperty(f"{full_prop}.font")
-                
-                # Check for uuid or generate one
-                uuid_prop = f"{full_prop}.uuid"
-                if rv.commands.propertyExists(uuid_prop):
-                    ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
-                else:
-                    ann_uuid = str(uuid.uuid4())
-                    rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
-                    rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
-
-                # Frame number is part of the component name: text:N:F:user
-                parts = component.split(":")
-                frame = int(parts[2])
-
-                # Map size: font_size in xstudio is around 50.0, RV size is around 0.01.
-                # So: font_size = size[0] * 5000.0 if size else 50.0.
-                r_size = size[0] if size else 0.01
-                font_size = r_size * 5000.0
-                
-                try:
-                    otio.schema.schemadef.module_from_name('SyncEvent')
-                    text_event = otio.schemadef.SyncEvent.TextAnnotation(
-                        rgba=list(color) if color else [1.0, 1.0, 1.0, 1.0],
-                        position=list(position) if position else [0.0, 0.0],
-                        spacing=spacing[0] if spacing else 0.0,
-                        friendly_name=font[0] if font else "",
-                        font_size=float(font_size),
-                        font=font[0] if font else "",
-                        text=text_val,
-                        rotation=rotation[0] if rotation else 0.0,
-                        scale=scale[0] if scale else 1.0,
-                        uuid=ann_uuid
-                    )
-                    event_data = json.loads(otio.adapters.write_to_string(text_event, "otio_json", indent=-1))
-                    events = [event_data]
-                except Exception as e:
-                    _log(f"SEND annotation skipped: SyncEvent TextAnnotation serialisation failed: {e}")
-                    return
-            else:
-                points = rv.commands.getFloatProperty(f"{full_prop}.points")
-                if not points:
-                    _log(f"SEND annotation skipped: no points on {full_prop}")
-                    return
-                color = rv.commands.getFloatProperty(f"{full_prop}.color")
-                brush = rv.commands.getStringProperty(f"{full_prop}.brush")[0]
-                width = rv.commands.getFloatProperty(f"{full_prop}.width")
-                join = rv.commands.getIntProperty(f"{full_prop}.join")[0]
-                cap = rv.commands.getIntProperty(f"{full_prop}.cap")[0]
-                frame = int(component.split(":")[2])
-
-                try:
-                    otio.schema.schemadef.module_from_name('SyncEvent')
-                    penuuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
-
-                    def _int_prop(prop, default=0):
-                        try:
-                            return rv.commands.getIntProperty(prop)[0]
-                        except Exception:
-                            return default
-
-                    hold         = bool(_int_prop(f"{full_prop}.hold"))
-                    ghost        = bool(_int_prop(f"{full_prop}.ghost"))
-                    ghost_before = _int_prop(f"{full_prop}.ghostBefore")
-                    ghost_after  = _int_prop(f"{full_prop}.ghostAfter")
-
-                    start_event = otio.schemadef.SyncEvent.PaintStart(
-                        brush=brush,
-                        rgba=list(color),
-                        friendly_name=component.split(':')[-1],
-                        uuid=penuuid,
-                        hold=hold,
-                        ghost=ghost,
-                        ghost_before=ghost_before,
-                        ghost_after=ghost_after,
-                    )
-                    mode_prop = f"{full_prop}.mode"
-                    if rv.commands.propertyExists(mode_prop) and rv.commands.getIntProperty(mode_prop)[0] == 1:
-                        start_event.type = 'erase'
-
-                    x = [i for i in points[::2]]
-                    y = [i for i in points[1::2]]
-                    if len(width) == 1:
-                        w = [width[0]] * (len(points) // 2)
-                    else:
-                        w = [i for i in width]
-                    p = otio.schemadef.SyncEvent.PaintVertices(x, y, w)
-                    points_event = otio.schemadef.SyncEvent.PaintPoints(uuid=penuuid, points=p)
-
-                    start_event_data = json.loads(otio.adapters.write_to_string(start_event, "otio_json", indent=-1))
-                    points_event_data = json.loads(otio.adapters.write_to_string(points_event, "otio_json", indent=-1))
-                    events = [start_event_data, points_event_data]
-                except Exception as e:
-                    _log(f"SEND annotation skipped: SyncEvent serialisation failed: {e}")
-                    return
+            frame = int(component.split(":")[2])
 
             # Frame numbers in RV pen properties are clip-local, not global sequence
             # frames, so metaEvaluateClosestByType(frame) would land on the wrong clip.

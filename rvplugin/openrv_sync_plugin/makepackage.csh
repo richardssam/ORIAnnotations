@@ -1,6 +1,6 @@
 #!/bin/bash
 
-rm -f otiosyncdemo-1.1.rvpkg
+rm -f otiosyncdemo-1.2.rvpkg
 rm -rf pika
 
 # Copy pika from the pyenv site-packages to vendor it into the package
@@ -13,12 +13,12 @@ else
 fi
 
 # Zip plugin files from this directory
-zip -r otiosyncdemo-1.1.rvpkg plugin.py PACKAGE pika
+zip -r otiosyncdemo-1.2.rvpkg plugin.py PACKAGE pika
 
 # From the repo root, zip in the otio_sync_core library.
 cd ../..
 cd python
-zip ../rvplugin/openrv_sync_plugin/otiosyncdemo-1.1.rvpkg \
+zip ../rvplugin/openrv_sync_plugin/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/__init__.py \
     otio_sync_core/network.py \
     otio_sync_core/rabbitmq_network.py \
@@ -26,4 +26,4 @@ zip ../rvplugin/openrv_sync_plugin/otiosyncdemo-1.1.rvpkg \
     otio_sync_core/patcher.py \
     otio_sync_core/proxy.py
 
-echo "Built otiosyncdemo-1.1.rvpkg"
+echo "Built otiosyncdemo-1.2.rvpkg"

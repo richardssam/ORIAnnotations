@@ -165,14 +165,16 @@ def xs_captions_to_sync_events(
             if isinstance(pos, list) and len(pos) >= 4
             else [0.0, 0.0]
         )
+        font_name = caption.get("font_name", "")
+
         events.append(
             se.TextAnnotation(
                 rgba=[r, g, b, opacity],
                 position=position,
                 spacing=0.0,
-                friendly_name=caption.get("font_name", ""),
+                friendly_name=font_name,
                 font_size=float(caption.get("font_size", 50.0)),
-                font=caption.get("font_name", ""),
+                font=font_name,
                 text=caption.get("text", ""),
                 rotation=0.0,
                 scale=1.0,
@@ -356,18 +358,28 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
         text = _get("text", "") or ""
         font = _get("font", "") or ""
         font_size = float(_get("font_size", 50.0) or 50.0)
+        uuid_val = _get("uuid", "") or ""
+
+        # xStudio requires a valid font name to render text; default to one of its built-ins
+        if not font:
+            font = "Overpass Regular"
 
         x_xs = float(position[0]) / aspect_half
         y_xs = -float(position[1]) / aspect_half
 
-        captions.append({
+        cap_dict = {
             "colour": ["colour", 1, rgba[0], rgba[1], rgba[2]],
             "opacity": rgba[3] if len(rgba) > 3 else 1.0,
             "position": ["vec2", 1, x_xs, y_xs],
             "font_name": font,
             "font_size": font_size,
             "text": text,
-            "wrap_width": 0.0,
+            "wrap_width": 0.5,
             "justification": 0,
-        })
+            "background_colour": ["colour", 1, 0.0, 0.0, 0.0],
+            "background_opacity": 0.5,
+        }
+        if uuid_val:
+            cap_dict["uuid"] = uuid_val
+        captions.append(cap_dict)
     return captions

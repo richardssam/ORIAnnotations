@@ -14,6 +14,7 @@ import asyncio
 import json
 import sys
 import time
+import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -332,10 +333,13 @@ def main() -> None:
         "session": args.session,
     })
 
-    print(f"[viewer] Starting at http://{args.host}:{args.port}", flush=True)
+    url_host = "localhost" if args.host in ("0.0.0.0", "") else args.host
+    url = f"http://{url_host}:{args.port}"
+    print(f"[viewer] Starting at {url}", flush=True)
     print(f"[viewer] RabbitMQ: {args.rmq_host}:{args.rmq_port}", flush=True)
     print(f"[viewer] Session:  {args.session}", flush=True)
 
+    webbrowser.open(url)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

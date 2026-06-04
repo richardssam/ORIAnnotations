@@ -131,6 +131,12 @@ def _make_logger() -> logging.Logger:
 
 _logger = _make_logger()
 
+# Also configure the core network logger so users can see raw payloads
+_core_logger = logging.getLogger("otio_sync")
+_core_logger.setLevel(logging.DEBUG)
+for h in _logger.handlers:
+    if h not in _core_logger.handlers:
+        _core_logger.addHandler(h)
 
 def _log(msg: str) -> None:
     _logger.debug(msg)
@@ -162,6 +168,11 @@ def _uri_to_posix_path(uri: str) -> str:
     if uri.startswith("localhost//"):
         # xStudio stores local URIs as "localhost//absolute/path"
         return uri[10:]  # strip "localhost/" leaving "/absolute/path"
+    
+    # If the path is relative, convert to absolute using current working directory.
+    if not uri.startswith(("http://", "https://")) and not os.path.isabs(uri):
+        return os.path.abspath(uri)
+        
     return uri
 
 
@@ -206,6 +217,14 @@ class ORISyncPlugin(PluginBase):
     #: This scan catches strokes in builds where those events are absent.
     #: Set to 1.0 until AnnotationsCore events are confirmed in the target build.
     ANNOTATION_SCAN_INTERVAL = 1.0
+
+    #: Sentinel stored in ``_last_sent_captions`` immediately after a remote
+    #: annotation is applied, before xStudio has committed the annotation_data.
+    #: On the first periodic scan the sentinel is replaced with the actual
+    #: quantized signature without triggering a broadcast — this prevents
+    #: spurious re-broadcasts caused by float precision differences between the
+    #: OTIO-derived positions we set and the values xStudio stores internally.
+    _CAPTION_SIG_UNCONFIRMED = "\x00unconfirmed\x00"
 
     def __init__(self, connection):
         PluginBase.__init__(
@@ -273,16 +292,23 @@ class ORISyncPlugin(PluginBase):
         self._our_bookmark_uuids: set = set()
         self._our_bookmark_uuids_lock = threading.Lock()
 
+        # Sync GUIDs of annotation clips that THIS peer has created or broadcast to.
+        # Used to guard broadcast_replace_annotation_commands: only replace a clip
+        # that we own.  If ann_clip_guid is not in this set, use broadcast_add_annotation
+        # (parallel annotation) instead of overwriting the remote peer's clip.
+        self._our_annotation_clip_guids: set = set()
+
         # Monotonic deadline before which show_atom annotation flushes are
         # suppressed.  Set briefly after load_otio reloads (e.g. on move_child)
         # so that xStudio's bookmark-re-trigger burst is not mistaken for new
         # local strokes.
         self._reload_suppress_until: float = 0.0
 
-        # Signature of the last xStudio caption data broadcast per (clip_guid, frame).
-        # Compared against the current bookmark on each scan to detect real user edits
-        # and avoid re-broadcasting when nothing has changed.  Keyed as
-        # "{clip_guid}:{frame}" → JSON string of the captions list.
+        # Signature of the last xStudio caption data broadcast (or confirmed-applied)
+        # per bookmark UUID.  Compared against the current bookmark on each scan to
+        # detect real user edits and avoid re-broadcasting when nothing has changed.
+        # A value of _CAPTION_SIG_UNCONFIRMED means the remote annotation was just
+        # applied; the first scan will update the signature without broadcasting.
         self._last_sent_captions: dict[str, str] = {}
 
         # Maps bookmark UUID → (clip_guid, clip_local_frame) for bookmarks created from
@@ -476,6 +502,7 @@ class ORISyncPlugin(PluginBase):
         """
         self.disconnect()
         self._poll_stop.clear()
+        self._last_annotation_scan = time.monotonic()
 
         if host is None:
             host = self.mq_host_attr.value()
@@ -858,6 +885,11 @@ class ORISyncPlugin(PluginBase):
 
     def _on_synced(self) -> None:
         _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
+        # Reset the scan timer so the first bookmarks.bookmarks call is deferred
+        # by at least ANNOTATION_SCAN_INTERVAL seconds after STATE_SYNCED.
+        # Without this, the scan fires immediately while xStudio's bookmark actor
+        # may still be processing the async load_otio() call, causing a deadlock.
+        self._last_annotation_scan = time.monotonic()
         if not self.manager.is_master:
             # We joined an existing session — create one playlist per received timeline.
             self._cmd_queue.put(("load_timelines", {}))
@@ -3267,24 +3299,70 @@ class ORISyncPlugin(PluginBase):
         # because xStudio quantises float values internally, so reading back from
         # bm.annotation_data gives slightly different positions than what we set —
         # comparing against OTIO-reconverted values would loop forever.
+        #
+        # Guard: only REPLACE when ann_clip_guid is in _our_annotation_clip_guids
+        # (a clip this peer created or previously broadcast to).  If it isn't, the
+        # clip belongs to a remote peer and we must not overwrite it — broadcast a
+        # new INSERT_CHILD instead.  Likewise if the bookmark UUID is still in
+        # _our_bookmark_uuids, the user is annotating over a remote peer's frame
+        # and we use INSERT_CHILD to preserve the peer's annotation alongside ours.
         if sent_captions > 0 and sent_captions == len(all_captions):
-            cap_key = f"{clip_guid}:{int(clip_local_time.value)}"
+            cap_key = str(bm_uuid)
             current_sig = self._caption_signature(all_captions)
-            if self._last_sent_captions.get(cap_key) != current_sig:
+            saved_sig = self._last_sent_captions.get(cap_key)
+            if saved_sig == self._CAPTION_SIG_UNCONFIRMED:
+                # First scan after a remote annotation was applied — xStudio has
+                # now committed the data.  Record the actual quantized signature
+                # so subsequent scans detect only real user edits.
+                self._last_sent_captions[cap_key] = current_sig
+                saved_sig = current_sig  # fall through with no mismatch
+            if saved_sig != current_sig:
+                with self._our_bookmark_uuids_lock:
+                    is_remote_bookmark = str(bm_uuid) in self._our_bookmark_uuids
+
                 ann_clip_guid = self.manager.annotation_clip_guid_at(
                     clip_guid, int(clip_local_time.value)
                 )
                 if ann_clip_guid:
-                    existing_uuids = self._extract_caption_uuids(ann_clip_guid)
-                    all_events = (
-                        xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
-                        + xs_captions_to_sync_events(all_captions, aspect_half, existing_uuids)
-                    )
-                    _log(
-                        f"Broadcasting annotation replace: {len(all_events)} event(s)"
-                        f" (caption edit) at frame={frame} clip={clip_guid[:8]}"
-                    )
-                    self.manager.broadcast_replace_annotation_commands(ann_clip_guid, all_events)
+                    if is_remote_bookmark or ann_clip_guid not in self._our_annotation_clip_guids:
+                        # Broadcast as a new independent annotation to avoid
+                        # overwriting a remote peer's annotation clip.
+                        # This covers both:
+                        #   (a) is_remote_bookmark: user edited the xStudio bookmark
+                        #       that was created to display a remote peer's annotation.
+                        #   (b) ann_clip_guid not ours: xStudio created a new bookmark at
+                        #       this frame but annotation_clip_guid_at() returns a remote
+                        #       peer's clip — we must not REPLACE it.
+                        all_events = (
+                            xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
+                            + xs_captions_to_sync_events(all_captions, aspect_half)
+                        )
+                        reason = "local edit on remote bookmark" if is_remote_bookmark else "new local annotation at remote-owned frame"
+                        _log(
+                            f"Broadcasting annotation add: {len(all_events)} event(s)"
+                            f" ({reason}) at frame={frame} clip={clip_guid[:8]}"
+                        )
+                        new_guid = self.manager.broadcast_add_annotation(
+                            annotation_track_guid=annotation_track_guid,
+                            clip_guid=clip_guid,
+                            clip_local_time=clip_local_time,
+                            events=all_events,
+                        )
+                        if new_guid:
+                            self._our_annotation_clip_guids.add(new_guid)
+                        with self._our_bookmark_uuids_lock:
+                            self._our_bookmark_uuids.discard(str(bm_uuid))
+                    else:
+                        existing_uuids = self._extract_caption_uuids(ann_clip_guid)
+                        all_events = (
+                            xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
+                            + xs_captions_to_sync_events(all_captions, aspect_half, existing_uuids)
+                        )
+                        _log(
+                            f"Broadcasting annotation replace: {len(all_events)} event(s)"
+                            f" (caption edit) at frame={frame} clip={clip_guid[:8]}"
+                        )
+                        self.manager.broadcast_replace_annotation_commands(ann_clip_guid, all_events)
                     self._last_sent_captions[cap_key] = current_sig
                     return True
 
@@ -3300,15 +3378,17 @@ class ORISyncPlugin(PluginBase):
             f" (+{len(new_strokes)} strokes, +{len(new_captions)} captions)"
             f" at frame={frame} clip={clip_guid[:8]}"
         )
-        self.manager.broadcast_add_annotation(
+        new_guid = self.manager.broadcast_add_annotation(
             annotation_track_guid=annotation_track_guid,
             clip_guid=clip_guid,
             clip_local_time=clip_local_time,
             events=events,
         )
+        if new_guid:
+            self._our_annotation_clip_guids.add(new_guid)
         # Record caption signature so the next scan doesn't re-broadcast them.
         if new_captions:
-            cap_key = f"{clip_guid}:{int(clip_local_time.value)}"
+            cap_key = str(bm_uuid)
             self._last_sent_captions[cap_key] = self._caption_signature(all_captions)
         return True
 
@@ -3467,26 +3547,20 @@ class ORISyncPlugin(PluginBase):
                 bm = self.connection.api.session.bookmarks.add_bookmark(target=media)
                 detail = BookmarkDetail()
                 detail.start = datetime.timedelta(seconds=frame / fps)
-                detail.duration = datetime.timedelta(seconds=0.9 / fps)
+                detail.duration = datetime.timedelta(seconds=0)
                 self.connection.request_receive(bm.remote, bookmark_detail_atom(), detail)
                 bm.set_annotation(strokes=pen_strokes, captions=captions)
                 self._annotation_bookmarks[(clip_guid, frame)] = bm
                 with self._our_bookmark_uuids_lock:
-                    self._our_bookmark_uuids.add(bm.uuid)
+                    self._our_bookmark_uuids.add(str(bm.uuid))
                 self._our_bookmark_clip_frame[str(bm.uuid)] = (clip_guid, frame)
-                # Pre-populate with xStudio's quantized readback so the first
-                # periodic scan sees these captions as already broadcast.
+                # Mark as unconfirmed keyed by bookmark UUID (same key the scan
+                # uses via cap_key = str(bm_uuid)) so the first scan confirms the
+                # post-quantization signature without broadcasting.
                 if captions:
-                    try:
-                        rb = bm.annotation_data
-                        if rb:
-                            rb_caps = rb.get("Data", rb).get("captions", [])
-                            if rb_caps:
-                                self._last_sent_captions[f"{clip_guid}:{frame}"] = (
-                                    self._caption_signature(rb_caps)
-                                )
-                    except Exception:
-                        pass
+                    self._last_sent_captions[str(bm.uuid)] = (
+                        self._CAPTION_SIG_UNCONFIRMED
+                    )
                 count += 1
             except Exception:
                 _log_exc(
@@ -3540,6 +3614,13 @@ class ORISyncPlugin(PluginBase):
                 f"Refreshed annotation bookmark: {len(pen_strokes)} stroke(s), {len(captions)} caption(s)"
                 f" at frame {frame}"
             )
+            # Mark as unconfirmed so the first scan after this refresh confirms
+            # the post-quantization signature without broadcasting.  The refresh
+            # result is remote data, not a local edit.
+            if captions:
+                self._last_sent_captions[str(bm.uuid)] = (
+                    self._CAPTION_SIG_UNCONFIRMED
+                )
         except Exception:
             _log_exc("_refresh_annotation_bookmark: failed")
 
@@ -3626,7 +3707,6 @@ class ORISyncPlugin(PluginBase):
 
         pen_strokes = sync_events_to_xs_strokes(commands, aspect_half)
         captions = sync_events_to_xs_captions(commands, aspect_half)
-        _log(f"DEBUG: parsed pen_strokes: {pen_strokes}")
         if not pen_strokes and not captions:
             _log("_apply_remote_annotation: no strokes or captions decoded — skipping")
             return
@@ -3694,7 +3774,9 @@ class ORISyncPlugin(PluginBase):
                 # Set start and duration in a single BookmarkDetail message.
                 detail = BookmarkDetail()
                 detail.start = datetime.timedelta(seconds=frame / fps)
-                detail.duration = datetime.timedelta(seconds=0.9 / fps)
+                detail.duration = datetime.timedelta(seconds=0)
+                detail.author = "ORI Sync"
+                detail.note = "Annotation"
                 self.connection.request_receive(bm.remote, bookmark_detail_atom(), detail)
                 try:
                     readback = bm.detail
@@ -3711,25 +3793,21 @@ class ORISyncPlugin(PluginBase):
                 bm.set_annotation(strokes=pen_strokes, captions=captions)
                 self._annotation_bookmarks[bm_key] = bm
                 with self._our_bookmark_uuids_lock:
-                    self._our_bookmark_uuids.add(bm.uuid)
+                    self._our_bookmark_uuids.add(str(bm.uuid))
                 _log(
-                    f"Applied remote annotation: {len(pen_strokes)} stroke(s)"
-                    f" at frame {frame}"
+                    f"Applied remote annotation: {len(pen_strokes)} stroke(s),"
+                    f" {len(captions)} caption(s) at frame {frame}"
                 )
                 target_bm = bm
             self._our_bookmark_clip_frame[str(target_bm.uuid)] = (clip_guid, frame)
-            # Pre-populate caption signature using xStudio's quantized readback
+            # Mark as unconfirmed so the first periodic scan confirms the
+            # post-quantization signature without broadcasting.  We cannot read
+            # back the committed annotation_data here because xStudio's actor
+            # may not have processed set_annotation() yet.
             if captions:
-                try:
-                    rb = target_bm.annotation_data
-                    if rb:
-                        rb_caps = rb.get("Data", rb).get("captions", [])
-                        if rb_caps:
-                            self._last_sent_captions[f"{clip_guid}:{frame}"] = (
-                                self._caption_signature(rb_caps)
-                            )
-                except Exception:
-                    pass
+                self._last_sent_captions[str(target_bm.uuid)] = (
+                    self._CAPTION_SIG_UNCONFIRMED
+                )
         except Exception:
             _log_exc("_apply_remote_annotation: failed to set annotation")
 
@@ -3808,18 +3886,28 @@ class ORISyncPlugin(PluginBase):
 
         for playlist, _ in self._sync_playlists.values():
             try:
+                stem_match = None
+                uri_match = None
                 for media in playlist.media:
                     mname = media.name or ""
-                    if mname == clip_name or os.path.splitext(os.path.basename(mname))[0] == clip_stem:
+                    if mname == clip_name:
+                        # Exact name match — highest priority (timeline clip media
+                        # has just the filename; bin media has the full path).
                         return media, _aspect(media)
-                    try:
-                        ms = media.media_source()
-                        m_uri = str(ms.media_reference.uri())
-                        m_path = _uri_to_posix_path(m_uri)
-                        if (clip_uri and m_uri == clip_uri) or (clip_path and m_path == clip_path):
-                            return media, _aspect(media)
-                    except Exception:
-                        pass
+                    if stem_match is None and os.path.splitext(os.path.basename(mname))[0] == clip_stem:
+                        stem_match = media
+                    if uri_match is None:
+                        try:
+                            ms = media.media_source()
+                            m_uri = str(ms.media_reference.uri())
+                            m_path = _uri_to_posix_path(m_uri)
+                            if (clip_uri and m_uri == clip_uri) or (clip_path and m_path == clip_path):
+                                uri_match = media
+                        except Exception:
+                            pass
+                best = uri_match or stem_match
+                if best is not None:
+                    return best, _aspect(best)
             except Exception:
                 _log_exc("_find_media_for_clip_guid: error scanning playlist")
         return None, 0.8889
