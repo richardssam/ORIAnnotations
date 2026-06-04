@@ -4,9 +4,28 @@ import json
 import logging
 import sys
 import os
+import socket
 
 from .spawner import AppSpawner
 from .config import SyncTestConfig
+
+
+def _find_free_ports(count, start=19000):
+    """Find `count` consecutive-ish free TCP ports starting near `start`."""
+    ports = []
+    candidate = start
+    while len(ports) < count:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", candidate))
+                ports.append(candidate)
+            except OSError:
+                pass
+        candidate += 1
+        if candidate > start + 200:
+            raise RuntimeError(f"Could not find {count} free ports near {start}")
+    return ports
 
 # Try to import SyncPlayer from sync_recorder
 python_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -198,9 +217,8 @@ class TestRunner:
                 player_thread.start()
 
             app_ports = []
-            base_port = 9000
-            for i, app_name in enumerate(apps):
-                port = base_port + i
+            free_ports = _find_free_ports(len(apps))
+            for app_name, port in zip(apps, free_ports):
                 spawner.launch(app_name, port)
                 app_ports.append((app_name, port))
 
