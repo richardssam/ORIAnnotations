@@ -149,6 +149,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._rv_node_to_timeline_guid = {}  # RV node name → timeline GUID
         self._sequence_input_order = {}      # RV node name → [source_group, ...]
         self._sg_to_path_cache = {}          # source_group → media path (survives deletion)
+        self._sequence_settle_until = {}     # seq_group → time after which detection is live
         self._timer = None
         self._last_broadcast_frame = -1
         self._last_selection = []
@@ -517,6 +518,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
             self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+            self._sequence_settle_until[seq_group] = time.time() + 5.0
 
             if self._active_media_track_guid is None:
                 self._active_media_track_guid = track_guid
@@ -551,6 +553,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             view = rv.commands.viewNode()
             self._rv_node_to_timeline_guid[view] = tl_guid
             self._sequence_input_order[view] = self._get_sequence_inputs(view)
+            self._sequence_settle_until[view] = time.time() + 5.0
         except Exception:
             pass
 
@@ -608,6 +611,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
             self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+            self._sequence_settle_until[seq_group] = time.time() + 5.0
             self.sync_manager.broadcast_add_timeline(tl_guid)
             _log(f"New RVSequenceGroup '{seq_name}' → timeline {tl_guid[:8]} broadcast")
 
@@ -720,11 +724,26 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         for path, sg in path_to_sg.items():
             self._sg_to_path_cache[sg] = path
         sg_to_path = {v: k for k, v in path_to_sg.items()}
+        source_groups_set = set(rv.commands.nodesOfType("RVSourceGroup"))
         for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
-            current = self._source_groups_for_sequences([seq_group]).get(seq_group, [])
+            # Use nodeConnections order — this is what changes when the user drags clips
+            # (nodesOfType order is stable and does not reflect drag reorders).
+            current = [
+                sg for sg in self._get_sequence_inputs(seq_group)
+                if sg in source_groups_set
+            ]
             stored = self._sequence_input_order.get(seq_group)
             if stored is None or current == stored:
                 continue
+
+            # After a rebuild or programmatic setNodeInputs the RVSequenceGroup's
+            # connection order can take a few seconds to settle to the true EDL order.
+            # Silently absorb changes during this window to prevent false broadcasts.
+            settle_until = self._sequence_settle_until.get(seq_group, 0)
+            if time.time() < settle_until:
+                self._sequence_input_order[seq_group] = current
+                continue
+
             _log(f"Sequence changed in {seq_group}: {stored} -> {current}")
 
             # If any newly-added source groups aren't in sg_to_path yet their
@@ -833,51 +852,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     current_order.pop(cur_idx)
                     current_order.insert(target_idx, child_guid)
 
-    def _align_rv_sequences_to_otio(self):
-        """For client peers: align local RV sequence node inputs with the shared OTIO timelines."""
-        if not self.sync_manager or self.sync_manager.is_master or self.sync_manager.status != STATE_SYNCED:
-            return
-        
-        path_to_sg = self._path_to_source_group_map()
-        for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
-            timeline = self.sync_manager._timelines.get(tl_guid)
-            if not timeline:
-                continue
-            media_track = next((t for t in timeline.tracks if self._is_media_track(t)), None)
-            if media_track is None:
-                continue
-            
-            # Resolve all clips in the track to their corresponding RV source groups
-            expected_inputs = []
-            unresolved = False
-            for clip in media_track:
-                ref = clip.media_reference
-                if hasattr(ref, "target_url") and ref.target_url:
-                    path = self._media_path(ref.target_url)
-                    sg = path_to_sg.get(path)
-                    if sg:
-                        expected_inputs.append(sg)
-                    else:
-                        unresolved = True
-                        break
-            
-            if unresolved:
-                # Some clips are still loading or not yet present, wait
-                continue
-            
-            current_inputs = self._get_sequence_inputs(seq_group)
-            if current_inputs != expected_inputs:
-                _log(f"Aligning sequence '{seq_group}' to match OTIO: {current_inputs} -> {expected_inputs}")
-                try:
-                    self._rv_updating = True
-                    try:
-                        rv.commands.setNodeInputs(seq_group, expected_inputs)
-                        self._sequence_input_order[seq_group] = list(expected_inputs)
-                        rv.commands.redraw()
-                    finally:
-                        self._rv_updating = False
-                except Exception as e:
-                    _log(f"Failed to align sequence inputs for '{seq_group}': {e}")
 
     def _apply_insert_child(self, clip_obj):
         """Connect a newly-received source group to the right sequence group."""
@@ -903,7 +877,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                             new_inputs.append(sg)
                 if new_inputs:
                     rv.commands.setNodeInputs(seq_group, new_inputs)
-                    self._sequence_input_order[seq_group] = new_inputs
+                    self._sequence_input_order[seq_group] = (
+                        self._get_sequence_inputs(seq_group) or new_inputs
+                    )
                     _log(f"RECV insert_child: {seq_group} now has {len(new_inputs)} inputs")
                     rv.commands.redraw()
                 return
@@ -929,24 +905,22 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         if sg:
                             new_inputs.append(sg)
                 rv.commands.setNodeInputs(seq_group, new_inputs)
-                self._sequence_input_order[seq_group] = new_inputs
+                self._sequence_input_order[seq_group] = (
+                    self._get_sequence_inputs(seq_group) or new_inputs
+                )
                 _log(f"RECV remove_child: {seq_group} now has {len(new_inputs)} inputs")
                 rv.commands.redraw()
                 return
 
     def _apply_move_child(self, data):
         """Apply a MOVE_CHILD patch to the RV session after OTIO has already been updated."""
-        timeline_guid = None
         parent_uuid = data.get("parent_uuid")
-        # Find which timeline and sequence group own this track
         for seq_group, tl_guid in self._rv_node_to_timeline_guid.items():
             timeline = self.sync_manager._timelines.get(tl_guid)
             if not timeline:
                 continue
             for track in timeline.tracks:
                 if self._is_media_track(track) and track.metadata.get("sync", {}).get("guid") == parent_uuid:
-                    timeline_guid = tl_guid
-                    # Rebuild RV sequence inputs from the updated OTIO track order
                     path_to_sg = self._path_to_source_group_map()
                     new_inputs = []
                     for clip in track:
@@ -957,10 +931,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                 new_inputs.append(sg)
                     if new_inputs:
                         rv.commands.setNodeInputs(seq_group, new_inputs)
-                        self._sequence_input_order[seq_group] = new_inputs
+                        # Store the nodesOfType order (what _check_sequence_reorders reads)
+                        # not the connection order, so programmatic moves don't look like
+                        # user drags on the next poll tick.
+                        self._sequence_input_order[seq_group] = (
+                            self._get_sequence_inputs(seq_group) or new_inputs
+                        )
                         _log(f"RECV move_child: reordered {seq_group} → {new_inputs}")
                     rv.commands.redraw()
                     return
+        _log(f"RECV move_child: no media track found for parent_uuid={parent_uuid}")
 
     def poll_network(self):
         if not self.sync_manager:
@@ -1017,11 +997,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             except Exception as e:
                 import traceback
                 _log(f"ERROR in _check_sequence_reorders: {e}\n{traceback.format_exc()}")
-            try:
-                self._align_rv_sequences_to_otio()
-            except Exception as e:
-                import traceback
-                _log(f"ERROR in _align_rv_sequences_to_otio: {e}\n{traceback.format_exc()}")
             self._poll_new_sequences()
             self._poll_sequence_renames()
             self._broadcast_display_state()
@@ -1749,8 +1724,33 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         view = seq_groups[0]
                 if view:
                     self._rv_node_to_timeline_guid[view] = tl_guid
-                    self._sequence_input_order[view] = self._get_sequence_inputs(view)
-                    _log(f"Rebuild: mapped existing view '{view}' to timeline {tl_guid[:8]}")
+                    # Explicitly order the existing sequence to match OTIO, just
+                    # as the multi-timeline path does for newly created sequences.
+                    media_track = next(
+                        (t for t in timeline.tracks if self._is_media_track(t)), None
+                    )
+                    if media_track is not None:
+                        timeline_sgs = []
+                        for child in media_track:
+                            if not isinstance(child, otio.schema.Clip):
+                                continue
+                            ref = child.media_reference
+                            if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
+                                sg = path_to_sg.get(self._media_path(ref.target_url))
+                                if sg:
+                                    timeline_sgs.append(sg)
+                        if timeline_sgs:
+                            rv.commands.setNodeInputs(view, timeline_sgs)
+                            self._sequence_input_order[view] = self._get_sequence_inputs(view)
+                            self._sequence_settle_until[view] = time.time() + 5.0
+                            _log(f"Rebuild: mapped and ordered existing view '{view}' to timeline {tl_guid[:8]} ({len(timeline_sgs)} sources)")
+                        else:
+                            self._sequence_input_order[view] = self._get_sequence_inputs(view)
+                            self._sequence_settle_until[view] = time.time() + 5.0
+                            _log(f"Rebuild: mapped existing view '{view}' to timeline {tl_guid[:8]} (no sources to order)")
+                    else:
+                        self._sequence_input_order[view] = self._get_sequence_inputs(view)
+                        _log(f"Rebuild: mapped existing view '{view}' to timeline {tl_guid[:8]}")
 
         # Pass 4: replay annotations.
         for timeline in timelines:
@@ -2054,6 +2054,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self._stroke_timer.timeout.connect(self._send_partial_stroke)
                 if not self._stroke_timer.isActive():
                     self._stroke_timer.start(50)
+        else:
+            # Log unhandled graph-state-change contents so we can identify
+            # what RV fires for sequence reorders and other structural changes.
+            _log(f"graph-state-change (unhandled): {contents!r}")
         event.reject()
 
     def _stop_stroke_timers(self):

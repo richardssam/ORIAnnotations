@@ -23,6 +23,7 @@ media:
 tests:
   - name: "xstudio_vs_openrv_basic_annotation_notc"
     recording: "recordings/single_clip_annotation_notc.jsonl"
+    checkpoint_validation_delay: 2.5
     apps:
       - "xstudio"
       - "openrv"
@@ -75,6 +76,7 @@ tests:
   - name: "reorder_media"
     recording: "recordings/reorder_media_notc.jsonl"
     script_driven: false
+    checkpoint_validation_delay: 4.5
     apps:
       - "xstudio"
       - "openrv"
