@@ -2618,6 +2618,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # what frame offset.  Track the timeline GUID so we can pick the
             # matching RVSequenceGroup instead of arbitrarily grabbing the first one.
             start_frame = 1
+            end_frame = 1
             target_tl_guid = None
             for tl_guid_iter, tl in self.sync_manager.timelines.items():
                 found = False
@@ -2628,6 +2629,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     for child in track:
                         if child.metadata.get("sync", {}).get("guid") == clip_guid:
                             start_frame = elapsed + 1  # RV frames are 1-indexed
+                            try:
+                                clip_len = int(child.trimmed_range().duration.value)
+                            except Exception:
+                                clip_len = 0
+                            end_frame = start_frame + max(clip_len - 1, 0)
                             found = True
                             break
                         try:
@@ -2658,6 +2664,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
             _log(
                 f"RECV selection seq: seq_node={seq_node} start_frame={start_frame}"
+                f" end_frame={end_frame}"
                 f" target_tl={target_tl_guid[:8] if target_tl_guid else None}"
             )
             if seq_node:
@@ -2669,8 +2676,23 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 self._rv_updating = True
                 try:
                     rv.commands.setViewNode(seq_node)
-                    rv.commands.setFrame(start_frame)
-                    _log(f"RECV selection seq: applied setViewNode={seq_node} setFrame={start_frame}")
+                    current_frame = rv.commands.frame()
+                    if start_frame <= current_frame <= end_frame:
+                        # Already within this clip's range — stay at the current
+                        # frame rather than jumping back to the clip's start.
+                        # This prevents selection broadcasts during annotation from
+                        # resetting the playhead to frame 1.
+                        _log(
+                            f"RECV selection seq: applied setViewNode={seq_node}"
+                            f" (staying at frame {current_frame},"
+                            f" within clip range {start_frame}-{end_frame})"
+                        )
+                    else:
+                        rv.commands.setFrame(start_frame)
+                        _log(
+                            f"RECV selection seq: applied setViewNode={seq_node}"
+                            f" setFrame={start_frame}"
+                        )
                 except Exception as e:
                     _log(f"RECV selection seq: error applying setViewNode/setFrame: {e}")
                 finally:
