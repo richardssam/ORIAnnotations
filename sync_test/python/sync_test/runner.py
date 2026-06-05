@@ -158,6 +158,25 @@ class TestRunner:
             return False, f"Checkpoint at t={t:.1f}s failed:\n" + "\n".join(messages)
         return True, ""
 
+    def _wait_for_all_apps(self, app_ports, timeout=90.0):
+        """Poll each app's /state endpoint until all respond without error."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all("error" not in self.fetch_state(port) for _, port in app_ports):
+                return True
+            time.sleep(1.0)
+        return False
+
+    def _wait_for_snapshot(self, app_ports, timeout=30.0):
+        """Wait until every app reports a non-null clip (STATE_SNAPSHOT received)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            states = [self.fetch_state(port) for _, port in app_ports]
+            if all("error" not in st and st.get("clip") is not None for st in states):
+                return True
+            time.sleep(1.0)
+        return False
+
     def run_test(self, test_name, script_driven=False,
                  checkpoint_validation_delay=1.5,
                  checkpoint_min_spacing=2.0,
@@ -214,13 +233,17 @@ class TestRunner:
                     recording_path,
                     min_spacing=checkpoint_min_spacing,
                     frame_tolerance=frame_tolerance,
+                    validation_delay=checkpoint_validation_delay,
                 )
                 logging.info(f"Extracted {len(checkpoints)} validation checkpoints from recording.")
 
-                logging.info("Starting playback (waiting for peer)...")
-                player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=2.0)
-
+                # Start player FIRST so it claims master before any app launches.
+                # Apps that connect afterwards will send STATE_REQUEST and receive
+                # the recording's STATE_SNAPSHOT from the player.
                 import threading
+
+                logging.info(f"Starting playback (waiting for {len(apps)} peer(s))...")
+                player.start_playback(speed=1.0, wait_for_peer=True, min_peer_count=len(apps), post_snapshot_delay=2.0)
 
                 def player_thread_func():
                     while playing_state["playing"]:
@@ -237,8 +260,16 @@ class TestRunner:
                 spawner.launch(app_name, port)
                 app_ports.append((app_name, port))
 
-            logging.info("Apps launched. Waiting for them to settle (5s)...")
-            time.sleep(5.0)
+            logging.info("Apps launched. Waiting for all apps to connect...")
+            if not self._wait_for_all_apps(app_ports, timeout=90.0):
+                logging.error("Timed out waiting for apps to become ready.")
+                return False
+            logging.info("All apps connected.")
+
+            if not script_driven:
+                logging.info("Waiting for all apps to receive the initial snapshot...")
+                if not self._wait_for_snapshot(app_ports, timeout=30.0):
+                    logging.warning("Apps did not all report a clip within 30s — proceeding anyway.")
 
             failed = False
             fail_reason = ""
@@ -438,13 +469,13 @@ class TestRunner:
         return all_passed
 
 
-def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5):
+def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5,
+                       validation_delay=0.0):
     """Extract validation checkpoints from a recording.
 
-    Returns stable PLAYBACK_SETTINGS positions (not scrubbing, not playing).
-    Rapid scrubs produce many events close together; we keep the *last* one
-    in each burst so we validate the position the user actually landed on,
-    not the first frame they touched.
+    Only positions where the recording is silent for at least *validation_delay*
+    seconds afterwards are eligible.  This ensures that by the time we validate
+    the checkpoint the recording hasn't already advanced the frame further.
 
     Each checkpoint is a dict:
         time_offset     – seconds into the recording when the event was sent
@@ -500,6 +531,17 @@ def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5):
 
             except Exception:
                 continue
+
+    # Filter: only keep positions where the recording is silent for at least
+    # validation_delay seconds afterward.  This guarantees the frame won't
+    # have moved by the time we go to validate it.
+    if validation_delay > 0:
+        stable = []
+        for i, cp in enumerate(raw):
+            next_t = raw[i + 1]["time_offset"] if i + 1 < len(raw) else float("inf")
+            if next_t - cp["time_offset"] >= validation_delay:
+                stable.append(cp)
+        raw = stable
 
     # Keep the last event in each burst: scan backwards, emit when the gap to
     # the previous emitted entry is >= min_spacing.

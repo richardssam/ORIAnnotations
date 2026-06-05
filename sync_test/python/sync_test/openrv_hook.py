@@ -62,8 +62,13 @@ def get_openrv_state():
             if media_info and len(media_info) > 0:
                 path = media_info[0]
                 state["media_path"] = path
-                if path.startswith("file://"):
-                    path = path[7:]
+                if path.startswith("file:/"):
+                    if path.startswith("file://localhost"):
+                        path = path[16:]
+                    elif path.startswith("file://"):
+                        path = path[7:]
+                    elif path.startswith("file:/"):
+                        path = path[5:]
                 state["media_exists"] = os.path.exists(path)
         else:
             # If no sources, we don't treat media as "missing" (just empty)

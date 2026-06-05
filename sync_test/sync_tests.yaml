@@ -40,7 +40,7 @@ tests:
       - "openrv"
       - "openrv"
   - name: "delete_media_openrv"
-    #recording: "recordings/delete_media_notc.jsonl"
+    recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
     commands:
       - action: "add_media"
@@ -57,7 +57,7 @@ tests:
       - "openrv"
       - "openrv"
   - name: "delete_media_xstudio"
-    #recording: "recordings/delete_media_notc.jsonl"
+    recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
     commands:
       - action: "add_media"
@@ -78,8 +78,8 @@ tests:
     script_driven: false
     checkpoint_validation_delay: 4.5
     apps:
-      - "xstudio"
       - "openrv"
+      - "xstudio"
   - name: "xstudio_selects"
     recording: "recordings/xstudio_selects.jsonl"
     script_driven: true

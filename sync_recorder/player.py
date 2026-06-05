@@ -56,9 +56,11 @@ class SyncPlayer:
         # Peer-join gate: hold playback until a STATE_SNAPSHOT has been sent
         # and a configurable delay has elapsed.
         self._wait_for_peer = False
+        self._min_peer_count: int = 1
         self._post_snapshot_delay: float = 3.0
         self._peer_snapshot_sent_at: float | None = None
         self._peer_active_received: bool = False
+        self._peers_snapshotted: set[str] = set()
 
     def load_recording(self, filepath: str) -> None:
         """Load recorded events from a JSON Lines file.
@@ -168,6 +170,7 @@ class SyncPlayer:
         loop: bool = False,
         replace_source_guid: bool = True,
         wait_for_peer: bool = False,
+        min_peer_count: int = 1,
         post_snapshot_delay: float = 3.0,
     ) -> None:
         """Initialize non-blocking procedural playback.
@@ -175,19 +178,22 @@ class SyncPlayer:
         Subsequent calls to :meth:`tick` will send messages at the correct times.
 
         When *wait_for_peer* is ``True``, :meth:`tick` enters a waiting state
-        and does not send any events until a peer has requested and received
-        the ``STATE_SNAPSHOT`` **and** *post_snapshot_delay* seconds have
-        elapsed.  During this phase :meth:`tick` still returns ``True`` and
-        continues to service incoming network requests.
+        and does not send any events until *min_peer_count* peers have each
+        requested and received a ``STATE_SNAPSHOT`` **and** *post_snapshot_delay*
+        seconds have elapsed after the last snapshot was sent.  During this phase
+        :meth:`tick` still returns ``True`` and continues to service incoming
+        network requests.
 
         :param speed: Playback speed multiplier.
         :param loop: If True, loops playback indefinitely.
         :param replace_source_guid: If True, replaces payload source GUIDs with
             the player's own guid.
-        :param wait_for_peer: If True, hold event dispatch until a peer has
+        :param wait_for_peer: If True, hold event dispatch until peers have
             loaded the current state.
-        :param post_snapshot_delay: Seconds to wait after snapshot delivery
-            before the first event is sent.  Default 1.0 s.
+        :param min_peer_count: Number of distinct peers that must each receive
+            a STATE_SNAPSHOT before the gate clears.  Default 1.
+        :param post_snapshot_delay: Seconds to wait after the last snapshot is
+            delivered before playback begins.  Default 1.0 s.
         """
         if not self.events:
             raise ValueError("No recording loaded. Call load_recording() first.")
@@ -195,6 +201,8 @@ class SyncPlayer:
         self._ensure_network()
 
         self._peer_snapshot_sent_at = None
+        self._peers_snapshotted = set()
+        self._min_peer_count = min_peer_count
         self._wait_for_peer = wait_for_peer
         self._post_snapshot_delay = post_snapshot_delay
         # When waiting for a peer, defer setting _play_start_time until the
@@ -230,15 +238,15 @@ class SyncPlayer:
 
         self._process_network_requests()
 
-        # Peer-join gate: wait until the snapshot has been delivered and the
-        # post-snapshot delay has elapsed before sending any events.
+        # Peer-join gate: wait until min_peer_count peers have each received a
+        # snapshot and the post-snapshot delay has elapsed.
         if self._wait_for_peer:
-            if self._peer_snapshot_sent_at is None:
-                # Nobody has joined yet; keep servicing the network.
+            if len(self._peers_snapshotted) < self._min_peer_count:
+                # Not enough peers have joined yet; keep servicing the network.
                 return True
             elapsed = time.time() - self._peer_snapshot_sent_at
             if not self._peer_active_received and elapsed < self._post_snapshot_delay:
-                # Snapshot sent but cooling-off delay not yet elapsed and no activity seen.
+                # All peers snapshotted but cooling-off delay not yet elapsed.
                 return True
             # Gate cleared — arm the event clock and drop into normal playback.
             self._wait_for_peer = False
@@ -335,8 +343,9 @@ class SyncPlayer:
                         snapshot["source_guid"] = self.network.self_guid
                         snapshot["session"] = self.session_id
                         self.network.send_payload(snapshot)
-                        # Record that a peer has loaded state; the peer-join
-                        # gate in tick() and play() watches this timestamp.
+                        # Track each distinct peer that has received a snapshot.
+                        # The gate in tick() waits until min_peer_count are done.
+                        self._peers_snapshotted.add(requester)
                         self._peer_snapshot_sent_at = time.time()
                         self._peer_active_received = False
 

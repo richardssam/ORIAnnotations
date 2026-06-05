@@ -79,8 +79,14 @@ def get_xstudio_state(port=14441):
                         if ms_src and ms_src.media_reference:
                             uri_str = str(ms_src.media_reference.uri())
                         state["media_path"] = uri_str
-                        if uri_str.startswith("file://"):
-                            local_path = uri_str.replace("file://localhost", "").replace("file://", "")
+                        if uri_str.startswith("file:/"):
+                            local_path = uri_str
+                            if local_path.startswith("file://localhost"):
+                                local_path = local_path[16:]
+                            elif local_path.startswith("file://"):
+                                local_path = local_path[7:]
+                            elif local_path.startswith("file:/"):
+                                local_path = local_path[5:]
                             state["media_exists"] = os.path.exists(local_path)
                         else:
                             state["media_exists"] = os.path.exists(uri_str)
