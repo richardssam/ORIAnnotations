@@ -21,6 +21,18 @@ export OTIO_PLUGIN_MANIFEST_PATH=/path/to/ORIAnnotations/otio_event_plugin/plugi
 
 > **Note:** The plugin automatically extends `OTIO_PLUGIN_MANIFEST_PATH` and `sys.path` at load time, so only `XSTUDIO_PYTHON_PLUGIN_PATH` is strictly required if the ORIAnnotations repo is on `PYTHONPATH`. Setting all three explicitly avoids any ordering issues.
 
+### Debug logging environment variables (Optional)
+
+To write detailed execution and debug logs to a file, set the following environment variables before launching xSTUDIO:
+
+```bash
+# Enable file logging for the Live Sync plugin
+export ORI_SYNC_LOG_FILE=/path/to/sync_plugin.log
+
+# Enable file logging for the manual Annotations Export plugin
+export ORI_ANNOTATIONS_LOG_FILE=/path/to/annotations_plugin.log
+```
+
 ### Example (bash, absolute paths)
 
 ```bash

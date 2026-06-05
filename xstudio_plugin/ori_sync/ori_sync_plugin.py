@@ -116,6 +116,7 @@ def _make_logger() -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
     log_file = os.environ.get("ORI_SYNC_LOG_FILE")
     if log_file:
+        print("ORI Sync Plugin: Logging output to: ", log_file)
         fh = logging.FileHandler(log_file, mode="w")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -467,6 +468,10 @@ class ORISyncPlugin(PluginBase):
         # records without comparing.  Only the poll AFTER that can detect real deletions.
         self._xs_sequence_track_names: dict[str, list | None] = {}
 
+        # Bidirectional mapping between sync GUIDs and xStudio media objects/UUIDs.
+        self._sync_guid_to_xs_media: dict = {}
+        self._xs_uuid_to_sync_guid: dict = {}
+
         # Add session management menu items.
         self.insert_menu_item(
             "main menu bar",
@@ -666,6 +671,8 @@ class ORISyncPlugin(PluginBase):
         self._selection_broadcast_suppress_until = 0.0
         self._pending_snapshot_requesters.clear()
         self._xs_sequence_track_names.clear()
+        self._sync_guid_to_xs_media.clear()
+        self._xs_uuid_to_sync_guid.clear()
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -774,6 +781,7 @@ class ORISyncPlugin(PluginBase):
                 for _tl_guid in _dirty_tl_guids:
                     self._poll_sequence_new_media(only_guid=_tl_guid)
                     self._poll_sequence_track_deletions(only_guid=_tl_guid)
+                    self._poll_sequence_reorders(only_guid=_tl_guid)
 
                 now = time.monotonic()
                 if now - self._last_selection_scan >= 0.2:
@@ -800,6 +808,7 @@ class ORISyncPlugin(PluginBase):
                     self._poll_flat_playlist_reorders()
                     self._poll_sequence_new_media()
                     self._poll_sequence_track_deletions()
+                    self._poll_sequence_reorders()
                     self._poll_new_playlists()
                     self._poll_playlist_renames()
                     self._last_flat_playlist_scan = now
@@ -1002,8 +1011,36 @@ class ORISyncPlugin(PluginBase):
                     _log(f"    [{j}] {type(child).__name__} {getattr(child, 'name', '?')!r} sr={sr}")
 
             if otio_tl.metadata.get("xs_flat_playlist"):
-                # Flat media-bin Playlist: add each clip by URI so xStudio reads
-                # file headers directly (avoids the source_range=None problem).
+                # Flat media-bin Playlist: check if it belongs to a known sequence timeline.
+                xs_seq_guid = otio_tl.metadata.get("xs_sequence_guid")
+                if xs_seq_guid and xs_seq_guid in self._sync_playlists:
+                    try:
+                        playlist, xs_timeline = self._sync_playlists[xs_seq_guid]
+                        # Reorder the playlist to match flat-OTIO clip order
+                        video_track = next((t for t in otio_tl.tracks if t.kind == otio.schema.TrackKind.Video), None)
+                        if video_track:
+                            for clip in video_track:
+                                if isinstance(clip, otio.schema.Clip):
+                                    cg = clip.metadata.get("sync", {}).get("guid")
+                                    if cg:
+                                        media_obj = self._media_for_sync_guid(cg)[0]
+                                        if media_obj:
+                                            playlist.move_media(media_obj)
+                        
+                        self._sync_playlists[guid] = (playlist, None)
+                        try:
+                            current_media = playlist.media
+                            self._xs_flat_playlists[guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media])
+                        except Exception:
+                            pass
+                        if first_xs_timeline is None:
+                            first_xs_timeline = playlist
+                        _log(f"Linked flat playlist OTIO {guid[:8]} to existing sequence playlist for sequence {xs_seq_guid[:8]}")
+                        self._load_snapshot_annotations(otio_tl, playlist)
+                        continue
+                    except Exception:
+                        _log_exc(f"Failed to link/reorder flat playlist for sequence {xs_seq_guid[:8]} — falling through to create new")
+
                 try:
                     playlist = self.connection.api.session.create_playlist(playlist_name)[1]
                     added_media: list = []
@@ -1031,11 +1068,12 @@ class ORISyncPlugin(PluginBase):
                                 except Exception:
                                     _log_exc(f"  Could not add {path!r}")
                     self._sync_playlists[guid] = (playlist, None)
+                    self._bootstrap_media_mapping(playlist, otio_tl, None)
                     # Register in _xs_flat_playlists so _poll_flat_playlist_new_media
                     # can detect clips added by the local user (even as a client).
                     try:
                         current_media = playlist.media
-                        self._xs_flat_playlists[guid] = (playlist, [m.name for m in current_media])
+                        self._xs_flat_playlists[guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media])
                     except Exception:
                         _log_exc("Could not init _xs_flat_playlists entry from load")
                     if first_xs_timeline is None:
@@ -1047,30 +1085,12 @@ class ORISyncPlugin(PluginBase):
             else:
                 try:
                     playlist = self.connection.api.session.create_playlist(playlist_name)[1]
-                    # Add all media to the playlist bin BEFORE loading the timeline
-                    # so xStudio can assign media to sequence clips on export.
-                    for _track in otio_tl.tracks:
-                        if _track.name == "Annotations":
-                            continue
-                        if _track.kind != otio.schema.TrackKind.Video:
-                            continue
-                        for _clip in _track:
-                            if not isinstance(_clip, otio.schema.Clip):
-                                continue
-                            _mr = _clip.media_reference
-                            if not isinstance(_mr, otio.schema.ExternalReference):
-                                continue
-                            _path = _uri_to_posix_path(_mr.target_url or "")
-                            if _path:
-                                try:
-                                    playlist.add_media(_path)
-                                except Exception:
-                                    pass
                     xs_timeline = playlist.create_timeline(timeline_name)[1]
                     otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
                     self._xs_sequence_track_names[guid] = None
                     self._sync_playlists[guid] = (playlist, xs_timeline)
+                    self._bootstrap_media_mapping(playlist, otio_tl, xs_timeline)
                     # Register in _xs_sequence_playlists so _poll_sequence_new_media
                     # can detect clips added by the local user (even as a client).
                     # Use clip names from the snapshot OTIO's Media track so that
@@ -1097,17 +1117,7 @@ class ORISyncPlugin(PluginBase):
                         self._xs_sequence_media_names[guid] = {m.name for m in playlist.media}
                     except Exception:
                         self._xs_sequence_media_names[guid] = set()
-                    # Record the OTIO Media-track clip-GUID order so move_children
-                    # calls can find the current index without querying xStudio clip actors.
-                    media_track = next(
-                        (t for t in otio_tl.tracks if t.name == "Media"), None
-                    )
-                    if media_track is not None:
-                        self._xs_media_order[guid] = [
-                            c.metadata.get("sync", {}).get("guid")
-                            for c in media_track
-                            if isinstance(c, otio.schema.Clip)
-                        ]
+                    self._update_xs_media_order(guid, otio_tl)
                     if first_xs_timeline is None:
                         first_xs_timeline = xs_timeline
                     _log(f"Created playlist {playlist_name!r} / timeline {timeline_name!r} from OTIO timeline {guid[:8]}")
@@ -1204,11 +1214,20 @@ class ORISyncPlugin(PluginBase):
                             pass
                         self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_seq)
                         self._sync_playlists[tl_guid] = (playlist, xs_tl)
+                        self._bootstrap_media_mapping(playlist, tl, xs_tl)
+                        self._update_xs_media_order(tl_guid, tl)
                         try:
                             self._xs_sequence_media_names[tl_guid] = {m.name for m in playlist.media}
                         except Exception:
                             self._xs_sequence_media_names[tl_guid] = set()
                         self._subscribe_timeline_item_events(tl_guid, xs_tl)
+                        try:
+                            flat_tl = self._build_otio_from_playlist_media(playlist)
+                            if flat_tl is not None:
+                                flat_tl.metadata["xs_sequence_guid"] = tl_guid
+                                result.append(flat_tl)
+                        except Exception:
+                            _log_exc(f"Could not build flat playlist OTIO for playlist {playlist.name!r}")
                     except Exception:
                         _log_exc(f"Could not export Timeline {getattr(xs_tl, 'name', '?')!r}")
             else:
@@ -1281,7 +1300,6 @@ class ORISyncPlugin(PluginBase):
         tl_guid = str(playlist.uuid)
         tl.metadata.setdefault("sync", {})["guid"] = tl_guid
         tl.metadata["xs_flat_playlist"] = True
-        self._xs_flat_playlists[tl_guid] = (playlist, [m.name for m in media_list])
         # Also register in _sync_playlists so _apply_selection works on the master.
         # xs_timeline is None for flat playlists on the master (no Timeline child exists
         # at build time); _apply_selection only needs the Playlist object.
@@ -1338,6 +1356,7 @@ class ORISyncPlugin(PluginBase):
 
                 clip.metadata["sync"] = {"guid": clip_guid}
                 self._flat_clip_to_media[clip_guid] = media
+                self._register_media(media, clip_guid)
                 track.append(clip)
                 _log(f"  Flat media clip: {media.name!r} fps={fps} frames={frame_count}")
             except Exception:
@@ -1348,6 +1367,7 @@ class ORISyncPlugin(PluginBase):
             return None
 
         tl.tracks.append(track)
+        self._xs_flat_playlists[tl_guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in media_list])
         _log(f"Built synthetic OTIO timeline for flat playlist {name!r}: {len(clips)} clip(s)")
         return tl
 
@@ -1378,34 +1398,55 @@ class ORISyncPlugin(PluginBase):
                 is_timeline = getattr(self, "_viewport_container_is_timeline", False)
                 _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
                 _media_name_hint = None
-                for _pl, _ in self._sync_playlists.values():
-                    try:
-                        for _m in _pl.media:
-                            if str(_m.uuid) == media_uuid_str:
-                                _media_name_hint = _m.name
-                                break
-                    except Exception:
-                        pass
-                    if _media_name_hint:
-                        break
+                clip_guid = self._sync_guid_for_xs_uuid(media_uuid_str)
+                if clip_guid:
+                    media_obj = self._sync_guid_to_xs_media.get(clip_guid) or self._flat_clip_to_media.get(clip_guid)
+                    if media_obj:
+                        _media_name_hint = media_obj.name
+
+                if not clip_guid or not _media_name_hint:
+                    # Legacy fallback scan
+                    for _pl, _ in self._sync_playlists.values():
+                        try:
+                            for _m in _pl.media:
+                                if str(_m.uuid) == media_uuid_str:
+                                    _media_name_hint = _m.name
+                                    clip_guid = self._clip_guid_for_media_name(_media_name_hint)
+                                    break
+                        except Exception:
+                            pass
+                        if _media_name_hint:
+                            break
+
                 _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
                 # Determine view_mode by checking whether this media UUID belongs
-                # to a tracked sequence (Timeline) playlist rather than using the
-                # cached _viewport_container_is_timeline poll value.  The cached
-                # value goes False once xStudio enters single-clip/Pinned-Source
-                # mode after the first double-click, breaking all subsequent
-                # sequence-clip selections.
+                # to a tracked sequence (Timeline) playlist.
                 _seq_tl_guid: str | None = None
-                for _tg, (_seq_pl, _xs_tl, _kn) in self._xs_sequence_playlists.items():
-                    try:
-                        for _m in _seq_pl.media:
-                            if str(_m.uuid) == media_uuid_str:
-                                _seq_tl_guid = _tg
-                                break
-                    except Exception:
-                        pass
-                    if _seq_tl_guid:
-                        break
+                if clip_guid and self.manager:
+                    for _tg, _tl in self.manager.timelines.items():
+                        if _tl.metadata.get("xs_flat_playlist"):
+                            continue
+                        for _track in _tl.tracks:
+                            if _track.kind == otio.schema.TrackKind.Video:
+                                if any(getattr(_c, "metadata", {}).get("sync", {}).get("guid") == clip_guid for _c in _track if isinstance(_c, otio.schema.Clip)):
+                                    _seq_tl_guid = _tg
+                                    break
+                        if _seq_tl_guid:
+                            break
+
+                if _seq_tl_guid is None:
+                    # Fallback to scanning sequence playlists media
+                    for _tg, (_seq_pl, _xs_tl, _kn) in self._xs_sequence_playlists.items():
+                        try:
+                            for _m in _seq_pl.media:
+                                if str(_m.uuid) == media_uuid_str:
+                                    _seq_tl_guid = _tg
+                                    break
+                        except Exception:
+                            pass
+                        if _seq_tl_guid:
+                            break
+
                 _is_seq_media = _seq_tl_guid is not None
                 # When xStudio is already in single-clip mode (PSM=False), any
                 # show_atom is a deliberate user click — use source mode regardless
@@ -1433,21 +1474,17 @@ class ORISyncPlugin(PluginBase):
                 if _is_seq_media and self._last_polled_playing and not _playing_just_started and not _in_single_clip:
                     _log(f"[SEL] → suppressed (playing through sequence)")
                     return
-                if (_media_name_hint and self.manager
+                if (clip_guid and self.manager
                         and self.manager.status == STATE_SYNCED):
-                    clip_guid = self._clip_guid_for_media_name(_media_name_hint)
-                    if clip_guid:
-                        self._last_viewed_clip_guid = clip_guid
-                        if view_mode == "sequence" and _seq_tl_guid:
-                            self.manager.active_timeline_guid = _seq_tl_guid
-                        elif view_mode == "source":
-                            clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
-                            if clip_tl_guid:
-                                self.manager.active_timeline_guid = clip_tl_guid
-                        self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
-                        _log(f"[SEL] → broadcast clip {clip_guid[:8]} mode={view_mode}")
-                    else:
-                        _log(f"[SEL] → no clip_guid found for {_media_name_hint!r}")
+                    self._last_viewed_clip_guid = clip_guid
+                    if view_mode == "sequence" and _seq_tl_guid:
+                        self.manager.active_timeline_guid = _seq_tl_guid
+                    elif view_mode == "source":
+                        clip_tl_guid = self.manager.get_or_create_clip_timeline(clip_guid)
+                        if clip_tl_guid:
+                            self.manager.active_timeline_guid = clip_tl_guid
+                    self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
+                    _log(f"[SEL] → broadcast clip {clip_guid[:8]} mode={view_mode}")
                 return
 
             if time.monotonic() < self._reload_suppress_until:
@@ -1681,6 +1718,7 @@ class ORISyncPlugin(PluginBase):
             self._viewport_container_is_timeline = is_timeline
 
             clip_name = None
+            clip_uuid_str = None
             if is_timeline:
                 try:
                     selected_items = container.selection
@@ -1691,6 +1729,8 @@ class ORISyncPlugin(PluginBase):
                     for item in selected_items:
                         if type(item).__name__ == "Clip":
                             clip_name = getattr(item, "name", None)
+                            if item.media:
+                                clip_uuid_str = str(item.media.uuid)
                             break
                 except Exception:
                     _log_exc("[SEL] Timeline.selection poll failed")
@@ -1704,6 +1744,7 @@ class ORISyncPlugin(PluginBase):
                         self._last_src_names = src_names
                     if selected_sources:
                         clip_name = selected_sources[0].name
+                        clip_uuid_str = str(selected_sources[0].uuid)
                 except Exception:
                     _log_exc("[SEL] Playlist.playhead_selection poll failed")
 
@@ -1716,7 +1757,11 @@ class ORISyncPlugin(PluginBase):
             # Update annotation fallback: flat-playlist path needs to know what clip
             # is currently viewed when _resolve_clip_at_frame returns None.
             if clip_name and self.manager:
-                cg = self._clip_guid_for_media_name(clip_name)
+                cg = None
+                if clip_uuid_str:
+                    cg = self._sync_guid_for_xs_uuid(clip_uuid_str)
+                if not cg:
+                    cg = self._clip_guid_for_media_name(clip_name)
                 if cg:
                     self._last_viewed_clip_guid = cg
 
@@ -1751,7 +1796,11 @@ class ORISyncPlugin(PluginBase):
                                 if not _media_h:
                                     _media_h = clip_name  # fallback: current poll value
                                 if _media_h:
-                                    _cg = self._clip_guid_for_media_name(_media_h)
+                                    _cg = None
+                                    if clip_uuid_str and _media_h == clip_name:
+                                        _cg = self._sync_guid_for_xs_uuid(clip_uuid_str)
+                                    if not _cg:
+                                        _cg = self._clip_guid_for_media_name(_media_h)
                                     if _cg:
                                         self._last_viewed_clip_guid = _cg
                                         _ctg = self.manager.get_or_create_clip_timeline(_cg)
@@ -1834,7 +1883,9 @@ class ORISyncPlugin(PluginBase):
                     sel = matching_pl.playhead_selection
                     selected_sources = sel.selected_sources
                     if len(selected_sources) == 1:
-                        clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
+                        clip_guid = self._sync_guid_for_xs_uuid(str(selected_sources[0].uuid))
+                        if not clip_guid:
+                            clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
                         if clip_guid:
                             return self.manager.get_or_create_clip_timeline(clip_guid)
                 except Exception:
@@ -2265,7 +2316,7 @@ class ORISyncPlugin(PluginBase):
                     # echo back to the peer that just sent us this selection.
                     self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self.connection.api.session.set_on_screen_source(playlist)
-                    media, _ = self._find_media_for_clip_guid(clip_guid)
+                    media, _ = self._media_for_sync_guid(clip_guid)
                     if media:
                         playlist.playhead_selection.set_selection([media.uuid])
                         _log(f"RECV selection: set_selection "
@@ -2334,13 +2385,13 @@ class ORISyncPlugin(PluginBase):
         poll cycle for the typical case; multi-hop reorders converge in subsequent
         cycles.
         """
-        if not self.manager or not self.manager.is_master:
+        if not self.manager or self.manager.status != STATE_SYNCED:
             return
 
         for tl_guid, (xs_playlist, stored_order) in list(self._xs_flat_playlists.items()):
             try:
                 current_media = xs_playlist.media
-                current_order = [m.name for m in current_media]
+                current_order = [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
             except Exception:
                 continue
 
@@ -2363,26 +2414,155 @@ class ORISyncPlugin(PluginBase):
             if not track_guid:
                 continue
 
-            # Build name → clip-GUID map from the current OTIO track state.
-            name_to_clip_guid: dict[str, str] = {}
-            for clip in video_track:
-                if isinstance(clip, otio.schema.Clip):
-                    cg = clip.metadata.get("sync", {}).get("guid")
-                    if cg:
-                        name_to_clip_guid[clip.name] = cg
+            track_clip_guids = {
+                clip.metadata["sync"]["guid"]
+                for clip in video_track
+                if isinstance(clip, otio.schema.Clip) and "sync" in clip.metadata and "guid" in clip.metadata["sync"]
+            }
 
             # Find the first position where orders differ; broadcast that clip
             # moving to its new index.
-            for new_idx, name in enumerate(current_order):
-                if new_idx >= len(stored_order) or stored_order[new_idx] != name:
-                    child_guid = name_to_clip_guid.get(name)
-                    if child_guid:
-                        self.manager.broadcast_move_child(track_guid, child_guid, new_idx)
-                        _log(f"Flat playlist reorder: {name!r} → index {new_idx}")
+            for new_idx, guid in enumerate(current_order):
+                if new_idx >= len(stored_order) or stored_order[new_idx] != guid:
+                    if guid in track_clip_guids:
+                        self.manager.broadcast_move_child(track_guid, guid, new_idx)
+                        _log(f"Flat playlist reorder: guid {guid[:8]} → index {new_idx}")
                     # Update stored order whether or not we found a GUID, so we
                     # don't re-fire on the same state next tick.
                     self._xs_flat_playlists[tl_guid] = (xs_playlist, list(current_order))
                     break
+
+    def _poll_sequence_reorders(self, only_guid: str | None = None) -> None:
+        """Detect and broadcast clip reorders in sequence Timelines.
+
+        Only runs on the master.  For each sequence Timeline registered in
+        ``_xs_sequence_playlists``, reads the current timeline order from
+        xStudio by re-serialising it to OTIO, maps each clip to its stable
+        sync GUID, and compares it to ``self._xs_media_order``.
+
+        :param only_guid: When given, only checks the timeline with this sync GUID.
+        """
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+
+        items = list(self._xs_sequence_playlists.items())
+        if only_guid is not None:
+            items = [(g, v) for g, v in items if g == only_guid]
+
+        for tl_guid, tl_entry in items:
+            xs_tl = tl_entry[1]
+            if xs_tl is None:
+                continue
+            otio_tl = self.manager.timelines.get(tl_guid)
+            if otio_tl is None:
+                continue
+            video_track = next(
+                (t for t in otio_tl.tracks
+                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                next(
+                    (t for t in otio_tl.tracks
+                     if t.kind == otio.schema.TrackKind.Video),
+                    None,
+                ),
+            )
+            if video_track is None:
+                continue
+            track_guid = video_track.metadata.get("sync", {}).get("guid")
+            if not track_guid:
+                continue
+
+            try:
+                xs_otio_str = xs_tl.to_otio_string()
+                xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
+                xs_video_track = next(
+                    (t for t in xs_tl_parsed.tracks
+                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                    next(
+                        (t for t in xs_tl_parsed.tracks
+                         if t.kind == otio.schema.TrackKind.Video),
+                        None,
+                    ),
+                )
+                xs_clips = (
+                    [c for c in xs_video_track if isinstance(c, otio.schema.Clip)]
+                    if xs_video_track is not None else []
+                )
+            except Exception:
+                continue
+
+            # Greedy match current clips to stable manager clip GUIDs
+            manager_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
+            pool = list(manager_clips)
+            current_order = []
+
+            for clip in xs_clips:
+                clip_guid = None
+                clip_url = ""
+                if isinstance(clip.media_reference, otio.schema.ExternalReference):
+                    clip_url = clip.media_reference.target_url or ""
+                clip_path = _uri_to_posix_path(clip_url)
+                norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
+                clip_stem = os.path.splitext(os.path.basename(clip_path))[0].lower() if clip_path else ""
+
+                matched_mc = None
+                for mc in pool:
+                    mc_url = ""
+                    if isinstance(mc.media_reference, otio.schema.ExternalReference):
+                        mc_url = mc.media_reference.target_url or ""
+                    mc_path = _uri_to_posix_path(mc_url)
+                    norm_mc_path = os.path.normpath(mc_path) if mc_path else ""
+                    if norm_clip_path and norm_clip_path == norm_mc_path:
+                        matched_mc = mc
+                        break
+                    mc_stem = os.path.splitext(os.path.basename(mc_path))[0].lower() if mc_path else ""
+                    if clip_stem and clip_stem == mc_stem:
+                        matched_mc = mc
+                        break
+
+                if matched_mc is not None:
+                    clip_guid = matched_mc.metadata.get("sync", {}).get("guid")
+                    pool.remove(matched_mc)
+                
+                if clip_guid:
+                    current_order.append(clip_guid)
+
+            stored_order = self._xs_media_order.get(tl_guid)
+            if stored_order is None:
+                self._xs_media_order[tl_guid] = list(current_order)
+                continue
+
+            if current_order == stored_order:
+                continue
+
+            if len(current_order) != len(stored_order):
+                self._xs_media_order[tl_guid] = list(current_order)
+                continue
+
+            # Find first mismatch
+            for new_idx, guid in enumerate(current_order):
+                if new_idx >= len(stored_order) or stored_order[new_idx] != guid:
+                    self.manager.broadcast_move_child(track_guid, guid, new_idx)
+                    _log(f"Sequence timeline reorder: guid {guid[:8]} → index {new_idx}")
+                    self._xs_media_order[tl_guid] = list(current_order)
+                    break
+
+    def _update_xs_media_order(self, tl_guid: str, otio_tl: "otio.schema.Timeline") -> None:
+        """Update self._xs_media_order for a sequence timeline from its OTIO representation."""
+        media_track = next(
+            (t for t in otio_tl.tracks
+             if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+            next(
+                (t for t in otio_tl.tracks
+                 if t.kind == otio.schema.TrackKind.Video),
+                None,
+            ),
+        )
+        if media_track is not None:
+            self._xs_media_order[tl_guid] = [
+                c.metadata.get("sync", {}).get("guid")
+                for c in media_track
+                if isinstance(c, otio.schema.Clip)
+            ]
 
     def _poll_flat_playlist_new_media(self) -> None:
         """Detect and broadcast media additions and deletions in flat Playlists.
@@ -2400,7 +2580,7 @@ class ORISyncPlugin(PluginBase):
             except Exception:
                 continue
 
-            current_order = [m.name for m in current_media]
+            current_order = [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
             if current_order == stored_order:
                 continue
 
@@ -2424,15 +2604,18 @@ class ORISyncPlugin(PluginBase):
             removed_names = stored_names - current_names
             if removed_names:
                 for clip in list(video_track):
-                    if isinstance(clip, otio.schema.Clip) and clip.name in removed_names:
-                        child_guid = clip.metadata.get("sync", {}).get("guid")
-                        if child_guid:
-                            self.manager.broadcast_remove_child(track_guid, child_guid)
+                    if isinstance(clip, otio.schema.Clip):
+                        cg = clip.metadata.get("sync", {}).get("guid")
+                        if cg in removed_names:
+                            self._evict_media(cg)
+                            self._flat_clip_to_media.pop(cg, None)
+                            self.manager.broadcast_remove_child(track_guid, cg)
                             _log(f"flat playlist deleted media: {clip.name!r} removed")
 
             # Broadcast additions.
             for media in current_media:
-                if media.name in stored_names:
+                guid = self._xs_uuid_to_sync_guid.get(str(media.uuid), str(media.uuid))
+                if guid in stored_names:
                     continue
                 try:
                     ms = media.media_source()
@@ -2468,7 +2651,12 @@ class ORISyncPlugin(PluginBase):
                             name=media.name,
                             media_reference=otio.schema.ExternalReference(target_url=uri),
                         )
-                    new_index = current_order.index(media.name)
+                    new_index = current_order.index(guid)
+                    self.manager._ensure_guid_and_map(clip)
+                    clip_guid = clip.metadata.get("sync", {}).get("guid")
+                    if clip_guid:
+                        self._flat_clip_to_media[clip_guid] = media
+                        self._register_media(media, clip_guid)
                     self.manager.insert_child(track_guid, clip, new_index)
                     _log(f"flat playlist new media: {media.name!r} inserted at {new_index}")
                 except Exception:
@@ -2758,6 +2946,10 @@ class ORISyncPlugin(PluginBase):
                             media_reference=otio.schema.ExternalReference(target_url=uri),
                         )
                     new_index = len([c for c in video_track if isinstance(c, otio.schema.Clip)])
+                    self.manager._ensure_guid_and_map(clip)
+                    clip_guid = clip.metadata.get("sync", {}).get("guid")
+                    if clip_guid:
+                        self._register_media(media, clip_guid)
                     self.manager.insert_child(track_guid, clip, new_index)
                     _log(f"sequence new media: {_bn!r} at index {new_index}")
                     known_names = known_names | {media.name, _bn}
@@ -2851,6 +3043,7 @@ class ORISyncPlugin(PluginBase):
                                 and otio_clip.name == clip_name):
                             child_guid = otio_clip.metadata.get("sync", {}).get("guid")
                             if child_guid:
+                                self._evict_media(child_guid)
                                 self.manager.broadcast_remove_child(track_guid, child_guid)
                                 _log(f"sequence track: deleted {clip_name!r} from xStudio timeline")
                             break
@@ -2886,8 +3079,8 @@ class ORISyncPlugin(PluginBase):
                             if tl_guid in self._xs_flat_playlists:
                                 try:
                                     cur_pl, stored = self._xs_flat_playlists[tl_guid]
-                                    if clip_obj.name not in stored:
-                                        self._xs_flat_playlists[tl_guid] = (cur_pl, stored + [clip_obj.name])
+                                    if clip_guid not in stored:
+                                        self._xs_flat_playlists[tl_guid] = (cur_pl, stored + [clip_guid])
                                 except Exception:
                                     pass
                         else:
@@ -3148,7 +3341,7 @@ class ORISyncPlugin(PluginBase):
         while len(cache) < len(all_strokes):
             cache.append(str(uuid.uuid4()))
 
-        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        _, aspect_half = self._media_for_sync_guid(clip_guid)
 
         # Send ALL current strokes so peers can update from any starting point.
         events_obj = xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=cache)
@@ -3253,7 +3446,7 @@ class ORISyncPlugin(PluginBase):
         # The live stroke always occupies the last slot in the cache.
         stroke_idx = len(cache) - 1
 
-        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        _, aspect_half = self._media_for_sync_guid(clip_guid)
 
         events_obj = xs_strokes_to_sync_events(
             live_strokes, aspect_half, uuid_list=[cache[stroke_idx]]
@@ -3438,7 +3631,7 @@ class ORISyncPlugin(PluginBase):
             _log("_broadcast_local_bookmark: no Annotations track")
             return False
 
-        _, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        _, aspect_half = self._media_for_sync_guid(clip_guid)
         all_strokes = canvas.get("pen_strokes", [])
         all_captions = canvas.get("captions", [])
 
@@ -3639,15 +3832,6 @@ class ORISyncPlugin(PluginBase):
         """
         if not self.manager:
             return
-        # Build a name → media lookup from the playlist so each annotation clip
-        # can find its target without re-scanning for every clip.
-        try:
-            name_to_media: dict = {m.name: m for m in playlist.media}
-        except Exception:
-            _log_exc("_load_snapshot_annotations: could not iterate playlist.media")
-            return
-
-        _log(f"  Playlist media names: {list(name_to_media.keys())}")
 
         # Group annotation clips by (clip_guid, frame) — old snapshots may have
         # multiple separate clips per frame (one per stroke) because the Gap/merge
@@ -3671,12 +3855,9 @@ class ORISyncPlugin(PluginBase):
                 if otio_clip is None:
                     _log(f"  Snapshot ann: clip_guid {clip_guid[:8]} not in object_map")
                     continue
-                media = name_to_media.get(otio_clip.name)
+                media = self._media_for_sync_guid(clip_guid)[0]
                 if media is None:
-                    _log(
-                        f"  Snapshot ann: no playlist media named {otio_clip.name!r}"
-                        f" (available: {list(name_to_media.keys())})"
-                    )
+                    _log(f"  Snapshot ann: no playlist media found for clip_guid {clip_guid[:8]}")
                     continue
 
                 frame = 0
@@ -3773,7 +3954,7 @@ class ORISyncPlugin(PluginBase):
             _log(f"_refresh_annotation_bookmark: no tracked bookmark for {bm_key}")
             return
 
-        media, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        media, aspect_half = self._media_for_sync_guid(clip_guid)
         if media is None:
             return
 
@@ -3875,7 +4056,7 @@ class ORISyncPlugin(PluginBase):
             _log("_apply_remote_annotation: no clip_guid in metadata — skipping")
             return
 
-        media, aspect_half = self._find_media_for_clip_guid(clip_guid)
+        media, aspect_half = self._media_for_sync_guid(clip_guid)
         if media is None:
             _log(
                 f"_apply_remote_annotation: no xStudio media for clip {clip_guid[:8]}"
@@ -3987,6 +4168,204 @@ class ORISyncPlugin(PluginBase):
                 )
         except Exception:
             _log_exc("_apply_remote_annotation: failed to set annotation")
+
+    def _register_media(self, media_obj, sync_guid: str) -> None:
+        """Register a media object and its sync GUID in the bidirectional mapping."""
+        if not media_obj or not sync_guid:
+            return
+        uuid_str = str(media_obj.uuid)
+        self._sync_guid_to_xs_media[sync_guid] = media_obj
+        self._xs_uuid_to_sync_guid[uuid_str] = sync_guid
+
+    def _evict_media(self, sync_guid: str) -> None:
+        """Remove a media object from the bidirectional mapping by its sync GUID."""
+        media_obj = self._sync_guid_to_xs_media.pop(sync_guid, None)
+        if media_obj:
+            uuid_str = str(media_obj.uuid)
+            self._xs_uuid_to_sync_guid.pop(uuid_str, None)
+
+    def _media_for_sync_guid(self, sync_guid: str) -> tuple:
+        """Look up the xStudio media item corresponding to an OTIO clip GUID.
+
+        Replaces `_find_media_for_clip_guid` and provides O(1) lookup.
+        Also derives ``aspect_half`` (``W / (2H)``) from the media stream
+        resolution so that coordinate conversion is accurate.
+
+        :param sync_guid: Sync GUID of the OTIO media clip.
+        :returns: ``(media, aspect_half)`` or ``(None, 0.8889)`` on failure.
+        :rtype: tuple
+        """
+        media = self._sync_guid_to_xs_media.get(sync_guid)
+        if media is None:
+            # Fall back to flat-playlist mapping if present
+            media = self._flat_clip_to_media.get(sync_guid)
+            if media is None:
+                media, aspect = self._find_media_for_clip_guid(sync_guid)
+                if media is not None:
+                    _log(f"WARNING: _media_for_sync_guid fell back to name-scan for guid {sync_guid[:8]}")
+                return media, aspect
+
+        def _aspect(m):
+            try:
+                ms = m.media_source()
+                streams = ms.streams()
+                if streams:
+                    res = streams[0].media_stream_detail.resolution()
+                    if res.y > 0:
+                        return res.x / (2.0 * res.y)
+            except Exception:
+                pass
+            return 0.8889
+
+        return media, _aspect(media)
+
+    def _prepare_otio_for_load(self, otio_tl: "otio.schema.Timeline") -> "otio.schema.Timeline":
+        """Create a copy of otio_tl where clip target URLs are replaced with their matched xStudio media URIs.
+
+        This ensures xStudio's C++ ``load_otio`` matches clips to existing media items in the bin,
+        preventing it from importing duplicate media items.
+        """
+        otio_copy = otio_tl.deepcopy()
+        for track in otio_copy.tracks:
+            if track.kind != otio.schema.TrackKind.Video:
+                continue
+            for clip in track:
+                if not isinstance(clip, otio.schema.Clip):
+                    continue
+                clip_guid = clip.metadata.get("sync", {}).get("guid")
+                if clip_guid:
+                    media_obj, _ = self._media_for_sync_guid(clip_guid)
+                    if media_obj:
+                        try:
+                            ms = media_obj.media_source()
+                            m_uri = str(ms.media_reference.uri())
+                            if m_uri:
+                                if not clip.media_reference:
+                                    clip.media_reference = otio.schema.ExternalReference()
+                                clip.media_reference.target_url = m_uri
+                        except Exception:
+                            pass
+        return otio_copy
+
+    def _bootstrap_media_mapping(self, playlist, otio_tl, xs_timeline=None) -> None:
+        """Scan playlist.media and match each item to its OTIO clip to build initial mapping."""
+        if not playlist or not otio_tl:
+            return
+
+        # Build path/stem -> sync_guid mapping from the OTIO timeline clips
+        otio_guid_by_path = {}
+        otio_guid_by_stem = {}
+        for track in otio_tl.tracks:
+            if track.kind != otio.schema.TrackKind.Video:
+                continue
+            for clip in track:
+                if not isinstance(clip, otio.schema.Clip):
+                    continue
+                guid = clip.metadata.get("sync", {}).get("guid")
+                if not guid:
+                    continue
+                
+                mr = clip.media_reference
+                if isinstance(mr, otio.schema.ExternalReference) and mr.target_url:
+                    posix_path = _uri_to_posix_path(mr.target_url)
+                    norm_path = os.path.normpath(posix_path) if posix_path else ""
+                    if norm_path:
+                        otio_guid_by_path[norm_path] = guid
+                        otio_guid_by_path[norm_path.lower()] = guid
+                    stem = os.path.splitext(os.path.basename(posix_path))[0]
+                    if stem:
+                        otio_guid_by_stem[stem] = guid
+                        otio_guid_by_stem[stem.lower()] = guid
+                elif clip.name:
+                    stem = os.path.splitext(os.path.basename(clip.name))[0]
+                    if stem:
+                        otio_guid_by_stem[stem] = guid
+                        otio_guid_by_stem[stem.lower()] = guid
+
+        # Scan playlist media and match to OTIO clips
+        try:
+            media_list = playlist.media
+        except Exception:
+            _log_exc("_bootstrap_media_mapping: failed to read playlist media")
+            return
+
+        referenced_media_uuids = set()
+        if xs_timeline:
+            try:
+                for track in xs_timeline.tracks:
+                    if track.is_video:
+                        for clip in track.clips:
+                            if clip.media:
+                                referenced_media_uuids.add(str(clip.media.uuid))
+            except Exception:
+                _log_exc("_bootstrap_media_mapping: failed to gather referenced media UUIDs")
+
+        guid_to_matched_media = {}
+        unmatched = []
+        for media in media_list:
+            mname = media.name or ""
+            m_path = ""
+            m_uri = ""
+            try:
+                ms = media.media_source()
+                m_uri = str(ms.media_reference.uri())
+                m_path = _uri_to_posix_path(m_uri)
+            except Exception:
+                pass
+
+            # Try to match
+            guid = None
+            if m_path:
+                norm_m_path = os.path.normpath(m_path)
+                guid = otio_guid_by_path.get(norm_m_path) or otio_guid_by_path.get(norm_m_path.lower())
+            
+            if not guid and mname:
+                stem = os.path.splitext(os.path.basename(mname))[0]
+                guid = otio_guid_by_stem.get(stem) or otio_guid_by_stem.get(stem.lower())
+            
+            if not guid and m_path:
+                stem = os.path.splitext(os.path.basename(m_path))[0]
+                guid = otio_guid_by_stem.get(stem) or otio_guid_by_stem.get(stem.lower())
+
+            if guid:
+                guid_to_matched_media.setdefault(guid, []).append(media)
+            else:
+                unmatched.append(f"name={mname!r} path={m_path!r}")
+
+        for guid, matched_list in guid_to_matched_media.items():
+            if len(matched_list) == 1:
+                self._register_media(matched_list[0], guid)
+            else:
+                # Duplicates!
+                keepers = [m for m in matched_list if str(m.uuid) in referenced_media_uuids]
+                others = [m for m in matched_list if str(m.uuid) not in referenced_media_uuids]
+                if len(keepers) == 1:
+                    self._register_media(keepers[0], guid)
+                    for other in others:
+                        try:
+                            _other_name = other.name
+                        except Exception:
+                            _other_name = str(getattr(other, 'uuid', '???'))
+                        try:
+                            playlist.remove_media(other)
+                            _log(f"Removed duplicate unreferenced media item {_other_name!r} for guid {guid[:8]}")
+                        except Exception:
+                            _log_exc(f"Failed to remove duplicate media {_other_name!r}")
+                else:
+                    # Keep both if referenced status is ambiguous or multiple keepers exist
+                    _log(f"WARNING: duplicate media items for guid {guid[:8]} referenced count={len(keepers)}; keeping both")
+                    self._register_media(matched_list[0], guid)
+
+    def _sync_guid_for_xs_uuid(self, xs_uuid_str: str) -> str | None:
+        """Return the OTIO clip GUID for an xStudio media item by its UUID string.
+
+        Replaces `_clip_guid_for_media_name` and provides O(1) lookup.
+
+        :param xs_uuid_str: String representation of the media UUID.
+        :returns: GUID string, or ``None`` if not found.
+        :rtype: str or None
+        """
+        return self._xs_uuid_to_sync_guid.get(str(xs_uuid_str))
 
     def _clip_guid_for_media_name(self, media_name: str) -> "str | None":
         """Return the OTIO clip GUID for an xStudio media item by its display name.
@@ -4124,7 +4503,7 @@ class ORISyncPlugin(PluginBase):
         # file path as the media name (which happens after add_media(path)).
         def _media_for_clip(clip):
             cg = clip.metadata.get("sync", {}).get("guid", "")
-            return self._flat_clip_to_media.get(cg)
+            return self._media_for_sync_guid(cg)[0]
 
         moved_media = _media_for_clip(ordered_clips[to_index])
         if not moved_media:
@@ -4141,6 +4520,17 @@ class ORISyncPlugin(PluginBase):
             xs_playlist.move_media(moved_media)  # move to end
 
         _log(f"flat playlist move: {ordered_clips[to_index].name!r} → index {to_index}")
+
+        # Update stored order in flat playlists map to prevent polling feedback loop
+        if tl_guid in self._xs_flat_playlists:
+            try:
+                current_media = xs_playlist.media
+                self._xs_flat_playlists[tl_guid] = (
+                    xs_playlist,
+                    [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
+                )
+            except Exception:
+                pass
 
     def _apply_flat_playlist_insert(
         self, clip_obj: "otio.schema.Clip", xs_playlist, xs_timeline
@@ -4168,6 +4558,7 @@ class ORISyncPlugin(PluginBase):
             clip_guid = clip_obj.metadata.get("sync", {}).get("guid", "")
             if clip_guid and media_obj:
                 self._flat_clip_to_media[clip_guid] = media_obj
+                self._register_media(media_obj, clip_guid)
             if xs_timeline is not None:
                 try:
                     xs_timeline.add_media(media_obj)
@@ -4191,11 +4582,15 @@ class ORISyncPlugin(PluginBase):
         :param xs_timeline: xStudio Timeline to reload.
         """
         try:
-            self._fill_source_ranges(otio_tl)
-            otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+            prepared_otio = self._prepare_otio_for_load(otio_tl)
+            self._fill_source_ranges(prepared_otio)
+            otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             self._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
+            if tl_guid in self._sync_playlists:
+                playlist = self._sync_playlists[tl_guid][0]
+                self._bootstrap_media_mapping(playlist, otio_tl, xs_timeline)
             try:
                 self.connection.api.session.set_on_screen_source(xs_timeline)
             except Exception:
@@ -4224,6 +4619,8 @@ class ORISyncPlugin(PluginBase):
         child_uuid = data.get("child_uuid")
         if not parent_uuid or not child_uuid:
             return
+
+        self._evict_media(child_uuid)
 
         # Identify the owning timeline by its track GUID.
         tl_guid = None
@@ -4262,7 +4659,7 @@ class ORISyncPlugin(PluginBase):
             if tl_guid in self._xs_flat_playlists:
                 try:
                     cur_pl, _ = self._xs_flat_playlists[tl_guid]
-                    self._xs_flat_playlists[tl_guid] = (cur_pl, [m.name for m in xs_playlist.media])
+                    self._xs_flat_playlists[tl_guid] = (cur_pl, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in xs_playlist.media])
                 except Exception:
                     pass
             return
@@ -4271,11 +4668,16 @@ class ORISyncPlugin(PluginBase):
         if otio_tl is None:
             return
         try:
-            self._fill_source_ranges(otio_tl)
-            otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+            prepared_otio = self._prepare_otio_for_load(otio_tl)
+            self._fill_source_ranges(prepared_otio)
+            otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             self._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
+            if tl_guid in self._sync_playlists:
+                playlist = self._sync_playlists[tl_guid][0]
+                self._bootstrap_media_mapping(playlist, otio_tl, xs_timeline)
+            self._update_xs_media_order(tl_guid, otio_tl)
             _log(f"remote remove_child: reloaded sequence timeline {tl_guid[:8]}")
             try:
                 self.connection.api.session.set_on_screen_source(xs_timeline)
@@ -4366,14 +4768,54 @@ class ORISyncPlugin(PluginBase):
             self._apply_flat_playlist_move(tl_guid, xs_playlist, otio_tl, to_index)
             return
 
+        # Try the lightweight incremental path: move the clip directly in the
+        # xStudio track without rebuilding the whole timeline.  load_otio with
+        # clear=True is very slow and creates duplicate media items, so we
+        # avoid it for incremental MOVE_CHILD events whenever possible.
+        stored_order = self._xs_media_order.get(tl_guid)
+        if stored_order and child_uuid in stored_order:
+            from_index = stored_order.index(child_uuid)
+            try:
+                # Find the Media track — the video track that actually has clips
+                # (Annotations track has 0 clips and should be skipped).
+                media_track = None
+                for _track in xs_timeline.video_tracks:
+                    try:
+                        if len(_track.clips) > 0:
+                            media_track = _track
+                            break
+                    except Exception:
+                        pass
+                if media_track is not None:
+                    media_track.move_children(from_index, 1, to_index, False)
+                    self._update_xs_media_order(tl_guid, otio_tl)
+                    try:
+                        self.connection.api.session.set_on_screen_source(xs_timeline)
+                    except Exception:
+                        pass
+                    _log(f"move_child: moved clip {child_uuid[:8]} from {from_index} to {to_index} in {tl_guid[:8]}")
+                    return
+            except Exception:
+                _log_exc(f"move_child: direct move_children failed for {tl_guid[:8]}, falling back to load_otio")
+
+        # Fall back to load_otio when move_children is unavailable or fails.
         try:
-            self._fill_source_ranges(otio_tl)
-            otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+            # Bootstrap mapping before preparing OTIO so _prepare_otio_for_load
+            # can rewrite all clip URIs to match existing media, preventing
+            # load_otio from creating duplicate media items.
+            self._bootstrap_media_mapping(xs_playlist, otio_tl, xs_timeline)
+            prepared_otio = self._prepare_otio_for_load(otio_tl)
+            self._fill_source_ranges(prepared_otio)
+            otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             # Suppress show_atom bursts that xStudio fires when it re-triggers
             # existing bookmarks after the timeline is rebuilt.
             self._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
+            if tl_guid in self._sync_playlists:
+                playlist = self._sync_playlists[tl_guid][0]
+                self._bootstrap_media_mapping(playlist, otio_tl, xs_timeline)
+            self._update_xs_media_order(tl_guid, otio_tl)
             # Re-activate the timeline in the UI — load_otio does not restore
             # the viewed source automatically.
             try:
@@ -4385,17 +4827,6 @@ class ORISyncPlugin(PluginBase):
             self._reload_suppress_until = 0.0
             _log_exc(f"move_child: failed to reload timeline {tl_guid[:8]}")
             return
-
-        # Keep tracked order in sync with the new OTIO Media track order.
-        media_track = next(
-            (t for t in otio_tl.tracks if t.name == "Media"), None
-        )
-        if media_track is not None:
-            self._xs_media_order[tl_guid] = [
-                c.metadata.get("sync", {}).get("guid")
-                for c in media_track
-                if isinstance(c, otio.schema.Clip)
-            ]
 
     # ── OTIO helpers ───────────────────────────────────────────────────────────
 

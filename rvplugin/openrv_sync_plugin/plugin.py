@@ -480,8 +480,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception:
             current_view = None
 
-        seq_sources = self._source_groups_for_sequences(seq_groups)
-        _log(f"Sequence source counts: { {k: len(v) for k, v in seq_sources.items()} }")
+        source_groups_set = set(rv.commands.nodesOfType("RVSourceGroup"))
 
         for seq_group in seq_groups:
             try:
@@ -500,7 +499,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
             edl_counts = self._edl_frame_counts(seq_group)
             _log(f"EDL frame counts for {seq_group}: {edl_counts}")
-            for idx, sg in enumerate(seq_sources.get(seq_group, [])):
+            seq_inputs = [sg for sg in self._get_sequence_inputs(seq_group) if sg in source_groups_set]
+            _log(f"Sequence inputs in edit order for {seq_group}: {seq_inputs}")
+            for idx, sg in enumerate(seq_inputs):
                 num_frames = edl_counts[idx] if idx < len(edl_counts) else None
                 try:
                     for n in rv.commands.nodesInGroup(sg):
@@ -518,7 +519,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
             self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
-            self._sequence_settle_until[seq_group] = time.time() + 5.0
 
             if self._active_media_track_guid is None:
                 self._active_media_track_guid = track_guid
@@ -553,7 +553,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             view = rv.commands.viewNode()
             self._rv_node_to_timeline_guid[view] = tl_guid
             self._sequence_input_order[view] = self._get_sequence_inputs(view)
-            self._sequence_settle_until[view] = time.time() + 5.0
         except Exception:
             pass
 
@@ -611,7 +610,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
             self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
-            self._sequence_settle_until[seq_group] = time.time() + 5.0
             self.sync_manager.broadcast_add_timeline(tl_guid)
             _log(f"New RVSequenceGroup '{seq_name}' → timeline {tl_guid[:8]} broadcast")
 
@@ -738,11 +736,17 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
             # After a rebuild or programmatic setNodeInputs the RVSequenceGroup's
             # connection order can take a few seconds to settle to the true EDL order.
-            # Silently absorb changes during this window to prevent false broadcasts.
+            # Suppress broadcasts during this window, but do NOT update the baseline
+            # order — that way any user-initiated reorders that happen during settle
+            # are still detected and broadcast once the window expires.
             settle_until = self._sequence_settle_until.get(seq_group, 0)
-            if time.time() < settle_until:
-                self._sequence_input_order[seq_group] = current
-                continue
+            if settle_until:
+                if time.time() < settle_until:
+                    continue
+                # Settle window just expired: clear the flag and fall through to
+                # normal detection so any changes accumulated during settle are
+                # broadcast now (e.g. user reordered before a second peer connected).
+                self._sequence_settle_until[seq_group] = 0
 
             _log(f"Sequence changed in {seq_group}: {stored} -> {current}")
 
@@ -1648,9 +1652,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     def _rebuild_rv_session(self):
         """Clear and rebuild the RV session based on the current OTIO timelines."""
         _log("Rebuilding RV session from OTIO snapshot...")
-        if not self.sync_manager._timelines: return
-
-        timelines = list(self.sync_manager._timelines.values())
+        timelines = [
+            tl for tl in self.sync_manager._timelines.values()
+            if not tl.metadata.get("xs_flat_playlist")
+        ]
+        if not timelines:
+            return
 
         # Pass 1: load every unique path once.
         # addSource in RV may be deferred, so we scan for source groups in a
