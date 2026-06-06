@@ -18,7 +18,7 @@ zip -r otiosyncdemo-1.2.rvpkg plugin.py PACKAGE pika
 # From the repo root, zip in the otio_sync_core library.
 cd ../..
 cd python
-zip ../rvplugin/openrv_sync_plugin/otiosyncdemo-1.2.rvpkg \
+zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/__init__.py \
     otio_sync_core/network.py \
     otio_sync_core/rabbitmq_network.py \

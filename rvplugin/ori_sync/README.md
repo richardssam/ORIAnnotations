@@ -14,7 +14,7 @@ An OpenRV plugin that synchronises OTIO timeline state between multiple OpenRV i
 Build the package:
 
 ```bash
-cd rvplugin/openrv_sync_plugin
+cd rvplugin/ori_sync
 ./makepackage.csh
 ```
 

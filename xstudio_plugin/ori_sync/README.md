@@ -116,7 +116,7 @@ The plugin currently assumes `event == "pen_down"` and `event == "pen_up"` as th
 
 ## Interoperability
 
-The plugin uses the same wire protocol as the OpenRV plugin (`rvplugin/openrv_sync_plugin/plugin.py`). Any mix of xStudio and RV peers can join the same session as long as they share the same `Session ID`, `MQ Host`, and `MQ Port`.
+The plugin uses the same wire protocol as the OpenRV plugin (`rvplugin/ori_sync/plugin.py`). Any mix of xStudio and RV peers can join the same session as long as they share the same `Session ID`, `MQ Host`, and `MQ Port`.
 
 Annotations broadcast from xStudio are stored in the shared OTIO timeline as `insert_child` patches and are readable by the `sync_viewer` debug viewer and the OTIO export pipeline.
 

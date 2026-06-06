@@ -1,6 +1,6 @@
 # ORIAnnotations xSTUDIO Plugin
 
-Exports annotations (bookmarks) from xSTUDIO as an ORIAnnotations-compatible OTIO file that can be imported by the OpenRV plugin (`rvplugin/ori_annotations_plugin.py`).
+Exports annotations (bookmarks) from xSTUDIO as an ORIAnnotations-compatible OTIO file that can be imported by the OpenRV plugin (`rvplugin/ori_annotations/ori_annotations_plugin.py`).
 
 ## Installation
 
@@ -53,7 +53,7 @@ export OTIO_PLUGIN_MANIFEST_PATH=$REPO/otio_event_plugin/plugin_manifest.json
    - **Render annotation images** — renders each annotated frame as a transparent PNG (annotations only, no background image) alongside the OTIO.
 5. Click **Export**.
 
-The resulting `.otio` file can be imported into OpenRV using the **Tools → Import annotations** menu entry provided by `rvplugin/ori_annotations_plugin.py`.
+The resulting `.otio` file can be imported into OpenRV using the **Tools → Import annotations** menu entry provided by `rvplugin/ori_annotations/ori_annotations_plugin.py`.
 
 ## What gets exported
 

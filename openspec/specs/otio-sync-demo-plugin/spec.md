@@ -6,7 +6,7 @@ The plugin SHALL register an "OTIO Sync" top-level menu in OpenRV. The menu cont
 
 #### Scenario: Menu appears on startup
 
-- **WHEN** OpenRV starts with the `openrv_sync_plugin` loaded
+- **WHEN** OpenRV starts with the `ori_sync` plugin loaded
 - **THEN** an "OTIO Sync" menu SHALL be visible in the RV menu bar
 
 ---

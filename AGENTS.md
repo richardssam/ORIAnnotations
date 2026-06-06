@@ -22,8 +22,9 @@ For a detailed breakdown of the protocol and architecture, see [docs/architectur
 | `python/otio_sync_core/manager.py` | `SyncManager` — master-election, timeline mutations, annotation persistence. |
 | `python/otio_sync_core/rabbitmq_network.py` | RabbitMQ fanout-exchange backend (uses `pika`). |
 | `python/otio_sync_core/proxy.py` | `OTIOSyncProxy` — transparent attribute-write interceptor for OTIO objects. |
-| `rvplugin/openrv_sync_plugin/plugin.py` | OpenRV plugin. Builds OTIO timelines from RV sessions, broadcasts playback & annotations. |
-| `rvplugin/openrv_sync_plugin/makepackage.csh` | Build script that produces the `.rvpkg` installable. |
+| `rvplugin/ori_sync/plugin.py` | OpenRV sync plugin. Builds OTIO timelines from RV sessions, broadcasts playback & annotations. |
+| `rvplugin/ori_sync/makepackage.csh` | Build script that produces the `.rvpkg` installable. |
+| `rvplugin/ori_annotations/` | Legacy OpenRV plugin for exporting/importing annotations as custom OTIO files. |
 | `sync_viewer/server.py` | FastAPI + WebSocket debug viewer server. Joins the session as a passive peer. |
 | `sync_viewer/static/index.html` | Single-file browser UI for the debug viewer. |
 | `xstudio_plugin/` | xStudio equivalent of the RV plugin (separate integration). |

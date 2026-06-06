@@ -125,7 +125,7 @@ In `manager.py` `_process_message`, `_persist_annotation_to_timeline` must be ca
 ## Building and installing the RV plugin
 
 ```bash
-cd rvplugin/openrv_sync_plugin
+cd rvplugin/ori_sync
 bash reinstall.csh          # produces otiosyncdemo-0.1.rvpkg
 ```
 
@@ -133,4 +133,4 @@ bash reinstall.csh          # produces otiosyncdemo-0.1.rvpkg
 
 The `otio_sync_core` library bundled inside the `.rvpkg` is a **copy** of `python/otio_sync_core/`. Any change to the library files requires a package rebuild.
 
-Logs are written to `rvplugin/openrv_sync_plugin/host.log` (set `RV_OTIO_SYNC_LOG_FILE` env var to the desired path, or see `_make_otio_logger` in `plugin.py`).
+Logs are written to `rvplugin/ori_sync/host.log` (set `RV_OTIO_SYNC_LOG_FILE` env var to the desired path, or see `_make_otio_logger` in `plugin.py`).
