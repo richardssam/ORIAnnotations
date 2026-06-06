@@ -127,6 +127,14 @@ def batch_process(otio_path, output_dir):
         print("Waiting 5 seconds for media files to load and resolve in xStudio...")
         time.sleep(5)
 
+        # Save xStudio session for inspection
+        session_path = os.path.join(output_dir, "session.xst")
+        try:
+            conn.api.session.save(session_path)
+            print(f"Saved xStudio session to: {session_path}")
+        except Exception as se:
+            print(f"Could not save xStudio session: {se}")
+
         # Export and render snapshots
         print("Exporting and rendering annotation overlay PNGs...")
         success, message = plugin.export_annotations(

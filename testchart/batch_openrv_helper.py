@@ -89,30 +89,42 @@ def _run_batch_impl():
             media_track = newtimeline.tracks[0]
             
         # Create track and load media
-        otio_reader._create_track(media_track, context)
+        new_seq = otio_reader._create_track(media_track, context)
         commands.addSourceEnd()
-        
+
         # Allow a brief moment for RV to populate sources and groups
         time.sleep(1.0)
-        
-        # Build clip map of media paths to RV source groups/paint nodes
+
+        # Build clip map using sequence-level paint nodes.
+        # Annotations must go to defaultSequence_p_<sourceGroup>* nodes — those are
+        # the ones that render in the sequence view.  metaEvaluateClosestByType returns
+        # the wrong layer (Media_p_*) when the active view is not the sequence, so
+        # we find the nodes directly by their naming convention instead.
+        all_paint_nodes = commands.nodesOfType("RVPaint")
+        seq_paint_map = {}  # sourceGroupName → sequence-level paint node
+        for pn in all_paint_nodes:
+            if not pn.startswith("defaultSequence_p_"):
+                continue
+            sg = pn[len("defaultSequence_p_"):].replace("_switchGroup", "")
+            seq_paint_map[sg] = pn
+
+        sg_to_media = {}
+        for sourcenode in commands.nodesOfType("RVFileSource"):
+            sg = commands.nodeGroup(sourcenode)
+            movie_prop = f"{sourcenode}.media.movie"
+            if commands.propertyExists(movie_prop):
+                movie = commands.getStringProperty(movie_prop)[0]
+                if movie:
+                    sg_to_media[sg] = movie
+
         clipmap = {}
-        sourcenodes = commands.nodesOfType("RVFileSource")
-        for sourcenode in sourcenodes:
-            sourcegroup = commands.nodeGroup(sourcenode)
-            movie = f"{sourcenode}.media.movie"
-            if commands.propertyExists(movie):
-                media_path = commands.getStringProperty(movie)[0]
-                if media_path:
-                    paintnodes = extra_commands.nodesInGroupOfType(sourcegroup, 'RVPaint')
-                    clipinfo = {
-                        'media_path': media_path,
-                        'source_group': sourcegroup,
-                        'paint_node': paintnodes[0] if paintnodes else None
-                    }
-                    clipmap[media_path] = clipinfo
-                    clipmap[os.path.basename(media_path)] = clipinfo
-                    clipmap[os.path.splitext(os.path.basename(media_path))[0]] = clipinfo
+        for sg, media_path in sg_to_media.items():
+            paint_node = seq_paint_map.get(sg)
+            print(f"Source group {sg}: media={os.path.basename(media_path)} paint_node={paint_node}")
+            clipinfo = {'media_path': media_path, 'paint_node': paint_node}
+            clipmap[media_path] = clipinfo
+            clipmap[os.path.basename(media_path)] = clipinfo
+            clipmap[os.path.splitext(os.path.basename(media_path))[0]] = clipinfo
                     
         # Apply annotations (logic matching the RV plugin)
         for review in rg.reviews:
@@ -131,7 +143,7 @@ def _run_batch_impl():
                     
                 rv_node = clipinfo['paint_node']
                 if not rv_node:
-                    print(f"Warning: No paint node found for source {clipinfo['source_group']}")
+                    print(f"Warning: No paint node found for {media_key}")
                     continue
                     
                 for frame in ri.review_frames:
@@ -189,31 +201,32 @@ def _run_batch_impl():
                     for stroke in strokes:
                         if stroke['type'] == 'text':
                             text_node = f"{rv_node}.text:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                            if not commands.propertyExists(f"{text_node}.position"):
-                                commands.newProperty(f"{text_node}.position", commands.FloatType, 2)
-                            commands.setFloatProperty(f"{text_node}.position", [x for x in stroke['position']], True)
-                            if not commands.propertyExists(f"{text_node}.color"):
-                                commands.newProperty(f"{text_node}.color", commands.FloatType, 4)
-                            commands.setFloatProperty(f"{text_node}.color", [float(x) for x in stroke['color']], True)
-                            if not commands.propertyExists(f"{text_node}.spacing"):
-                                commands.newProperty(f"{text_node}.spacing", commands.FloatType, 1)
-                            commands.setFloatProperty(f"{text_node}.spacing", [stroke['spacing']], True)
-                            if not commands.propertyExists(f"{text_node}.size"):
-                                commands.newProperty(f"{text_node}.size", commands.FloatType, 1)
-                            commands.setFloatProperty(f"{text_node}.size", [stroke['font_size']], True)
-                            if not commands.propertyExists(f"{text_node}.font"):
-                                commands.newProperty(f"{text_node}.font", commands.StringType, 1)
-                            commands.setStringProperty(f"{text_node}.font", [stroke['font']], True)
-                            if not commands.propertyExists(f"{text_node}.text"):
-                                commands.newProperty(f"{text_node}.text", commands.StringType, 1)
-                            commands.setStringProperty(f"{text_node}.text", [stroke['text']], True)
-                            if not commands.propertyExists(f"{text_node}.scale"):
-                                commands.newProperty(f"{text_node}.scale", commands.FloatType, 1)
-                            commands.setFloatProperty(f"{text_node}.scale", [stroke['scale']], True)
-                            if not commands.propertyExists(f"{text_node}.rotation"):
-                                commands.newProperty(f"{text_node}.rotation", commands.FloatType, 1)
-                            commands.setFloatProperty(f"{text_node}.rotation", [stroke['rotation']], True)
-                            order.append(f"text:{strokeid}:{int(frame.frame)}:{stroke['user']}")
+                            rv_frame = int(frame.frame)
+                            def set_prop(name, ptype, val, dim=1):
+                                if not commands.propertyExists(f"{text_node}.{name}"):
+                                    commands.newProperty(f"{text_node}.{name}", ptype, dim)
+                                if ptype == commands.FloatType:
+                                    commands.setFloatProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
+                                elif ptype == commands.StringType:
+                                    commands.setStringProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
+                                else:
+                                    commands.setIntProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
+                            set_prop("position",    commands.FloatType,  list(stroke['position']), dim=2)
+                            set_prop("color",       commands.FloatType,  [float(x) for x in stroke['color']], dim=4)
+                            set_prop("spacing",     commands.FloatType,  stroke['spacing'] or 0.8)
+                            set_prop("size",        commands.FloatType,  stroke['font_size'] / 5000.0)
+                            set_prop("font",        commands.StringType, "")
+                            set_prop("text",        commands.StringType, stroke['text'])
+                            set_prop("scale",       commands.FloatType,  stroke['scale'] or 1.0)
+                            set_prop("rotation",    commands.FloatType,  stroke['rotation'] or 0.0)
+                            set_prop("origin",      commands.StringType, "")
+                            set_prop("debug",       commands.IntType,    0)
+                            set_prop("startFrame",  commands.IntType,    rv_frame)
+                            set_prop("duration",    commands.IntType,    1)
+                            set_prop("mode",        commands.IntType,    0)
+                            set_prop("uuid",        commands.StringType, stroke.get('uuid', str(uuid.uuid4())))
+                            set_prop("softDeleted", commands.IntType,    0)
+                            order.append(f"text:{strokeid}:{rv_frame}:{stroke['user']}")
                             strokeid += 1
                             continue
 
@@ -270,13 +283,13 @@ def _run_batch_impl():
                 if commands.propertyExists(f"{paint_node}.nextId"):
                     commands.setIntProperty(f"{paint_node}.nextId", [strokeid], False)
 
-        # Save temporary session to render snapshots via rvio
-        temp_session = tempfile.NamedTemporaryFile(suffix=".rv", delete=False)
-        temp_session_name = temp_session.name
-        temp_session.close()
-        
-        commands.saveSession(temp_session_name, asACopy=True)
-        print(f"Saved temporary RV session to: {temp_session_name}")
+        # Save session for inspection and for rvio rendering
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        session_path = os.path.join(output_dir, "session.rv")
+        commands.saveSession(session_path, asACopy=True)
+        print(f"Saved RV session to: {session_path}")
+        temp_session_name = session_path
         
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -329,8 +342,7 @@ def _run_batch_impl():
         otio.adapters.write_to_file(newtimeline, otio_export_path)
         print(f"Exported OTIO to: {otio_export_path}")
         
-        if os.path.exists(temp_session_name):
-            os.remove(temp_session_name)
+        print(f"Session saved at: {temp_session_name} — open in RV to inspect annotations")
             
     except Exception as e:
         import traceback

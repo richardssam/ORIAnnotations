@@ -149,7 +149,7 @@ def make_stroke(points_px, width, height, rgba, brush_size,
     return events
 
 
-def make_text(px, py, width, height, text, rgba, font_size=0.05):
+def make_text(px, py, width, height, text, rgba, font_size=50.0):
     """Build a single TextAnnotation event."""
     nx, ny = px_to_norm(px, py, width, height)
     j = json.dumps({
@@ -1073,6 +1073,7 @@ def vector_fonts_annotations():
             100, y, W, H,
             f"{sz}pt Font Size Sample Text",
             [1.0, 0.24, 0.24, 0.9],
+            font_size=sz * 417.0 / H,
         )
 
     # Corner tracing lines
@@ -1116,7 +1117,6 @@ def main():
 
     print("Building OTIO annotation file …")
 
-    # Modular media
     m_shapes = ORIAnnotations.Media(name="vector_shapes.png", media_path=v_shapes_path, frame_rate=24.0, duration=24, start_frame=0)
     m_shapes_uhd = ORIAnnotations.Media(name="vector_shapes_uhd.png", media_path=v_shapes_uhd_path, frame_rate=24.0, duration=24, start_frame=0)
     m_thickness = ORIAnnotations.Media(name="vector_thickness.png", media_path=v_thickness_path, frame_rate=24.0, duration=24, start_frame=0)
@@ -1128,8 +1128,6 @@ def main():
     m_fonts = ORIAnnotations.Media(name="vector_fonts.png", media_path=v_fonts_path, frame_rate=24.0, duration=24, start_frame=0)
     m_fonts_uhd = ORIAnnotations.Media(name="vector_fonts_uhd.png", media_path=v_fonts_uhd_path, frame_rate=24.0, duration=24, start_frame=0)
 
-    # ── Review Items ───────────────────────────────────────────────────────────
-    # Shapes review
     ri_shapes = ORIAnnotations.ReviewItem(media=m_shapes)
     frame_shapes = ORIAnnotations.ReviewItemFrame(review_item=ri_shapes, frame=1, note="**Vector Shapes test**", annotation_image=v_shapes_path)
     frame_shapes.annotation_commands = vector_shapes_annotations()
@@ -1140,7 +1138,6 @@ def main():
     frame_shapes_uhd.annotation_commands = vector_shapes_annotations()
     ri_shapes_uhd.review_frames = [frame_shapes_uhd]
 
-    # Thickness review
     ri_thickness = ORIAnnotations.ReviewItem(media=m_thickness)
     frame_thickness = ORIAnnotations.ReviewItemFrame(review_item=ri_thickness, frame=1, note="**Vector Thickness/Gaussian test**", annotation_image=v_thickness_path)
     frame_thickness.annotation_commands = vector_thickness_annotations()
@@ -1151,7 +1148,6 @@ def main():
     frame_thickness_uhd.annotation_commands = vector_thickness_annotations()
     ri_thickness_uhd.review_frames = [frame_thickness_uhd]
 
-    # Calligraphy review
     ri_calligraphy = ORIAnnotations.ReviewItem(media=m_calligraphy)
     frame_calligraphy = ORIAnnotations.ReviewItemFrame(review_item=ri_calligraphy, frame=1, note="**Vector Calligraphy test**", annotation_image=v_calligraphy_path)
     frame_calligraphy.annotation_commands = vector_calligraphy_annotations()
@@ -1162,7 +1158,6 @@ def main():
     frame_calligraphy_uhd.annotation_commands = vector_calligraphy_annotations()
     ri_calligraphy_uhd.review_frames = [frame_calligraphy_uhd]
 
-    # Colors review
     ri_colors = ORIAnnotations.ReviewItem(media=m_colors)
     frame_colors = ORIAnnotations.ReviewItemFrame(review_item=ri_colors, frame=1, note="**Vector Color Curves test**", annotation_image=v_colors_path)
     frame_colors.annotation_commands = vector_colors_annotations()
@@ -1173,7 +1168,6 @@ def main():
     frame_colors_uhd.annotation_commands = vector_colors_annotations()
     ri_colors_uhd.review_frames = [frame_colors_uhd]
 
-    # Fonts review
     ri_fonts = ORIAnnotations.ReviewItem(media=m_fonts)
     frame_fonts = ORIAnnotations.ReviewItemFrame(review_item=ri_fonts, frame=1, note="**Vector Font test**", annotation_image=v_fonts_path)
     frame_fonts.annotation_commands = vector_fonts_annotations()

@@ -374,7 +374,7 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
             "font_name": font,
             "font_size": font_size,
             "text": text,
-            "wrap_width": 0.5,
+            "wrap_width": 1.5,
             "justification": 0,
             "background_colour": ["colour", 1, 0.0, 0.0, 0.0],
             "background_opacity": 0.5,

@@ -257,11 +257,15 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             stroke['position'] = commands.getFloatProperty(f"{baseprop}.position")
                             stroke['color'] = commands.getFloatProperty(f"{baseprop}.color")
                             stroke['spacing'] = commands.getFloatProperty(f"{baseprop}.spacing")[0]
-                            stroke['font_size'] = commands.getFloatProperty(f"{baseprop}.size")[0]
+                            stroke['font_size'] = commands.getFloatProperty(f"{baseprop}.size")[0] * 5000.0
                             stroke['font'] = commands.getStringProperty(f"{baseprop}.font")[0]
                             stroke['text'] = commands.getStringProperty(f"{baseprop}.text")[0]
                             stroke['scale'] = commands.getFloatProperty(f"{baseprop}.scale")[0]
                             stroke['rotation'] = commands.getFloatProperty(f"{baseprop}.rotation")[0]
+
+                            if not stroke['text']:
+                                strokes.append(stroke)
+                                continue
 
                             textuuid = str(uuid.uuid4())
                             event = otio.schemadef.SyncEvent.TextAnnotation(
@@ -348,32 +352,35 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         rg.read_otio_timeline(newtimeline)
         context = {"otio_file": otiofile}
         new_seq = otio_reader._create_track(newtimeline.tracks[0], context)
+        commands.addSourceEnd()
         print("NEW SEQ:", new_seq)
-        # new_seq = "DefaultSequence"  # We assume the first track is the one we want to use.
-        # We want a mapping from the source group to the media file.
+
+        # Build clipmap using sequence-level paint nodes.
+        # Annotations must go to defaultSequence_p_<sourceGroup>* nodes.
+        all_paint_nodes = commands.nodesOfType("RVPaint")
+        seq_paint_map = {}
+        for pn in all_paint_nodes:
+            if not pn.startswith("defaultSequence_p_"):
+                continue
+            sg = pn[len("defaultSequence_p_"):].replace("_switchGroup", "")
+            seq_paint_map[sg] = pn
+
+        sg_to_media = {}
+        for sourcenode in commands.nodesOfType("RVFileSource"):
+            sg = commands.nodeGroup(sourcenode)
+            movie_prop = f"{sourcenode}.media.movie"
+            if commands.propertyExists(movie_prop):
+                movie = commands.getStringProperty(movie_prop)[0]
+                if movie:
+                    sg_to_media[sg] = movie
+
         clipmap = {}
-        for media in rg.media:
-            mediapath = media.media_path.replace("file://", "")
-            clipmap[mediapath] = {'media_path': mediapath,
-                                         'media': media}
-            
-        sourcenodes = commands.nodesOfType("RVFileSource")
-        # For the source nodes we have just imported (via the create_track), we wnat to find the actual 
-        # media loaded, and the associated paint nodes that we are applying the annotations to.
-        for sourcenode in sourcenodes:
-            print("Source node:", sourcenode)
-            sourcegroup = commands.nodeGroup(sourcenode)
-            if sourcegroup not in clipmap:
-                media = commands.getStringProperty(f"{sourcenode}.media.movie")[0]
-                if media is None or len(media) == 0:
-                    continue
-                mediaid = os.path.basename(media)
-                print("Media for source node:", media, mediaid)
-                paintnodes = extra_commands.nodesInGroupOfType(sourcegroup, 'RVPaint')
-                print("Paint nodes for source group:", sourcegroup, paintnodes)
-                clipmap[mediaid] = {'media_path': media, 'source_group': sourcegroup, 'paint_node': paintnodes[0] if paintnodes else None}
-            else:
-                print("Source group already in clipmap:", sourcegroup)
+        for sg, media_path in sg_to_media.items():
+            paint_node = seq_paint_map.get(sg)
+            print(f"Source group {sg}: media={os.path.basename(media_path)} paint_node={paint_node}")
+            clipinfo = {'media_path': media_path, 'paint_node': paint_node}
+            clipmap[media_path] = clipinfo
+            clipmap[os.path.basename(media_path)] = clipinfo
         print("Clipmap:", clipmap)
 
         for review in rg.reviews:
@@ -408,9 +415,10 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             stroke['points'] = [val for pair in zip(event.points.x, event.points.y) for val in pair]
 
                         if isinstance(event, otio.schemadef.SyncEvent.PaintEnd):
-                            stroke = strokemap[event.uuid]
-                            stroke['width'].extend(event.points.size)
-                            stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
+                            stroke = strokemap.get(event.uuid)
+                            if stroke and event.points:
+                                stroke['width'].extend(event.points.size)
+                                stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
 
                         if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
                             strokemap[event.uuid] = {'type': 'text'}
@@ -428,7 +436,10 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             stroke['rotation'] = event.rotation
 
                     rv_node = clipinfo['paint_node']
-            
+                    if not rv_node:
+                        print(f"Warning: No paint node found for {ri.media.media_path}")
+                        continue
+
                     if not commands.propertyExists(f"{rv_node}.tag.annotate"):
                         commands.newProperty(f"{rv_node}.tag.annotate", commands.StringType, 1)
                     commands.setStringProperty(
@@ -463,7 +474,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                             if not commands.propertyExists(f"{text_node}.size"):
                                 commands.newProperty(f"{text_node}.size", commands.FloatType, 1)
                             commands.setFloatProperty(
-                                f"{text_node}.size", [stroke['font_size']], True
+                                f"{text_node}.size", [stroke['font_size'] / 5000.0], True
                             )
                             if not commands.propertyExists(f"{text_node}.font"):
                                 commands.newProperty(f"{text_node}.font", commands.StringType, 1)

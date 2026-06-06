@@ -1633,7 +1633,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if track.kind not in (otio.schema.TrackKind.Video, "Video"):
             return False
         name = track.name or ""
-        return not name.startswith("Annotations")
+        if name.startswith("Annotations"):
+            return False
+        return not any(
+            isinstance(c, otio.schema.Clip) and "annotation_commands" in c.metadata
+            for c in track
+        )
 
     def _path_to_source_group_map(self):
         """Return {path: source_group_node_name} for all currently loaded RVSourceGroups."""
@@ -1774,7 +1779,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         break
 
             for item in timeline.tracks:
-                if item.name and item.name.startswith("Annotations"):
+                is_annotation_track = (item.name and item.name.startswith("Annotations")) or any(
+                    isinstance(c, otio.schema.Clip) and "annotation_commands" in c.metadata
+                    for c in item
+                )
+                if is_annotation_track:
                     for child in item:
                         if isinstance(child, otio.schema.Clip):
                             if "annotation_commands" not in child.metadata:
