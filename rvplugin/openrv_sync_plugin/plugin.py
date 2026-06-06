@@ -1342,6 +1342,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 if isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
                     uuid_val = ev.uuid or ""
                     text_val = ev.text or ""
+                    if not text_val.strip():
+                        continue
                     # Snapshot replay sends the full clip as insert_child; if the
                     # node was already painted by _rebuild_rv_session, skip it.
                     if _paint_node_cache and self._text_uuid_exists_in_rv(_paint_node_cache, rv_frame, uuid_val):
@@ -1815,6 +1817,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                     except Exception:
                                         pass
                                 if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
+                                    if not (event.text or "").strip():
+                                        continue
                                     rv_size = float(event.font_size) / 5000.0 if getattr(event, "font_size", None) else 0.01
                                     uuid_val = event.uuid or ""
                                     # Guard against duplicates when INSERT_CHILD already painted
@@ -2122,6 +2126,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             text_val = text[0] if text else ""
             text_val = text_val.replace("\x01", "")
             
+            # Skip soft-deleted text nodes
+            soft_deleted_prop = f"{full_prop}.softDeleted"
+            if rv.commands.propertyExists(soft_deleted_prop):
+                if rv.commands.getIntProperty(soft_deleted_prop)[0]:
+                    return []
+
             color = rv.commands.getFloatProperty(f"{full_prop}.color")
             position = rv.commands.getFloatProperty(f"{full_prop}.position")
             size = rv.commands.getFloatProperty(f"{full_prop}.size")
@@ -2129,7 +2139,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             scale = rv.commands.getFloatProperty(f"{full_prop}.scale")
             rotation = rv.commands.getFloatProperty(f"{full_prop}.rotation")
             font = rv.commands.getStringProperty(f"{full_prop}.font")
-            
+
             # Check for uuid or generate one
             uuid_prop = f"{full_prop}.uuid"
             if rv.commands.propertyExists(uuid_prop):
@@ -2146,14 +2156,14 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             # So: font_size = size[0] * 5000.0 if size else 50.0.
             r_size = size[0] if size else 0.01
             font_size = r_size * 5000.0
-            
+
             try:
                 otio.schema.schemadef.module_from_name('SyncEvent')
                 text_event = otio.schemadef.SyncEvent.TextAnnotation(
                     rgba=list(color) if color else [1.0, 1.0, 1.0, 1.0],
                     position=list(position) if position else [0.0, 0.0],
                     spacing=spacing[0] if spacing else 0.0,
-                    friendly_name=font[0] if font else "",
+                    friendly_name=component.split(':')[-1],
                     font_size=float(font_size),
                     font=font[0] if font else "",
                     text=text_val,
