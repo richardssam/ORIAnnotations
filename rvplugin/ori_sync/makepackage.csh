@@ -13,7 +13,7 @@ else
 fi
 
 # Zip plugin files from this directory
-zip -r otiosyncdemo-1.2.rvpkg plugin.py PACKAGE pika
+zip -r otiosyncdemo-1.2.rvpkg plugin.py utils.py sequence_sync.py playback_sync.py display_sync.py annotation_sync.py PACKAGE pika
 
 # From the repo root, zip in the otio_sync_core library.
 cd ../..
