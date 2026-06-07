@@ -48,6 +48,7 @@ if os.path.exists(_manifest_file):
 
 import datetime
 from collections import Counter
+from typing import Any
 import json
 import logging
 import queue
@@ -67,14 +68,19 @@ from xstudio.core import (
     event_atom,
     join_broadcast_atom,
     position_atom,
+    play_forward_atom,
+    play_atom,
     serialise_atom,
     show_atom,
     viewport_playhead_atom,
     viewport_active_media_container_atom,
     item_atom,
+    media_content_changed_atom,
     item_selection_atom,
     item_type_atom,
     selection_actor_atom,
+    selection_changed_atom,
+    source_atom,
     get_media_atom,
     attribute_value_atom,
     JsonStore,
@@ -373,10 +379,10 @@ class ORISyncPlugin(PluginBase):
         self._last_show_atom_seq_tl_guid: str | None = None
         self._last_show_atom_at: float = 0.0
 
-        # Last-logged container UUID / selection state; used by
-        # _poll_and_broadcast_selection to suppress duplicate log lines.
         self._last_logged_container_uuid: str | None = None
         self._last_logged_clip_name: str | None = None
+        self._current_selection_sub_id: int | None = None
+        self._current_selection_container_uuid: str | None = None
         # Last clip GUID seen in the viewport (playlist selection or show_atom).
         # Used as a fallback in the annotation broadcast path for flat playlists,
         # where _resolve_clip_at_frame returns None.
@@ -407,6 +413,7 @@ class ORISyncPlugin(PluginBase):
         # the resulting show_atom burst from echoing individual clip selections
         # back to remote peers.
         self._selection_broadcast_suppress_until: float = 0.0
+        self._structural_mutation_suppress_until: float = 0.0
         # Cached Viewport object; created lazily, cleared on disconnect.
         self._viewport: "Viewport | None" = None
         # Timeline to set as on-screen source once the viewport is ready.
@@ -415,6 +422,7 @@ class ORISyncPlugin(PluginBase):
         self._last_selection_scan = 0.0
         self._last_display_scan = 0.0
         self._last_flat_playlist_scan = 0.0
+        self._last_structure_scan = 0.0
         # Timestamps to throttle log messages during viewport discovery retry loop.
         self._last_timeline_defer_log_time: float = 0.0
         self._last_viewport_error_log_time: float = 0.0
@@ -576,10 +584,9 @@ class ORISyncPlugin(PluginBase):
 
         self.manager.start_session()
 
-        # Grab the current playhead so the poll loop can start reading position.
+        # Grab the current playhead and subscribe to its position events.
         try:
-            ph = self.current_playhead()
-            self.active_playhead = ph
+            self._check_and_update_active_playhead()
         except Exception:
             _log_exc("Could not initialize active playhead at connect time")
 
@@ -609,21 +616,27 @@ class ORISyncPlugin(PluginBase):
         # group.  If change_atom fires reliably here we can replace the
         # _poll_sequence_new_media poll with an event-driven path.
         try:
-            container = self.connection.api.session.viewed_container
-            self._test_container_sub_id = self.subscribe_to_event_group(
-                container, self._on_test_container_event
-            )
-            _log(
-                f"[TEST change_atom] subscribed to viewed_container events"
-                f" (type={type(container).__name__})"
-            )
-        except RuntimeError as e:
-            if "invalid_argument" in str(e):
-                _log("[TEST change_atom] no viewed_container yet (session empty at connect time)")
+            container = self._get_viewed_container_safe()
+            if container:
+                self._test_container_sub_id = self.subscribe_to_event_group(
+                    container, self._on_test_container_event
+                )
+                _log(
+                    f"[TEST change_atom] subscribed to viewed_container events"
+                    f" (type={type(container).__name__})"
+                )
             else:
-                _log_exc("[TEST change_atom] subscribe_to_event_group failed")
+                _log("[TEST change_atom] no viewed_container yet (session empty at connect time)")
         except Exception:
             _log_exc("[TEST change_atom] subscribe_to_event_group failed")
+
+        # Subscribe to viewed container selection actor
+        try:
+            container = self._get_viewed_container_safe()
+            if container:
+                self._subscribe_container_selection(container)
+        except Exception:
+            _log_exc("[SEL] Initial selection subscription failed")
 
         # Self-elect if no master answers within DISCOVERY_TIMEOUT.
         threading.Thread(
@@ -661,6 +674,13 @@ class ORISyncPlugin(PluginBase):
         self._timeline_item_sub_ids.clear()
         with self._timeline_item_lock:
             self._timeline_item_dirty.clear()
+        if self._current_selection_sub_id is not None:
+            try:
+                self.unsubscribe_from_event_group(self._current_selection_sub_id)
+            except Exception:
+                pass
+            self._current_selection_sub_id = None
+        self._current_selection_container_uuid = None
         self._last_logged_container_uuid = None
         self._last_logged_clip_name = None
         self._last_viewed_clip_guid = None
@@ -669,6 +689,7 @@ class ORISyncPlugin(PluginBase):
         self._last_pinned_source_mode = None
         self._applying_pinned_mode = False
         self._selection_broadcast_suppress_until = 0.0
+        self._structural_mutation_suppress_until = 0.0
         self._pending_snapshot_requesters.clear()
         self._xs_sequence_track_names.clear()
         self._sync_guid_to_xs_media.clear()
@@ -762,38 +783,45 @@ class ORISyncPlugin(PluginBase):
     # ── poll loop ──────────────────────────────────────────────────────────────
 
     def _poll_loop(self) -> None:
-        """Background thread: processes the command queue then polls the manager."""
+        """Background thread: blocks on command queue and processes ticks."""
         while not self._poll_stop.is_set():
             try:
-                self._drain_cmd_queue()
+                # 1. Determine timeout based on active hot scanning (partial strokes)
+                timeout = self.POLL_INTERVAL if self._hot_scan_active else 0.1
+
+                # 2. Block on the queue to wait for events or ticks
+                try:
+                    cmd, payload = self._cmd_queue.get(timeout=timeout)
+                    self._execute_command(cmd, payload)
+                    self._drain_cmd_queue()
+                except queue.Empty:
+                    pass
+
+                # 3. Manager/network tick
                 if self.manager:
                     for action, data in self.manager.tick():
                         self._handle_manager_event(action, data)
+
+                # 4. Partial annotation / stroke hot scanning
                 self._hot_scan_active_annotation()
                 self._flush_pending_annotations()
-                self._poll_and_broadcast_frame()
+
+                # 5. Deferred seek application
                 self._apply_pending_seek()
 
-                # [2F] Event-driven clip insertion: drain timelines flagged by item_atom.
-                with self._timeline_item_lock:
-                    _dirty_tl_guids = self._timeline_item_dirty.copy()
-                    self._timeline_item_dirty.clear()
-                for _tl_guid in _dirty_tl_guids:
-                    self._poll_sequence_new_media(only_guid=_tl_guid)
-                    self._poll_sequence_track_deletions(only_guid=_tl_guid)
-                    self._poll_sequence_reorders(only_guid=_tl_guid)
-
+                # 6. Periodic display state (zoom) scan (0.5s interval)
                 now = time.monotonic()
-                if now - self._last_selection_scan >= 0.2:
-                    self._poll_and_broadcast_selection()
-                    self._last_selection_scan = now
-                    
                 if now - self._last_display_scan >= 0.5:
                     self._poll_and_broadcast_display()
                     self._last_display_scan = now
 
-                # Retry deferred STATE_SNAPSHOT responses (requests that arrived
-                # before any timelines were registered).
+                # 6.5. Periodic structure scan (1.0s interval)
+                if now - self._last_structure_scan >= 1.0:
+                    self._poll_new_playlists()
+                    self._poll_playlist_renames()
+                    self._last_structure_scan = now
+
+                # 7. Deferred snapshot responses
                 if self._pending_snapshot_requesters and self.manager and self.manager._timelines:
                     for _req_guid in list(self._pending_snapshot_requesters):
                         _log(f"Deferred snapshot: sending to {_req_guid[:8]}")
@@ -803,18 +831,57 @@ class ORISyncPlugin(PluginBase):
                         )
                     self._pending_snapshot_requesters.clear()
 
-                if now - self._last_flat_playlist_scan >= 0.5:
-                    self._poll_flat_playlist_new_media()
-                    self._poll_flat_playlist_reorders()
-                    self._poll_sequence_new_media()
-                    self._poll_sequence_track_deletions()
-                    self._poll_sequence_reorders()
-                    self._poll_new_playlists()
-                    self._poll_playlist_renames()
-                    self._last_flat_playlist_scan = now
             except Exception:
                 _log_exc("Poll loop error")
-            self._poll_stop.wait(self.POLL_INTERVAL)
+
+    def _execute_command(self, cmd: str, payload) -> None:
+        """Execute a single enqueued command from the queue on the poll thread."""
+        try:
+            if cmd == "load_timelines":
+                self._do_load_timelines()
+            elif cmd == "hot_scan":
+                self._hot_scan_active_annotation()
+            elif cmd == "live_stroke":
+                self._broadcast_live_stroke_from_json(payload)
+            elif cmd == "clear_live_stroke":
+                self._live_stroke_current_key = None
+            elif cmd == "leave_session":
+                self.disconnect()
+            elif cmd == "broadcast_playback_state":
+                if self.manager and self.manager.status == STATE_SYNCED:
+                    self.manager.broadcast_playback_state(payload)
+            elif cmd == "broadcast_selection":
+                if self.manager and self.manager.status == STATE_SYNCED:
+                    clip_guid, view_mode = payload
+                    self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
+            elif cmd == "resolve_selection":
+                self._resolve_and_broadcast_selection()
+            elif cmd == "sync_container":
+                self._execute_sync_container(payload.get("tl_guid"))
+        except Exception:
+            _log_exc(f"Command {cmd!r} failed")
+
+    def _execute_sync_container(self, tl_guid: str) -> None:
+        """Process event-driven structural updates for a given timeline/container.
+
+        :param tl_guid: Sync GUID of the timeline/container to sync.
+        """
+        if not tl_guid:
+            return
+        if not self.manager or self.manager.status != STATE_SYNCED:
+            return
+
+        if tl_guid in self._xs_sequence_playlists:
+            _log(f"[2F] Executing sequence sync_container for {tl_guid[:8]}")
+            self._poll_sequence_new_media(only_guid=tl_guid)
+            self._poll_sequence_track_deletions(only_guid=tl_guid)
+            self._poll_sequence_reorders(only_guid=tl_guid)
+        elif tl_guid in self._xs_flat_playlists:
+            _log(f"[2F] Executing flat playlist sync_container for {tl_guid[:8]}")
+            self._poll_flat_playlist_new_media(only_guid=tl_guid)
+            self._poll_flat_playlist_reorders(only_guid=tl_guid)
+            self._poll_new_playlists()
+            self._poll_playlist_renames()
 
     def _drain_cmd_queue(self) -> None:
         """Execute all enqueued commands on the poll thread."""
@@ -824,19 +891,7 @@ class ORISyncPlugin(PluginBase):
                 cmd, payload = self._cmd_queue.get_nowait()
             except queue.Empty:
                 break
-            try:
-                if cmd == "load_timelines":
-                    self._do_load_timelines()
-                elif cmd == "hot_scan":
-                    self._hot_scan_active_annotation()
-                elif cmd == "live_stroke":
-                    self._broadcast_live_stroke_from_json(payload)
-                elif cmd == "clear_live_stroke":
-                    self._live_stroke_current_key = None
-                elif cmd == "leave_session":
-                    self.disconnect()
-            except Exception:
-                _log_exc(f"Command {cmd!r} failed")
+            self._execute_command(cmd, payload)
 
     # ── manager event dispatch ─────────────────────────────────────────────────
 
@@ -982,6 +1037,8 @@ class ORISyncPlugin(PluginBase):
             if now - getattr(self, "_last_timeline_defer_log_time", 0.0) >= 5.0:
                 _log("Deferring timeline loading — viewport not ready")
                 self._last_timeline_defer_log_time = now
+            # Yield CPU to prevent tight-loop CPU starvation on the C++ actor side
+            time.sleep(0.2)
             self._cmd_queue.put(("load_timelines", {}))
             return
 
@@ -1028,9 +1085,10 @@ class ORISyncPlugin(PluginBase):
                                             playlist.move_media(media_obj)
                         
                         self._sync_playlists[guid] = (playlist, None)
+                        self._subscribe_timeline_item_events(guid, playlist)
                         try:
                             current_media = playlist.media
-                            self._xs_flat_playlists[guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media])
+                            self._xs_flat_playlists[guid] = (playlist, [self._sync_guid_for_xs_uuid(str(m.uuid), guid) or str(m.uuid) for m in current_media])
                         except Exception:
                             pass
                         if first_xs_timeline is None:
@@ -1068,12 +1126,13 @@ class ORISyncPlugin(PluginBase):
                                 except Exception:
                                     _log_exc(f"  Could not add {path!r}")
                     self._sync_playlists[guid] = (playlist, None)
+                    self._subscribe_timeline_item_events(guid, playlist)
                     self._bootstrap_media_mapping(playlist, otio_tl, None)
                     # Register in _xs_flat_playlists so _poll_flat_playlist_new_media
                     # can detect clips added by the local user (even as a client).
                     try:
                         current_media = playlist.media
-                        self._xs_flat_playlists[guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media])
+                        self._xs_flat_playlists[guid] = (playlist, [self._sync_guid_for_xs_uuid(str(m.uuid), guid) or str(m.uuid) for m in current_media])
                     except Exception:
                         _log_exc("Could not init _xs_flat_playlists entry from load")
                     if first_xs_timeline is None:
@@ -1250,14 +1309,9 @@ class ORISyncPlugin(PluginBase):
         :rtype: opentimelineio.schema.Timeline or None
         """
         try:
-            try:
-                container = self.connection.api.session.viewed_container
-            except RuntimeError as e:
-                if "invalid_argument" in str(e):
-                    _log("_build_otio_from_viewed_container: no valid viewed_container (session may be empty)")
-                    return None
-                raise
+            container = self._get_viewed_container_safe()
             if container is None:
+                _log("_build_otio_from_viewed_container: no valid viewed_container (session may be empty)")
                 return None
             if hasattr(container, "to_otio_string"):
                 otio_str = container.to_otio_string()
@@ -1304,6 +1358,7 @@ class ORISyncPlugin(PluginBase):
         # xs_timeline is None for flat playlists on the master (no Timeline child exists
         # at build time); _apply_selection only needs the Playlist object.
         self._sync_playlists[tl_guid] = (playlist, None)
+        self._subscribe_timeline_item_events(tl_guid, playlist)
         track = otio.schema.Track(name="Video Track", kind=otio.schema.TrackKind.Video)
         import hashlib
         track_seed = f"{tl_guid}:Video:0:Video Track"
@@ -1356,18 +1411,15 @@ class ORISyncPlugin(PluginBase):
 
                 clip.metadata["sync"] = {"guid": clip_guid}
                 self._flat_clip_to_media[clip_guid] = media
-                self._register_media(media, clip_guid)
+                self._register_media(media, clip_guid, tl_guid)
                 track.append(clip)
                 _log(f"  Flat media clip: {media.name!r} fps={fps} frames={frame_count}")
             except Exception:
                 _log_exc(f"Could not convert media {getattr(media, 'name', '?')!r} to OTIO clip")
 
         clips = list(track)
-        if not clips:
-            return None
-
         tl.tracks.append(track)
-        self._xs_flat_playlists[tl_guid] = (playlist, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in media_list])
+        self._xs_flat_playlists[tl_guid] = (playlist, [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in media_list])
         _log(f"Built synthetic OTIO timeline for flat playlist {name!r}: {len(clips)} clip(s)")
         return tl
 
@@ -1392,13 +1444,14 @@ class ORISyncPlugin(PluginBase):
             is_bookmark_shown = len(event) == 6 and isinstance(event[5], int)
             if not is_bookmark_shown and len(event) >= 5 and hasattr(event[2], 'uuid'):
                 # On-screen media changed
+                self._check_and_update_active_playhead()
                 media_ua = event[2]
                 media_uuid_str = str(media_ua.uuid)
                 is_playlist = getattr(self, "_viewport_container_is_playlist", False)
                 is_timeline = getattr(self, "_viewport_container_is_timeline", False)
                 _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
                 _media_name_hint = None
-                clip_guid = self._sync_guid_for_xs_uuid(media_uuid_str)
+                clip_guid = self._sync_guid_for_xs_uuid(media_uuid_str, self.manager.active_timeline_guid if self.manager else None)
                 if clip_guid:
                     media_obj = self._sync_guid_to_xs_media.get(clip_guid) or self._flat_clip_to_media.get(clip_guid)
                     if media_obj:
@@ -1515,29 +1568,160 @@ class ORISyncPlugin(PluginBase):
             _log(f"viewport_playhead_atom Form-1 (ignored): len={len(event)}")
             return
         ph_remote = event[3]
-        try:
-            self.active_playhead = Playhead(self.connection, ph_remote)
-            _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
-        except Exception:
-            _log_exc("_on_global_playhead_event: failed to update playhead")
+        current_remote = getattr(self.active_playhead, "remote", None)
+        if ph_remote != current_remote:
+            try:
+                self.active_playhead = Playhead(self.connection, ph_remote)
+                _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
+                self.subscribe_to_playhead_events(ph_remote, self._on_position_event, auto_cancel=True)
+                _log("[position_atom] subscribed to playhead events")
+            except Exception:
+                _log_exc("_on_global_playhead_event: failed to update playhead and subscribe")
 
-        # [TEST position_atom] Subscribe to this playhead's position events.
-        # If position_atom fires reliably (even across timeline switches) we can
-        # replace the poll-based frame detection with an event-driven path.
+        # Subscribe to viewed container's selection actor events.
         try:
-            self.subscribe_to_playhead_events(ph_remote, self._on_test_position_event)
-            _log("[TEST position_atom] subscribed to playhead events")
+            container = self._get_viewed_container_safe()
+            if container:
+                self._subscribe_container_selection(container)
         except Exception:
-            _log_exc("[TEST position_atom] subscribe_to_playhead_events failed")
+            _log_exc("[SEL] Failed to subscribe to container selection events")
 
-    def _on_test_position_event(self, event) -> None:
-        """[TEST] Fires if subscribe_to_playhead_events + position_atom works."""
-        if (
+    def _subscribe_container_selection(self, container) -> None:
+        """Subscribe to the container's selection actor to receive selection events."""
+        try:
+            container_uuid = str(container.uuid)
+            if self._current_selection_container_uuid == container_uuid:
+                return
+
+            if self._current_selection_sub_id is not None:
+                try:
+                    self.unsubscribe_from_event_group(self._current_selection_sub_id)
+                except Exception:
+                    pass
+                self._current_selection_sub_id = None
+                self._current_selection_container_uuid = None
+
+            # Get selection actor
+            selection_actor = self.connection.request_receive(container.remote, selection_actor_atom())[0]
+
+            from xstudio.api.auxiliary import ActorConnection
+            selection_conn = ActorConnection(self.connection, selection_actor)
+
+            # Subscribe
+            self._current_selection_sub_id = self.subscribe_to_event_group(
+                selection_conn, self._on_selection_event
+            )
+            self._current_selection_container_uuid = container_uuid
+            _log(f"[SEL] Subscribed to selection actor events for container={type(container).__name__} uuid={container_uuid[:8]}")
+            self._enqueue_selection_update()
+        except Exception:
+            _log_exc("[SEL] Failed to subscribe to container selection events")
+
+    def _on_selection_event(self, event) -> None:
+        """Fires when selection actor changes selection."""
+        if not (
+            len(event) > 1
+            and isinstance(event[0], event_atom)
+            and (isinstance(event[1], source_atom) or isinstance(event[1], selection_changed_atom))
+        ):
+            return
+        _log(f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution")
+        self._check_and_update_active_playhead()
+        self._enqueue_selection_update()
+
+    def _enqueue_selection_update(self) -> None:
+        """Enqueue selection resolution to the poll thread command queue."""
+        self._cmd_queue.put(("resolve_selection", None))
+
+    def _check_and_update_active_playhead(self) -> None:
+        """Query the active playhead from xStudio and subscribe to its events if changed."""
+        try:
+            ph = self.current_playhead()
+        except Exception:
+            return
+
+        if ph:
+            current_remote = getattr(self.active_playhead, "remote", None)
+            if ph.remote != current_remote:
+                self.active_playhead = ph
+                try:
+                    self.subscribe_to_playhead_events(ph.remote, self._on_position_event, auto_cancel=True)
+                    _log(f"[position_atom] active playhead updated/subscribed: {ph.remote}")
+                except Exception:
+                    _log_exc("[position_atom] failed to subscribe to active playhead events")
+
+    def _on_position_event(self, event) -> None:
+        """Fires when playhead position or play state changes."""
+        # Verbose debug log commented out to prevent spam during playback.
+        # try:
+        #     types_str = [type(x).__name__ for x in event] if hasattr(event, '__iter__') else type(event).__name__
+        #     _log(f"DEBUG position_event: len={len(event) if hasattr(event, '__len__') else 'n/a'} types={types_str} event={event}")
+        # except Exception:
+        #     pass
+
+        if not (
             len(event) > 2
             and isinstance(event[0], event_atom)
-            and isinstance(event[1], position_atom)
         ):
-            _log(f"[TEST position_atom] FIRED frame={event[2]}")
+            return
+
+        is_pos = isinstance(event[1], position_atom)
+        is_play = isinstance(event[1], play_forward_atom) or isinstance(event[1], play_atom)
+        if not (is_pos or is_play):
+            return
+
+        if not self.active_playhead:
+            return
+
+        try:
+            playing = self.active_playhead.playing
+            frame = self.active_playhead.position
+            fps = self.active_playhead.frame_rate.fps() or 25.0
+        except Exception:
+            return
+
+        if frame < 0:
+            return
+
+        # Echo guard: check if this is a remote-applied frame/state change
+        if frame == self._last_applied_frame:
+            return
+
+        # Initialize play state on first run
+        if self._last_polled_playing is None:
+            self._last_polled_playing = playing
+            self._last_polled_frame = frame
+
+        # Check playing state change
+        playing_changed = (playing != self._last_polled_playing)
+
+        # Skip frame updates while playing if play state didn't change
+        if playing and not playing_changed:
+            return
+
+        # If paused and frame hasn't changed, skip
+        if not playing and not playing_changed:
+            if frame == self._last_polled_frame:
+                return
+
+        # Update cache to prevent redundant broadcasts
+        self._last_polled_playing = playing
+        self._last_polled_frame = frame
+
+        # Construct playback state payload
+        state = {
+            "playing": playing,
+            "current_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "value": float(frame),
+                "rate": fps,
+            },
+            "looping": False,
+        }
+
+        # Enqueue the broadcast command to be processed asynchronously
+        _log(f"Event: queuing playback state broadcast frame={frame} playing={playing} (source_event={type(event[1]).__name__})")
+        self._cmd_queue.put(("broadcast_playback_state", state))
 
     def _on_test_container_event(self, event) -> None:
         """[TEST] Fires if subscribe_to_event_group + change_atom works."""
@@ -1566,102 +1750,58 @@ class ORISyncPlugin(PluginBase):
             _log_exc(f"[2F] subscribe_to_event_group failed for timeline {tl_guid[:8]}")
 
     def _on_timeline_item_event(self, tl_guid: str, event) -> None:
-        """Handle item_atom events from a tracked Timeline's event group.
+        """Handle item_atom or media_content_changed_atom events from a tracked Timeline or Playlist event group.
 
-        Marks *tl_guid* as dirty so the next poll-thread tick calls
-        ``_poll_sequence_new_media`` for that timeline immediately rather than
-        waiting for the next 0.5 s fallback scan.
+        Parses the event to detect mutations and enqueues a structural synchronization command.
 
-        :param tl_guid: Sync GUID of the timeline that fired the event.
+        :param tl_guid: Sync GUID of the timeline/container that fired the event.
         :param event: Event tuple from xStudio's CAF message bus.
         """
-        if not (len(event) > 1 and isinstance(event[0], event_atom)
-                and isinstance(event[1], item_atom)):
+        if time.monotonic() < self._structural_mutation_suppress_until:
             return
+
+        if not (len(event) > 2 and isinstance(event[0], event_atom)):
+            return
+
+        is_item = isinstance(event[1], item_atom)
+        is_media_change = isinstance(event[1], media_content_changed_atom)
+        if not (is_item or is_media_change):
+            return
+
+        if is_media_change:
+            _log(f"[2F] media_content_changed_atom fired for playlist {tl_guid[:8]} — queuing sync_container")
+            self._cmd_queue.put(("sync_container", {"tl_guid": tl_guid}))
+            return
+
         hidden = event[3] if len(event) > 3 else False
         if hidden:
             return
-        _log(f"[2F] item_atom fired for timeline {tl_guid[:8]} — queuing clip check")
-        with self._timeline_item_lock:
-            self._timeline_item_dirty.add(tl_guid)
 
-    def _poll_and_broadcast_frame(self) -> None:
-        """Broadcast the local playhead position when the user scrubs.
-
-        Called from the poll thread on every tick.  Reads position and play
-        state directly from ``active_playhead`` so it works regardless of
-        whether xStudio event subscriptions are delivering events.
-
-        Echo guard: when the poll loop itself applied a remote frame to the
-        local playhead, ``_last_applied_frame`` records that frame.  If the
-        polled position equals ``_last_applied_frame`` the change was caused
-        by the remote apply, not by local user interaction, and we skip the
-        broadcast to avoid an echo loop.
-        """
-        if not self.manager or self.manager.status != STATE_SYNCED:
-            return
-        if not self.active_playhead:
-            # Retry lazy init — xStudio may not have had an active playhead at
-            # connect time (e.g. no media loaded yet).
+        changes = event[2]
+        if hasattr(changes, "dump"):
             try:
-                self.active_playhead = self.current_playhead()
+                changes = json.loads(changes.dump())
             except Exception:
-                return
-        try:
-            playing: bool = self.active_playhead.playing
-            frame: int = self.active_playhead.position
-            fps: float = self.active_playhead.frame_rate.fps() or 25.0
-        except Exception:
+                changes = {}
+
+        actions = []
+        if isinstance(changes, dict):
+            actions.append(changes.get("action"))
+        elif isinstance(changes, list):
+            for c in changes:
+                if isinstance(c, dict):
+                    actions.append(c.get("action"))
+
+        # IA_INSERT=6, IA_REMOVE=7, IA_SPLICE=8, IA_NAME=9, IA_DIRTY=20
+        matching_actions = [a for a in actions if a in (6, 7, 8, 9, 20)]
+        if not matching_actions:
             return
 
-        # Initialize play state on first run
-        if self._last_polled_playing is None:
-            self._last_polled_playing = playing
-            self._last_polled_frame = frame
-            return
+        action = matching_actions[0]
+        _log(f"[2F] item_atom fired for timeline {tl_guid[:8]} with action {action} — queuing sync_container")
+        self._cmd_queue.put(("sync_container", {"tl_guid": tl_guid}))
 
-        playing_changed = (playing != self._last_polled_playing)
-        if playing_changed and playing:
-            self._playing_started_at = time.monotonic()
 
-        if playing_changed and playing:
-            self._playing_started_at = time.monotonic()
-
-        # Skip polling frame updates while actively playing if there's no state transition
-        if playing and not playing_changed:
-            return
-
-        # Check frame/scrub changes if paused
-        if not playing and not playing_changed:
-            if frame == self._last_polled_frame:
-                return
-            self._last_polled_frame = frame
-            if frame == self._last_applied_frame:
-                # This change was caused by _apply_playback_state — skip re-broadcast.
-                return
-
-        broadcast_frame = frame
-        # xStudio's async position write may not have settled yet; a negative
-        # frame means the playhead hasn't reached the clip yet.
-        if broadcast_frame < 0:
-            return
-
-        state = {
-            "playing": playing,
-            "current_time": {
-                "OTIO_SCHEMA": "RationalTime.1",
-                "value": float(broadcast_frame),
-                "rate": fps,
-            },
-            "looping": False,
-        }
-
-        # Update cache to prevent echo loops
-        self._last_polled_playing = playing
-        self._last_polled_frame = frame
-
-        _log(f"Poll: broadcasting playback playing={playing} frame={frame} fps={fps}")
-        self.manager.broadcast_playback_state(state)
 
     def _apply_pending_seek(self) -> None:
         """Apply a deferred sequence-playhead seek once its deadline has passed.
@@ -1687,8 +1827,8 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc(f"Deferred seek: failed at frame {frame}")
 
-    def _poll_and_broadcast_selection(self) -> None:
-        """Log xStudio viewport container and selection state on every change."""
+    def _resolve_and_broadcast_selection(self) -> None:
+        """Resolve xStudio viewport container and selection state on change, and broadcast."""
         try:
             session_actor = self.connection.api.session.remote
             result = self.connection.request_receive_timeout(
@@ -1759,7 +1899,7 @@ class ORISyncPlugin(PluginBase):
             if clip_name and self.manager:
                 cg = None
                 if clip_uuid_str:
-                    cg = self._sync_guid_for_xs_uuid(clip_uuid_str)
+                    cg = self._sync_guid_for_xs_uuid(clip_uuid_str, container_uuid)
                 if not cg:
                     cg = self._clip_guid_for_media_name(clip_name)
                 if cg:
@@ -1798,7 +1938,7 @@ class ORISyncPlugin(PluginBase):
                                 if _media_h:
                                     _cg = None
                                     if clip_uuid_str and _media_h == clip_name:
-                                        _cg = self._sync_guid_for_xs_uuid(clip_uuid_str)
+                                        _cg = self._sync_guid_for_xs_uuid(clip_uuid_str, container_uuid)
                                     if not _cg:
                                         _cg = self._clip_guid_for_media_name(_media_h)
                                     if _cg:
@@ -1836,6 +1976,21 @@ class ORISyncPlugin(PluginBase):
                 },
                 "looping": False,
             }
+        except Exception:
+            return None
+
+    def _get_viewed_container_safe(self) -> Any:
+        """Safely query viewed_container, handling expected RuntimeError if empty.
+
+        :returns: The viewed container instance, or ``None``.
+        :rtype: Container or None
+        """
+        try:
+            return self.connection.api.session.viewed_container
+        except RuntimeError as e:
+            if "invalid_argument" in str(e):
+                return None
+            raise
         except Exception:
             return None
 
@@ -1883,7 +2038,7 @@ class ORISyncPlugin(PluginBase):
                     sel = matching_pl.playhead_selection
                     selected_sources = sel.selected_sources
                     if len(selected_sources) == 1:
-                        clip_guid = self._sync_guid_for_xs_uuid(str(selected_sources[0].uuid))
+                        clip_guid = self._sync_guid_for_xs_uuid(str(selected_sources[0].uuid), container_uuid)
                         if not clip_guid:
                             clip_guid = self._clip_guid_for_media_name(selected_sources[0].name)
                         if clip_guid:
@@ -2142,6 +2297,16 @@ class ORISyncPlugin(PluginBase):
                             else:
                                 self.connection.api.session.set_on_screen_source(pl)
                                 _log("RECV selection clear: set_on_screen_source to playlist (Source)")
+                                if self.active_playhead:
+                                    try:
+                                        self._applying_pinned_mode = True
+                                        self.active_playhead.set_attribute("Pinned Source Mode", False)
+                                        self._last_pinned_source_mode = False
+                                        _log("RECV selection clear: set Pinned Source Mode = False")
+                                    except Exception:
+                                        _log_exc("RECV selection: failed to set Pinned Source Mode")
+                                    finally:
+                                        self._applying_pinned_mode = False
 
                             pl.playhead_selection.select_all()
                             # select_all() fires show_atom for every media item in the
@@ -2323,6 +2488,20 @@ class ORISyncPlugin(PluginBase):
                              f"→ {getattr(media, 'name', '?')!r} ({str(media.uuid)[:8]})")
                     else:
                         _log(f"RECV selection: media not found for clip {clip_guid[:8]}")
+
+                # Ensure the active playhead's Pinned Source Mode matches the view_mode.
+                self._check_and_update_active_playhead()
+                if self.active_playhead:
+                    try:
+                        self._applying_pinned_mode = True
+                        psm = (view_mode == "sequence")
+                        self.active_playhead.set_attribute("Pinned Source Mode", psm)
+                        self._last_pinned_source_mode = psm
+                        _log(f"RECV selection: set Pinned Source Mode = {psm}")
+                    except Exception:
+                        _log_exc("RECV selection: failed to set Pinned Source Mode")
+                    finally:
+                        self._applying_pinned_mode = False
             except Exception:
                 _log_exc("RECV selection: container switch or selection failed")
 
@@ -2373,7 +2552,7 @@ class ORISyncPlugin(PluginBase):
         _log(f"RECV display exposure={exposure:.3f} channel={channel} "
              f"(zoom={zoom} pan={pan} received but not applied — write not safe)")
 
-    def _poll_flat_playlist_reorders(self) -> None:
+    def _poll_flat_playlist_reorders(self, only_guid: str | None = None) -> None:
         """Detect and broadcast clip reorders in flat (media-bin) Playlists.
 
         Only runs on the master.  For each flat Playlist registered in
@@ -2384,14 +2563,18 @@ class ORISyncPlugin(PluginBase):
         Because user drags move one clip at a time this converges in a single
         poll cycle for the typical case; multi-hop reorders converge in subsequent
         cycles.
+
+        :param only_guid: When given, only checks the timeline with this sync GUID.
         """
         if not self.manager or self.manager.status != STATE_SYNCED:
             return
 
         for tl_guid, (xs_playlist, stored_order) in list(self._xs_flat_playlists.items()):
+            if only_guid is not None and tl_guid != only_guid:
+                continue
             try:
                 current_media = xs_playlist.media
-                current_order = [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
+                current_order = [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in current_media]
             except Exception:
                 continue
 
@@ -2420,17 +2603,24 @@ class ORISyncPlugin(PluginBase):
                 if isinstance(clip, otio.schema.Clip) and "sync" in clip.metadata and "guid" in clip.metadata["sync"]
             }
 
-            # Find the first position where orders differ; broadcast that clip
-            # moving to its new index.
-            for new_idx, guid in enumerate(current_order):
-                if new_idx >= len(stored_order) or stored_order[new_idx] != guid:
-                    if guid in track_clip_guids:
-                        self.manager.broadcast_move_child(track_guid, guid, new_idx)
-                        _log(f"Flat playlist reorder: guid {guid[:8]} → index {new_idx}")
-                    # Update stored order whether or not we found a GUID, so we
-                    # don't re-fire on the same state next tick.
-                    self._xs_flat_playlists[tl_guid] = (xs_playlist, list(current_order))
+            # Simulate the moves to transform stored_order into current_order,
+            # broadcasting each MOVE_CHILD so the remote peer receives the full sequence.
+            temp_order = list(stored_order)
+            while temp_order != current_order:
+                found = False
+                for new_idx, guid in enumerate(current_order):
+                    if new_idx >= len(temp_order) or temp_order[new_idx] != guid:
+                        if guid in track_clip_guids:
+                            self.manager.broadcast_move_child(track_guid, guid, new_idx)
+                            _log(f"Flat playlist reorder: guid {guid[:8]} → index {new_idx}")
+                        if guid in temp_order:
+                            temp_order.remove(guid)
+                            temp_order.insert(new_idx, guid)
+                        found = True
+                        break
+                if not found:
                     break
+            self._xs_flat_playlists[tl_guid] = (xs_playlist, list(current_order))
 
     def _poll_sequence_reorders(self, only_guid: str | None = None) -> None:
         """Detect and broadcast clip reorders in sequence Timelines.
@@ -2538,13 +2728,23 @@ class ORISyncPlugin(PluginBase):
                 self._xs_media_order[tl_guid] = list(current_order)
                 continue
 
-            # Find first mismatch
-            for new_idx, guid in enumerate(current_order):
-                if new_idx >= len(stored_order) or stored_order[new_idx] != guid:
-                    self.manager.broadcast_move_child(track_guid, guid, new_idx)
-                    _log(f"Sequence timeline reorder: guid {guid[:8]} → index {new_idx}")
-                    self._xs_media_order[tl_guid] = list(current_order)
+            # Simulate the moves to transform stored_order into current_order,
+            # broadcasting each MOVE_CHILD so the remote peer receives the full sequence.
+            temp_order = list(stored_order)
+            while temp_order != current_order:
+                found = False
+                for new_idx, guid in enumerate(current_order):
+                    if new_idx >= len(temp_order) or temp_order[new_idx] != guid:
+                        self.manager.broadcast_move_child(track_guid, guid, new_idx)
+                        _log(f"Sequence timeline reorder: guid {guid[:8]} → index {new_idx}")
+                        if guid in temp_order:
+                            temp_order.remove(guid)
+                            temp_order.insert(new_idx, guid)
+                        found = True
+                        break
+                if not found:
                     break
+            self._xs_media_order[tl_guid] = list(current_order)
 
     def _update_xs_media_order(self, tl_guid: str, otio_tl: "otio.schema.Timeline") -> None:
         """Update self._xs_media_order for a sequence timeline from its OTIO representation."""
@@ -2564,24 +2764,33 @@ class ORISyncPlugin(PluginBase):
                 if isinstance(c, otio.schema.Clip)
             ]
 
-    def _poll_flat_playlist_new_media(self) -> None:
+    def _poll_flat_playlist_new_media(self, only_guid: str | None = None) -> None:
         """Detect and broadcast media additions and deletions in flat Playlists.
 
         Runs on both master and client.  Compares the current media list
         against the stored order; broadcasts INSERT_CHILD for additions and
         REMOVE_CHILD for deletions so all peers stay in sync.
+
+        :param only_guid: When given, only checks the timeline with this sync GUID.
         """
         if not self.manager:
             return
 
         for tl_guid, (xs_playlist, stored_order) in list(self._xs_flat_playlists.items()):
+            if only_guid is not None and tl_guid != only_guid:
+                continue
             try:
                 current_media = xs_playlist.media
             except Exception:
                 continue
 
-            current_order = [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
+            current_order = [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in current_media]
             if current_order == stored_order:
+                continue
+
+            if set(current_order) == set(stored_order):
+                # Pure reorder: do not update the cached stored_order so that
+                # _poll_flat_playlist_reorders has a chance to detect and broadcast it.
                 continue
 
             otio_tl = self.manager.timelines.get(tl_guid)
@@ -2607,14 +2816,14 @@ class ORISyncPlugin(PluginBase):
                     if isinstance(clip, otio.schema.Clip):
                         cg = clip.metadata.get("sync", {}).get("guid")
                         if cg in removed_names:
-                            self._evict_media(cg)
+                            self._evict_media(cg, tl_guid)
                             self._flat_clip_to_media.pop(cg, None)
                             self.manager.broadcast_remove_child(track_guid, cg)
                             _log(f"flat playlist deleted media: {clip.name!r} removed")
 
             # Broadcast additions.
-            for media in current_media:
-                guid = self._xs_uuid_to_sync_guid.get(str(media.uuid), str(media.uuid))
+            for new_idx, media in enumerate(current_media):
+                guid = self._sync_guid_for_xs_uuid(str(media.uuid), tl_guid) or str(media.uuid)
                 if guid in stored_names:
                     continue
                 try:
@@ -2651,17 +2860,18 @@ class ORISyncPlugin(PluginBase):
                             name=media.name,
                             media_reference=otio.schema.ExternalReference(target_url=uri),
                         )
-                    new_index = current_order.index(guid)
                     self.manager._ensure_guid_and_map(clip)
                     clip_guid = clip.metadata.get("sync", {}).get("guid")
                     if clip_guid:
                         self._flat_clip_to_media[clip_guid] = media
-                        self._register_media(media, clip_guid)
-                    self.manager.insert_child(track_guid, clip, new_index)
-                    _log(f"flat playlist new media: {media.name!r} inserted at {new_index}")
+                        self._register_media(media, clip_guid, tl_guid)
+                    self.manager.insert_child(track_guid, clip, new_idx)
+                    _log(f"flat playlist new media: {media.name!r} inserted at {new_idx}")
                 except Exception:
                     _log_exc(f"flat playlist new media: failed for {media.name!r}")
 
+            # Re-evaluate current_order using updated mapping to ensure sync GUIDs are cached
+            current_order = [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in current_media]
             self._xs_flat_playlists[tl_guid] = (xs_playlist, current_order)
 
     def _build_single_sequence_otio(
@@ -2746,10 +2956,7 @@ class ORISyncPlugin(PluginBase):
                 pl_uuid = str(playlist.uuid)
             except Exception:
                 continue
-            if pl_uuid in known_pl_uuids:
-                continue
 
-            # Unknown playlist — determine type and register.
             try:
                 containers = playlist.containers
             except Exception:
@@ -2761,6 +2968,22 @@ class ORISyncPlugin(PluginBase):
 
             timelines = [c for c in containers if isinstance(c, Timeline)]
             if timelines:
+                # If this playlist was previously registered as flat, clean up the flat entry
+                if pl_uuid in self._xs_flat_playlists:
+                    _log(f"Playlist {playlist.name!r} ({pl_uuid[:8]}) transitioned from flat to sequence. Cleaning up flat entry.")
+                    self._xs_flat_playlists.pop(pl_uuid, None)
+                    self._sync_playlists.pop(pl_uuid, None)
+                    sub_id = self._timeline_item_sub_ids.pop(pl_uuid, None)
+                    if sub_id:
+                        try:
+                            self.unsubscribe_from_event_group(sub_id)
+                        except Exception:
+                            pass
+                    try:
+                        self.manager.broadcast_remove_timeline(pl_uuid)
+                    except Exception:
+                        pass
+
                 for xs_tl in timelines:
                     tl_guid = str(xs_tl.uuid)
                     if tl_guid in self._sync_playlists:
@@ -2768,7 +2991,11 @@ class ORISyncPlugin(PluginBase):
                     tl = self._build_single_sequence_otio(playlist, xs_tl)
                     if tl is None:
                         continue
+
+                    self._bootstrap_media_mapping(playlist, tl, xs_tl)
                     self.manager.register_timeline(tl)
+                    self._xs_sequence_track_names[tl_guid] = None
+
                     _media_tr_np = next(
                         (t for t in tl.tracks
                          if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
@@ -2799,16 +3026,14 @@ class ORISyncPlugin(PluginBase):
                         f"(playlist={playlist.name!r}) → broadcast"
                     )
             else:
+                if pl_uuid in known_pl_uuids:
+                    continue
                 tl = self._build_otio_from_playlist_media(playlist)
                 if tl is None:
                     continue
                 tl_guid = tl.metadata.get("sync", {}).get("guid", "")
                 if not tl_guid:
                     continue
-                # _build_otio_from_playlist_media already adds to _sync_playlists
-                # as a side effect, so do NOT check tl_guid in _sync_playlists here —
-                # it would always be True and suppress the broadcast.
-                # Deduplication is handled by the known_pl_uuids check at the top.
                 self.manager.register_timeline(tl)
                 self.manager.broadcast_add_timeline(tl_guid)
                 _log(f"New flat playlist {playlist.name!r} → broadcast")
@@ -2902,7 +3127,7 @@ class ORISyncPlugin(PluginBase):
                             known_names = known_names - {clip.name}
             self._xs_sequence_media_names[tl_guid] = current_media_name_set
 
-            # --- Additions ---
+            # --- Additions (from media bin) ---
             for media in current_media:
                 if media.name in known_names:
                     continue
@@ -2949,12 +3174,94 @@ class ORISyncPlugin(PluginBase):
                     self.manager._ensure_guid_and_map(clip)
                     clip_guid = clip.metadata.get("sync", {}).get("guid")
                     if clip_guid:
-                        self._register_media(media, clip_guid)
+                        self._register_media(media, clip_guid, tl_guid)
                     self.manager.insert_child(track_guid, clip, new_index)
                     _log(f"sequence new media: {_bn!r} at index {new_index}")
                     known_names = known_names | {media.name, _bn}
                 except Exception:
                     _log_exc(f"sequence new media: failed for {media.name!r}")
+
+            # --- Additions (direct track dragging) ---
+            try:
+                xs_otio_str = xs_tl.to_otio_string()
+                xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
+                xs_video_track = next(
+                    (t for t in xs_tl_parsed.tracks
+                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                    next(
+                        (t for t in xs_tl_parsed.tracks
+                         if t.kind == otio.schema.TrackKind.Video),
+                        None,
+                    ),
+                )
+                xs_clips = (
+                    [c for c in xs_video_track if isinstance(c, otio.schema.Clip)]
+                    if xs_video_track is not None else []
+                )
+            except Exception:
+                xs_clips = []
+                _log_exc(f"Failed to read track clips for {tl_guid[:8]}")
+
+            manager_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
+            pool = list(manager_clips)
+
+            for new_idx, clip in enumerate(xs_clips):
+                # Try to find a match in the manager clips pool
+                clip_url = ""
+                if isinstance(clip.media_reference, otio.schema.ExternalReference):
+                    clip_url = clip.media_reference.target_url or ""
+                clip_path = _uri_to_posix_path(clip_url)
+                norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
+                clip_stem = os.path.splitext(os.path.basename(clip_path))[0].lower() if clip_path else ""
+
+                matched_mc = None
+                for mc in pool:
+                    mc_url = ""
+                    if isinstance(mc.media_reference, otio.schema.ExternalReference):
+                        mc_url = mc.media_reference.target_url or ""
+                    mc_path = _uri_to_posix_path(mc_url)
+                    norm_mc_path = os.path.normpath(mc_path) if mc_path else ""
+                    if norm_clip_path and norm_clip_path == norm_mc_path:
+                        matched_mc = mc
+                        break
+                    mc_stem = os.path.splitext(os.path.basename(mc_path))[0].lower() if mc_path else ""
+                    if clip_stem and clip_stem == mc_stem:
+                        matched_mc = mc
+                        break
+
+                if matched_mc is not None:
+                    pool.remove(matched_mc)
+                else:
+                    # No match found in current manager clips -> this is a new track clip addition!
+                    try:
+                        self.manager._ensure_guid_and_map(clip)
+                        clip_guid = clip.metadata.get("sync", {}).get("guid")
+
+                        # Register in media mapping if we can find a matching Media object in current_media
+                        matched_media = None
+                        for media in current_media:
+                            if media.name == clip.name or os.path.basename(media.name) == clip.name:
+                                matched_media = media
+                                break
+                            try:
+                                m_uri = str(media.media_source().media_reference.uri())
+                                m_path = _uri_to_posix_path(m_uri)
+                                if m_path and norm_clip_path == os.path.normpath(m_path):
+                                    matched_media = media
+                                    break
+                            except Exception:
+                                pass
+
+                        if matched_media and clip_guid:
+                            self._register_media(matched_media, clip_guid, tl_guid)
+
+                        self.manager.insert_child(track_guid, clip, new_idx)
+                        _log(f"sequence track new media: {clip.name!r} inserted at index {new_idx}")
+                        known_names = known_names | {clip.name}
+                        if matched_media:
+                            known_names = known_names | {matched_media.name}
+                    except Exception:
+                        _log_exc(f"sequence track new media: failed to insert {clip.name!r}")
 
             self._xs_sequence_playlists[tl_guid] = (xs_playlist, xs_tl, known_names)
 
@@ -3043,7 +3350,7 @@ class ORISyncPlugin(PluginBase):
                                 and otio_clip.name == clip_name):
                             child_guid = otio_clip.metadata.get("sync", {}).get("guid")
                             if child_guid:
-                                self._evict_media(child_guid)
+                                self._evict_media(child_guid, tl_guid)
                                 self.manager.broadcast_remove_child(track_guid, child_guid)
                                 _log(f"sequence track: deleted {clip_name!r} from xStudio timeline")
                             break
@@ -3073,16 +3380,12 @@ class ORISyncPlugin(PluginBase):
                 for child in track:
                     if child.metadata.get("sync", {}).get("guid") == clip_guid:
                         if otio_tl.metadata.get("xs_flat_playlist"):
-                            self._apply_flat_playlist_insert(clip_obj, pl, xs_tl)
-                            # Keep stored_order in sync so the next poll tick
-                            # doesn't re-broadcast this remote-received clip.
-                            if tl_guid in self._xs_flat_playlists:
-                                try:
-                                    cur_pl, stored = self._xs_flat_playlists[tl_guid]
-                                    if clip_guid not in stored:
-                                        self._xs_flat_playlists[tl_guid] = (cur_pl, stored + [clip_guid])
-                                except Exception:
-                                    pass
+                            self._apply_flat_playlist_insert(clip_obj, pl, xs_tl, tl_guid)
+                            # Reorder/reconcile the playlist order with the OTIO timeline
+                            try:
+                                self._apply_flat_playlist_move(tl_guid, pl, otio_tl, 0)
+                            except Exception:
+                                _log_exc("Failed to reconcile playlist order after remote insert")
                         else:
                             self._apply_sequence_insert(tl_guid, otio_tl, xs_tl)
                             # Keep known_names in sync so next poll doesn't
@@ -4169,20 +4472,39 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("_apply_remote_annotation: failed to set annotation")
 
-    def _register_media(self, media_obj, sync_guid: str) -> None:
+    def _register_media(self, media_obj, sync_guid: str, tl_guid: str = None) -> None:
         """Register a media object and its sync GUID in the bidirectional mapping."""
         if not media_obj or not sync_guid:
             return
         uuid_str = str(media_obj.uuid)
         self._sync_guid_to_xs_media[sync_guid] = media_obj
-        self._xs_uuid_to_sync_guid[uuid_str] = sync_guid
+        if not tl_guid and self.manager:
+            for g, tl in self.manager.timelines.items():
+                found = False
+                for track in tl.tracks:
+                    for child in track:
+                        if child.metadata.get("sync", {}).get("guid") == sync_guid:
+                            tl_guid = g
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+        key = (tl_guid or "global", uuid_str)
+        self._xs_uuid_to_sync_guid[key] = sync_guid
 
-    def _evict_media(self, sync_guid: str) -> None:
+    def _evict_media(self, sync_guid: str, tl_guid: str = None) -> None:
         """Remove a media object from the bidirectional mapping by its sync GUID."""
         media_obj = self._sync_guid_to_xs_media.pop(sync_guid, None)
         if media_obj:
             uuid_str = str(media_obj.uuid)
-            self._xs_uuid_to_sync_guid.pop(uuid_str, None)
+            if tl_guid:
+                self._xs_uuid_to_sync_guid.pop((tl_guid, uuid_str), None)
+            else:
+                for k in list(self._xs_uuid_to_sync_guid.keys()):
+                    if isinstance(k, tuple) and len(k) == 2 and k[1] == uuid_str:
+                        self._xs_uuid_to_sync_guid.pop(k, None)
 
     def _media_for_sync_guid(self, sync_guid: str) -> tuple:
         """Look up the xStudio media item corresponding to an OTIO clip GUID.
@@ -4356,16 +4678,25 @@ class ORISyncPlugin(PluginBase):
                     _log(f"WARNING: duplicate media items for guid {guid[:8]} referenced count={len(keepers)}; keeping both")
                     self._register_media(matched_list[0], guid)
 
-    def _sync_guid_for_xs_uuid(self, xs_uuid_str: str) -> str | None:
+    def _sync_guid_for_xs_uuid(self, xs_uuid_str: str, tl_guid: str = None) -> str | None:
         """Return the OTIO clip GUID for an xStudio media item by its UUID string.
 
         Replaces `_clip_guid_for_media_name` and provides O(1) lookup.
 
         :param xs_uuid_str: String representation of the media UUID.
+        :param tl_guid: Optional sync GUID of the owner timeline.
         :returns: GUID string, or ``None`` if not found.
         :rtype: str or None
         """
-        return self._xs_uuid_to_sync_guid.get(str(xs_uuid_str))
+        uuid_str = str(xs_uuid_str)
+        if tl_guid:
+            guid = self._xs_uuid_to_sync_guid.get((tl_guid, uuid_str))
+            if guid:
+                return guid
+        for k, v in self._xs_uuid_to_sync_guid.items():
+            if isinstance(k, tuple) and len(k) == 2 and k[1] == uuid_str:
+                return v
+        return None
 
     def _clip_guid_for_media_name(self, media_name: str) -> "str | None":
         """Return the OTIO clip GUID for an xStudio media item by its display name.
@@ -4477,15 +4808,13 @@ class ORISyncPlugin(PluginBase):
     ) -> None:
         """Reorder a media item in a flat xStudio Playlist to match a MOVE_CHILD event.
 
-        The OTIO track has already been updated by the manager.  We read the
-        new clip order from the OTIO track, find the corresponding xStudio
-        Media objects by name, and call ``playlist.move_media`` so that the
-        bin order matches.
+        Reconciles the entire xStudio playlist order to match the updated OTIO track
+        by executing a right-to-left movement pass.
 
         :param tl_guid: GUID of the flat-playlist OTIO timeline.
         :param xs_playlist: xStudio Playlist object.
         :param otio_tl: Updated OTIO Timeline (MOVE_CHILD already applied).
-        :param to_index: Target index from the MOVE_CHILD payload.
+        :param to_index: Target index from the MOVE_CHILD payload (not directly used).
         """
         video_track = next(
             (t for t in otio_tl.tracks if t.kind == otio.schema.TrackKind.Video),
@@ -4495,46 +4824,65 @@ class ORISyncPlugin(PluginBase):
             return
 
         ordered_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
-        if to_index >= len(ordered_clips):
-            return
 
-        # Resolve clip GUIDs → Media objects via the direct mapping built at load
-        # time.  This avoids fragile name matching when xStudio stores the full
-        # file path as the media name (which happens after add_media(path)).
-        def _media_for_clip(clip):
+        # Resolve target media UUIDs to verify and align
+        target_uuids = []
+        for clip in ordered_clips:
             cg = clip.metadata.get("sync", {}).get("guid", "")
-            return self._media_for_sync_guid(cg)[0]
+            media = self._media_for_sync_guid(cg)[0]
+            if media:
+                target_uuids.append(media.uuid)
 
-        moved_media = _media_for_clip(ordered_clips[to_index])
-        if not moved_media:
-            _log(f"flat playlist move: no Media for clip {ordered_clips[to_index].name!r}")
+        # Get current order in xStudio
+        try:
+            current_media = xs_playlist.media
+            current_uuids = [m.uuid for m in current_media]
+        except Exception:
             return
 
-        before_media = None
-        if to_index + 1 < len(ordered_clips):
-            before_media = _media_for_clip(ordered_clips[to_index + 1])
+        if current_uuids == target_uuids:
+            return
 
-        if before_media:
-            xs_playlist.move_media(moved_media, before=before_media)
-        else:
-            xs_playlist.move_media(moved_media)  # move to end
+        # Reconcile from right to left
+        for i in range(len(target_uuids) - 1, -1, -1):
+            uuid = target_uuids[i]
+            try:
+                current_media = xs_playlist.media
+                current_uuids = [m.uuid for m in current_media]
+                curr_idx = current_uuids.index(uuid)
+            except Exception:
+                continue
 
-        _log(f"flat playlist move: {ordered_clips[to_index].name!r} → index {to_index}")
+            if curr_idx != i:
+                before_media = None
+                if i + 1 < len(target_uuids):
+                    before_uuid = target_uuids[i + 1]
+                    before_media = next((m for m in current_media if m.uuid == before_uuid), None)
+
+                moved_media = next((m for m in current_media if m.uuid == uuid), None)
+                if moved_media:
+                    try:
+                        if before_media:
+                            xs_playlist.move_media(moved_media, before=before_media)
+                        else:
+                            xs_playlist.move_media(moved_media)
+                        _log(f"flat playlist move (reconcile): moved {getattr(moved_media, 'name', '?')!r} to index {i}")
+                    except Exception:
+                        _log_exc(f"flat playlist move (reconcile): failed for {getattr(moved_media, 'name', '?')!r}")
 
         # Update stored order in flat playlists map to prevent polling feedback loop
         if tl_guid in self._xs_flat_playlists:
             try:
-                current_media = xs_playlist.media
-                self._xs_flat_playlists[tl_guid] = (
-                    xs_playlist,
-                    [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in current_media]
-                )
+                final_media = xs_playlist.media
+                final_order = [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in final_media]
+                self._xs_flat_playlists[tl_guid] = (xs_playlist, final_order)
             except Exception:
                 pass
 
     def _apply_flat_playlist_insert(
-        self, clip_obj: "otio.schema.Clip", xs_playlist, xs_timeline
+        self, clip_obj: "otio.schema.Clip", xs_playlist, xs_timeline, tl_guid: str = None
     ) -> None:
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Add a newly-broadcast clip to a flat xStudio Playlist.
 
         Called when an INSERT_CHILD event arrives for a clip that belongs to a
@@ -4546,6 +4894,7 @@ class ORISyncPlugin(PluginBase):
             into the OTIO track).
         :param xs_playlist: xStudio Playlist to add the media to.
         :param xs_timeline: xStudio Timeline child to add the media to.
+        :param tl_guid: Sync GUID of the target timeline.
         """
         mr = clip_obj.media_reference
         if not isinstance(mr, otio.schema.ExternalReference):
@@ -4558,7 +4907,7 @@ class ORISyncPlugin(PluginBase):
             clip_guid = clip_obj.metadata.get("sync", {}).get("guid", "")
             if clip_guid and media_obj:
                 self._flat_clip_to_media[clip_guid] = media_obj
-                self._register_media(media_obj, clip_guid)
+                self._register_media(media_obj, clip_guid, tl_guid)
             if xs_timeline is not None:
                 try:
                     xs_timeline.add_media(media_obj)
@@ -4571,6 +4920,7 @@ class ORISyncPlugin(PluginBase):
     def _apply_sequence_insert(
         self, tl_guid: str, otio_tl: "otio.schema.Timeline", xs_timeline
     ) -> None:
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Reload an xStudio sequence Timeline after a remote clip insertion.
 
         The manager has already inserted the new OTIO Clip into the track.
@@ -4601,6 +4951,7 @@ class ORISyncPlugin(PluginBase):
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")
 
     def _apply_remote_remove_child(self, data: dict) -> None:
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Apply a REMOVE_CHILD event from a remote peer to the local xStudio session.
 
         The manager has already removed the clip from the OTIO track before this
@@ -4620,8 +4971,6 @@ class ORISyncPlugin(PluginBase):
         if not parent_uuid or not child_uuid:
             return
 
-        self._evict_media(child_uuid)
-
         # Identify the owning timeline by its track GUID.
         tl_guid = None
         for guid, tl in self.manager.timelines.items():
@@ -4631,6 +4980,8 @@ class ORISyncPlugin(PluginBase):
                     break
             if tl_guid:
                 break
+
+        self._evict_media(child_uuid, tl_guid)
 
         if tl_guid is None:
             _log(f"remote remove_child: no timeline for track {parent_uuid[:8]}")
@@ -4659,7 +5010,7 @@ class ORISyncPlugin(PluginBase):
             if tl_guid in self._xs_flat_playlists:
                 try:
                     cur_pl, _ = self._xs_flat_playlists[tl_guid]
-                    self._xs_flat_playlists[tl_guid] = (cur_pl, [self._xs_uuid_to_sync_guid.get(str(m.uuid), str(m.uuid)) for m in xs_playlist.media])
+                    self._xs_flat_playlists[tl_guid] = (cur_pl, [self._sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in xs_playlist.media])
                 except Exception:
                     pass
             return
@@ -4712,6 +5063,7 @@ class ORISyncPlugin(PluginBase):
                 pass
 
     def _apply_remote_move_child(self, data: dict) -> None:
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Reorder a media clip in the xStudio timeline to match a remote MOVE_CHILD event.
 
         ``track.move_children`` triggers xStudio's QML delegate model directly
