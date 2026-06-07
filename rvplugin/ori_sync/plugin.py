@@ -1,15 +1,14 @@
 import rv.commands
 import rv.extra_commands
 import rv.rvtypes
-import logging as _logging
 import os
 import time
 
-from utils import _log, _log_exc, _show_warning, _parse_ori_session, _media_path, _is_media_track
+from utils import _log, _show_warning, _parse_ori_session, _media_path, _is_media_track
 
 try:
     from otio_sync_core import SyncManager, RabbitMQNetwork
-    from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED, STATE_JOINING
+    from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED
     import opentimelineio as otio
 except ImportError as e:
     SyncManager = None

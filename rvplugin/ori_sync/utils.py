@@ -2,7 +2,6 @@ import os
 import sys
 import logging as _logging
 import traceback
-import rv.commands
 
 try:
     import opentimelineio as otio

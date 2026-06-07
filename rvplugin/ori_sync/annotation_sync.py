@@ -19,6 +19,7 @@ except ImportError:
         QtCore = None
 
 from utils import _log, _log_exc, _media_path
+from otio_sync_core.manager import STATE_SYNCED
 
 
 class AnnotationSyncController:
@@ -1029,7 +1030,7 @@ class AnnotationSyncController:
                 try:
                     frame = int(component.split(":")[2])
                     self._broadcast_frame_annotations_replace(node_name, frame)
-                except Exception as e:
+                except Exception:
                     _log_exc(f"Failed to parse frame from text update: {contents}")
             event.reject()
             return
