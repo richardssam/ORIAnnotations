@@ -46,7 +46,7 @@ class PlaybackSyncController:
             "looping": looping,
             "timeline_guid": timeline_guid,
         }
-        self.plugin.sync_manager.broadcast_playback(state)
+        self.plugin.sync_manager.broadcast_playback_state(state)
         self._last_broadcast_frame = current_frame
 
     def _apply_playback(self, data):
