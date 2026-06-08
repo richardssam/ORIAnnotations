@@ -29,6 +29,77 @@ playhead active.  The user scrubs on the first timeline → no events arrive.
 Use poll-based position reading from the poll thread instead (see
 `_poll_and_broadcast_frame`).
 
+## `request_receive` has a 100-second default timeout — bound poll-thread reads
+
+**This is the single most important gotcha for the sync poll thread.**
+
+Every xStudio Python property that reads/writes an actor (`playhead.playing`,
+`playhead.position`, `bm.set_annotation`, `bm.annotation_data`, `bm.detail`,
+`vp.colour_pipeline.exposure.value()`, `container.type`, …) is a synchronous
+`connection.request_receive(...)` bounded **only** by
+`connection.default_timeout_ms`, which defaults to **100 000 ms (100 s)**.
+
+If the target actor is **stale** — e.g. a playhead or viewport actor that was
+destroyed during a source-view switch, or a bookmark actor that is busy under a
+rapid partial-annotation stream — the call blocks the **poll thread** for the
+full 100 s.  Symptom: xStudio's UI stays responsive (it uses the *new* live
+actor), but sync silently stops — the poll thread is stuck, so `manager.tick()`
+never runs and incoming RabbitMQ messages pile up unprocessed.  The last log
+line is whatever poll-thread step entered the dead actor (`apply_patch …`,
+`Updated annotation bookmark …`, etc.).
+
+### A Python-thread timeout does **not** work
+
+The blocking happens inside a C++ `link.dequeue_message_with_timeout` call that
+**holds the GIL**.  A `threading.Thread(...).join(timeout=…)` around it can never
+fire, because the worker thread never releases the GIL for the poll thread to
+wake up.  The timeout **must** be enforced at the C++ level via
+`default_timeout_ms`.
+
+### The fix: `bounded` / `bounded_timeout` (in `utils.py`)
+
+`bounded_timeout(connection, ms)` is a context manager that temporarily lowers
+`default_timeout_ms`; `bounded(ms)` is the decorator form for whole methods.  A
+healthy actor replies in a few ms, so a 2 s bound never trips in normal use, but
+a dead actor raises promptly and the poll thread keeps running.
+
+```python
+@bounded(_PLAYHEAD_TIMEOUT_MS)      # 2000 ms
+def apply_pending_seek(self): ...
+
+with bounded_timeout(self.plugin.connection, 2000):
+    playing_changed = (playing != ph.playing)   # was a potential 100 s hang
+```
+
+On a playhead timeout, `apply_playback_state` drops `active_playhead` and
+re-acquires the live one via `current_playhead()` (which queries the
+global-playhead-events actor, **not** the dead playhead).  A skipped annotation
+render is harmless — the final `INSERT_CHILD` re-renders the full state.
+
+### Rule for future revisions
+
+- **Bound** any *poll-thread* read/write of a **playhead, viewport, or bookmark**
+  actor — these go stale during source-view switches / annotation streaming.
+  Currently bounded: `read_xs_display_state`, `apply_playback_state`,
+  `apply_pending_seek`, `current_playback_state`,
+  `resolve_and_broadcast_selection`, `apply_selection`,
+  `_reacquire_active_playhead` (playback); `apply_remote_annotation`,
+  `refresh_annotation_bookmark`, `broadcast_local_bookmark`,
+  `flush_pending_annotations`, `hot_scan_active_annotation`,
+  `load_snapshot_annotations`, `broadcast_live_stroke_from_json` (annotation).
+- **Do NOT bound** the structural methods in `structure_sync.py` /
+  `timeline_build.py` (`poll_*`, `apply_remote_move_child`, `do_load_timelines`,
+  `build_otio_*`).  They touch **playlist/timeline** actors that *persist*
+  through source-view switches (not stale-prone), and they contain
+  `load_otio` / `to_otio_string` / `create_playlist`, which can legitimately
+  take several seconds — a 2 s bound would abort valid slow operations.  If a
+  freeze ever ends on a structural step, bound the *specific* non-`load_otio`
+  call there, not the whole method.
+- **Do NOT bound** the xStudio-thread event handlers (`on_position_event`,
+  `on_global_playhead_event`, `on_selection_event`).  They run on xStudio's
+  dispatch thread, not the poll thread, and a dead playhead fires no events so
+  they only ever see live actors.
+
 ## Poll-based scrubbing with echo guard
 
 `_poll_and_broadcast_frame` (called every `POLL_INTERVAL` from the poll thread)
