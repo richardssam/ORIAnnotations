@@ -1053,7 +1053,7 @@ def create_vector_fonts_image(path, is_uhd=False):
     font_sizes = [12, 16, 24, 32, 48, 72, 96]
     for sz, y in zip(font_sizes, font_y):
         tf = _load_font(sz * scale)
-        d.text((100*scale, y*scale), f"{sz}pt Font Size Sample Text", fill=(60, 60, 70), font=tf)
+        d.text((100*scale, y*scale), f"{sz}pt Font Size Sample Text", fill=(60, 60, 70), font=tf, anchor="ls")
 
     c_lw = CORNER_LINE_WIDTH * scale
     d.line([c_lw, c_lw, W - 1 - c_lw, c_lw, W - 1 - c_lw, H - 1 - c_lw, c_lw, H - 1 - c_lw, c_lw, c_lw], fill=(120, 120, 130), width=2*scale)
