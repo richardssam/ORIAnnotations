@@ -10,6 +10,15 @@ from typing import Any, Callable
 
 import opentimelineio as otio
 
+from .protocol_messages import (
+    ProtocolMessage,
+    InsertChild,
+    MoveChild,
+    RemoveChild,
+    SetProperty,
+    ReplaceAnnotationCommands,
+)
+
 _logger = logging.getLogger("otio_sync")
 
 
@@ -179,7 +188,7 @@ class OTIOPatcher:
         existing.metadata["annotation_commands"].extend(incoming_cmds)
         return existing
 
-    def set_property(self, target_uuid: str, path: str, value: Any) -> dict[str, Any] | None:
+    def set_property(self, target_uuid: str, path: str, value: Any) -> "ProtocolMessage | None":
         """Set property *path* to *value* on object *target_uuid* locally.
 
         :param target_uuid: GUID of the target object.
@@ -206,19 +215,19 @@ class OTIOPatcher:
 
         self._fire_property_changed(target_uuid, path, value)
 
-        return {
-            "target_uuid": target_uuid,
-            "path": path,
-            "value": value,
-            "sync_timestamp": time.time(),
-        }
+        return SetProperty(
+            target_uuid=target_uuid,
+            path=path,
+            value=value,
+            sync_timestamp=time.time(),
+        )
 
     def insert_child(
         self,
         parent_uuid: str,
         child_obj: otio.core.SerializableObject,
         index: int = -1,
-    ) -> dict[str, Any] | None:
+    ) -> "ProtocolMessage | None":
         """Insert *child_obj* into the parent container locally.
 
         :param parent_uuid: GUID of the parent container.
@@ -241,14 +250,14 @@ class OTIOPatcher:
         child_uuid = child_obj.metadata["sync"]["guid"]
         self._fire_hierarchy_changed(parent_uuid, "insert_child", child_uuid)
 
-        return {
-            "parent_uuid": parent_uuid,
-            "index": index,
-            "child_data": _otio_to_dict(child_obj),
-            "sync_timestamp": time.time(),
-        }
+        return InsertChild(
+            parent_uuid=parent_uuid,
+            index=index,
+            child_data=_otio_to_dict(child_obj),
+            sync_timestamp=time.time(),
+        )
 
-    def remove_child(self, parent_uuid: str, child_uuid: str) -> dict[str, Any] | None:
+    def remove_child(self, parent_uuid: str, child_uuid: str) -> "ProtocolMessage | None":
         """Remove *child_uuid* from its parent container locally.
 
         :param parent_uuid: GUID of the parent container.
@@ -273,13 +282,13 @@ class OTIOPatcher:
 
         self._fire_hierarchy_changed(parent_uuid, "remove_child", child_uuid)
 
-        return {
-            "parent_uuid": parent_uuid,
-            "child_uuid": child_uuid,
-            "sync_timestamp": time.time(),
-        }
+        return RemoveChild(
+            parent_uuid=parent_uuid,
+            child_uuid=child_uuid,
+            sync_timestamp=time.time(),
+        )
 
-    def move_child(self, parent_uuid: str, child_uuid: str, to_index: int) -> dict[str, Any] | None:
+    def move_child(self, parent_uuid: str, child_uuid: str, to_index: int) -> "ProtocolMessage | None":
         """Move *child_uuid* within its parent container locally.
 
         :param parent_uuid: GUID of the parent container.
@@ -306,29 +315,35 @@ class OTIOPatcher:
 
         self._fire_hierarchy_changed(parent_uuid, "move_child", child_uuid)
 
-        return {
-            "parent_uuid": parent_uuid,
-            "child_uuid": child_uuid,
-            "to_index": to_index,
-            "sync_timestamp": time.time(),
-        }
+        return MoveChild(
+            parent_uuid=parent_uuid,
+            child_uuid=child_uuid,
+            to_index=to_index,
+            sync_timestamp=time.time(),
+        )
 
-    def apply_patch(self, event: str, data: dict[str, Any]) -> tuple[str, Any] | None:
-        """Apply a patch silently to the local OTIO graph and trigger callbacks.
+    def apply_patch(self, msg: "ProtocolMessage") -> tuple[str, Any] | None:
+        """Apply an OTIO-session mutation message to the local graph.
 
-        :param event: The patch event type (e.g. ``"SET_PROPERTY"``, ``"MOVE_CHILD"``).
-        :param data: The patch data payload.
-        :returns: An ``(action_name, action_data)`` tuple when the caller needs to act, or ``None``.
+        Dispatches on the concrete message type, so the same class that built
+        the payload (in :meth:`set_property`, :meth:`insert_child`, etc.) is the
+        one used to consume it.
+
+        :param msg: A reconstructed OTIO-session :class:`ProtocolMessage`:
+            :class:`SetProperty`, :class:`MoveChild`, :class:`RemoveChild`,
+            :class:`ReplaceAnnotationCommands`, or :class:`InsertChild`.
+        :returns: An ``(action_name, action_data)`` tuple when the caller needs
+            to act, or ``None``.
         :rtype: tuple or None
         """
         self._is_syncing = True
         try:
-            if event == "SET_PROPERTY":
-                target_uuid = data.get("target_uuid")
+            if isinstance(msg, SetProperty):
+                target_uuid = msg.target_uuid
                 if target_uuid in self.object_map:
                     obj = self.object_map[target_uuid]
-                    path: str = data.get("path")
-                    value: Any = data.get("value")
+                    path: str = msg.path
+                    value: Any = msg.value
                     if path.startswith("metadata/"):
                         parts = path.split("/")
                         curr = obj.metadata
@@ -342,10 +357,10 @@ class OTIOPatcher:
                     self._fire_property_changed(target_uuid, path, value)
                     return ("set_property", obj)
 
-            elif event == "MOVE_CHILD":
-                parent_uuid: str = data.get("parent_uuid")
-                child_uuid: str = data.get("child_uuid")
-                to_index: int = data.get("to_index", 0)
+            elif isinstance(msg, MoveChild):
+                parent_uuid: str = msg.parent_uuid
+                child_uuid: str = msg.child_uuid
+                to_index: int = msg.to_index
                 parent = self.object_map.get(parent_uuid)
                 child = self.object_map.get(child_uuid)
                 if parent is not None and child is not None:
@@ -358,11 +373,11 @@ class OTIOPatcher:
                         del parent[current_index]
                         parent.insert(to_index, child)
                         self._fire_hierarchy_changed(parent_uuid, "move_child", child_uuid)
-                        return ("move_child", data)
+                        return ("move_child", msg.to_payload())
 
-            elif event == "REMOVE_CHILD":
-                parent_uuid = data.get("parent_uuid")
-                child_uuid = data.get("child_uuid")
+            elif isinstance(msg, RemoveChild):
+                parent_uuid = msg.parent_uuid
+                child_uuid = msg.child_uuid
                 parent = self.object_map.get(parent_uuid)
                 if parent is not None:
                     current_index = next(
@@ -374,16 +389,16 @@ class OTIOPatcher:
                         del parent[current_index]
                         self.object_map.pop(child_uuid, None)
                         self._fire_hierarchy_changed(parent_uuid, "remove_child", child_uuid)
-                        return ("remove_child", data)
+                        return ("remove_child", msg.to_payload())
 
-            elif event == "REPLACE_ANNOTATION_COMMANDS":
-                ann_clip_guid = data.get("annotation_clip_guid")
+            elif isinstance(msg, ReplaceAnnotationCommands):
+                ann_clip_guid = msg.annotation_clip_guid
                 clip = self.object_map.get(ann_clip_guid)
                 if clip is None:
                     _log(f"REPLACE_ANNOTATION_COMMANDS: clip {ann_clip_guid} not found")
                     return None
                 commands: list[otio.core.SerializableObject] = []
-                for cmd_dict in data.get("commands", []):
+                for cmd_dict in msg.commands:
                     try:
                         commands.append(
                             _dict_to_otio(cmd_dict) if isinstance(cmd_dict, dict) else cmd_dict
@@ -393,12 +408,12 @@ class OTIOPatcher:
                 clip.metadata["annotation_commands"] = commands
                 return ("annotation_commands_replaced", clip)
 
-            elif event == "INSERT_CHILD":
-                parent_uuid = data.get("parent_uuid")
+            elif isinstance(msg, InsertChild):
+                parent_uuid = msg.parent_uuid
                 if parent_uuid in self.object_map:
                     parent = self.object_map[parent_uuid]
-                    index: int = data.get("index", -1)
-                    child_obj = _dict_to_otio(data.get("child_data"))
+                    index: int = msg.index
+                    child_obj = _dict_to_otio(msg.child_data)
                     merged = self._try_merge_annotation(parent, child_obj)
                     if merged is not None:
                         self.ensure_guid_and_map(child_obj)

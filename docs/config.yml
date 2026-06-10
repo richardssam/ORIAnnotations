@@ -87,6 +87,10 @@ SyncPlayback:
         rate: 24.0
     source: "/path/to/media/shot_010_v003.mov"
     source_index: 0
+    output_bounds:
+      OTIO_SCHEMA: "box2d.1"
+      min: [0.0, 0.0]
+      max: [1.0, 1.0]
     timestamp: "2025-01-31T16:14:00Z"
   playing_state:
     looping: false
@@ -222,6 +226,52 @@ PaintEnd:
       size: [0.009, 0.009, 0.009, 0.009, 0.009]
       x: [0.0, 0.1, 0.2, 0.3, 0.4]
       y: [0.0, 0.1, 0.0, 0.0, -0.1]
+
+PaintVertex:
+  _category: Annotation
+  default:
+    x: 0.15
+    y: -0.08
+    size: 0.009
+  eraser_vertex:
+    x: -0.25
+    y: 0.10
+    size: 0.015
+
+PaintVertices:
+  _category: Annotation
+  default:
+    x: [0.0, 0.1, 0.2, 0.3]
+    y: [0.0, 0.05, 0.0, -0.05]
+    size: [0.009, 0.009, 0.009, 0.009]
+  large_stroke:
+    x: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    y: [0.0, 0.1, 0.2, 0.1, 0.0, -0.1]
+    size: [0.012, 0.011, 0.010, 0.010, 0.011, 0.012]
+
+AnnotationEffect:
+  _category: Annotation
+  default:
+    name: "Annotation"
+    visible: true
+    commands: []
+  with_stroke:
+    name: "Review Annotations"
+    visible: true
+    commands:
+      - OTIO_SCHEMA: "PaintStart.1"
+        uuid: "paint_stroke_uuid_001"
+        friendly_name: "Director"
+        participant_hash: "d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"
+        rgba: [1.0, 1.0, 0.0, 1.0]
+        type: "color"
+        brush: "circle"
+        visible: true
+        hold: false
+        ghost: true
+        ghost_before: 3
+        ghost_after: 3
+        timestamp: "2025-01-31T16:14:00Z"
 
 TextAnnotation:
   _category: Annotation

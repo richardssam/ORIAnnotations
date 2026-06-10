@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>OTIO Sync — Protocol Messages</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f1115;color:#e6e6e6;line-height:1.5}
+.wrap{max-width:920px;margin:0 auto;padding:2rem}
+h1{font-size:1.8rem}h2{margin-top:2.5rem;border-bottom:1px solid #2a2f3a;padding-bottom:.3rem;color:#9ecbff}
+.msg{background:#161a22;border:1px solid #2a2f3a;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0}
+.msg h3{margin:.2rem 0;font-size:1.2rem}
+.badge{display:inline-block;font-size:.75rem;font-family:monospace;background:#243047;color:#9ecbff;padding:.1rem .5rem;border-radius:4px;margin-right:.4rem}
+.desc{color:#b9c0cc;margin:.5rem 0}
+table{border-collapse:collapse;width:100%;margin:.5rem 0;font-size:.9rem}
+th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #232834;vertical-align:top}
+th{color:#8a93a3;font-weight:600}
+code{font-family:monospace;color:#e3b341}
+pre{background:#0b0d12;border:1px solid #232834;border-radius:6px;padding:.75rem;overflow-x:auto;font-size:.82rem}
+.toc a{color:#9ecbff;text-decoration:none;margin-right:1rem}
+</style></head><body><div class='wrap'>
+<h1>OTIO Sync — Protocol Messages</h1>
+<p class='desc'>Transport-layer messages exchanged over the sync network. Generated from <code>otio_sync_core.protocol_messages</code>.</p>
+<p class='toc'>
+<a href='#Annotation'>Annotation</a>
+<a href='#OTIO-Session'>OTIO Session</a>
+<a href='#Selection'>Selection</a>
+<a href='#Session'>Session</a>
+<a href='#Settings'>Settings</a>
+<a href='#Timeline'>Timeline</a>
+</p>
+<h2 id='Annotation'>Annotation</h2>
+<div class='msg'>
+<h3>PartialAnnotation</h3>
+<span class='badge'>schema: Annotation.1</span><span class='badge'>event: PARTIAL</span>
+<p class='desc'>Mid-stroke partial annotation (visual preview, not persisted).</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>clip_guid</code></td><td>str</td><td>Sync GUID of the clip being annotated.</td></tr>
+<tr><td><code>frame</code></td><td>float</td><td>0-indexed clip-local frame number.</td></tr>
+<tr><td><code>fps</code></td><td>float</td><td>Frame rate used to interpret &#x27;frame&#x27;.</td></tr>
+<tr><td><code>events</code></td><td>list</td><td>Serialized SyncEvent dicts for the in-progress stroke.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;clip_guid&quot;: &quot;clip-guid-001&quot;,
+  &quot;frame&quot;: 12.0,
+  &quot;fps&quot;: 24.0,
+  &quot;events&quot;: [
+    {
+      &quot;OTIO_SCHEMA&quot;: &quot;PaintStart.1&quot;,
+      &quot;uuid&quot;: &quot;stroke-001&quot;
+    }
+  ]
+}</pre>
+</div>
+<h2 id='OTIO-Session'>OTIO Session</h2>
+<div class='msg'>
+<h3>InsertChild</h3>
+<span class='badge'>schema: OTIO_SESSION_1.0</span><span class='badge'>event: INSERT_CHILD</span>
+<p class='desc'>Inserts a child object into a parent container.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>parent_uuid</code></td><td>str</td><td>GUID of the parent container.</td></tr>
+<tr><td><code>child_data</code></td><td>dict</td><td>Serialized OTIO child object.</td></tr>
+<tr><td><code>index</code></td><td>int</td><td>Insert position; -1 appends.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;parent_uuid&quot;: &quot;track-guid-001&quot;,
+  &quot;index&quot;: -1,
+  &quot;child_data&quot;: {
+    &quot;OTIO_SCHEMA&quot;: &quot;Clip.1&quot;,
+    &quot;name&quot;: &quot;New Clip&quot;
+  },
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>MoveChild</h3>
+<span class='badge'>schema: OTIO_SESSION_1.0</span><span class='badge'>event: MOVE_CHILD</span>
+<p class='desc'>Moves a child to a new index within its parent container.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>parent_uuid</code></td><td>str</td><td>GUID of the parent container.</td></tr>
+<tr><td><code>child_uuid</code></td><td>str</td><td>GUID of the child to move.</td></tr>
+<tr><td><code>to_index</code></td><td>int</td><td>Target position in the parent.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;parent_uuid&quot;: &quot;track-guid-001&quot;,
+  &quot;child_uuid&quot;: &quot;clip-guid-001&quot;,
+  &quot;to_index&quot;: 2,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>RemoveChild</h3>
+<span class='badge'>schema: OTIO_SESSION_1.0</span><span class='badge'>event: REMOVE_CHILD</span>
+<p class='desc'>Removes a child from its parent container.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>parent_uuid</code></td><td>str</td><td>GUID of the parent container.</td></tr>
+<tr><td><code>child_uuid</code></td><td>str</td><td>GUID of the child to remove.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;parent_uuid&quot;: &quot;track-guid-001&quot;,
+  &quot;child_uuid&quot;: &quot;clip-guid-001&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>ReplaceAnnotationCommands</h3>
+<span class='badge'>schema: OTIO_SESSION_1.0</span><span class='badge'>event: REPLACE_ANNOTATION_COMMANDS</span>
+<p class='desc'>Replaces the full annotation-command list on an annotation clip.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>annotation_clip_guid</code></td><td>str</td><td>GUID of the annotation clip to update.</td></tr>
+<tr><td><code>commands</code></td><td>list</td><td>Full replacement list of serialized SyncEvents.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;annotation_clip_guid&quot;: &quot;ann-clip-001&quot;,
+  &quot;commands&quot;: [
+    {
+      &quot;OTIO_SCHEMA&quot;: &quot;TextAnnotation.1&quot;,
+      &quot;text&quot;: &quot;Fix lighting&quot;
+    }
+  ],
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>SetProperty</h3>
+<span class='badge'>schema: OTIO_SESSION_1.0</span><span class='badge'>event: SET_PROPERTY</span>
+<p class='desc'>Sets a property or metadata path on an object.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>target_uuid</code></td><td>str</td><td>GUID of the target object.</td></tr>
+<tr><td><code>path</code></td><td>str</td><td>Property name or &#x27;metadata/...&#x27; sub-path.</td></tr>
+<tr><td><code>value</code></td><td>Any</td><td>New primitive value.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;target_uuid&quot;: &quot;obj-guid-001&quot;,
+  &quot;path&quot;: &quot;name&quot;,
+  &quot;value&quot;: &quot;Renamed Clip&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<h2 id='Selection'>Selection</h2>
+<div class='msg'>
+<h3>SelectionSet</h3>
+<span class='badge'>schema: SELECTION_1.0</span><span class='badge'>event: SET</span>
+<p class='desc'>Broadcasts the clip the master has selected and the active view mode.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>clip_guid</code></td><td>str</td><td>Sync GUID of the selected clip (&#x27;&#x27; to clear).</td></tr>
+<tr><td><code>view_mode</code></td><td>str</td><td>View mode: &quot;source&quot; or &quot;sequence&quot;.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;clip_guid&quot;: &quot;clip-guid-001&quot;,
+  &quot;view_mode&quot;: &quot;sequence&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<h2 id='Session'>Session</h2>
+<div class='msg'>
+<h3>IAmMaster</h3>
+<span class='badge'>schema: LiveSession.1</span><span class='badge'>event: I_AM_MASTER</span>
+<p class='desc'>Master&#x27;s response to discovery, announcing itself as session master.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>master_guid</code></td><td>str</td><td>GUID of the peer that is the session master.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;master_guid&quot;: &quot;peer-master-001&quot;
+}</pre>
+</div>
+<div class='msg'>
+<h3>StateRequest</h3>
+<span class='badge'>schema: LiveSession.1</span><span class='badge'>event: STATE_REQUEST</span>
+<p class='desc'>Joiner&#x27;s request to the master for a full state snapshot.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>target_guid</code></td><td>str</td><td>GUID of the master the request is aimed at.</td></tr>
+<tr><td><code>requester_guid</code></td><td>str</td><td>GUID of the joining peer.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;target_guid&quot;: &quot;peer-master-001&quot;,
+  &quot;requester_guid&quot;: &quot;peer-abc123&quot;
+}</pre>
+</div>
+<div class='msg'>
+<h3>StateSnapshot</h3>
+<span class='badge'>schema: LiveSession.1</span><span class='badge'>event: STATE_SNAPSHOT</span>
+<p class='desc'>Master&#x27;s full session snapshot sent in response to a state request.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>target_guid</code></td><td>str</td><td>GUID of the joining peer this snapshot is for.</td></tr>
+<tr><td><code>timelines</code></td><td>dict</td><td>Map of timeline GUID to serialized OTIO timeline.</td></tr>
+<tr><td><code>active_timeline_guid</code></td><td>&#x27;str | None&#x27;</td><td>GUID of the active timeline at snapshot time.</td></tr>
+<tr><td><code>snapshot_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the snapshot was taken.</td></tr>
+<tr><td><code>playback_state</code></td><td>&#x27;dict | None&#x27;</td><td>Optional current playback state to seed the joiner.</td></tr>
+<tr><td><code>display_state</code></td><td>&#x27;dict | None&#x27;</td><td>Optional current display state to seed the joiner.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;target_guid&quot;: &quot;peer-abc123&quot;,
+  &quot;timelines&quot;: {
+    &quot;tl-guid-1&quot;: {
+      &quot;OTIO_SCHEMA&quot;: &quot;Timeline.1&quot;,
+      &quot;name&quot;: &quot;Sequence 1&quot;
+    }
+  },
+  &quot;active_timeline_guid&quot;: &quot;tl-guid-1&quot;,
+  &quot;snapshot_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>WhoIsMaster</h3>
+<span class='badge'>schema: LiveSession.1</span><span class='badge'>event: WHO_IS_MASTER</span>
+<p class='desc'>Master-discovery broadcast asking any existing master to identify itself.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>requester_guid</code></td><td>str</td><td>GUID of the peer asking who the master is.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;requester_guid&quot;: &quot;peer-abc123&quot;
+}</pre>
+</div>
+<h2 id='Settings'>Settings</h2>
+<div class='msg'>
+<h3>DisplaySettingsSet</h3>
+<span class='badge'>schema: DISPLAY_SETTINGS_1.0</span><span class='badge'>event: SET</span>
+<p class='desc'>Display state broadcast (pan/zoom/exposure/channel).</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>pan</code></td><td>&#x27;list | None&#x27;</td><td>Normalised [x, y] pan offset.</td></tr>
+<tr><td><code>zoom</code></td><td>&#x27;float | None&#x27;</td><td>Zoom multiplier (1.0 = none).</td></tr>
+<tr><td><code>exposure</code></td><td>&#x27;float | None&#x27;</td><td>Exposure adjustment in stops (0.0 = none).</td></tr>
+<tr><td><code>channel</code></td><td>&#x27;str | None&#x27;</td><td>Active channel: &quot;RGBA&quot;, &quot;R&quot;, &quot;G&quot;, &quot;B&quot;, or &quot;A&quot;.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;pan&quot;: [
+    0.0,
+    0.0
+  ],
+  &quot;zoom&quot;: 1.0,
+  &quot;exposure&quot;: 0.5,
+  &quot;channel&quot;: &quot;RGBA&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>PlaybackSettingsSet</h3>
+<span class='badge'>schema: PLAYBACK_SETTINGS_1.0</span><span class='badge'>event: SET</span>
+<p class='desc'>Playback state broadcast.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>playing</code></td><td>&#x27;bool | None&#x27;</td><td>Whether playback is running.</td></tr>
+<tr><td><code>current_time</code></td><td>&#x27;dict | None&#x27;</td><td>Current position as a serialized RationalTime.</td></tr>
+<tr><td><code>looping</code></td><td>&#x27;bool | None&#x27;</td><td>Whether playback loops.</td></tr>
+<tr><td><code>timeline_guid</code></td><td>&#x27;str | None&#x27;</td><td>GUID of the timeline being played.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;playing&quot;: true,
+  &quot;current_time&quot;: {
+    &quot;OTIO_SCHEMA&quot;: &quot;RationalTime.1&quot;,
+    &quot;value&quot;: 48.0,
+    &quot;rate&quot;: 24.0
+  },
+  &quot;looping&quot;: false,
+  &quot;timeline_guid&quot;: &quot;tl-guid-1&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<h2 id='Timeline'>Timeline</h2>
+<div class='msg'>
+<h3>AddTimeline</h3>
+<span class='badge'>schema: TIMELINE_1.0</span><span class='badge'>event: ADD_TIMELINE</span>
+<p class='desc'>Registers a new timeline (sequence or single-clip) with all peers.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>timeline_guid</code></td><td>str</td><td>GUID of the timeline being added.</td></tr>
+<tr><td><code>timeline</code></td><td>dict</td><td>Serialized OTIO timeline.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;timeline_guid&quot;: &quot;tl-guid-1&quot;,
+  &quot;timeline&quot;: {
+    &quot;OTIO_SCHEMA&quot;: &quot;Timeline.1&quot;,
+    &quot;name&quot;: &quot;Sequence 1&quot;
+  },
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+<div class='msg'>
+<h3>RenameTimeline</h3>
+<span class='badge'>schema: TIMELINE_1.0</span><span class='badge'>event: RENAME_TIMELINE</span>
+<p class='desc'>Renames an existing timeline on all peers.</p>
+<table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>timeline_guid</code></td><td>str</td><td>GUID of the timeline to rename.</td></tr>
+<tr><td><code>name</code></td><td>str</td><td>New display name for the timeline.</td></tr>
+<tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
+</table>
+<p class='desc'><strong>Example</strong></p>
+<pre>{
+  &quot;timeline_guid&quot;: &quot;tl-guid-1&quot;,
+  &quot;name&quot;: &quot;Reel 2 \u2014 Director Cut&quot;,
+  &quot;sync_timestamp&quot;: 1738339200.0
+}</pre>
+</div>
+</div></body></html>
