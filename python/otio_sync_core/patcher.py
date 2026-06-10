@@ -253,7 +253,7 @@ class OTIOPatcher:
         return InsertChild(
             parent_uuid=parent_uuid,
             index=index,
-            child_data=_otio_to_dict(child_obj),
+            child_data=child_obj,
             sync_timestamp=time.time(),
         )
 
@@ -397,15 +397,7 @@ class OTIOPatcher:
                 if clip is None:
                     _log(f"REPLACE_ANNOTATION_COMMANDS: clip {ann_clip_guid} not found")
                     return None
-                commands: list[otio.core.SerializableObject] = []
-                for cmd_dict in msg.commands:
-                    try:
-                        commands.append(
-                            _dict_to_otio(cmd_dict) if isinstance(cmd_dict, dict) else cmd_dict
-                        )
-                    except Exception as exc:
-                        _log(f"REPLACE_ANNOTATION_COMMANDS: failed to deserialise: {exc}")
-                clip.metadata["annotation_commands"] = commands
+                clip.metadata["annotation_commands"] = msg.as_otio()
                 return ("annotation_commands_replaced", clip)
 
             elif isinstance(msg, InsertChild):
@@ -413,7 +405,7 @@ class OTIOPatcher:
                 if parent_uuid in self.object_map:
                     parent = self.object_map[parent_uuid]
                     index: int = msg.index
-                    child_obj = _dict_to_otio(msg.child_data)
+                    child_obj = msg.as_otio()
                     merged = self._try_merge_annotation(parent, child_obj)
                     if merged is not None:
                         self.ensure_guid_and_map(child_obj)

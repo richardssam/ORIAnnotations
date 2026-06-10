@@ -57,7 +57,7 @@ pre{background:#0b0d12;border:1px solid #232834;border-radius:6px;padding:.75rem
 <p class='desc'>Inserts a child object into a parent container.</p>
 <table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
 <tr><td><code>parent_uuid</code></td><td>str</td><td>GUID of the parent container.</td></tr>
-<tr><td><code>child_data</code></td><td>dict</td><td>Serialized OTIO child object.</td></tr>
+<tr><td><code>child_data</code></td><td>Any</td><td>OTIO child object (object on send, wire dict on receive).</td></tr>
 <tr><td><code>index</code></td><td>int</td><td>Insert position; -1 appends.</td></tr>
 <tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
 </table>
@@ -112,7 +112,7 @@ pre{background:#0b0d12;border:1px solid #232834;border-radius:6px;padding:.75rem
 <p class='desc'>Replaces the full annotation-command list on an annotation clip.</p>
 <table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
 <tr><td><code>annotation_clip_guid</code></td><td>str</td><td>GUID of the annotation clip to update.</td></tr>
-<tr><td><code>commands</code></td><td>list</td><td>Full replacement list of serialized SyncEvents.</td></tr>
+<tr><td><code>commands</code></td><td>list</td><td>Full replacement list of OTIO SyncEvents (objects on send, wire dicts on receive).</td></tr>
 <tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the mutation occurred.</td></tr>
 </table>
 <p class='desc'><strong>Example</strong></p>
@@ -195,7 +195,7 @@ pre{background:#0b0d12;border:1px solid #232834;border-radius:6px;padding:.75rem
 <p class='desc'>Master&#x27;s full session snapshot sent in response to a state request.</p>
 <table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
 <tr><td><code>target_guid</code></td><td>str</td><td>GUID of the joining peer this snapshot is for.</td></tr>
-<tr><td><code>timelines</code></td><td>dict</td><td>Map of timeline GUID to serialized OTIO timeline.</td></tr>
+<tr><td><code>timelines</code></td><td>dict</td><td>Map of timeline GUID to OTIO timeline (objects on send, wire dicts on receive).</td></tr>
 <tr><td><code>active_timeline_guid</code></td><td>&#x27;str | None&#x27;</td><td>GUID of the active timeline at snapshot time.</td></tr>
 <tr><td><code>snapshot_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the snapshot was taken.</td></tr>
 <tr><td><code>playback_state</code></td><td>&#x27;dict | None&#x27;</td><td>Optional current playback state to seed the joiner.</td></tr>
@@ -281,7 +281,7 @@ pre{background:#0b0d12;border:1px solid #232834;border-radius:6px;padding:.75rem
 <p class='desc'>Registers a new timeline (sequence or single-clip) with all peers.</p>
 <table><tr><th>Field</th><th>Type</th><th>Description</th></tr>
 <tr><td><code>timeline_guid</code></td><td>str</td><td>GUID of the timeline being added.</td></tr>
-<tr><td><code>timeline</code></td><td>dict</td><td>Serialized OTIO timeline.</td></tr>
+<tr><td><code>timeline</code></td><td>Any</td><td>OTIO timeline (object on send, wire dict on receive).</td></tr>
 <tr><td><code>sync_timestamp</code></td><td>&#x27;float | None&#x27;</td><td>Epoch seconds when the message was sent.</td></tr>
 </table>
 <p class='desc'><strong>Example</strong></p>

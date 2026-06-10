@@ -25,8 +25,47 @@ Design constraints (see the ``typed-protocol-messages`` change design doc):
 
 from __future__ import annotations
 
+import json
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, ClassVar
+
+# ---------------------------------------------------------------------------
+# OTIO wire conversion
+#
+# These helpers are the single place that converts between OTIO objects and
+# their wire form.  ``opentimelineio`` is imported lazily *inside* them so this
+# module stays importable without OTIO installed (the documentation generator
+# only reads class/field metadata, never calls these).  The format must stay
+# byte-identical to the prior call-site serialization (``otio_json``,
+# ``indent=-1``) so peers on older code keep interoperating.
+# ---------------------------------------------------------------------------
+
+
+def _to_wire(obj: Any) -> Any:
+    """Serialize an OTIO object to its wire ``dict``; pass through a ``dict``.
+
+    :param obj: An OTIO ``SerializableObject`` or an already-serialized dict.
+    :returns: The wire-form dict.
+    """
+    if isinstance(obj, dict):
+        return obj
+    import opentimelineio as otio
+
+    return json.loads(otio.adapters.write_to_string(obj, "otio_json", indent=-1))
+
+
+def _from_wire(data: Any) -> Any:
+    """Deserialize a wire ``dict`` to an OTIO object; pass through a non-dict.
+
+    :param data: A wire-form dict, or an already-deserialized OTIO object.
+    :returns: The OTIO ``SerializableObject``.
+    """
+    if not isinstance(data, dict):
+        return data
+    import opentimelineio as otio
+
+    return otio.adapters.read_from_string(json.dumps(data), "otio_json")
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -222,7 +261,7 @@ class StateSnapshot(ProtocolMessage):
     target_guid: str = doc_field(doc="GUID of the joining peer this snapshot is for.")
     timelines: dict = doc_field(
         default_factory=dict,
-        doc="Map of timeline GUID to serialized OTIO timeline.",
+        doc="Map of timeline GUID to OTIO timeline (objects on send, wire dicts on receive).",
     )
     active_timeline_guid: "str | None" = doc_field(
         default=None, doc="GUID of the active timeline at snapshot time."
@@ -240,7 +279,7 @@ class StateSnapshot(ProtocolMessage):
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "target_guid": self.target_guid,
-            "timelines": self.timelines,
+            "timelines": {g: _to_wire(tl) for g, tl in self.timelines.items()},
             "active_timeline_guid": self.active_timeline_guid,
             "snapshot_timestamp": self.snapshot_timestamp,
         }
@@ -261,6 +300,10 @@ class StateSnapshot(ProtocolMessage):
             display_state=data.get("display_state"),
         )
 
+    def as_otio(self) -> dict[str, Any]:
+        """Return ``{guid: OTIO timeline}``, deserializing any wire-form entries."""
+        return {g: _from_wire(tl) for g, tl in self.timelines.items()}
+
 
 # ---------------------------------------------------------------------------
 # Timeline family — TIMELINE_1.0
@@ -276,7 +319,9 @@ class AddTimeline(ProtocolMessage):
     EVENT = "ADD_TIMELINE"
 
     timeline_guid: str = doc_field(doc="GUID of the timeline being added.")
-    timeline: dict = doc_field(doc="Serialized OTIO timeline.")
+    timeline: Any = doc_field(
+        doc="OTIO timeline (object on send, wire dict on receive)."
+    )
     sync_timestamp: "float | None" = doc_field(
         default=None, doc="Epoch seconds when the message was sent."
     )
@@ -284,7 +329,7 @@ class AddTimeline(ProtocolMessage):
     def to_payload(self) -> dict[str, Any]:
         return {
             "timeline_guid": self.timeline_guid,
-            "timeline": self.timeline,
+            "timeline": _to_wire(self.timeline),
             "sync_timestamp": self.sync_timestamp,
         }
 
@@ -295,6 +340,10 @@ class AddTimeline(ProtocolMessage):
             timeline=data.get("timeline"),
             sync_timestamp=data.get("sync_timestamp"),
         )
+
+    def as_otio(self) -> Any:
+        """Return the OTIO timeline, deserializing if still in wire form."""
+        return _from_wire(self.timeline)
 
 
 @register
@@ -511,6 +560,9 @@ class PartialAnnotation(ProtocolMessage):
     clip_guid: str = doc_field(doc="Sync GUID of the clip being annotated.")
     frame: float = doc_field(doc="0-indexed clip-local frame number.")
     fps: float = doc_field(doc="Frame rate used to interpret 'frame'.")
+    # Deliberately kept as serialized SyncEvent dicts (NOT typed OTIO objects):
+    # this is the hottest path and the host codec already produces dicts, so a
+    # typed field would force wasteful deserialize-then-reserialize churn.
     events: list = doc_field(
         default_factory=list, doc="Serialized SyncEvent dicts for the in-progress stroke."
     )
@@ -583,7 +635,9 @@ class InsertChild(ProtocolMessage):
     EVENT = "INSERT_CHILD"
 
     parent_uuid: str = doc_field(doc="GUID of the parent container.")
-    child_data: dict = doc_field(doc="Serialized OTIO child object.")
+    child_data: Any = doc_field(
+        doc="OTIO child object (object on send, wire dict on receive)."
+    )
     index: int = doc_field(default=-1, doc="Insert position; -1 appends.")
     sync_timestamp: "float | None" = doc_field(
         default=None, doc="Epoch seconds when the mutation occurred."
@@ -593,7 +647,7 @@ class InsertChild(ProtocolMessage):
         return {
             "parent_uuid": self.parent_uuid,
             "index": self.index,
-            "child_data": self.child_data,
+            "child_data": _to_wire(self.child_data),
             "sync_timestamp": self.sync_timestamp,
         }
 
@@ -605,6 +659,10 @@ class InsertChild(ProtocolMessage):
             index=data.get("index", -1),
             sync_timestamp=data.get("sync_timestamp"),
         )
+
+    def as_otio(self) -> Any:
+        """Return the OTIO child object, deserializing if still in wire form."""
+        return _from_wire(self.child_data)
 
 
 @register
@@ -680,7 +738,8 @@ class ReplaceAnnotationCommands(ProtocolMessage):
 
     annotation_clip_guid: str = doc_field(doc="GUID of the annotation clip to update.")
     commands: list = doc_field(
-        default_factory=list, doc="Full replacement list of serialized SyncEvents."
+        default_factory=list,
+        doc="Full replacement list of OTIO SyncEvents (objects on send, wire dicts on receive).",
     )
     sync_timestamp: "float | None" = doc_field(
         default=None, doc="Epoch seconds when the mutation occurred."
@@ -689,7 +748,7 @@ class ReplaceAnnotationCommands(ProtocolMessage):
     def to_payload(self) -> dict[str, Any]:
         return {
             "annotation_clip_guid": self.annotation_clip_guid,
-            "commands": self.commands,
+            "commands": [_to_wire(c) for c in self.commands],
             "sync_timestamp": self.sync_timestamp,
         }
 
@@ -700,3 +759,7 @@ class ReplaceAnnotationCommands(ProtocolMessage):
             commands=data.get("commands", []),
             sync_timestamp=data.get("sync_timestamp"),
         )
+
+    def as_otio(self) -> list:
+        """Return the OTIO SyncEvent list, deserializing any wire-form entries."""
+        return [_from_wire(c) for c in self.commands]

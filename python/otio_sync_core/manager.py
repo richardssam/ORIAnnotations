@@ -376,7 +376,7 @@ class SyncManager:
         self._send_message(
             AddTimeline(
                 timeline_guid=tl_guid,
-                timeline=_otio_to_dict(tl),
+                timeline=tl,
                 sync_timestamp=time.time(),
             )
         )
@@ -634,9 +634,7 @@ class SyncManager:
             return
         self._send_message(StateSnapshot(
             target_guid=target_guid,
-            timelines={
-                guid: _otio_to_dict(tl) for guid, tl in self._timelines.items()
-            },
+            timelines=dict(self._timelines),
             active_timeline_guid=self.active_timeline_guid,
             snapshot_timestamp=time.time(),
             playback_state=playback_state or None,
@@ -1022,7 +1020,7 @@ class SyncManager:
             self._send_message(InsertChild(
                 parent_uuid=annotation_track_guid,
                 index=-1,
-                child_data=_otio_to_dict(delta_clip),
+                child_data=delta_clip,
                 sync_timestamp=time.time(),
             ))
             return existing.metadata.get("sync", {}).get("guid")
@@ -1102,7 +1100,7 @@ class SyncManager:
 
         self._send_message(ReplaceAnnotationCommands(
             annotation_clip_guid=annotation_clip_guid,
-            commands=[_otio_to_dict(e) for e in otio_events],
+            commands=list(otio_events),
             sync_timestamp=time.time(),
         ))
 
@@ -1298,9 +1296,10 @@ class SyncManager:
         self, msg: AddTimeline, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
         tl_guid = msg.timeline_guid
-        tl_dict = msg.timeline
-        if tl_guid and tl_dict and tl_guid not in self._timelines:
-            tl = _dict_to_otio(tl_dict)
+        # Check the GUID guard *before* deserializing: a timeline we already
+        # hold must not pay the as_otio() cost.
+        if tl_guid and msg.timeline and tl_guid not in self._timelines:
+            tl = msg.as_otio()
             self._timelines[tl_guid] = tl
             seq_clip_guid = tl.metadata.get("clip_timeline_for")
             if seq_clip_guid:
