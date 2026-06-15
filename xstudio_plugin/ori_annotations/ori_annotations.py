@@ -175,6 +175,11 @@ class ORIAnnotationsPlugin(PluginBase):
     # ------------------------------------------------------------------
 
     def _export_menu_callback(self):
+        # ``create_qml_item`` keeps one dialog instance alive (keyed on the QML
+        # string) and shows it by setting its ``attr_enabled`` role True.  The
+        # QML closes with ``dialog.hide()`` — never ``destroy()`` — which lets
+        # the runtime reset ``attr_enabled`` to False, so each menu click is a
+        # real False→True transition that re-shows the dialog.
         self.create_qml_item(_EXPORT_DIALOG_QML)
 
     def _import_menu_callback(self):

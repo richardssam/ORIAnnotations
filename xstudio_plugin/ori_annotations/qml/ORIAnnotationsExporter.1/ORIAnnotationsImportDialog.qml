@@ -77,8 +77,9 @@ XsWindow {
                 text: "Cancel"
                 width: XsStyleSheet.primaryButtonStdWidth * 2
                 onClicked: {
+                    // Hide (not destroy): the runtime keeps the single dialog
+                    // instance alive and re-shows it by toggling attr_enabled.
                     dialog.hide()
-                    dialog.destroy()
                 }
             }
 
@@ -95,7 +96,6 @@ XsWindow {
                         if (result[0] === true) {
                             dialogHelpers.messageDialogFunc("Import Complete", result[1], "Ok")
                             dialog.hide()
-                            dialog.destroy()
                         } else {
                             dialogHelpers.errorDialogFunc("Import Failed", result[1])
                         }

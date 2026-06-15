@@ -79,7 +79,7 @@ XsWindow {
         // ── Checkboxes ──────────────────────────────────────────────────
         Item { Layout.preferredWidth: 1 }
 
-        CheckBox {
+        XsCheckBox {
             id: includeMedia
             text: "Copy media files into export directory"
             checked: false
@@ -87,7 +87,7 @@ XsWindow {
 
         Item { Layout.preferredWidth: 1 }
 
-        CheckBox {
+        XsCheckBox {
             id: includeImages
             text: "Render annotation images (PNG)"
             checked: false
@@ -104,8 +104,9 @@ XsWindow {
                 text: "Cancel"
                 width: XsStyleSheet.primaryButtonStdWidth * 2
                 onClicked: {
+                    // Hide (not destroy): the runtime keeps the single dialog
+                    // instance alive and re-shows it by toggling attr_enabled.
                     dialog.hide()
-                    dialog.destroy()
                 }
             }
 
@@ -125,7 +126,6 @@ XsWindow {
                         if (result[0] === true) {
                             dialogHelpers.messageDialogFunc("Export Complete", result[1], "Ok")
                             dialog.hide()
-                            dialog.destroy()
                         } else {
                             dialogHelpers.errorDialogFunc("Export Failed", result[1])
                         }
