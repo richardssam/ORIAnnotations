@@ -275,6 +275,12 @@ class ORISyncPlugin(PluginBase):
             callback=self._menu_leave_session,
         )
 
+        # Place the top-level "Session" menu just before "Help" (which xStudio
+        # fixes at position 100 on the main menu bar).  The position must be a
+        # float — xStudio's menu-model handler matches on a double, so an int
+        # is silently ignored and the menu falls back to its default slot.
+        self.set_submenu_position("main menu bar", "Session", 99.0)
+
         self.connect_to_ui()
 
         ori_session = os.environ.get("ORI_SESSION")

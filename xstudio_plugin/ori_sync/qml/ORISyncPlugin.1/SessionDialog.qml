@@ -77,8 +77,9 @@ XsWindow {
                 text: "Cancel"
                 width: XsStyleSheet.primaryButtonStdWidth * 2
                 onClicked: {
+                    // Hide (not destroy): the runtime keeps the single dialog
+                    // instance alive and re-shows it by toggling attr_enabled.
                     dialog.hide()
-                    dialog.destroy()
                 }
             }
 
@@ -97,7 +98,6 @@ XsWindow {
                         }
                     )
                     dialog.hide()
-                    dialog.destroy()
                 }
             }
         }
