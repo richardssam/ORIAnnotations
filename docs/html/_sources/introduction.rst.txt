@@ -46,5 +46,5 @@ You can run this from the command line, once the libraries are installed with:
 
 See also:
    * https://lf-aswf.atlassian.net/wiki/spaces/PRWG/pages/11274625/OTIO-Based+Synchronized+Review+Messaging
-
+   * https://docs.google.com/document/d/1dmo5Le5elqNNl9p4GpcRPT76BV7r6KYtrapHITD25uA/edit?tab=t.0#heading=h.3jckyebptegj
 

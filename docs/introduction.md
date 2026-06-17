@@ -9,6 +9,14 @@ layers:
 2. **OTIO add-ons** — custom OpenTimelineIO schemas that let a timeline carry
    review/annotation data and discrete sync events.
 
+Auto-generated API reference (built with `make html` in `docs/`):
+
+- [`otio_sync_core` API](html/otio_sync_core.html) — the core sync library
+  (manager, protocol messages, network backends, proxy, patcher, colour, and
+  annotation codec).
+- [`SyncEvent` / OTIO add-ons API](html/ori_event_plugin.html) — the custom
+  OpenTimelineIO schemas (`SyncEvent` and its subclasses).
+
 
 ---
 

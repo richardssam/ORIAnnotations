@@ -6,4 +6,5 @@
 
    introduction
    ORIAnnotations
+   otio_sync_core
    ori_event_plugin

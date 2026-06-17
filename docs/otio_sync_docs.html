@@ -240,6 +240,14 @@ small envelope and fanned out to every peer over RabbitMQ.</li>
 <li><strong>OTIO add-ons</strong> — custom OpenTimelineIO schemas that let a timeline carry
 review/annotation data and discrete sync events.</li>
 </ol>
+<p>Auto-generated API reference (built with <code>make html</code> in <code>docs/</code>):</p>
+<ul>
+<li><a href="html/otio_sync_core.html"><code>otio_sync_core</code> API</a> — the core sync library
+(manager, protocol messages, network backends, proxy, patcher, colour, and
+annotation codec).</li>
+<li><a href="html/ori_event_plugin.html"><code>SyncEvent</code> / OTIO add-ons API</a> — the custom
+OpenTimelineIO schemas (<code>SyncEvent</code> and its subclasses).</li>
+</ul>
 <hr />
 <h2>Protocol messages</h2>
 <p>The transport layer is defined by typed
@@ -521,45 +529,6 @@ event = otio.schema.schemadef.AnnotationEffect(name=<span class="py-string">'Rev
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-start"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker')">Red Marker</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker_python')">Red Marker (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser')">Eraser</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser_python')">Eraser (Python)</button></div>
-                <div id="paint-start-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
-  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Patrick Chevalier"</span>,
-  <span class="json-key">"ghost"</span>: <span class="json-boolean">true</span>,
-  <span class="json-key">"ghost_after"</span>: <span class="json-number">3</span>,
-  <span class="json-key">"ghost_before"</span>: <span class="json-number">3</span>,
-  <span class="json-key">"hold"</span>: <span class="json-boolean">false</span>,
-  <span class="json-key">"layer_range"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
-    <span class="json-key">"duration"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
-    },
-    <span class="json-key">"start_time"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
-    }
-  },
-  <span class="json-key">"participant_hash"</span>: <span class="json-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
-  <span class="json-key">"rgba"</span>: [
-    1.0,
-    1.0,
-    0.0,
-    1.0
-  ],
-  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
-  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>,
-  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-start-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -570,45 +539,6 @@ SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'Sync
 event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'paint_stroke_uuid_001'</span>, friendly_name=<span class="py-string">'Patrick Chevalier'</span>, participant_hash=<span class="py-string">'d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'color'</span>, brush=<span class="py-string">'circle'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">0.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), hold=<span class=<span class="py-string">"py-keyword"</span>>False</span>, ghost=<span class=<span class="py-string">"py-keyword"</span>>True</span>, ghost_before=<span class="py-number">3</span>, ghost_after=<span class="py-number">3</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
                     </div>
                 </div>
-                <div id="paint-start-red_marker" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
-  <span class="json-key">"brush"</span>: <span class="json-string">"gaussian"</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Jane Doe"</span>,
-  <span class="json-key">"ghost"</span>: <span class="json-boolean">false</span>,
-  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"hold"</span>: <span class="json-boolean">true</span>,
-  <span class="json-key">"layer_range"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
-    <span class="json-key">"duration"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
-    },
-    <span class="json-key">"start_time"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">5.0</span>
-    }
-  },
-  <span class="json-key">"participant_hash"</span>: <span class="json-string">"abc123def456ghi789"</span>,
-  <span class="json-key">"rgba"</span>: [
-    1.0,
-    0.0,
-    0.0,
-    1.0
-  ],
-  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">30</span>Z"</span>,
-  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_002"</span>,
-  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-start-red_marker_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -617,45 +547,6 @@ event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0<
 SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
 event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'paint_stroke_uuid_002'</span>, friendly_name=<span class="py-string">'Jane Doe'</span>, participant_hash=<span class="py-string">'abc123def456ghi789'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'color'</span>, brush=<span class="py-string">'gaussian'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">5.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), hold=<span class=<span class="py-string">"py-keyword"</span>>True</span>, ghost=<span class=<span class="py-string">"py-keyword"</span>>False</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">30</span>Z'</span>)</pre>
-                    </div>
-                </div>
-                <div id="paint-start-eraser" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
-  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"John Smith"</span>,
-  <span class="json-key">"ghost"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"hold"</span>: <span class="json-null">null</span>,
-  <span class="json-key">"layer_range"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
-    <span class="json-key">"duration"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
-    },
-    <span class="json-key">"start_time"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">10.0</span>
-    }
-  },
-  <span class="json-key">"participant_hash"</span>: <span class="json-string">"xyz789abc123"</span>,
-  <span class="json-key">"rgba"</span>: [
-    1.0,
-    1.0,
-    1.0,
-    1.0
-  ],
-  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">00</span>Z"</span>,
-  <span class="json-key">"type"</span>: <span class="json-string">"erase"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"eraser_stroke_uuid_003"</span>,
-  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
-}</pre>
                     </div>
                 </div>
                 <div id="paint-start-eraser_python" class="example-content">
@@ -692,32 +583,6 @@ Grouping paint vertices together to form a stroke, and be a little more efficien
                         <td><span class="type-badge">list</span></td>
                         <td>The sizes of the paint stroke</td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-vertices"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertices', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertices', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertices', 'large_stroke')">Large Stroke</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertices', 'large_stroke_python')">Large Stroke (Python)</button></div>
-                <div id="paint-vertices-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
-  <span class="json-key">"size"</span>: [
-    0.009,
-    0.009,
-    0.009,
-    0.009
-  ],
-  <span class="json-key">"x"</span>: [
-    0.0,
-    0.1,
-    0.2,
-    0.3
-  ],
-  <span class="json-key">"y"</span>: [
-    0.0,
-    0.05,
-    0.0,
-    -0.05
-  ]
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-vertices-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -726,38 +591,6 @@ Grouping paint vertices together to form a stroke, and be a little more efficien
 SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
 event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.05</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.05</span>], size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>])</pre>
-                    </div>
-                </div>
-                <div id="paint-vertices-large_stroke" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
-  <span class="json-key">"size"</span>: [
-    0.012,
-    0.011,
-    0.01,
-    0.01,
-    0.011,
-    0.012
-  ],
-  <span class="json-key">"x"</span>: [
-    0.0,
-    0.2,
-    0.4,
-    0.6,
-    0.8,
-    1.0
-  ],
-  <span class="json-key">"y"</span>: [
-    0.0,
-    0.1,
-    0.2,
-    0.1,
-    0.0,
-    -0.1
-  ]
-}</pre>
                     </div>
                 </div>
                 <div id="paint-vertices-large_stroke_python" class="example-content">
@@ -793,17 +626,6 @@ event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span
                         <td><span class="type-badge">float</span></td>
                         <td>The size of the point vertex</td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-vertex"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertex', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertex', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertex', 'eraser_vertex')">Eraser Vertex</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertex', 'eraser_vertex_python')">Eraser Vertex (Python)</button></div>
-                <div id="paint-vertex-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertex.1"</span>,
-  <span class="json-key">"size"</span>: <span class="json-number">0.009</span>,
-  <span class="json-key">"x"</span>: <span class="json-number">0.15</span>,
-  <span class="json-key">"y"</span>: <span class="json-number">-0.08</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-vertex-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -812,17 +634,6 @@ event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span
 SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
 event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">0.15</span>, y=<span class="py-number">-0.08</span>, size=<span class="py-number">0.009</span>)</pre>
-                    </div>
-                </div>
-                <div id="paint-vertex-eraser_vertex" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertex.1"</span>,
-  <span class="json-key">"size"</span>: <span class="json-number">0.015</span>,
-  <span class="json-key">"x"</span>: <span class="json-number">-0.25</span>,
-  <span class="json-key">"y"</span>: <span class="json-number">0.1</span>
-}</pre>
                     </div>
                 </div>
                 <div id="paint-vertex-eraser_vertex_python" class="example-content">
@@ -875,54 +686,6 @@ Attribute:
                         <td><span class="type-badge">str</span></td>
                         <td>timestamp is an ISO 8601 formatted string representing the time of the change.</td>
                     </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-paint-points"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default_python')">Default (Python)</button></div>
-                <div id="paint-points-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintPoint.1"</span>,
-  <span class="json-key">"layer_range"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
-    <span class="json-key">"duration"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
-    },
-    <span class="json-key">"start_time"</span>: {
-      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
-      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
-      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
-    }
-  },
-  <span class="json-key">"points"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
-    <span class="json-key">"size"</span>: [
-      0.009,
-      0.009,
-      0.009,
-      0.009,
-      0.009
-    ],
-    <span class="json-key">"x"</span>: [
-      0.0,
-      0.1,
-      0.2,
-      0.3,
-      0.4
-    ],
-    <span class="json-key">"y"</span>: [
-      0.0,
-      0.1,
-      0.0,
-      0.0,
-      -0.1
-    ]
-  },
-  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00.500</span>Z"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-points-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -956,40 +719,6 @@ event = otio.schema.schemadef.PaintPoints(source_index=<span class="py-number">0
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-paint-end"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default_python')">Default (Python)</button></div>
-                <div id="paint-end-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintEnd.1"</span>,
-  <span class="json-key">"points"</span>: {
-    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
-    <span class="json-key">"size"</span>: [
-      0.009,
-      0.009,
-      0.009,
-      0.009,
-      0.009
-    ],
-    <span class="json-key">"x"</span>: [
-      0.0,
-      0.1,
-      0.2,
-      0.3,
-      0.4
-    ],
-    <span class="json-key">"y"</span>: [
-      0.0,
-      0.1,
-      0.0,
-      0.0,
-      -0.1
-    ]
-  },
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">01</span>Z"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="paint-end-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -1063,33 +792,6 @@ event = otio.schema.schemadef.PaintEnd(uuid=<span class="py-string">'paint_strok
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-text-annotation"><button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note')">Approval Note</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note_python')">Approval Note (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note')">Rotated Note</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note_python')">Rotated Note (Python)</button></div>
-                <div id="text-annotation-default" class="example-content active">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
-  <span class="json-key">"font"</span>: <span class="json-string">"Arial"</span>,
-  <span class="json-key">"font_size"</span>: <span class="json-number">24.0</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Director"</span>,
-  <span class="json-key">"position"</span>: [
-    5.5,
-    2.0
-  ],
-  <span class="json-key">"rgba"</span>: [
-    1.0,
-    0.0,
-    0.0,
-    1.0
-  ],
-  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
-  <span class="json-key">"scale"</span>: <span class="json-number">1.0</span>,
-  <span class="json-key">"spacing"</span>: <span class="json-number">1.2</span>,
-  <span class="json-key">"text"</span>: <span class="json-string">"Fix the lighting in this shot"</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_001"</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="text-annotation-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -1100,33 +802,6 @@ SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'Sync
 event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_annotation_uuid_001'</span>, friendly_name=<span class="py-string">'Director'</span>, position=[<span class="py-number">5.5</span>, <span class="py-number">2.0</span>], rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], text=<span class="py-string">'Fix the lighting <span class="py-keyword">in</span> this shot'</span>, spacing=<span class="py-number">1.2</span>, font_size=<span class="py-number">24.0</span>, scale=<span class="py-number">1.0</span>, rotation=<span class="py-number">0.0</span>, font=<span class="py-string">'Arial'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
                     </div>
                 </div>
-                <div id="text-annotation-approval_note" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
-  <span class="json-key">"font"</span>: <span class="json-string">"Helvetica"</span>,
-  <span class="json-key">"font_size"</span>: <span class="json-number">36.0</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Producer"</span>,
-  <span class="json-key">"position"</span>: [
-    -6.0,
-    -3.0
-  ],
-  <span class="json-key">"rgba"</span>: [
-    0.0,
-    1.0,
-    0.0,
-    1.0
-  ],
-  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
-  <span class="json-key">"scale"</span>: <span class="json-number">1.5</span>,
-  <span class="json-key">"spacing"</span>: <span class="json-number">1.0</span>,
-  <span class="json-key">"text"</span>: <span class="json-string">"Approved!"</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">20</span>: <span class="json-number">00</span>Z"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_002"</span>
-}</pre>
-                    </div>
-                </div>
                 <div id="text-annotation-approval_note_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
@@ -1135,33 +810,6 @@ event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_
 SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
 event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_annotation_uuid_002'</span>, friendly_name=<span class="py-string">'Producer'</span>, position=[<span class="py-number">-6.0</span>, <span class="py-number">-3.0</span>], rgba=[<span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], text=<span class="py-string">'Approved!'</span>, spacing=<span class="py-number">1.0</span>, font_size=<span class="py-number">36.0</span>, scale=<span class="py-number">1.5</span>, rotation=<span class="py-number">0.0</span>, font=<span class="py-string">'Helvetica'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">20</span>:<span class="py-number">00</span>Z'</span>)</pre>
-                    </div>
-                </div>
-                <div id="text-annotation-rotated_note" class="example-content ">
-                    <div class="code-block">
-                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-                        <pre>{
-  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
-  <span class="json-key">"font"</span>: <span class="json-string">"Impact"</span>,
-  <span class="json-key">"font_size"</span>: <span class="json-number">28.0</span>,
-  <span class="json-key">"friendly_name"</span>: <span class="json-string">"VFX Supervisor"</span>,
-  <span class="json-key">"position"</span>: [
-    0.0,
-    0.0
-  ],
-  <span class="json-key">"rgba"</span>: [
-    1.0,
-    1.0,
-    0.0,
-    1.0
-  ],
-  <span class="json-key">"rotation"</span>: <span class="json-number">15.0</span>,
-  <span class="json-key">"scale"</span>: <span class="json-number">1.2</span>,
-  <span class="json-key">"spacing"</span>: <span class="json-number">1.1</span>,
-  <span class="json-key">"text"</span>: <span class="json-string">"Add more explosion here"</span>,
-  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">18</span>: <span class="json-number">00</span>Z"</span>,
-  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_003"</span>
-}</pre>
                     </div>
                 </div>
                 <div id="text-annotation-rotated_note_python" class="example-content">
