@@ -28,6 +28,7 @@ from sequence_sync import SequenceSyncController
 from playback_sync import PlaybackSyncController
 from display_sync import DisplaySyncController
 from annotation_sync import AnnotationSyncController
+from color_sync import ColorSyncController
 
 SYNC_DEMO_TRACK_UUID = "otio-sync-demo-track-0"
 
@@ -57,6 +58,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.playback = PlaybackSyncController(self)
         self.display = DisplaySyncController(self)
         self.annotation = AnnotationSyncController(self)
+        self.color = ColorSyncController(self)
 
         self.init(self.MENU_NAME, [
             ("play-start", self.on_rv_play_start, "Broadcast Play"),
@@ -266,6 +268,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         @self.sync_manager.on_property_changed
         def _on_property_changed(target_uuid, path, new_value):
+            if path and path.startswith("metadata/color") and not self._rv_updating:
+                self._rv_updating = True
+                try:
+                    self.color.on_property_changed(target_uuid, path, new_value)
+                finally:
+                    self._rv_updating = False
             if not self._rv_updating:
                 rv.commands.redraw()
 
@@ -289,6 +297,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         self.playback._apply_playback(self.sync_manager.playback_state)
                     if self.sync_manager.display_state:
                         self.display._apply_display_state(self.sync_manager.display_state)
+                    self.color.apply_all()
                 finally:
                     self._rv_updating = False
             if self._pending_create_check:
@@ -507,6 +516,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.playback.on_selection_changed(event)
 
     def on_rv_graph_state_change(self, event):
+        # Color changes (ocio.inColorSpace) are consumed here; everything else
+        # falls through to the annotation handler.
+        if self.color.on_graph_state_change(event):
+            return
         self.annotation.on_graph_state_change(event)
 
     def _session_dialog(self, title):

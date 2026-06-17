@@ -46,6 +46,7 @@ from .display_sync import DisplaySyncController  # noqa: E402
 from .playback_sync import PlaybackSyncController  # noqa: E402
 from .structure_sync import StructureSyncController  # noqa: E402
 from .annotation_sync import AnnotationSyncController  # noqa: E402
+from .color_sync import ColorSyncController  # noqa: E402
 
 import os
 import queue
@@ -112,6 +113,7 @@ class ORISyncPlugin(PluginBase):
         self.playback = PlaybackSyncController(self)
         self.structure = StructureSyncController(self)
         self.annotation = AnnotationSyncController(self)
+        self.color = ColorSyncController(self)
 
         # ── xStudio handles ────────────────────────────────────────────────
         self.active_playhead: Playhead | None = None
@@ -336,6 +338,9 @@ class ORISyncPlugin(PluginBase):
         self.manager.on_status_changed(
             lambda s: self.status_attr.set_value(s)
         )
+        # Colour metadata changes arrive as property changes (no dedicated tick
+        # action); apply them to xStudio's OCIO pipeline as they land.
+        self.manager.on_property_changed(self.color.apply_property_change)
 
         # Register on_synced here so the pending_create_check flag is captured
         # correctly for this connect call.
@@ -448,6 +453,7 @@ class ORISyncPlugin(PluginBase):
         self.structure._xs_sequence_playlists.clear()
         self.structure._xs_sequence_media_names.clear()
         self.media.reset()
+        self.color.reset()
         self.structure._timeline_item_sub_ids.clear()
         with self.structure._timeline_item_lock:
             self.structure._timeline_item_dirty.clear()
@@ -589,6 +595,11 @@ class ORISyncPlugin(PluginBase):
                 if now - self.display._last_display_scan >= 0.5:
                     self.display.poll_and_broadcast_display()
                     self.display._last_display_scan = now
+
+                # 6.1. Periodic colour state scan (0.5s interval)
+                if now - self.color._last_color_scan >= 0.5:
+                    self.color.poll_and_broadcast_color()
+                    self.color._last_color_scan = now
 
                 # 6.5. Periodic structure scan (1.0s interval)
                 if now - self.structure._last_structure_scan >= 1.0:
