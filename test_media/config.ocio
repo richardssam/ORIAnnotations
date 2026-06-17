@@ -26,6 +26,7 @@ roles:
   texture_paint: ACEScct
 
 file_rules:
+  - !<Rule> {name: ACES_sRGB, regex: ".*_ACES_sRGB.*", colorspace: ACES_sRGB}
   - !<Rule> {name: Default, colorspace: ACES2065-1}
 
 shared_views:
