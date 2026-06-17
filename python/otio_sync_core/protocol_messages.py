@@ -305,6 +305,76 @@ class StateSnapshot(ProtocolMessage):
         return {g: _from_wire(tl) for g, tl in self.timelines.items()}
 
 
+@register
+@dataclass
+class NewPresenter(ProtocolMessage):
+    """Announces that a peer has become the session presenter."""
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "NEW_PRESENTER"
+
+    presenter_hash: str = doc_field(doc="Hash identifying the new presenter.")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"presenter_hash": self.presenter_hash}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "NewPresenter":
+        return cls(presenter_hash=data.get("presenter_hash"))
+
+
+@register
+@dataclass
+class NewParticipant(ProtocolMessage):
+    """Announces that a new participant has joined the sync review."""
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "NEW_PARTICIPANT"
+
+    def to_payload(self) -> dict[str, Any]:
+        return {}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "NewParticipant":
+        return cls()
+
+
+@register
+@dataclass
+class SharedKeyRequest(ProtocolMessage):
+    """Requests the session's shared key from a peer."""
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "SHARED_KEY_REQUEST"
+
+    key: str = doc_field(doc="The shared key being requested.")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"key": self.key}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "SharedKeyRequest":
+        return cls(key=data.get("key"))
+
+
+@register
+@dataclass
+class SharedKeyResponse(ProtocolMessage):
+    """Responds to a shared-key request with the session's shared key."""
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "SHARED_KEY_RESPONSE"
+
+    key: str = doc_field(doc="The shared key being returned.")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"key": self.key}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "SharedKeyResponse":
+        return cls(key=data.get("key"))
+
+
 # ---------------------------------------------------------------------------
 # Timeline family — TIMELINE_1.0
 # ---------------------------------------------------------------------------
