@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>otio_sync_core.proxy &#8212; ORIAnnotations 0.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="../../_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="../../_static/alabaster.css?v=27fed22d" />
+    <script src="../../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="https://unpkg.com/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({"startOnLoad": true})</script>
+    <link rel="canonical" href="https://richardssam.github.io/ORIAnnotations/docs/build/html/_modules/otio_sync_core/proxy.html" />
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+<base href="./">  
+   
+  <link rel="stylesheet" href="../../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for otio_sync_core.proxy</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot;Transparent proxy that intercepts attribute writes and forwards them to OTIOPatcher.&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">opentimelineio</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">otio</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">.patcher</span><span class="w"> </span><span class="kn">import</span> <span class="n">OTIOPatcher</span>
+
+
+<div class="viewcode-block" id="OTIOSyncProxy">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.proxy.OTIOSyncProxy">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">OTIOSyncProxy</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Transparent proxy around an OTIO :class:`~opentimelineio.core.SerializableObject`.</span>
+
+<span class="sd">    Attribute reads are passed through to the wrapped object unchanged.  Attribute</span>
+<span class="sd">    writes are applied to the wrapped object **and** forwarded to the</span>
+<span class="sd">    :class:`~otio_sync_core.patcher.OTIOPatcher` as a ``set_property`` change,</span>
+<span class="sd">    so that remote peers stay in sync without the caller needing to be aware of the</span>
+<span class="sd">    sync layer.</span>
+
+<span class="sd">    Child OTIO objects returned by ``__getattr__`` are themselves wrapped in a new</span>
+<span class="sd">    :class:`OTIOSyncProxy` so that nested attribute writes are also captured.</span>
+
+<span class="sd">    :param obj: The OTIO object to wrap.</span>
+<span class="sd">    :param patcher: The :class:`~otio_sync_core.patcher.OTIOPatcher` (or compatible)</span>
+<span class="sd">        that owns this object.</span>
+<span class="sd">    :param parent_path: Dot-separated path prefix used when constructing the property</span>
+<span class="sd">        path for nested objects.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">obj</span><span class="p">:</span> <span class="n">otio</span><span class="o">.</span><span class="n">core</span><span class="o">.</span><span class="n">SerializableObject</span><span class="p">,</span>
+        <span class="n">patcher</span><span class="p">:</span> <span class="n">OTIOPatcher</span><span class="p">,</span>
+        <span class="n">parent_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_obj&quot;</span><span class="p">,</span> <span class="n">obj</span><span class="p">)</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_patcher&quot;</span><span class="p">,</span> <span class="n">patcher</span><span class="p">)</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_path&quot;</span><span class="p">,</span> <span class="n">parent_path</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">__class__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">type</span><span class="p">:</span>  <span class="c1"># type: ignore[override]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="o">.</span><span class="vm">__class__</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the attribute from the wrapped object.</span>
+
+<span class="sd">        If the value is itself a :class:`~opentimelineio.core.SerializableObject`</span>
+<span class="sd">        it is wrapped in a new :class:`OTIOSyncProxy` so that nested writes are</span>
+<span class="sd">        also intercepted.</span>
+
+<span class="sd">        :param name: Attribute name.</span>
+<span class="sd">        :returns: Attribute value, proxied if it is an OTIO object.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">val</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="n">otio</span><span class="o">.</span><span class="n">core</span><span class="o">.</span><span class="n">SerializableObject</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">OTIOSyncProxy</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_patcher</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">val</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Write *value* to the wrapped object and broadcast the change.</span>
+
+<span class="sd">        Private proxy attributes (``_obj``, ``_patcher``, ``_path``) are stored</span>
+<span class="sd">        directly on the proxy instance and are never forwarded.</span>
+
+<span class="sd">        :param name: Attribute name.</span>
+<span class="sd">        :param value: New value.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;_obj&quot;</span><span class="p">,</span> <span class="s2">&quot;_patcher&quot;</span><span class="p">,</span> <span class="s2">&quot;_path&quot;</span><span class="p">):</span>
+            <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+            <span class="k">return</span>
+
+        <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_patcher</span><span class="p">,</span> <span class="s2">&quot;_is_syncing&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+            <span class="k">return</span>
+
+        <span class="n">guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="p">,</span> <span class="n">otio</span><span class="o">.</span><span class="n">core</span><span class="o">.</span><span class="n">SerializableObject</span><span class="p">):</span>
+            <span class="k">if</span> <span class="s2">&quot;sync&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">and</span> <span class="s2">&quot;guid&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">&quot;sync&quot;</span><span class="p">]:</span>
+                <span class="n">guid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">&quot;sync&quot;</span><span class="p">][</span><span class="s2">&quot;guid&quot;</span><span class="p">]</span>
+
+        <span class="k">if</span> <span class="n">guid</span><span class="p">:</span>
+            <span class="n">path</span> <span class="o">=</span> <span class="n">name</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_path</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_path</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_patcher</span><span class="o">.</span><span class="n">set_property</span><span class="p">(</span><span class="n">guid</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">repr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj</span><span class="p">)</span></div>
+
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">ORIAnnotations</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction.html">Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ORIAnnotations.html">ORIAnnotations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../otio_sync_core.html">otio_sync_core</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ori_event_plugin.html">SyncEvent</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../../index.html">Documentation overview</a><ul>
+  <li><a href="../index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Sam Richards.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>

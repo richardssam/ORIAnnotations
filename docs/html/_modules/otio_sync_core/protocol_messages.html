@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>otio_sync_core.protocol_messages &#8212; ORIAnnotations 0.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="../../_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="../../_static/alabaster.css?v=27fed22d" />
+    <script src="../../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="https://unpkg.com/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({"startOnLoad": true})</script>
+    <link rel="canonical" href="https://richardssam.github.io/ORIAnnotations/docs/build/html/_modules/otio_sync_core/protocol_messages.html" />
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+<base href="./">  
+   
+  <link rel="stylesheet" href="../../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for otio_sync_core.protocol_messages</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot;Typed protocol message definitions for the OTIO Sync transport layer.</span>
+
+<span class="sd">Each message class defined here is the **single source of truth** for one</span>
+<span class="sd">transport-layer message: its ``command_schema``, its ``event`` name, and the</span>
+<span class="sd">shape of its payload.  This mirrors how :mod:`SyncEvent` is the source of truth</span>
+<span class="sd">for the OTIO message layer, and lets a documentation generator describe the</span>
+<span class="sd">protocol directly from these classes (see ``docs/`` generator).</span>
+
+<span class="sd">Design constraints (see the ``typed-protocol-messages`` change design doc):</span>
+
+<span class="sd">* Messages are **pure data** — handler logic lives in the manager/patcher, not</span>
+<span class="sd">  on the message classes — so the classes stay importable in isolation for</span>
+<span class="sd">  documentation.</span>
+<span class="sd">* Registration is explicit via the :func:`register` decorator, keyed on</span>
+<span class="sd">  ``(SCHEMA, EVENT)``, so the receive-side dispatch registry cannot drift from</span>
+<span class="sd">  the definitions.</span>
+<span class="sd">* Serialization is explicit: ``to_payload()`` builds a plain ``dict`` without</span>
+<span class="sd">  reflective whole-object walking (no :func:`dataclasses.asdict`) and without</span>
+<span class="sd">  per-message ``isinstance`` validation, so hot-path messages</span>
+<span class="sd">  (:class:`PartialAnnotation`, :class:`PlaybackSettingsSet`) stay cheap.</span>
+<span class="sd">* The settings messages declare their known fields for documentation but</span>
+<span class="sd">  **tolerate** unknown fields (carried in ``extras``) for forward-compatibility</span>
+<span class="sd">  with independent producers.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">MISSING</span><span class="p">,</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span>
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># OTIO wire conversion</span>
+<span class="c1">#</span>
+<span class="c1"># These helpers are the single place that converts between OTIO objects and</span>
+<span class="c1"># their wire form.  ``opentimelineio`` is imported lazily *inside* them so this</span>
+<span class="c1"># module stays importable without OTIO installed (the documentation generator</span>
+<span class="c1"># only reads class/field metadata, never calls these).  The format must stay</span>
+<span class="c1"># byte-identical to the prior call-site serialization (``otio_json``,</span>
+<span class="c1"># ``indent=-1``) so peers on older code keep interoperating.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_to_wire</span><span class="p">(</span><span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Serialize an OTIO object to its wire ``dict``; pass through a ``dict``.</span>
+
+<span class="sd">    :param obj: An OTIO ``SerializableObject`` or an already-serialized dict.</span>
+<span class="sd">    :returns: The wire-form dict.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">obj</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">opentimelineio</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">otio</span>
+
+    <span class="k">return</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">otio</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">write_to_string</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="s2">&quot;otio_json&quot;</span><span class="p">,</span> <span class="n">indent</span><span class="o">=-</span><span class="mi">1</span><span class="p">))</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_from_wire</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Deserialize a wire ``dict`` to an OTIO object; pass through a non-dict.</span>
+
+<span class="sd">    :param data: A wire-form dict, or an already-deserialized OTIO object.</span>
+<span class="sd">    :returns: The OTIO ``SerializableObject``.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">data</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">opentimelineio</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">otio</span>
+
+    <span class="k">return</span> <span class="n">otio</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">read_from_string</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">data</span><span class="p">),</span> <span class="s2">&quot;otio_json&quot;</span><span class="p">)</span>
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Registry</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="c1">#: Maps ``(command_schema, event)`` to the message class that defines it.</span>
+<span class="n">_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">type</span><span class="p">[</span><span class="s2">&quot;ProtocolMessage&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+
+
+<div class="viewcode-block" id="register">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.register">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="bp">cls</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="s2">&quot;ProtocolMessage&quot;</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">type</span><span class="p">[</span><span class="s2">&quot;ProtocolMessage&quot;</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Register *cls* in the protocol registry keyed on ``(SCHEMA, EVENT)``.</span>
+
+<span class="sd">    Used as a class decorator.  Raises if two classes claim the same</span>
+<span class="sd">    ``(SCHEMA, EVENT)`` pair, so collisions surface at import time.</span>
+
+<span class="sd">    :param cls: A :class:`ProtocolMessage` subclass with ``SCHEMA``/``EVENT`` set.</span>
+<span class="sd">    :returns: *cls* unchanged (decorator-compatible).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="bp">cls</span><span class="o">.</span><span class="n">SCHEMA</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="n">EVENT</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">cls</span><span class="o">.</span><span class="n">SCHEMA</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">cls</span><span class="o">.</span><span class="n">EVENT</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> must define non-empty SCHEMA and EVENT&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">_REGISTRY</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Duplicate protocol message registration for </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">: &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">_REGISTRY</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> and </span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+    <span class="n">_REGISTRY</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">cls</span>
+    <span class="k">return</span> <span class="bp">cls</span></div>
+
+
+
+<div class="viewcode-block" id="message_for">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.message_for">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">message_for</span><span class="p">(</span><span class="n">command_schema</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">event</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;type[ProtocolMessage] | None&quot;</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return the message class for ``(command_schema, event)``, or ``None``.</span>
+
+<span class="sd">    :param command_schema: Envelope ``command_schema`` value.</span>
+<span class="sd">    :param event: Envelope ``command.event`` value.</span>
+<span class="sd">    :returns: The registered :class:`ProtocolMessage` subclass, or ``None`` when</span>
+<span class="sd">        the pair is unknown (caller should ignore the message safely).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">_REGISTRY</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">command_schema</span><span class="p">,</span> <span class="n">event</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="registered_messages">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.registered_messages">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">registered_messages</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">type</span><span class="p">[</span><span class="s2">&quot;ProtocolMessage&quot;</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return a copy of the full ``(schema, event) -&gt; class`` registry.</span>
+
+<span class="sd">    Used by the documentation generator to enumerate every protocol message.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">_REGISTRY</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="doc_field">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.doc_field">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">doc_field</span><span class="p">(</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">default</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">MISSING</span><span class="p">,</span>
+    <span class="n">default_factory</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">MISSING</span><span class="p">,</span>
+    <span class="n">doc</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Declare a dataclass field carrying a documentation string in metadata.</span>
+
+<span class="sd">    The documentation generator reads ``field.metadata[&quot;doc&quot;]`` for each field.</span>
+
+<span class="sd">    :param default: Default value (mutually exclusive with *default_factory*).</span>
+<span class="sd">    :param default_factory: Zero-arg callable producing the default.</span>
+<span class="sd">    :param doc: Human-readable description of the field.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">default_factory</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">MISSING</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">default_factory</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;doc&quot;</span><span class="p">:</span> <span class="n">doc</span><span class="p">})</span>
+    <span class="k">if</span> <span class="n">default</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">MISSING</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="n">default</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;doc&quot;</span><span class="p">:</span> <span class="n">doc</span><span class="p">})</span>
+    <span class="k">return</span> <span class="n">field</span><span class="p">(</span><span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;doc&quot;</span><span class="p">:</span> <span class="n">doc</span><span class="p">})</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Base class</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="ProtocolMessage">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ProtocolMessage">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ProtocolMessage</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Base class for all transport-layer protocol messages.</span>
+
+<span class="sd">    Subclasses are ``@dataclass``-decorated and ``@register``-ed.  They set the</span>
+<span class="sd">    class-level :attr:`SCHEMA` and :attr:`EVENT` constants and implement</span>
+<span class="sd">    :meth:`to_payload` / :meth:`from_payload` explicitly.</span>
+
+<span class="sd">    :cvar SCHEMA: The envelope ``command_schema`` for this message.</span>
+<span class="sd">    :cvar EVENT: The envelope ``command.event`` for this message.</span>
+<span class="sd">    :cvar ENVELOPE_SCHEMA: Optional top-level ``schema`` key written on the</span>
+<span class="sd">        envelope (only :class:`IAmMaster` uses this for legacy compatibility).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">EVENT</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">ENVELOPE_SCHEMA</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="s2">&quot;str | None&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ProtocolMessage.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ProtocolMessage.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the ``command.payload`` dict for this message.&quot;&quot;&quot;</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span></div>
+
+
+<div class="viewcode-block" id="ProtocolMessage.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ProtocolMessage.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;ProtocolMessage&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Reconstruct a message instance from a received ``command.payload``.&quot;&quot;&quot;</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span></div>
+
+
+<div class="viewcode-block" id="ProtocolMessage.doc_fields">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ProtocolMessage.doc_fields">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">doc_fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return ``(name, type, description)`` triples for documentation.</span>
+
+<span class="sd">        Default implementation reads the dataclass fields, skipping the</span>
+<span class="sd">        ``extras`` catch-all used by tolerant messages.</span>
+
+<span class="sd">        :returns: List of ``(field_name, type_name, doc)`` tuples.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">out</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>  <span class="c1"># type: ignore[arg-type]</span>
+            <span class="k">if</span> <span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;extras&quot;</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">type_name</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="s2">&quot;__name__&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">type</span><span class="p">))</span>
+            <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">type_name</span><span class="p">,</span> <span class="n">f</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;doc&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)))</span>
+        <span class="k">return</span> <span class="n">out</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Session family — LiveSession.1</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="WhoIsMaster">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.WhoIsMaster">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">WhoIsMaster</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Master-discovery broadcast asking any existing master to identify itself.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;WHO_IS_MASTER&quot;</span>
+
+    <span class="n">requester_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the peer asking who the master is.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="WhoIsMaster.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.WhoIsMaster.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;requester_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">requester_guid</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="WhoIsMaster.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.WhoIsMaster.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;WhoIsMaster&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">requester_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;requester_guid&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="IAmMaster">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.IAmMaster">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">IAmMaster</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Master&#39;s response to discovery, announcing itself as session master.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;I_AM_MASTER&quot;</span>
+    <span class="c1">#: Legacy top-level envelope schema preserved for older peers.</span>
+    <span class="n">ENVELOPE_SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;SYNC_REVIEW_1.0&quot;</span>
+
+    <span class="n">master_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the peer that is the session master.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="IAmMaster.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.IAmMaster.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;master_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">master_guid</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="IAmMaster.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.IAmMaster.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;IAmMaster&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">master_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;master_guid&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="StateRequest">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateRequest">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StateRequest</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Joiner&#39;s request to the master for a full state snapshot.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;STATE_REQUEST&quot;</span>
+
+    <span class="n">target_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the master the request is aimed at.&quot;</span><span class="p">)</span>
+    <span class="n">requester_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the joining peer.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="StateRequest.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateRequest.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;target_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_guid</span><span class="p">,</span> <span class="s2">&quot;requester_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">requester_guid</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="StateRequest.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateRequest.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;StateRequest&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">target_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_guid&quot;</span><span class="p">),</span>
+            <span class="n">requester_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;requester_guid&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="StateSnapshot">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateSnapshot">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StateSnapshot</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Master&#39;s full session snapshot sent in response to a state request.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;STATE_SNAPSHOT&quot;</span>
+
+    <span class="n">target_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the joining peer this snapshot is for.&quot;</span><span class="p">)</span>
+    <span class="n">timelines</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Map of timeline GUID to OTIO timeline (objects on send, wire dicts on receive).&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">active_timeline_guid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the active timeline at snapshot time.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">snapshot_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the snapshot was taken.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">playback_state</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Optional current playback state to seed the joiner.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">display_state</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Optional current display state to seed the joiner.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="StateSnapshot.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateSnapshot.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="n">payload</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;target_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_guid</span><span class="p">,</span>
+            <span class="s2">&quot;timelines&quot;</span><span class="p">:</span> <span class="p">{</span><span class="n">g</span><span class="p">:</span> <span class="n">_to_wire</span><span class="p">(</span><span class="n">tl</span><span class="p">)</span> <span class="k">for</span> <span class="n">g</span><span class="p">,</span> <span class="n">tl</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">timelines</span><span class="o">.</span><span class="n">items</span><span class="p">()},</span>
+            <span class="s2">&quot;active_timeline_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">active_timeline_guid</span><span class="p">,</span>
+            <span class="s2">&quot;snapshot_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">snapshot_timestamp</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">playback_state</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;playback_state&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">playback_state</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">display_state</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;display_state&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">display_state</span>
+        <span class="k">return</span> <span class="n">payload</span></div>
+
+
+<div class="viewcode-block" id="StateSnapshot.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateSnapshot.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;StateSnapshot&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">target_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_guid&quot;</span><span class="p">),</span>
+            <span class="n">timelines</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timelines&quot;</span><span class="p">,</span> <span class="p">{}),</span>
+            <span class="n">active_timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;active_timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">snapshot_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;snapshot_timestamp&quot;</span><span class="p">),</span>
+            <span class="n">playback_state</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;playback_state&quot;</span><span class="p">),</span>
+            <span class="n">display_state</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;display_state&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StateSnapshot.as_otio">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateSnapshot.as_otio">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return ``{guid: OTIO timeline}``, deserializing any wire-form entries.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">g</span><span class="p">:</span> <span class="n">_from_wire</span><span class="p">(</span><span class="n">tl</span><span class="p">)</span> <span class="k">for</span> <span class="n">g</span><span class="p">,</span> <span class="n">tl</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">timelines</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="NewPresenter">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewPresenter">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NewPresenter</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Announces that a peer has become the session presenter.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;NEW_PRESENTER&quot;</span>
+
+    <span class="n">presenter_hash</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Hash identifying the new presenter.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="NewPresenter.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewPresenter.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;presenter_hash&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">presenter_hash</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="NewPresenter.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewPresenter.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;NewPresenter&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">presenter_hash</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;presenter_hash&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="NewParticipant">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewParticipant">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NewParticipant</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Announces that a new participant has joined the sync review.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;NEW_PARTICIPANT&quot;</span>
+
+<div class="viewcode-block" id="NewParticipant.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewParticipant.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
+<div class="viewcode-block" id="NewParticipant.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.NewParticipant.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;NewParticipant&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">()</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="SharedKeyRequest">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyRequest">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SharedKeyRequest</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Requests the session&#39;s shared key from a peer.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SHARED_KEY_REQUEST&quot;</span>
+
+    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;The shared key being requested.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="SharedKeyRequest.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyRequest.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;key&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">key</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="SharedKeyRequest.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyRequest.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;SharedKeyRequest&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="SharedKeyResponse">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyResponse">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SharedKeyResponse</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Responds to a shared-key request with the session&#39;s shared key.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SHARED_KEY_RESPONSE&quot;</span>
+
+    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;The shared key being returned.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="SharedKeyResponse.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyResponse.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;key&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">key</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="SharedKeyResponse.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SharedKeyResponse.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;SharedKeyResponse&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Timeline family — TIMELINE_1.0</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="AddTimeline">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.AddTimeline">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">AddTimeline</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Registers a new timeline (sequence or single-clip) with all peers.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;TIMELINE_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;ADD_TIMELINE&quot;</span>
+
+    <span class="n">timeline_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline being added.&quot;</span><span class="p">)</span>
+    <span class="n">timeline</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;OTIO timeline (object on send, wire dict on receive).&quot;</span>
+    <span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="AddTimeline.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.AddTimeline.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;timeline_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span><span class="p">,</span>
+            <span class="s2">&quot;timeline&quot;</span><span class="p">:</span> <span class="n">_to_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timeline</span><span class="p">),</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="AddTimeline.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.AddTimeline.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;AddTimeline&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">timeline</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="AddTimeline.as_otio">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.AddTimeline.as_otio">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the OTIO timeline, deserializing if still in wire form.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">_from_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timeline</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="RenameTimeline">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RenameTimeline">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RenameTimeline</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Renames an existing timeline on all peers.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;TIMELINE_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;RENAME_TIMELINE&quot;</span>
+
+    <span class="n">timeline_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline to rename.&quot;</span><span class="p">)</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;New display name for the timeline.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="RenameTimeline.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RenameTimeline.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;timeline_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span><span class="p">,</span>
+            <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="RenameTimeline.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RenameTimeline.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;RenameTimeline&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">name</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Settings family — declare known fields, tolerate extras (hot paths)</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="PlaybackSettingsSet">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PlaybackSettingsSet">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PlaybackSettingsSet</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Playback state broadcast.</span>
+
+<span class="sd">    Hot path: fires on frame change during playback/scrubbing.  Known fields are</span>
+<span class="sd">    declared for documentation; any additional producer fields are preserved in</span>
+<span class="sd">    ``extras`` and round-tripped unchanged.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;PLAYBACK_SETTINGS_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SET&quot;</span>
+
+    <span class="n">playing</span><span class="p">:</span> <span class="s2">&quot;bool | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Whether playback is running.&quot;</span><span class="p">)</span>
+    <span class="n">current_time</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Current position as a serialized RationalTime.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">looping</span><span class="p">:</span> <span class="s2">&quot;bool | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Whether playback loops.&quot;</span><span class="p">)</span>
+    <span class="n">timeline_guid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline being played.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">extras</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
+    <span class="c1">#: Field names modelled explicitly (everything else falls into ``extras``).</span>
+    <span class="n">_KNOWN</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">&quot;playing&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;current_time&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;looping&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;timeline_guid&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="PlaybackSettingsSet.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PlaybackSettingsSet.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="n">payload</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">playing</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;playing&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">playing</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;current_time&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_time</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">looping</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;looping&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">looping</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span>
+        <span class="n">payload</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">extras</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">payload</span></div>
+
+
+<div class="viewcode-block" id="PlaybackSettingsSet.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PlaybackSettingsSet.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;PlaybackSettingsSet&quot;</span><span class="p">:</span>
+        <span class="n">extras</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">data</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_KNOWN</span><span class="p">}</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">playing</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;playing&quot;</span><span class="p">),</span>
+            <span class="n">current_time</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;current_time&quot;</span><span class="p">),</span>
+            <span class="n">looping</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;looping&quot;</span><span class="p">),</span>
+            <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+            <span class="n">extras</span><span class="o">=</span><span class="n">extras</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="DisplaySettingsSet">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.DisplaySettingsSet">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DisplaySettingsSet</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Display state broadcast (pan/zoom/exposure/channel).</span>
+
+<span class="sd">    Known fields are declared for documentation; additional producer fields are</span>
+<span class="sd">    preserved in ``extras``.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;DISPLAY_SETTINGS_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SET&quot;</span>
+
+    <span class="n">pan</span><span class="p">:</span> <span class="s2">&quot;list | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Normalised [x, y] pan offset.&quot;</span><span class="p">)</span>
+    <span class="n">zoom</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Zoom multiplier (1.0 = none).&quot;</span><span class="p">)</span>
+    <span class="n">exposure</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Exposure adjustment in stops (0.0 = none).&quot;</span>
+    <span class="p">)</span>
+    <span class="n">channel</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Active channel: &quot;RGBA&quot;, &quot;R&quot;, &quot;G&quot;, &quot;B&quot;, or &quot;A&quot;.&#39;</span>
+    <span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">extras</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
+    <span class="n">_KNOWN</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">&quot;pan&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;zoom&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;exposure&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;channel&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="DisplaySettingsSet.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.DisplaySettingsSet.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="n">payload</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pan</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;pan&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pan</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">zoom</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;zoom&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">zoom</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exposure</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;exposure&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">exposure</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">channel</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;channel&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">channel</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span>
+        <span class="n">payload</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">extras</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">payload</span></div>
+
+
+<div class="viewcode-block" id="DisplaySettingsSet.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.DisplaySettingsSet.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;DisplaySettingsSet&quot;</span><span class="p">:</span>
+        <span class="n">extras</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">data</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_KNOWN</span><span class="p">}</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">pan</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;pan&quot;</span><span class="p">),</span>
+            <span class="n">zoom</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;zoom&quot;</span><span class="p">),</span>
+            <span class="n">exposure</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;exposure&quot;</span><span class="p">),</span>
+            <span class="n">channel</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;channel&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+            <span class="n">extras</span><span class="o">=</span><span class="n">extras</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Selection family — SELECTION_1.0</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="SelectionSet">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SelectionSet</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Broadcasts the clip the master has selected and the active view mode.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;SELECTION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SET&quot;</span>
+
+    <span class="n">clip_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Sync GUID of the selected clip (&#39;&#39; to clear).&quot;</span><span class="p">)</span>
+    <span class="n">view_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;source&quot;</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;View mode: &quot;source&quot; or &quot;sequence&quot;.&#39;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="SelectionSet.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;clip_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">clip_guid</span><span class="p">,</span>
+            <span class="s2">&quot;view_mode&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">view_mode</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="SelectionSet.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;SelectionSet&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">clip_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;clip_guid&quot;</span><span class="p">),</span>
+            <span class="n">view_mode</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;view_mode&quot;</span><span class="p">,</span> <span class="s2">&quot;source&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Annotation family — Annotation.1 (hot path)</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="PartialAnnotation">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PartialAnnotation">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PartialAnnotation</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Mid-stroke partial annotation (visual preview, not persisted).</span>
+
+<span class="sd">    Hot path: fires repeatedly while a stroke is being drawn.  No validation or</span>
+<span class="sd">    reflective serialization is performed.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;Annotation.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;PARTIAL&quot;</span>
+
+    <span class="n">clip_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Sync GUID of the clip being annotated.&quot;</span><span class="p">)</span>
+    <span class="n">frame</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;0-indexed clip-local frame number.&quot;</span><span class="p">)</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Frame rate used to interpret &#39;frame&#39;.&quot;</span><span class="p">)</span>
+    <span class="c1"># Deliberately kept as serialized SyncEvent dicts (NOT typed OTIO objects):</span>
+    <span class="c1"># this is the hottest path and the host codec already produces dicts, so a</span>
+    <span class="c1"># typed field would force wasteful deserialize-then-reserialize churn.</span>
+    <span class="n">events</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Serialized SyncEvent dicts for the in-progress stroke.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="PartialAnnotation.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PartialAnnotation.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;clip_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">clip_guid</span><span class="p">,</span>
+            <span class="s2">&quot;frame&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">frame</span><span class="p">,</span>
+            <span class="s2">&quot;fps&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">fps</span><span class="p">,</span>
+            <span class="s2">&quot;events&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">events</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="PartialAnnotation.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PartialAnnotation.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;PartialAnnotation&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">clip_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;clip_guid&quot;</span><span class="p">),</span>
+            <span class="n">frame</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;frame&quot;</span><span class="p">),</span>
+            <span class="n">fps</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">),</span>
+            <span class="n">events</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;events&quot;</span><span class="p">,</span> <span class="p">[]),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># OTIO session family — OTIO_SESSION_1.0</span>
+<span class="c1"># Single definition: built and consumed by patcher.py.  Payloads carry the</span>
+<span class="c1"># wire form (already-serialized child_data / commands), so to_payload is a cheap</span>
+<span class="c1"># field copy.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="SetProperty">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SetProperty">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SetProperty</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Sets a property or metadata path on an object.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SET_PROPERTY&quot;</span>
+
+    <span class="n">target_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the target object.&quot;</span><span class="p">)</span>
+    <span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Property name or &#39;metadata/...&#39; sub-path.&quot;</span><span class="p">)</span>
+    <span class="n">value</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;New primitive value.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the mutation occurred.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="SetProperty.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SetProperty.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;target_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">path</span><span class="p">,</span>
+            <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="SetProperty.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SetProperty.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;SetProperty&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">target_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_uuid&quot;</span><span class="p">),</span>
+            <span class="n">path</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;path&quot;</span><span class="p">),</span>
+            <span class="n">value</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;value&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="InsertChild">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.InsertChild">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">InsertChild</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Inserts a child object into a parent container.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;INSERT_CHILD&quot;</span>
+
+    <span class="n">parent_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the parent container.&quot;</span><span class="p">)</span>
+    <span class="n">child_data</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;OTIO child object (object on send, wire dict on receive).&quot;</span>
+    <span class="p">)</span>
+    <span class="n">index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Insert position; -1 appends.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the mutation occurred.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="InsertChild.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.InsertChild.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;parent_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">parent_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;index&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="p">,</span>
+            <span class="s2">&quot;child_data&quot;</span><span class="p">:</span> <span class="n">_to_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">child_data</span><span class="p">),</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="InsertChild.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.InsertChild.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;InsertChild&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">parent_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;parent_uuid&quot;</span><span class="p">),</span>
+            <span class="n">child_data</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;child_data&quot;</span><span class="p">),</span>
+            <span class="n">index</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;index&quot;</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="InsertChild.as_otio">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.InsertChild.as_otio">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the OTIO child object, deserializing if still in wire form.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">_from_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">child_data</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="MoveChild">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.MoveChild">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MoveChild</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Moves a child to a new index within its parent container.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;MOVE_CHILD&quot;</span>
+
+    <span class="n">parent_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the parent container.&quot;</span><span class="p">)</span>
+    <span class="n">child_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the child to move.&quot;</span><span class="p">)</span>
+    <span class="n">to_index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Target position in the parent.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the mutation occurred.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="MoveChild.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.MoveChild.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;parent_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">parent_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;child_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">child_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;to_index&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">to_index</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="MoveChild.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.MoveChild.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;MoveChild&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">parent_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;parent_uuid&quot;</span><span class="p">),</span>
+            <span class="n">child_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;child_uuid&quot;</span><span class="p">),</span>
+            <span class="n">to_index</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;to_index&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="RemoveChild">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveChild">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RemoveChild</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Removes a child from its parent container.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;REMOVE_CHILD&quot;</span>
+
+    <span class="n">parent_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the parent container.&quot;</span><span class="p">)</span>
+    <span class="n">child_uuid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the child to remove.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the mutation occurred.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="RemoveChild.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveChild.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;parent_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">parent_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;child_uuid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">child_uuid</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="RemoveChild.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveChild.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;RemoveChild&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">parent_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;parent_uuid&quot;</span><span class="p">),</span>
+            <span class="n">child_uuid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;child_uuid&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ReplaceAnnotationCommands">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceAnnotationCommands">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReplaceAnnotationCommands</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Replaces the full annotation-command list on an annotation clip.&quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;REPLACE_ANNOTATION_COMMANDS&quot;</span>
+
+    <span class="n">annotation_clip_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the annotation clip to update.&quot;</span><span class="p">)</span>
+    <span class="n">commands</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Full replacement list of OTIO SyncEvents (objects on send, wire dicts on receive).&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the mutation occurred.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="ReplaceAnnotationCommands.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceAnnotationCommands.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;annotation_clip_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">annotation_clip_guid</span><span class="p">,</span>
+            <span class="s2">&quot;commands&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">_to_wire</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">commands</span><span class="p">],</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="ReplaceAnnotationCommands.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceAnnotationCommands.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;ReplaceAnnotationCommands&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">annotation_clip_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;annotation_clip_guid&quot;</span><span class="p">),</span>
+            <span class="n">commands</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;commands&quot;</span><span class="p">,</span> <span class="p">[]),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ReplaceAnnotationCommands.as_otio">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceAnnotationCommands.as_otio">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the OTIO SyncEvent list, deserializing any wire-form entries.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">_from_wire</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">commands</span><span class="p">]</span></div>
+</div>
+
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">ORIAnnotations</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction.html">Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ORIAnnotations.html">ORIAnnotations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../otio_sync_core.html">otio_sync_core</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ori_event_plugin.html">SyncEvent</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../../index.html">Documentation overview</a><ul>
+  <li><a href="../index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Sam Richards.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>
