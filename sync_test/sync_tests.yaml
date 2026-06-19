@@ -99,3 +99,9 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
+  - name: "text_annotations_xstudio_to_rv"
+    recording: "recordings/text_annotations_xstudio_to_rv.jsonl"
+    script_driven: false
+    apps:
+      - "openrv"
+      - "xstudio"
