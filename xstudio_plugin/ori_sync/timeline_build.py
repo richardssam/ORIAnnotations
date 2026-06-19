@@ -382,8 +382,15 @@ class TimelineBuildController:
                 plugin.media.register(media, clip_guid, tl_guid)
                 track.append(clip)
                 _log(f"  Flat media clip: {media.name!r} fps={fps} frames={frame_count}")
-            except Exception:
-                _log_exc(f"Could not convert media {getattr(media, 'name', '?')!r} to OTIO clip")
+            except Exception as exc:
+                # "No MediaSources" is an expected transient: the media is being
+                # deleted and its MediaSource is already gone as we rebuild the
+                # synthetic timeline. Skip it quietly (no traceback) so it isn't
+                # flagged as an exception; surface anything else with a traceback.
+                if "No MediaSources" in str(exc):
+                    _log(f"  Skipping media {getattr(media, 'name', '?')!r}: source removed (mid-delete)")
+                else:
+                    _log_exc(f"Could not convert media {getattr(media, 'name', '?')!r} to OTIO clip")
 
         clips = list(track)
         tl.tracks.append(track)

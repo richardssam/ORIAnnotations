@@ -40,7 +40,8 @@ class AppSpawner:
             logging.info(f"Launching XStudio. Logging to {log_path}")
             # Configure environment variables for the plugins
             env = os.environ.copy()
-            plugin_log_path = os.path.join(self.logs_dir, f"xstudio_plugin.log")
+            # Per-port log (see openrv note): keeps two-xStudio tests separable.
+            plugin_log_path = os.path.join(self.logs_dir, f"xstudio_plugin_{http_port}.log")
             env["ORI_SYNC_LOG_FILE"] = plugin_log_path
             
             repo_root = os.path.abspath(os.path.join(self.base_dir, ".."))
@@ -115,7 +116,10 @@ class AppSpawner:
             logging.info(f"Launching OpenRV on port {http_port}. Logging to {log_path}")
             
             env = os.environ.copy()
-            plugin_log_path = os.path.join(self.logs_dir, f"openrv_plugin.log")
+            # Per-port log: two OpenRV instances in one test (RV-vs-RV) would
+            # otherwise interleave into one file, corrupting it and making
+            # per-peer diagnosis impossible.
+            plugin_log_path = os.path.join(self.logs_dir, f"openrv_plugin_{http_port}.log")
             env["RV_OTIO_SYNC_LOG_FILE"] = plugin_log_path
             env["ORI_SESSION"] = self.session_id
             env["RV_NO_CONSOLE_REDIRECT"] = "1"

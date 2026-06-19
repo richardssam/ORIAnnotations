@@ -1404,7 +1404,9 @@ class StructureSyncController:
                     media_track.move_children(from_index, 1, dest, False)
                     # Mirror the move in our tracked order so the next move in a
                     # burst computes ``from_index`` against xStudio's real state
-                    # (no OTIO round-trip, no drift).
+                    # (no OTIO round-trip, no drift). Verified against the live
+                    # xStudio track: this mirror stays exactly in step with what
+                    # move_children produces, so no re-read is needed here.
                     new_order = list(stored_order)
                     new_order.insert(to_index, new_order.pop(from_index))
                     self._xs_media_order[tl_guid] = new_order

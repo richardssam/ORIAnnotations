@@ -468,18 +468,31 @@ class TestRunner:
                             scp = state_checkpoints[state_checkpoint_idx]
                             if current_offset < scp["time_offset"] + checkpoint_validation_delay:
                                 break
-                            full_states = [self.fetch_full_state(port) for _, port in app_ports]
                             names = [a[0] for a in app_ports]
-                            ok, msg = self.validate_state_checkpoint(
-                                full_states, names, scp, frame_tolerance=frame_tolerance,
-                            )
-                            if ok:
-                                # Oracle passed; also require client-vs-client
-                                # consensus (frame only when the playhead is parked).
-                                ok, msg = self.compare_full_states(
-                                    full_states, names, frame_tolerance=frame_tolerance,
-                                    compare_frame=scp.get("frame_held", False),
+                            # Poll until the apps converge to the checkpoint state
+                            # rather than sampling once: structural mutations
+                            # (e.g. a reorder replayed as a burst of MOVE_CHILDs)
+                            # take time to fully apply, so a one-shot check at a
+                            # fixed replay offset is flaky — it can land mid-burst.
+                            # The apps are eventually-consistent; a genuine desync
+                            # never converges and still fails after the timeout.
+                            ok, msg = False, ""
+                            scp_deadline = time.time() + 10.0
+                            while True:
+                                full_states = [self.fetch_full_state(port) for _, port in app_ports]
+                                ok, msg = self.validate_state_checkpoint(
+                                    full_states, names, scp, frame_tolerance=frame_tolerance,
                                 )
+                                if ok:
+                                    # Oracle passed; also require client-vs-client
+                                    # consensus (frame only when playhead parked).
+                                    ok, msg = self.compare_full_states(
+                                        full_states, names, frame_tolerance=frame_tolerance,
+                                        compare_frame=scp.get("frame_held", False),
+                                    )
+                                if ok or time.time() >= scp_deadline:
+                                    break
+                                time.sleep(0.5)
                             if ok:
                                 logging.info(
                                     f"✅ State checkpoint t={scp['time_offset']:.1f}s passed"

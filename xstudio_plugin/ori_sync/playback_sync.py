@@ -1067,10 +1067,18 @@ class PlaybackSyncController:
                             if target_track_idx != -1:
                                 break
 
-                        if target_track_idx != -1 and target_child_idx != -1:
+                        # The indices come from the OTIO manager timeline (which
+                        # includes an Annotations track and may hold a different
+                        # child count than xStudio's live timeline). They are NOT
+                        # guaranteed positionally aligned with playlist_xs_tl, so
+                        # bounds-check before indexing rather than throwing an
+                        # IndexError that gets logged as a noisy traceback.
+                        xs_tracks = playlist_xs_tl.stack.children
+                        xs_track = xs_tracks[target_track_idx] if 0 <= target_track_idx < len(xs_tracks) else None
+                        xs_children = xs_track.children if xs_track is not None else []
+                        if target_track_idx != -1 and 0 <= target_child_idx < len(xs_children):
                             try:
-                                xs_track = playlist_xs_tl.stack.children[target_track_idx]
-                                xs_child = xs_track.children[target_child_idx]
+                                xs_child = xs_children[target_child_idx]
                                 from xstudio.core import UuidActor, UuidActorVec, item_selection_atom
                                 ua = UuidActor(xs_child.uuid, xs_child.remote)
                                 ua_vec = UuidActorVec()
@@ -1084,6 +1092,12 @@ class PlaybackSyncController:
                                 )
                             except Exception:
                                 _log_exc("RECV selection: failed to set timeline item selection")
+                        elif target_track_idx != -1:
+                            _log(
+                                f"RECV selection: skip timeline highlight — OTIO index "
+                                f"(track={target_track_idx} child={target_child_idx}) "
+                                f"out of range for xStudio timeline"
+                            )
                 else:
                     # Flat playlist: viewed_container + set_on_screen_source + set_selection.
                     # Suppress the show_atom that fires from set_selection so it doesn't
