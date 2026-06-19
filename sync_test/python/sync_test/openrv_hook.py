@@ -50,7 +50,41 @@ def get_openrv_state():
         except Exception as e:
             logging.error(f"get_openrv_state: clip lookup failed: {e}", exc_info=True)
         state["clip"] = clip_name if clip_name else view_node
-        
+
+        # Prefer the synced active timeline name from the manager: the
+        # "first non-empty sequence" heuristic above is ambiguous once more than
+        # one sequence exists (it can report a non-active sequence's name, e.g.
+        # "Sequence of graphic" while RV is actually viewing "Default Sequence").
+        # The manager's active_timeline_guid is the authoritative synced selection
+        # and matches what RV's viewport shows.
+        try:
+            import otio_sync_core
+            _mgr = otio_sync_core.get_registered_manager()
+            _atl_guid = getattr(_mgr, "active_timeline_guid", None) if _mgr else None
+            if _atl_guid:
+                _atl = _mgr._timelines.get(_atl_guid)
+                # If the active timeline is a single-clip-view timeline, report
+                # the containing sequence's name instead — peers differ on view
+                # mode (single-clip vs sequence) but share the same sequence, so
+                # this keeps compare_states consistent with the structural
+                # projection (which resolves clip-timelines to their sequence).
+                if _atl is not None:
+                    _ctf = _atl.metadata.get("clip_timeline_for")
+                    if _ctf:
+                        for _g, _tl in _mgr._timelines.items():
+                            if _tl.metadata.get("clip_timeline_for"):
+                                continue
+                            if any(
+                                getattr(c, "metadata", {}).get("sync", {}).get("guid") == _ctf
+                                for trk in _tl.tracks for c in trk
+                            ):
+                                _atl = _tl
+                                break
+                    if getattr(_atl, "name", None):
+                        state["clip"] = _atl.name
+        except Exception:
+            pass
+
         state["media_path"] = None
         state["media_exists"] = False
         
@@ -74,22 +108,43 @@ def get_openrv_state():
             # If no sources, we don't treat media as "missing" (just empty)
             state["media_exists"] = True
         
-        # To get annotations, we check for RVPaint nodes in the graph
-        paint_nodes = rv.commands.nodesOfType("RVPaint")
+        # Count painted strokes across all RVPaint nodes. A stroke is a
+        # component named "pen:..." or "text:..."; the leaf properties under it
+        # (e.g. ".points") share that component prefix, so we de-dupe to the
+        # component path.  This lets the test assert annotations were *created*
+        # (placement/frame correctness is validated separately).
         total_strokes = 0
-        for pnode in paint_nodes:
-            # We can inspect properties of the paint node if needed
-            # For now, just count if it exists and has strokes
-            pass
-            
-        # Simplified annotation state for OpenRV for now
-        # You'd expand this based on the exact representation of OpenRV annotations
-        # expected by your tests.
+        for pnode in rv.commands.nodesOfType("RVPaint"):
+            try:
+                comps = set()
+                for prop in rv.commands.properties(pnode):
+                    short = prop[len(pnode) + 1:] if prop.startswith(pnode + ".") else prop
+                    if short.startswith("pen:") or short.startswith("text:"):
+                        comps.add(short.rsplit(".", 1)[0])
+                total_strokes += len(comps)
+            except Exception:
+                continue
+        state["annotation_count"] = total_strokes
 
     except Exception as e:
         logging.error(f"Error getting openrv state: {e}")
 
     return state
+
+def get_openrv_full_state():
+    """Return the sync plugin's reduced state as a StateSnapshot-shaped dict.
+
+    Sources directly from the in-process ``SyncManager`` the plugin registered
+    (``manager.export_state()``) so the structure, GUIDs and frame match the
+    recorded master snapshot exactly.  Returns an ``{"error": ...}`` dict if the
+    manager has not registered yet.
+    """
+    import otio_sync_core
+    manager = otio_sync_core.get_registered_manager()
+    if manager is None:
+        return {"error": "sync manager not registered yet"}
+    return manager.export_state()
+
 
 def execute_openrv_command(payload):
     if rv is None:
@@ -221,12 +276,22 @@ def start_openrv_inspector(http_port):
 
     def get_state_callback():
         return executor.run_sync(get_openrv_state)
-        
+
+    def get_full_state_callback():
+        # export_state() serializes OTIO timelines the plugin mutates on RV's
+        # main thread, so marshal it there.
+        return executor.run_sync(get_openrv_full_state)
+
     def execute_callback(payload):
         # Use a longer timeout for commands that load media (addSourceVerbose can
         # take several seconds on first load).
         return executor.run_sync(lambda: execute_openrv_command_safe(payload), timeout=30.0)
-    
-    server = InspectionServer(http_port, get_state_callback, execute_command_callback=execute_callback)
+
+    server = InspectionServer(
+        http_port,
+        get_state_callback,
+        execute_command_callback=execute_callback,
+        get_full_state_callback=get_full_state_callback,
+    )
     server.start()
     return server

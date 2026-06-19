@@ -42,7 +42,10 @@ class SyncPlayer:
         self.port = port
         self.network = network
         self.events: list[dict[str, Any]] = []
+        # The first recorded snapshot answers joiners' STATE_REQUEST during
+        # replay; the full time-ordered list is the validation expectation.
         self._recorded_snapshot: dict[str, Any] | None = None
+        self._recorded_snapshots: list[tuple[float, dict[str, Any]]] = []
 
         # Procedural playback tracking state
         self._playing = False
@@ -70,6 +73,7 @@ class SyncPlayer:
         """
         self.events.clear()
         self._recorded_snapshot = None
+        self._recorded_snapshots = []
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
@@ -86,14 +90,25 @@ class SyncPlayer:
                         p = envelope.get("payload", {})
                         if p.get("command_schema") == "LiveSession.1":
                             if p.get("command", {}).get("event") == "STATE_SNAPSHOT":
-                                self._recorded_snapshot = envelope
+                                # Retain every snapshot for validation; the first
+                                # also seeds joiners during replay.  Snapshots are
+                                # never appended to self.events, so they are never
+                                # replayed as playback traffic.
+                                self._recorded_snapshots.append(
+                                    (event.get("time_offset", 0.0), envelope)
+                                )
+                                if self._recorded_snapshot is None:
+                                    self._recorded_snapshot = envelope
                             continue
-                        
+
                         self.events.append(event)
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Failed to parse line {line_num}: {e}")
         except FileNotFoundError:
             raise ValueError(f"File not found: {filepath}")
+
+        # Keep snapshots in chronological order for time-keyed validation lookup.
+        self._recorded_snapshots.sort(key=lambda item: item[0])
 
         if not self.events:
             raise ValueError(f"No events found in {filepath}")

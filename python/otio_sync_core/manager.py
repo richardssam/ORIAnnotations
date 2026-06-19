@@ -641,6 +641,27 @@ class SyncManager:
             display_state=self.display_state or None,
         ))
 
+    def export_state(self) -> dict[str, Any]:
+        """Return this peer's current reduced state as a ``StateSnapshot`` payload.
+
+        Produces the same dict shape the master sends in a ``STATE_SNAPSHOT``
+        (``timelines``, ``active_timeline_guid``, ``playback_state``,
+        ``display_state``) but **without touching the network**.  This is the
+        "ask the client's own reducer" source used by the sync_test inspector to
+        expose a peer's state for structural validation via
+        :func:`otio_sync_core.project_state`.  Works on any peer, not only the
+        master.
+
+        :returns: A ``StateSnapshot``-shaped payload dict (timelines in wire form).
+        """
+        return StateSnapshot(
+            target_guid="",
+            timelines=dict(self._timelines),
+            active_timeline_guid=self.active_timeline_guid,
+            snapshot_timestamp=time.time(),
+            playback_state=self.playback_state or None,
+            display_state=self.display_state or None,
+        ).to_payload()
 
     def _send_message(self, msg: ProtocolMessage) -> None:
         """Wrap a typed :class:`ProtocolMessage` in the envelope and send it.

@@ -26,6 +26,8 @@ zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/manager.py \
     otio_sync_core/patcher.py \
     otio_sync_core/protocol_messages.py \
-    otio_sync_core/proxy.py
+    otio_sync_core/proxy.py \
+    otio_sync_core/state_projection.py \
+    otio_sync_core/inspection.py
 
 echo "Built otiosyncdemo-1.2.rvpkg"

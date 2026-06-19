@@ -534,9 +534,19 @@ class PlaybackSyncController:
                 and self.plugin.manager.status == STATE_SYNCED
             ):
                 try:
-                    psm_attr = self.plugin.active_playhead.get_attribute("Pinned Source Mode")
+                    # Read PSM from a freshly-acquired LIVE playhead, not the
+                    # cached active_playhead: after a source-view switch the
+                    # cached reference can point at a destroyed actor and the read
+                    # hangs the poll thread for ~100s (below the request_receive
+                    # timeout layer, so @bounded on this method does not catch it,
+                    # confirmed by the FREEZE-PROBE). current_playhead() queries
+                    # the persistent global-playhead actor and is bounded.
+                    with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                        _psm_ph = self.plugin.current_playhead()
+                    psm_attr = _psm_ph.get_attribute("Pinned Source Mode") if _psm_ph else None
                     if psm_attr is not None:
-                        psm = psm_attr.value()
+                        with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                            psm = psm_attr.value()
                         if (
                             self._last_pinned_source_mode is not None
                             and psm != self._last_pinned_source_mode

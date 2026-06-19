@@ -8,8 +8,13 @@ class AppSpawner:
     Manages launching XStudio and OpenRV as subprocesses, handles log redirection,
     and ensures clean teardown without leaving zombie processes.
     """
-    def __init__(self, test_name, executables=None):
+    def __init__(self, test_name, executables=None, session_id="otio-sync-demo"):
         self.test_name = test_name
+        # Per-test session id isolates each test on its own RabbitMQ exchange so
+        # leftover state/peers from a prior test cannot bleed in (the cause of
+        # suite-only flakiness, made worse by deterministic guids colliding
+        # across tests that share a session).
+        self.session_id = session_id
         self.executables = executables or {}
         self.processes = []
         self.log_files = []
@@ -44,8 +49,17 @@ class AppSpawner:
             python_path = os.environ.get("PYTHONPATH", "")
             env["PYTHONPATH"] = f"{os.path.join(repo_root, 'python')}:{python_path}"
             env["OTIO_PLUGIN_MANIFEST_PATH"] = os.path.join(repo_root, "otio_event_plugin", "plugin_manifest.json")
-            env["ORI_SESSION"] = "otio-sync-demo"
-            
+            env["ORI_SESSION"] = self.session_id
+
+            # File bridge: the plugin dumps manager.export_state() here and the
+            # out-of-process inspector reads it for guid-accurate full state.
+            fullstate_path = os.path.join(self.logs_dir, f"xstudio_fullstate_{http_port}.json")
+            try:
+                os.remove(fullstate_path)  # clear any stale file from a prior run
+            except OSError:
+                pass
+            env["ORI_FULLSTATE_FILE"] = fullstate_path
+
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             self.processes.append((app_name, p))
             
@@ -84,7 +98,9 @@ class AppSpawner:
             
             inspector_cmd = [python_bin, "-u", inspector_script, str(http_port), xstudio_api_port]
             logging.info(f"Launching XStudio Inspector on port {http_port} (talking to xstudio on {xstudio_api_port})")
-            ip = subprocess.Popen(inspector_cmd, stdout=inspector_log, stderr=subprocess.STDOUT)
+            inspector_env = os.environ.copy()
+            inspector_env["ORI_FULLSTATE_FILE"] = fullstate_path  # read by get_xstudio_full_state
+            ip = subprocess.Popen(inspector_cmd, stdout=inspector_log, stderr=subprocess.STDOUT, env=inspector_env)
             self.processes.append(("xstudio_inspector", ip))
             
         elif app_name == "openrv":
@@ -101,7 +117,7 @@ class AppSpawner:
             env = os.environ.copy()
             plugin_log_path = os.path.join(self.logs_dir, f"openrv_plugin.log")
             env["RV_OTIO_SYNC_LOG_FILE"] = plugin_log_path
-            env["ORI_SESSION"] = "otio-sync-demo"
+            env["ORI_SESSION"] = self.session_id
             env["RV_NO_CONSOLE_REDIRECT"] = "1"
             
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)

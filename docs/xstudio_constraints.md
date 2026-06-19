@@ -4,6 +4,35 @@ The plugin lives in `xstudio_plugin/ori_sync/ori_sync_plugin.py`.  Set
 `ORI_SYNC_LOG_FILE=/path/to/xstudio_client.log` before launching xStudio so
 the plugin writes a persistent log (mirrors `RV_OTIO_SYNC_LOG_FILE` for RV).
 
+## ⚠️ xStudio OTIO export strips ALL metadata — no sync GUIDs survive
+
+**This has bitten us more than once.**  `timeline_to_otio_string` (from
+`xstudio.api.auxiliary.otio`) and the timeline's `to_otio_string()` build OTIO
+objects from an xStudio timeline carrying **only** `name`, time ranges, and
+media references — they copy **no `metadata` whatsoever** (see `__process_obj`
+in the xStudio `auxiliary/otio/writer.py`).  So the exported OTIO has **no
+`metadata.sync.guid`** on timelines *or* clips, and even the names are
+unreliable (a Timeline actor named `"Default Sequence"` can export as
+`"Default "` or `""`).
+
+**Consequence:** you cannot recover sync GUIDs by exporting an xStudio timeline
+and reading its metadata back.  Anything that needs guid-accurate state must
+come from the plugin's `manager` (`manager._timelines` / `manager.export_state()`,
+keyed by the real sync GUIDs) — **never** from an OTIO-export round-trip.
+
+Where this has actually bitten us:
+- `_poll_sequence_new_media` can't diff clips by GUID → uses index-based name
+  alignment instead (see "Index-Based Timeline Sequence Polling" below).
+- The `sync_test` inspector first reconstructed xStudio's `/full_state` via
+  `timeline_to_otio_string` and got name-keyed, GUID-less timelines that never
+  matched the recording.  Fixed with a **file bridge**: the plugin periodically
+  writes `manager.export_state()` to `$ORI_FULLSTATE_FILE` (`_write_fullstate_file`
+  in the poll loop) and the out-of-process inspector reads that file.
+
+(Aside: `timeline_to_otio_string` also defaults `adapter_name=None`, which newer
+OTIO rejects with "Could not find plugin: 'None'"; pass `adapter_name="otio_json"`
+if you ever must call it.)
+
 ## Global playhead events — Form 1 vs Form 2
 
 `subscribe_to_global_playhead_events` delivers events in two shapes:

@@ -255,6 +255,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._current_session_name = session_name
 
         self.sync_manager = SyncManager(session_id=session_name)
+        # Expose the manager to the in-process sync_test inspector (it reads
+        # manager.export_state() for /full_state and the active timeline name).
+        try:
+            import otio_sync_core
+            otio_sync_core.register_manager(self.sync_manager)
+        except Exception as e:
+            _log(f"Could not register manager for inspection: {e}")
         network = RabbitMQNetwork(
             host=host,
             session_id=session_name,

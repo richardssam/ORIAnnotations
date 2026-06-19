@@ -27,6 +27,48 @@ class SequenceSyncController:
         self._active_media_track_guid = None
         self._track = None
 
+    @staticmethod
+    def _normalize_seq_name(name):
+        """Normalise a sequence name for tolerant cross-app matching.
+
+        Mirrors ``state_projection.normalize_clip_name`` so adoption here agrees
+        with how the validator unifies names: case-folded, spaces removed, and
+        the word ``sequence`` stripped (xStudio's "Default" vs RV's
+        "Default Sequence" both reduce to "default").
+        """
+        return str(name or "").replace(" ", "").lower().replace("sequence", "")
+
+    def _session_timeline_guid_for_name(self, seq_name):
+        """Return the guid of an already-known sequence timeline matching *seq_name*.
+
+        When this peer joins a session that already established a sequence with
+        this name (e.g. xStudio's "Default Sequence" playlist, received verbatim
+        via STATE_SNAPSHOT), its local RVSequenceGroup must **adopt** that
+        timeline's identity rather than register a second timeline under a
+        different (deterministic) guid. Holding the same logical sequence under
+        two guids is the root cause of the cross-app convergence flakiness: the
+        deterministic guid scheme cannot unify the apps because xStudio assigns
+        random guids and does not participate in it.
+
+        Returns ``None`` when no peer timeline matches (two fresh peers each
+        auto-creating the sequence — the deterministic guid is the fallback that
+        lets *those* converge), or when the only match is already mapped to
+        another local node.
+        """
+        mgr = self.plugin.sync_manager
+        if not mgr:
+            return None
+        target = self._normalize_seq_name(seq_name)
+        already_mapped = set(self._rv_node_to_timeline_guid.values())
+        for guid, tl in mgr._timelines.items():
+            if tl.metadata.get("clip_timeline_for"):
+                continue  # single-clip view timeline, not a shared sequence
+            if guid in already_mapped:
+                continue
+            if self._normalize_seq_name(getattr(tl, "name", None)) == target:
+                return guid
+        return None
+
     def _init_timelines_from_sequences(self, seq_groups, fps):
         """Create one OTIO timeline per RVSequenceGroup and register each."""
         try:
@@ -41,6 +83,34 @@ class SequenceSyncController:
                 seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
             except Exception:
                 seq_name = seq_group
+
+            # Adopt a peer's existing same-name sequence rather than registering a
+            # parallel one (see _session_timeline_guid_for_name). Covers the case
+            # where a peer is already present when RV starts up.
+            adopted = self._session_timeline_guid_for_name(seq_name)
+            if adopted:
+                self._rv_node_to_timeline_guid[seq_group] = adopted
+                self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+                # Track the adopted timeline's media track so reorder/delete
+                # detection maps RV node changes onto the shared track guid.
+                _adopted_tl = self.plugin.sync_manager._timelines.get(adopted)
+                _media_trk = next(
+                    (t for t in (_adopted_tl.tracks if _adopted_tl else []) if _is_media_track(t)),
+                    None,
+                )
+                _media_trk_guid = (
+                    _media_trk.metadata.get("sync", {}).get("guid") if _media_trk else None
+                )
+                if self._active_media_track_guid is None and _media_trk_guid:
+                    self._active_media_track_guid = _media_trk_guid
+                    self._track = _media_trk
+                if seq_group == current_view:
+                    self.plugin.sync_manager.active_timeline_guid = adopted
+                    if _media_trk_guid:
+                        self._active_media_track_guid = _media_trk_guid
+                        self._track = _media_trk
+                _log(f"Adopted peer timeline {adopted[:8]} for RVSequenceGroup '{seq_name}'")
+                continue
 
             timeline = otio.schema.Timeline(seq_name)
             timeline.tracks = otio.schema.Stack("tracks")
@@ -67,6 +137,13 @@ class SequenceSyncController:
                 except Exception as e:
                     _log(f"Skipping source group {sg}: {e}")
 
+            # Deterministic guid from the sequence name so two peers that each
+            # auto-create the same sequence (RV's defaultSequence after add_media)
+            # converge on one identity instead of random per-instance guids.
+            # ensure_guid_and_map (in register_timeline) preserves a pre-set guid.
+            timeline.metadata.setdefault("sync", {})["guid"] = (
+                self.plugin.sync_manager._derive_guid(f"rv_sequence:{seq_name}")
+            )
             self.plugin.sync_manager.register_timeline(timeline)
             # Read UUIDs back after registration (assigned by _ensure_guid_and_map)
             track_guid = media_track.metadata["sync"]["guid"]
@@ -99,6 +176,10 @@ class SequenceSyncController:
                 media_track.append(clip)
                 _log(f"Auto-imported existing source: {clip.name}")
 
+        # Deterministic guid (see _init_timelines_from_sequences) so peers agree.
+        timeline.metadata.setdefault("sync", {})["guid"] = (
+            self.plugin.sync_manager._derive_guid(f"rv_sequence:{timeline.name}")
+        )
         self.plugin.sync_manager.register_timeline(timeline)
         self._active_media_track_guid = media_track.metadata["sync"]["guid"]
         self._track = media_track
@@ -170,10 +251,25 @@ class SequenceSyncController:
                 num_frames = int(fps)  # 1-second fallback
             duration = otio.opentime.RationalTime(num_frames, fps)
             time_range = otio.opentime.TimeRange(otio.opentime.RationalTime(0, fps), duration)
-            return otio.schema.Clip(
+            clip = otio.schema.Clip(
                 name=os.path.basename(path),
                 media_reference=otio.schema.ExternalReference(target_url=path, available_range=time_range)
             )
+            # Give the clip a cross-peer-stable guid so two peers that each
+            # (re)build a sequence for the same media converge on one clip
+            # identity instead of minting random per-instance guids. Prefer an
+            # already-synced guid for this media; otherwise derive deterministically
+            # from the media path (at build time the media isn't in the object map
+            # yet, so reuse alone races — the derivation makes both peers agree).
+            # ensure_guid_and_map preserves a pre-set guid.
+            try:
+                _mp = _media_path(path)
+                _guid = (self.plugin.playback._clip_guid_for_media_path(_mp)
+                         or self.plugin.sync_manager._derive_guid(f"rv_clip:{_mp}"))
+                clip.metadata["sync"] = {"guid": _guid}
+            except Exception:
+                pass
+            return clip
         except Exception as e:
             _log(f"_make_clip failed for {file_source_node}: {e}")
             return None
@@ -428,6 +524,18 @@ class SequenceSyncController:
                 seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
             except Exception:
                 seq_name = seq_group
+            # If a peer already established a sequence with this name (e.g.
+            # xStudio's playlist received via STATE_SNAPSHOT), adopt its guid
+            # instead of registering a duplicate timeline. This is what makes the
+            # two apps converge on one identity; registering a parallel
+            # deterministic-guid timeline here is what caused the intermittent
+            # "missing timeline" consensus failures.
+            adopted = self._session_timeline_guid_for_name(seq_name)
+            if adopted:
+                self._rv_node_to_timeline_guid[seq_group] = adopted
+                self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+                _log(f"Adopted peer timeline {adopted[:8]} for RVSequenceGroup '{seq_name}'")
+                continue
             timeline = otio.schema.Timeline(seq_name)
             timeline.tracks = otio.schema.Stack("tracks")
             media_track = otio.schema.Track("Media")
@@ -446,6 +554,15 @@ class SequenceSyncController:
                                 media_track.append(clip)
                 except Exception as e:
                     _log(f"_poll_new_sequences: error reading {sg}: {e}")
+            # Derive a deterministic GUID from the sequence name so two peers
+            # that each auto-create the same sequence (e.g. RV's defaultSequence
+            # after add_media) independently arrive at the *same* GUID instead of
+            # random ones — otherwise they hold the same media under different
+            # timeline identities and never converge. ensure_guid_and_map (called
+            # by register_timeline) preserves a pre-set guid.
+            timeline.metadata.setdefault("sync", {})["guid"] = (
+                self.plugin.sync_manager._derive_guid(f"rv_sequence:{seq_name}")
+            )
             self.plugin.sync_manager.register_timeline(timeline)
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
@@ -470,6 +587,21 @@ class SequenceSyncController:
             if current_name and current_name != (tl.name or ""):
                 _log(f"Sequence rename: '{tl.name}' → '{current_name}' (node={seq_group})")
                 self.plugin.sync_manager.broadcast_timeline_rename(tl_guid, current_name)
+
+    def _set_sequence_ui_name(self, seq_node, name):
+        """Set an RVSequenceGroup's ``ui.name`` to *name*.
+
+        Used right after :func:`newNode`, whose name argument is sanitised into
+        the node name (spaces truncated); without this the ui.name defaults to
+        the truncation and :meth:`_poll_sequence_renames` broadcasts a spurious
+        rename. Best-effort: a failure here must not abort sequence creation.
+        """
+        if not name:
+            return
+        try:
+            rv.commands.setStringProperty(f"{seq_node}.ui.name", [name], True)
+        except Exception as e:
+            _log(f"_set_sequence_ui_name: could not set ui.name for {seq_node}: {e}")
 
     def _create_rv_sequence_for_timeline(self, tl):
         """Create an RVSequenceGroup for a remotely-received OTIO timeline."""
@@ -509,6 +641,13 @@ class SequenceSyncController:
 
         try:
             seq_node = rv.commands.newNode("RVSequenceGroup", tl.name)
+            # newNode sanitises the node name (truncates at spaces, e.g.
+            # "Default Sequence" -> node "Default"), so the ui.name defaults to
+            # that truncation. Set ui.name to the full timeline name explicitly,
+            # otherwise _poll_sequence_renames sees ui.name != tl.name and
+            # broadcasts a spurious RENAME_TIMELINE that corrupts the name on
+            # every peer.
+            self._set_sequence_ui_name(seq_node, tl.name)
             rv.commands.setNodeInputs(seq_node, seq_sources)
             self._rv_node_to_timeline_guid[seq_node] = tl_guid
             self._sequence_input_order[seq_node] = list(seq_sources)
@@ -671,6 +810,10 @@ class SequenceSyncController:
                 if timeline_sgs:
                     try:
                         seq_node = rv.commands.newNode("RVSequenceGroup", timeline.name)
+                        # See _create_rv_sequence_for_timeline: set ui.name to the
+                        # full timeline name so the rename poller does not echo a
+                        # spurious RENAME from newNode's space-truncated node name.
+                        self._set_sequence_ui_name(seq_node, timeline.name)
                         rv.commands.setNodeInputs(seq_node, list(timeline_sgs))
                         tl_guid = timeline.metadata.get("sync", {}).get("guid")
                         if tl_guid:
@@ -694,6 +837,10 @@ class SequenceSyncController:
                         view = seq_groups[0]
                 if view:
                     self._rv_node_to_timeline_guid[view] = tl_guid
+                    # Align the reused sequence's ui.name with the OTIO timeline
+                    # name so the rename poller does not echo a spurious rename
+                    # (RV's default view node is named e.g. "defaultSequence").
+                    self._set_sequence_ui_name(view, timeline.name)
                     # Explicitly order the existing sequence to match OTIO, just
                     # as the multi-timeline path does for newly created sequences.
                     media_track = next(

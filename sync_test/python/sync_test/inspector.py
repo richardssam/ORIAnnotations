@@ -9,33 +9,45 @@ class InspectionServer:
     A lightweight HTTP server meant to be injected into target applications
     (like XStudio or OpenRV) to expose their true internal state for testing.
     """
-    def __init__(self, port, get_state_callback, execute_command_callback=None):
+    def __init__(self, port, get_state_callback, execute_command_callback=None,
+                 get_full_state_callback=None):
         self.port = port
         self.get_state_callback = get_state_callback
         self.execute_command_callback = execute_command_callback
+        # Optional richer state for structural validation: returns a
+        # StateSnapshot-shaped dict suitable for otio_sync_core.project_state.
+        self.get_full_state_callback = get_full_state_callback
         self.server = None
         self.thread = None
 
     def start(self):
         get_callback = self.get_state_callback
         exec_callback = self.execute_command_callback
+        full_state_callback = self.get_full_state_callback
 
         class Handler(http.server.SimpleHTTPRequestHandler):
+            def _write_json(self, code, obj):
+                self.send_response(code)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(obj).encode('utf-8'))
+
             def do_GET(self):
                 if self.path == '/state':
                     try:
-                        state = get_callback()
-                        self.send_response(200)
-                        self.send_header('Content-type', 'application/json')
-                        self.end_headers()
-                        self.wfile.write(json.dumps(state).encode('utf-8'))
+                        self._write_json(200, get_callback())
                     except Exception as e:
                         logging.error(f"Error getting state: {e}")
-                        self.send_response(500)
-                        self.send_header('Content-type', 'application/json')
-                        self.end_headers()
-                        error_res = {"error": str(e)}
-                        self.wfile.write(json.dumps(error_res).encode('utf-8'))
+                        self._write_json(500, {"error": str(e)})
+                elif self.path == '/full_state':
+                    if not full_state_callback:
+                        self._write_json(501, {"error": "full_state not supported"})
+                        return
+                    try:
+                        self._write_json(200, full_state_callback())
+                    except Exception as e:
+                        logging.error(f"Error getting full state: {e}")
+                        self._write_json(500, {"error": str(e)})
                 else:
                     self.send_response(404)
                     self.end_headers()

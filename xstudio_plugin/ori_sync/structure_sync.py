@@ -571,9 +571,20 @@ class StructureSyncController:
                     except Exception:
                         pass
 
+                # xStudio timeline actors already synced under a sync guid —
+                # i.e. created from a remote snapshot/ADD_TIMELINE, which stores
+                # them as the *value* in _sync_playlists keyed by the sync guid
+                # (e.g. 19458ef9), not by their native xStudio uuid (e.g.
+                # 8391ed30). A key-only check below misses them and would
+                # re-broadcast a phantom duplicate timeline under the native uuid.
+                synced_xs_uuids = {
+                    str(_t.uuid)
+                    for _pl, _t in self.plugin._sync_playlists.values()
+                    if _t is not None
+                }
                 for xs_tl in timelines:
                     tl_guid = str(xs_tl.uuid)
-                    if tl_guid in self.plugin._sync_playlists:
+                    if tl_guid in self.plugin._sync_playlists or tl_guid in synced_xs_uuids:
                         continue
                     tl = self.plugin.builder.build_single_sequence_otio(playlist, xs_tl)
                     if tl is None:
@@ -1357,10 +1368,23 @@ class StructureSyncController:
             return
 
         # Try the lightweight incremental path: move the clip directly in the
-        # xStudio track without rebuilding the whole timeline.
+        # xStudio track without rebuilding the whole timeline.  ``_xs_media_order``
+        # must track the order xStudio has *actually applied* (we mirror each
+        # successful move below instead of reading the OTIO model, which the
+        # manager batch-patches ahead of xStudio during a burst of moves).
+        # Keeping it accurate is what stops ``from_index`` collapsing onto
+        # ``to_index`` — a no-op that xStudio rejects as "Invalid Move" and that
+        # forced every move onto the ~100x slower load_otio rebuild path.
         stored_order = self._xs_media_order.get(tl_guid)
         if stored_order and child_uuid in stored_order:
             from_index = stored_order.index(child_uuid)
+            if from_index == to_index:
+                # Already where the move wants it in xStudio's real track.
+                _log(
+                    f"move_child: clip {child_uuid[:8]} already at index"
+                    f" {to_index} in {tl_guid[:8]}; nothing to do"
+                )
+                return
             try:
                 # Find the Media track — the video track that actually has clips
                 # (Annotations track has 0 clips and should be skipped).
@@ -1373,8 +1397,17 @@ class StructureSyncController:
                     except Exception:
                         pass
                 if media_track is not None:
-                    media_track.move_children(from_index, 1, to_index, False)
-                    self.update_xs_media_order(tl_guid, otio_tl)
+                    # xStudio splices the item *before* the destination index in
+                    # the pre-move list, so to land at final index ``to_index``
+                    # the dest is shifted by one when moving downward.
+                    dest = to_index if to_index <= from_index else to_index + 1
+                    media_track.move_children(from_index, 1, dest, False)
+                    # Mirror the move in our tracked order so the next move in a
+                    # burst computes ``from_index`` against xStudio's real state
+                    # (no OTIO round-trip, no drift).
+                    new_order = list(stored_order)
+                    new_order.insert(to_index, new_order.pop(from_index))
+                    self._xs_media_order[tl_guid] = new_order
                     try:
                         self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
                     except Exception:

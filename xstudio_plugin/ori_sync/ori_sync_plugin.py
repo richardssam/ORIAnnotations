@@ -49,6 +49,7 @@ from .annotation_sync import AnnotationSyncController  # noqa: E402
 from .color_sync import ColorSyncController  # noqa: E402
 
 import os
+import json
 import queue
 import threading
 import time
@@ -123,6 +124,11 @@ class ORISyncPlugin(PluginBase):
         self.manager: SyncManager | None = None
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
+        # Periodic dump of manager.export_state() to ORI_FULLSTATE_FILE so the
+        # out-of-process test inspector can read guid-accurate state (it cannot
+        # reach this in-process manager, and timeline_to_otio_string drops the
+        # sync metadata).
+        self._last_fullstate_write = 0.0
 
         # One xStudio (playlist, timeline) per OTIO timeline GUID received from the session.
         # Populated by _do_load_timelines() when we join as a non-master peer.
@@ -563,6 +569,25 @@ class ORISyncPlugin(PluginBase):
 
     # ── poll loop ──────────────────────────────────────────────────────────────
 
+    def _write_fullstate_file(self) -> None:
+        """Atomically dump ``manager.export_state()`` to ``ORI_FULLSTATE_FILE``.
+
+        The out-of-process test inspector reads this for guid-accurate state
+        (it cannot reach this in-process manager, and ``timeline_to_otio_string``
+        strips the sync metadata).  No-op unless the env var is set.
+        """
+        path = os.environ.get("ORI_FULLSTATE_FILE")
+        if not path or not self.manager:
+            return
+        try:
+            data = self.manager.export_state()
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        except Exception as e:
+            _log(f"_write_fullstate_file failed: {e}")
+
     def _poll_loop(self) -> None:
         """Background thread: blocks on command queue and processes ticks."""
         while not self._poll_stop.is_set():
@@ -600,6 +625,11 @@ class ORISyncPlugin(PluginBase):
                 if now - self.color._last_color_scan >= 0.5:
                     self.color.poll_and_broadcast_color()
                     self.color._last_color_scan = now
+
+                # 6.2. Periodic full-state dump for the test inspector (0.5s).
+                if now - self._last_fullstate_write >= 0.5:
+                    self._write_fullstate_file()
+                    self._last_fullstate_write = now
 
                 # 6.5. Periodic structure scan (1.0s interval)
                 if now - self.structure._last_structure_scan >= 1.0:

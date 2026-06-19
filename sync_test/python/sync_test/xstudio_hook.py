@@ -16,6 +16,10 @@ try:
     from xstudio.api.session.container import Container
     from xstudio.api.intrinsic.viewport import Viewport
     from xstudio.api.session.playhead import Playhead
+    # NOTE: timeline_to_otio_string is intentionally NOT used for /full_state — it
+    # strips all metadata (no sync guids). Full state comes from the plugin's
+    # manager.export_state() via the ORI_FULLSTATE_FILE bridge. See
+    # docs/xstudio_constraints.md.
 except ImportError:
     Connection = None
 
@@ -73,6 +77,13 @@ def get_xstudio_state(port=14441):
                 ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
                 if ph_actor:
                     ph = Playhead(conn, ph_actor)
+                    # Report the actual playhead frame so frame checkpoints can
+                    # validate xStudio too (was hard-coded None, which made every
+                    # frame check silently skip xStudio).
+                    try:
+                        state["frame"] = ph.position
+                    except Exception:
+                        pass
                     ms = ph.on_screen_media
                     if ms:
                         ms_src = ms.media_source()
@@ -105,36 +116,64 @@ def get_xstudio_state(port=14441):
             except Exception:
                 pass
 
-        # 3. Annotations
+        # 3. Annotations — enumerate ALL session bookmarks globally instead of
+        # filtering media by the viewed container's name.  When a Timeline is on
+        # screen, state["clip"] is the timeline name ("Default Sequence") while
+        # the annotations live on bookmarks owned by the timeline clip's media
+        # actor (not the bin media), so a media-name filter misses them entirely.
         try:
-            for pl in session.playlists:
-                for m in pl.media:
-                    if m.name == state["clip"]:
-                        for bm in m.ordered_bookmarks():
-                            try:
-                                detail = conn.request_receive_timeout(200, bm.remote, bookmark_detail_atom())[0]
-                                b_uuid = str(detail.uuid)
-                            except Exception:
-                                continue
-                            ann_state = {
-                                "start": detail.start.frames,
-                                "duration": detail.duration.frames,
-                                "strokes": 0,
-                                "captions": 0
-                            }
-                            ann = bm.annotation_data
-                            if ann:
-                                data = ann.get("Data", {})
-                                ann_state["strokes"] = len(data.get("pen_strokes", []))
-                                ann_state["captions"] = len(data.get("captions", []))
-                            state["annotations"].append(ann_state)
+            for bm in session.bookmarks.bookmarks:
+                ann_state = {"strokes": 0, "captions": 0}
+                try:
+                    detail = conn.request_receive_timeout(
+                        200, bm.remote, bookmark_detail_atom())[0]
+                    ann_state["start"] = detail.start.frames
+                    ann_state["duration"] = detail.duration.frames
+                except Exception:
+                    pass
+                try:
+                    ann = bm.annotation_data
+                    if ann:
+                        data = ann.get("Data", {})
+                        ann_state["strokes"] = len(data.get("pen_strokes", []))
+                        ann_state["captions"] = len(data.get("captions", []))
+                except Exception:
+                    pass
+                state["annotations"].append(ann_state)
         except Exception as e:
             logging.debug(f"Could not read annotations: {e}")
 
     except Exception as e:
         logging.error(f"Error in get_xstudio_state: {e}")
 
+    # Comparable stroke/caption count so the runner can assert annotations were
+    # created (mirrors the OpenRV inspector's annotation_count).
+    state["annotation_count"] = sum(
+        a.get("strokes", 0) + a.get("captions", 0) for a in state["annotations"]
+    )
+
     return state
+
+def get_xstudio_full_state(port=14441):
+    """Return xStudio's reduced state as a StateSnapshot-shaped dict.
+
+    Read from the file the in-process plugin writes (``ORI_FULLSTATE_FILE``),
+    which is ``manager.export_state()`` — guid-accurate, keyed by the real sync
+    guids. This out-of-process inspector cannot reach the plugin's manager, and
+    ``timeline_to_otio_string`` strips all sync metadata, so reconstructing here
+    is impossible; the file bridge is the source of truth.
+    """
+    path = os.environ.get("ORI_FULLSTATE_FILE")
+    if not path:
+        return {"error": "ORI_FULLSTATE_FILE not set"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"error": "full-state file not yet written by xStudio plugin"}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def execute_xstudio_command(payload, port):
     try:
@@ -196,10 +235,18 @@ def execute_xstudio_command(payload, port):
 def start_xstudio_inspector(http_port, xstudio_port):
     def get_state_callback():
         return get_xstudio_state(xstudio_port)
-        
+
+    def get_full_state_callback():
+        return get_xstudio_full_state(xstudio_port)
+
     def execute_callback(payload):
         return execute_xstudio_command(payload, xstudio_port)
-    
-    server = InspectionServer(http_port, get_state_callback, execute_command_callback=execute_callback)
+
+    server = InspectionServer(
+        http_port,
+        get_state_callback,
+        execute_command_callback=execute_callback,
+        get_full_state_callback=get_full_state_callback,
+    )
     server.start()
     return server

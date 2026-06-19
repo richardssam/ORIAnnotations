@@ -6,6 +6,8 @@ import re
 import sys
 import os
 import socket
+import bisect
+import uuid
 from collections import Counter
 
 from .spawner import AppSpawner
@@ -44,9 +46,13 @@ try:
 except ImportError:
     SyncPlayer = None
 
+from otio_sync_core import project_state, diff_states, normalize_clip_name
+
 
 def _normalize_clip_name(name):
-    return str(name).replace(" ", "").lower().replace("sequence", "")
+    # Delegate to the shared projection helper so record-side and replay-side
+    # agree on normalization (kept as a thin alias for existing call sites).
+    return normalize_clip_name(name)
 
 
 class TestRunner:
@@ -61,6 +67,20 @@ class TestRunner:
             with urllib.request.urlopen(req, timeout=2.0) as response:
                 data = response.read()
                 return json.loads(data.decode('utf-8'))
+        except Exception as e:
+            return {"error": str(e)}
+
+    def fetch_full_state(self, port):
+        """Fetch a client's StateSnapshot-shaped full state from /full_state.
+
+        Returns an ``{"error": ...}`` dict on transport failure or if the
+        inspector does not support full state (HTTP 501).
+        """
+        url = f"http://127.0.0.1:{port}/full_state"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5.0) as response:
+                return json.loads(response.read().decode('utf-8'))
         except Exception as e:
             return {"error": str(e)}
 
@@ -103,8 +123,12 @@ class TestRunner:
             if "media_exists" in st and not st["media_exists"]:
                 return False, f"{app_names[i]} reports missing media: {st.get('media_path')}"
 
-            # Ignore transient states like playing or absolute path strings
-            ignore_keys = {"playing", "media_path", "media_exists", "frame"}
+            # Ignore transient states like playing or absolute path strings.
+            # Annotation fields differ in representation per app (RV stroke
+            # components vs xStudio bookmarks) and are checked separately by the
+            # annotation-presence check, so exclude them from structural equality.
+            ignore_keys = {"playing", "media_path", "media_exists", "frame",
+                           "annotations", "annotation_count"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 
@@ -158,6 +182,75 @@ class TestRunner:
             return False, f"Checkpoint at t={t:.1f}s failed:\n" + "\n".join(messages)
         return True, ""
 
+    def compare_full_states(self, full_states, app_names, frame_tolerance=5,
+                            compare_frame=False):
+        """Consensus check: every full-state-capable client must agree structurally.
+
+        Projects each client's ``/full_state`` and diffs the others against the
+        first valid one.  Clients lacking full state are skipped.
+
+        :returns: ``(consistent, reason_string)``.
+        """
+        projected = [
+            (name, project_state(st))
+            for st, name in zip(full_states, app_names)
+            if isinstance(st, dict) and "error" not in st
+        ]
+        if len(projected) < 2:
+            return True, ""
+        base_name, base = projected[0]
+        messages = []
+        for name, proj in projected[1:]:
+            # Frame compared only when the caller knows the playhead is parked
+            # (a frame-held checkpoint). Mid-playback, full_state frames are not
+            # comparable across apps — xStudio's arrives via the ~0.5s file
+            # bridge while OpenRV's is live, so a moving playhead reads frames
+            # apart even when in sync.
+            for d in diff_states(base, proj, frame_tolerance, compare_frame=compare_frame):
+                messages.append(f"{base_name} vs {name}: {d}")
+        if messages:
+            return False, "Client consensus mismatch:\n" + "\n".join(messages)
+        return True, ""
+
+    def validate_state_checkpoint(self, full_states, app_names, checkpoint,
+                                  frame_tolerance=5):
+        """Structurally validate each client's full state at a state checkpoint.
+
+        Each client's ``/full_state`` is projected and diffed (GUID-keyed)
+        against the checkpoint's expected projection (the recorded snapshot).
+        Clients that do not support full state (``error``) are skipped so a
+        recording can still validate the apps that do.
+
+        :param full_states: List of ``/full_state`` dicts, aligned with *app_names*.
+        :param app_names: App names aligned with *full_states*.
+        :param checkpoint: A state checkpoint from :func:`derive_state_checkpoints`.
+        :param frame_tolerance: Allowed absolute frame difference.
+        :returns: ``(passed, reason_string)``.
+        """
+        expected = checkpoint["expected"]
+        messages = []
+        validated_any = False
+        for state, name in zip(full_states, app_names):
+            if not isinstance(state, dict) or "error" in state:
+                # Inspector lacks full-state support or transient failure; skip.
+                logging.debug(f"state checkpoint: skipping {name}: "
+                              f"{state.get('error') if isinstance(state, dict) else state}")
+                continue
+            validated_any = True
+            # Compare frame only at frame-held checkpoints: with a moving
+            # playhead the snapshot's frame is a stale point-in-time and the
+            # clients read inconsistently. When parked, the frame is reliable.
+            diffs = diff_states(expected, project_state(state), frame_tolerance,
+                                compare_frame=checkpoint.get("frame_held", False))
+            for d in diffs:
+                messages.append(f"{name}: {d}")
+
+        if messages:
+            t = checkpoint.get("time_offset", 0)
+            return False, f"State checkpoint at t={t:.1f}s failed:\n" + "\n".join(messages)
+        # Nothing validated (no app exposed full state) is not a failure.
+        return True, ("" if validated_any else "no full-state-capable apps")
+
     def _wait_for_all_apps(self, app_ports, timeout=90.0):
         """Poll each app's /state endpoint until all respond without error."""
         deadline = time.time() + timeout
@@ -194,6 +287,12 @@ class TestRunner:
 
         script_driven = script_driven or test_data.get('script_driven', False)
 
+        # Annotations only flow in playback (non-script) mode. Script-driven runs
+        # replay *derived media commands* (add/delete media), never the
+        # recording's Annotation.1 events — so a recording that merely happens to
+        # contain annotations must not make the presence check expect them.
+        expect_annotations = (not script_driven) and recording_has_annotations(recording_path)
+
         # Allow per-test overrides for checkpoint tuning
         checkpoint_validation_delay = test_data.get('checkpoint_validation_delay', checkpoint_validation_delay)
         checkpoint_min_spacing = test_data.get('checkpoint_min_spacing', checkpoint_min_spacing)
@@ -205,11 +304,16 @@ class TestRunner:
         logging.info(f"Starting test '{test_name}' with apps: {apps}")
 
         executables = self.config.settings.get('executables', {})
-        with AppSpawner(test_name, executables) as spawner:
+        # Unique session per test so each test runs on its own RabbitMQ exchange —
+        # isolates the broker so leftover state/peers from a prior test cannot
+        # leak in (the cause of suite-only flakiness).
+        session_id = f"otio-sync-{test_name}-{uuid.uuid4().hex[:8]}"
+        with AppSpawner(test_name, executables, session_id=session_id) as spawner:
             player = None
             player_thread = None
             playing_state = {"playing": True}
             checkpoints = []
+            state_checkpoints = []
 
             if script_driven:
                 if 'commands' in test_data:
@@ -226,7 +330,7 @@ class TestRunner:
                     commands = derive_commands_from_recording(recording_path)
                     logging.info(f"Derived {len(commands)} commands.")
             else:
-                player = SyncPlayer(session_id="otio-sync-demo")
+                player = SyncPlayer(session_id=session_id)
                 player.load_recording(recording_path)
 
                 checkpoints = derive_checkpoints(
@@ -236,6 +340,14 @@ class TestRunner:
                     validation_delay=checkpoint_validation_delay,
                 )
                 logging.info(f"Extracted {len(checkpoints)} validation checkpoints from recording.")
+
+                state_checkpoints = derive_state_checkpoints(
+                    recording_path, validation_delay=checkpoint_validation_delay
+                )
+                logging.info(
+                    f"Extracted {len(state_checkpoints)} structural state checkpoint(s) "
+                    "from recording."
+                )
 
                 # Start player FIRST so it claims master before any app launches.
                 # Apps that connect afterwards will send STATE_REQUEST and receive
@@ -279,6 +391,7 @@ class TestRunner:
             MAX_DIVERGENCE_TIME = 10.0
 
             checkpoint_idx = 0
+            state_checkpoint_idx = 0
 
             if script_driven:
                 driver_app = app_ports[0]
@@ -348,6 +461,40 @@ class TestRunner:
                                 playing_state["playing"] = False
                             checkpoint_idx += 1
 
+                        # Structural state checkpoints: once a snapshot's settle
+                        # time has passed, fetch each app's full state, project it,
+                        # and diff against the recorded snapshot's projection.
+                        while state_checkpoint_idx < len(state_checkpoints):
+                            scp = state_checkpoints[state_checkpoint_idx]
+                            if current_offset < scp["time_offset"] + checkpoint_validation_delay:
+                                break
+                            full_states = [self.fetch_full_state(port) for _, port in app_ports]
+                            names = [a[0] for a in app_ports]
+                            ok, msg = self.validate_state_checkpoint(
+                                full_states, names, scp, frame_tolerance=frame_tolerance,
+                            )
+                            if ok:
+                                # Oracle passed; also require client-vs-client
+                                # consensus (frame only when the playhead is parked).
+                                ok, msg = self.compare_full_states(
+                                    full_states, names, frame_tolerance=frame_tolerance,
+                                    compare_frame=scp.get("frame_held", False),
+                                )
+                            if ok:
+                                logging.info(
+                                    f"✅ State checkpoint t={scp['time_offset']:.1f}s passed"
+                                    + (f" ({msg})" if msg else "")
+                                )
+                            else:
+                                logging.error(f"❌ FAIL: {msg}")
+                                logging.error("Check application logs for details:")
+                                for name, port in app_ports:
+                                    logging.error(f"  {os.path.join(spawner.logs_dir, f'{name}_{port}.log')}")
+                                failed = True
+                                fail_reason = msg
+                                playing_state["playing"] = False
+                            state_checkpoint_idx += 1
+
                 time.sleep(0.5)
 
             if player:
@@ -363,6 +510,59 @@ class TestRunner:
                 if not match:
                     logging.error(f"❌ FAIL: Final state mismatch in test '{test_name}'!\n{diff}")
                     failed = True
+
+            # Annotation-presence check: if the recording contained annotations,
+            # every app must have created at least one. Placement/frame
+            # correctness is intentionally not asserted here (punted for now);
+            # this only catches the "annotations silently dropped" failure.
+            if not failed and expect_annotations:
+                for name, port in app_ports:
+                    st = self.fetch_state(port)
+                    cnt = st.get("annotation_count")
+                    if cnt is None:
+                        logging.warning(
+                            f"{name} does not report annotation_count; "
+                            "skipping annotation-presence check"
+                        )
+                    elif cnt <= 0:
+                        logging.error(
+                            f"❌ FAIL: {name} created 0 annotations, but the "
+                            f"recording for '{test_name}' contains annotations."
+                        )
+                        failed = True
+                        fail_reason = f"{name} created no annotations"
+                    else:
+                        logging.info(f"✅ {name} created {cnt} annotation stroke(s)")
+
+            # Final structural consensus: the apps must agree on timeline
+            # structure (clip set + order). Catches desyncs that the lightweight
+            # compare_states is blind to — e.g. a MOVE_CHILD reorder where both
+            # apps still report the same active-timeline *name* but hold the
+            # clips in a different order. Independent of recorded snapshots, so it
+            # works even for recordings with only the initial STATE_SNAPSHOT.
+            # Apps that do not expose /full_state are skipped (compare_full_states
+            # needs >=2 valid projections), so this only fires when both report.
+            if not failed and len(app_ports) >= 2:
+                # Poll until the apps converge rather than checking once: cross-app
+                # sync has lag, so a one-shot check after a fixed wait is flaky
+                # (the slower peer may not have applied the last events yet). A
+                # genuine desync never converges and still fails after the timeout.
+                ok, msg = False, ""
+                deadline = time.time() + 15.0
+                while True:
+                    full_states = [self.fetch_full_state(port) for _, port in app_ports]
+                    ok, msg = self.compare_full_states(
+                        full_states, [a[0] for a in app_ports], frame_tolerance=frame_tolerance
+                    )
+                    if ok or time.time() >= deadline:
+                        break
+                    time.sleep(1.0)
+                if not ok:
+                    logging.error(f"❌ FAIL: structural consensus in '{test_name}':\n{msg}")
+                    failed = True
+                    fail_reason = msg
+                else:
+                    logging.info("✅ Apps agree on timeline structure (full-state consensus)")
 
             # Save session states
             for name, port in app_ports:
@@ -532,14 +732,16 @@ def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5,
             except Exception:
                 continue
 
-    # Filter: only keep positions where the recording is silent for at least
-    # validation_delay seconds afterward.  This guarantees the frame won't
-    # have moved by the time we go to validate it.
+    # Filter: only keep positions where the recording is silent for
+    # validation_delay + a safety margin afterward, so validation (which can land
+    # up to ~0.5 s late due to loop granularity) happens comfortably before the
+    # next frame change — not at the edge of a jump back to 0 mid-scrub.
     if validation_delay > 0:
+        required = validation_delay + _FRAME_HOLD_SAFETY_MARGIN
         stable = []
         for i, cp in enumerate(raw):
             next_t = raw[i + 1]["time_offset"] if i + 1 < len(raw) else float("inf")
-            if next_t - cp["time_offset"] >= validation_delay:
+            if next_t - cp["time_offset"] >= required:
                 stable.append(cp)
         raw = stable
 
@@ -552,6 +754,113 @@ def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5,
     checkpoints.reverse()
 
     return checkpoints
+
+
+# Schemas whose events change a timeline's structure or active selection — i.e.
+# the things the canonical projection compares. A state checkpoint is only valid
+# once the recording is quiet of these for ``validation_delay`` afterward;
+# otherwise the live apps will have advanced past the snapshot by the time we
+# validate it (frame drift is tolerated separately by diff_states).
+_STRUCTURAL_SCHEMAS = {"OTIO_SESSION_1.0", "TIMELINE_1.0", "SELECTION_1.0"}
+
+# Extra silence required *beyond* validation_delay before a frame is treated as
+# "held" and worth validating. A frame checkpoint validates at
+# ``snapshot_time + validation_delay``, but the runner's validation loop only
+# ticks every ~0.5 s, so validation can land up to that late. Without this margin
+# a frame held only marginally longer than validation_delay (e.g. a brief pause
+# mid-scrub before a jump back to 0) gets validated right as the next change
+# lands, and the live apps have already followed the recording onward.
+_FRAME_HOLD_SAFETY_MARGIN = 1.5
+
+
+def derive_state_checkpoints(jsonl_path, validation_delay=0.0):
+    """Extract structural state checkpoints from a recording's STATE_SNAPSHOTs.
+
+    Each periodic ``STATE_SNAPSHOT`` becomes a candidate checkpoint carrying the
+    snapshot's ``time_offset`` and its canonical projection (the expected state).
+    A snapshot is only kept if no structural event follows it within
+    *validation_delay* seconds — otherwise the recording reorders/inserts after
+    the snapshot but before we validate it, and the live state no longer matches
+    the snapshot (this is what made the very first snapshot a false failure).
+
+    A recording with no periodic snapshots yields an empty list (the runner then
+    falls back to frame-only validation).
+
+    Each checkpoint also carries ``frame_held``: True when the recording is quiet
+    of playback (frame) changes for *validation_delay* after the snapshot — i.e.
+    the playhead is parked. Frame is only compared at frame-held checkpoints,
+    where it is reliable (a moving playhead reads inconsistently across apps, and
+    xStudio's ~0.5s file-bridge value lags a live frame; neither matters when the
+    frame is parked).
+
+    :param jsonl_path: Path to the JSONL recording.
+    :param validation_delay: Required seconds of structural silence after a
+        snapshot for it to be a valid checkpoint, and of playback silence for it
+        to be frame-held.
+    :returns: List of ``{"time_offset", "expected", "frame_held"}`` dicts,
+        ordered by ``time_offset``.
+    """
+    snapshots = []          # (time_offset, projection)
+    structural_times = []   # offsets of structure/selection-changing events
+    playback_times = []     # offsets of PLAYBACK_SETTINGS (frame) changes
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            try:
+                row = json.loads(line.strip())
+            except Exception:
+                continue
+            t = row.get("time_offset", 0.0)
+            p = row.get("payload", {}).get("payload", {})
+            schema = p.get("command_schema")
+            if schema == "LiveSession.1" and p.get("command", {}).get("event") == "STATE_SNAPSHOT":
+                snapshots.append((t, project_state(p.get("command", {}).get("payload", {}))))
+            elif schema in _STRUCTURAL_SCHEMAS:
+                structural_times.append(t)
+            elif schema == "PLAYBACK_SETTINGS_1.0":
+                playback_times.append(t)
+
+    structural_times.sort()
+    playback_times.sort()
+    checkpoints = []
+    for t, proj in snapshots:
+        # Next structural event at or after this snapshot (>= t is conservative:
+        # an event sharing the snapshot's offset disqualifies it).
+        idx = bisect.bisect_left(structural_times, t)
+        next_struct = structural_times[idx] if idx < len(structural_times) else float("inf")
+        if validation_delay > 0 and (next_struct - t) < validation_delay:
+            continue
+        # Frame-held: no playback change for validation_delay + safety margin
+        # after the snapshot (same margin as the frame checkpoints, so a brief
+        # mid-scrub pause is never treated as a parked frame).
+        pidx = bisect.bisect_right(playback_times, t)
+        next_play = playback_times[pidx] if pidx < len(playback_times) else float("inf")
+        frame_held = (next_play - t) >= validation_delay + _FRAME_HOLD_SAFETY_MARGIN
+        checkpoints.append({"time_offset": t, "expected": proj, "frame_held": frame_held})
+    checkpoints.sort(key=lambda c: c["time_offset"])
+    return checkpoints
+
+
+def recording_has_annotations(jsonl_path):
+    """Return True if the recording contains live ``Annotation.1`` stroke messages.
+
+    Deliberately narrow: it triggers only on the live partial/full stroke stream
+    (the scenario where strokes must be drawn on receive), not on annotation
+    clips merely baked into a snapshot — so the annotation-presence check does
+    not fire for unrelated tests.
+    """
+    try:
+        with open(jsonl_path, 'r') as f:
+            for line in f:
+                try:
+                    row = json.loads(line.strip())
+                except Exception:
+                    continue
+                p = row.get("payload", {}).get("payload", {})
+                if p.get("command_schema") == "Annotation.1":
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def derive_commands_from_recording(jsonl_path):

@@ -36,12 +36,20 @@ class SyncRecorder:
         port: int = 5672,
         network: Any | None = None,
         capture_initial_state: bool = True,
+        capture_periodic_state: bool = False,
+        min_silence: float = 1.5,
+        min_interval: float = 5.0,
     ) -> None:
         self.session_id = session_id
         self.host = host
         self.port = port
         self.network = network
         self.capture_initial_state = capture_initial_state
+        # When enabled, request a fresh STATE_SNAPSHOT from the master at settle
+        # points (used by the sync_test framework to validate live client state).
+        self.capture_periodic_state = capture_periodic_state
+        self.min_silence = min_silence
+        self.min_interval = min_interval
         self.events: list[dict[str, Any]] = []
         self.output_file: str | None = None
         self._start_time: float | None = None
@@ -58,6 +66,17 @@ class SyncRecorder:
         self._handshake_start_time = 0.0
         self._snapshot_captured = False
         self._handshake_state_request_start = 0.0
+
+        # Periodic-capture state.  ``_cached_master_guid`` is learned from the
+        # initial handshake so active requests skip WHO_IS_MASTER.
+        self._cached_master_guid: str | None = None
+        self._last_message_time: float = 0.0
+        self._last_snapshot_time: float = 0.0
+        self._last_active_request_time: float = 0.0
+        self._active_request_pending: bool = False
+        # How long to wait for an active request to be answered before
+        # re-discovering the master via WHO_IS_MASTER.
+        self._active_request_timeout: float = 2.0
 
     def start(self, output_file: str | None = None) -> None:
         """Start recording events in a background thread.
@@ -92,6 +111,13 @@ class SyncRecorder:
             self.events.clear()
             self._start_time = time.time()
             self._stop_event.clear()
+
+            # Reset periodic-capture timers relative to recording start.
+            self._cached_master_guid = None
+            self._last_message_time = self._start_time
+            self._last_snapshot_time = 0.0
+            self._last_active_request_time = 0.0
+            self._active_request_pending = False
 
             # Initialize handshake state if capture is enabled
             if self.capture_initial_state:
@@ -190,6 +216,10 @@ class SyncRecorder:
                         })
                         self._handshake_sent_request = now
 
+            # Once the initial handshake is done, drive bounded periodic capture.
+            if self.capture_periodic_state and self._snapshot_captured:
+                self._drive_periodic_capture(now)
+
             payloads = self.network.receive_payloads()
             new_events = []
             for p in payloads:
@@ -197,6 +227,22 @@ class SyncRecorder:
                 cmd = inner.get("command_schema")
                 evt = inner.get("command", {}).get("event")
                 payload_data = inner.get("command", {}).get("payload", {})
+
+                # Any received payload counts as session activity for silence
+                # detection.  Cache the master GUID whenever it is announced so
+                # periodic active requests can skip WHO_IS_MASTER.
+                self._last_message_time = now
+                if cmd == "LiveSession.1" and evt == "I_AM_MASTER":
+                    master = payload_data.get("master_guid")
+                    if master:
+                        self._cached_master_guid = master
+
+                # Passive capture: record the arrival of *any* STATE_SNAPSHOT
+                # (regardless of target) so an active request can be suppressed
+                # when a snapshot just landed on its own.
+                if cmd == "LiveSession.1" and evt == "STATE_SNAPSHOT":
+                    self._last_snapshot_time = now
+                    self._active_request_pending = False
 
                 # Update handshake state machine based on received payloads
                 if self.capture_initial_state and not self._snapshot_captured:
@@ -222,6 +268,78 @@ class SyncRecorder:
                     self._write_event_to_file(event)
                 new_events.append(event)
             return new_events
+
+    def _drive_periodic_capture(self, now: float) -> None:
+        """Request a snapshot at settle points, bounded so the session is not flooded.
+
+        Called from :meth:`tick` (already holding ``self._lock``) once the initial
+        handshake has completed.  Issues at most one ``STATE_REQUEST`` per
+        ``min_interval`` and only after ``min_silence`` of stream quiet, skipping
+        when a snapshot has already arrived passively within the window.
+
+        :param now: Current monotonic-ish wall-clock time from :meth:`tick`.
+        """
+        # An active request is outstanding: wait for its snapshot, or, on
+        # timeout, drop the cached master and re-discover via WHO_IS_MASTER.
+        if self._active_request_pending:
+            if now - self._last_active_request_time > self._active_request_timeout:
+                self._active_request_pending = False
+                self._cached_master_guid = None
+                self._last_active_request_time = now
+                self._send_who_is_master()
+            return
+
+        # Without a known master we cannot target a direct request; rediscover,
+        # rate-limited by min_interval.
+        if not self._cached_master_guid:
+            if now - self._last_active_request_time >= self.min_interval:
+                self._last_active_request_time = now
+                self._send_who_is_master()
+            return
+
+        # Bounds: the stream must be quiet, the interval must have elapsed, and
+        # no snapshot may have landed passively within the interval window.
+        if now - self._last_message_time < self.min_silence:
+            return
+        if now - self._last_active_request_time < self.min_interval:
+            return
+        if self._last_snapshot_time and (now - self._last_snapshot_time) < self.min_interval:
+            return
+
+        self._send_state_request(self._cached_master_guid)
+        self._last_active_request_time = now
+        self._active_request_pending = True
+
+    def _send_who_is_master(self) -> None:
+        """Broadcast a WHO_IS_MASTER discovery message."""
+        self.network.send_payload({
+            "session": self.session_id,
+            "source_guid": self.network.self_guid,
+            "payload": {
+                "command_schema": "LiveSession.1",
+                "command": {
+                    "event": "WHO_IS_MASTER",
+                    "payload": {"requester_guid": self.network.self_guid},
+                },
+            },
+        })
+
+    def _send_state_request(self, target_guid: str) -> None:
+        """Send a STATE_REQUEST aimed at *target_guid* (the cached master)."""
+        self.network.send_payload({
+            "session": self.session_id,
+            "source_guid": self.network.self_guid,
+            "payload": {
+                "command_schema": "LiveSession.1",
+                "command": {
+                    "event": "STATE_REQUEST",
+                    "payload": {
+                        "target_guid": target_guid,
+                        "requester_guid": self.network.self_guid,
+                    },
+                },
+            },
+        })
 
     def get_events(self) -> list[dict[str, Any]]:
         """Return a copy of the list of recorded events.
@@ -271,6 +389,28 @@ def main() -> None:
         action="store_true",
         help="Do not capture the initial state snapshot on start",
     )
+    p.add_argument(
+        "--periodic-state",
+        action="store_true",
+        help=(
+            "Periodically request a fresh STATE_SNAPSHOT from the master at "
+            "settle points (for the sync_test framework). Off by default."
+        ),
+    )
+    p.add_argument(
+        "--min-silence",
+        type=float,
+        default=1.5,
+        metavar="SECONDS",
+        help="Stream-silence required before an active state request (default: 1.5).",
+    )
+    p.add_argument(
+        "--min-interval",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Minimum seconds between active state requests (default: 5.0).",
+    )
     args = p.parse_args()
 
     recorder = SyncRecorder(
@@ -278,6 +418,9 @@ def main() -> None:
         host=args.host,
         port=args.port,
         capture_initial_state=not args.no_handshake,
+        capture_periodic_state=args.periodic_state,
+        min_silence=args.min_silence,
+        min_interval=args.min_interval,
     )
     print(f"[*] Starting recording on session '{args.session}'...")
     print(f"[*] Writing events to: {args.output}")
