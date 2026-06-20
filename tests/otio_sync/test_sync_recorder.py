@@ -139,6 +139,55 @@ class TestSyncRecorderPlayer(unittest.TestCase):
         self.assertGreater(p1["payload"]["sync_timestamp"], 1000.0)
         self.assertGreater(p2["payload"]["sync_timestamp"], 1000.0)
 
+    def test_drain_lingers_after_last_event(self):
+        """With drain_seconds set, tick() keeps the player alive past the last
+        event until the drain deadline, then stops. This is what gives a
+        trailing checkpoint (and the apps) time after the final replayed event
+        (e.g. a REMOVE_TIMELINE) before teardown."""
+        port = 9991
+        player_net = UDPNetwork(port=port, self_guid="drain_player")
+        try:
+            player = SyncPlayer(network=player_net)
+            # Two events at offsets 0.0 and 0.05; the last is "the delete".
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+                {"time_offset": 0.05, "payload": {"command": "B", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True, drain_seconds=0.5)
+
+            # Drive past both events; player must NOT stop yet (still draining).
+            time.sleep(0.1)
+            self.assertTrue(player.tick(), "player stopped before drain elapsed")
+            self.assertGreaterEqual(player._play_index, len(player.events))
+            self.assertIsNotNone(player._drain_deadline)
+
+            # Still draining a moment later.
+            self.assertTrue(player.tick())
+
+            # After the drain window elapses, tick() reports finished.
+            time.sleep(0.55)
+            self.assertFalse(player.tick(), "player did not stop after drain elapsed")
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_no_drain_stops_immediately(self):
+        """Default drain_seconds=0.0 preserves the original behavior: the player
+        stops as soon as its last event is sent."""
+        port = 9990
+        player_net = UDPNetwork(port=port, self_guid="nodrain_player")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True)
+            time.sleep(0.05)
+            self.assertFalse(player.tick(), "player should stop immediately with no drain")
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
     def test_handshake_capture_and_master_simulation(self):
         port = 9992
 

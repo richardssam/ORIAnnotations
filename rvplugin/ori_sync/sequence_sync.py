@@ -588,6 +588,40 @@ class SequenceSyncController:
                 _log(f"Sequence rename: '{tl.name}' → '{current_name}' (node={seq_group})")
                 self.plugin.sync_manager.broadcast_timeline_rename(tl_guid, current_name)
 
+    def _poll_deleted_sequences(self):
+        """Detect RVSequenceGroups the user deleted and broadcast their removal.
+
+        Counterpart to :meth:`_poll_new_sequences`: when a previously-tracked
+        RVSequenceGroup is gone from the node graph, broadcast a
+        ``REMOVE_TIMELINE`` so peers drop the timeline and tear down their
+        containers. RV moves the on-screen view off a deleted sequence on its
+        own, satisfying the host ordering contract (switch on-screen source,
+        then remove).
+        """
+        if not self.plugin.sync_manager:
+            return
+        if self.plugin.sync_manager.status != STATE_SYNCED:
+            return
+        try:
+            seq_groups = set(rv.commands.nodesOfType("RVSequenceGroup"))
+        except Exception:
+            return
+        for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
+            if seq_group in seq_groups:
+                continue
+            # Node is gone — the user deleted this sequence.
+            del self._rv_node_to_timeline_guid[seq_group]
+            self._sequence_input_order.pop(seq_group, None)
+            # Another node may still represent the same timeline (e.g. adopted
+            # identity); only remove the timeline when nothing maps to it.
+            if tl_guid in self._rv_node_to_timeline_guid.values():
+                continue
+            self.plugin.sync_manager.broadcast_remove_timeline(tl_guid)
+            _log(
+                f"Deleted RVSequenceGroup '{seq_group}' → timeline "
+                f"{tl_guid[:8]} removal broadcast"
+            )
+
     def _set_sequence_ui_name(self, seq_node, name):
         """Set an RVSequenceGroup's ``ui.name`` to *name*.
 
@@ -658,6 +692,41 @@ class SequenceSyncController:
             rv.commands.redraw()
         except Exception as e:
             _log_exc(f"_create_rv_sequence_for_timeline: failed for '{tl.name}': {e}")
+
+    def _delete_rv_sequence_for_timeline(self, tl):
+        """Delete the RVSequenceGroup for a remotely-removed OTIO timeline.
+
+        Symmetric to :meth:`_create_rv_sequence_for_timeline`. No-op when no
+        local container maps to the timeline's GUID.
+        """
+        tl_guid = tl.metadata.get("sync", {}).get("guid") if tl else None
+        if not tl_guid:
+            _log("_delete_rv_sequence_for_timeline: no GUID on timeline")
+            return
+        targets = [
+            sg for sg, g in self._rv_node_to_timeline_guid.items() if g == tl_guid
+        ]
+        if not targets:
+            _log(f"RECV remove_timeline: no RVSequenceGroup for {tl_guid[:8]} (no-op)")
+            return
+        for seq_group in targets:
+            try:
+                rv.commands.deleteNode(seq_group)
+                _log(
+                    f"RECV remove_timeline: deleted RVSequenceGroup "
+                    f"'{seq_group}' for {tl_guid[:8]}"
+                )
+            except Exception as e:
+                _log_exc(
+                    f"_delete_rv_sequence_for_timeline: failed to delete "
+                    f"'{seq_group}': {e}"
+                )
+            self._rv_node_to_timeline_guid.pop(seq_group, None)
+            self._sequence_input_order.pop(seq_group, None)
+        try:
+            rv.commands.redraw()
+        except Exception:
+            pass
 
     def _apply_insert_child(self, clip_obj):
         """Connect a newly-received source group to the right sequence group."""

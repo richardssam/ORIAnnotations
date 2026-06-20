@@ -662,6 +662,143 @@ class StructureSyncController:
                 )
                 self.plugin.manager.broadcast_timeline_rename(tl_guid, current_name)
 
+    def _purge_local_playlist_entry(self, tl_guid: str) -> None:
+        """Drop all local tracking state for *tl_guid* and unsubscribe its events.
+
+        Shared by :meth:`delete_local_container` (inbound removal) and
+        :meth:`poll_deleted_playlists` (local deletion). Touches only tracking
+        dicts and subscriptions — never the xStudio container itself.
+        """
+        self.plugin._sync_playlists.pop(tl_guid, None)
+        self._xs_sequence_playlists.pop(tl_guid, None)
+        self._xs_flat_playlists.pop(tl_guid, None)
+        self._xs_sequence_media_names.pop(tl_guid, None)
+        self._xs_sequence_track_names.pop(tl_guid, None)
+        self._xs_media_order.pop(tl_guid, None)
+        sub_id = self._timeline_item_sub_ids.pop(tl_guid, None)
+        if sub_id:
+            try:
+                self.plugin.unsubscribe_from_event_group(sub_id)
+            except Exception:
+                pass
+
+    def delete_local_container(self, tl_guid: str) -> None:
+        """Remove the xStudio container for a remotely-removed timeline.
+
+        Symmetric to the ``add_timeline`` create path. No-op when no local
+        container maps to *tl_guid*. Runs on the poll thread (enqueued as the
+        ``remove_timeline`` command) so the xStudio session mutation is
+        thread-safe.
+        """
+        entry = self.plugin._sync_playlists.get(tl_guid)
+        if entry is None:
+            _log(f"RECV remove_timeline: no container for {tl_guid[:8]} (no-op)")
+            return
+        playlist, _xs_tl = entry
+        # Suppress our own structural-event echo: remove_container fires xStudio
+        # item/content events that on_timeline_item_event would otherwise turn
+        # into a sync_container scan, re-detecting the sequence and re-broadcasting
+        # it as a brand-new timeline — resurrecting the delete. Every other
+        # remote-apply path sets this guard for the same reason.
+        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        # remove_container keys on the *container* uuid (create_playlist's first
+        # return value), NOT the Playlist actor's uuid. We only stored the
+        # Playlist object, so passing it removes nothing (wrong uuid) and the
+        # periodic poll then re-detects the still-present playlist. Resolve the
+        # container uuid from the session tree before removing.
+        container_uuid = self._container_uuid_for_playlist(playlist)
+        try:
+            target = container_uuid if container_uuid is not None else playlist
+            self.plugin.connection.api.session.remove_container(target)
+            _log(
+                f"RECV remove_timeline: removed container for {tl_guid[:8]}"
+                + ("" if container_uuid is not None else " (actor-uuid fallback)")
+            )
+        except Exception:
+            _log_exc(f"delete_local_container: remove_container failed for {tl_guid[:8]}")
+        self._purge_local_playlist_entry(tl_guid)
+
+    def _container_uuid_for_playlist(self, playlist):
+        """Resolve the session-tree container uuid for a Playlist actor.
+
+        ``remove_container`` removes by the container uuid that
+        ``create_playlist`` returns first; ``Playlist.uuid`` is the actor uuid,
+        which is different. Match the playlist's actor uuid against each
+        container node's ``value_uuid`` in ``session.playlist_tree``.
+
+        :param playlist: The xStudio ``Playlist`` whose container to find.
+        :returns: The container ``Uuid``, or ``None`` if it cannot be resolved.
+        """
+        try:
+            actor_uuid = str(playlist.uuid)
+        except Exception:
+            return None
+        # Top-level container nodes expose ``value_uuid`` (the actor uuid) and
+        # ``uuid`` (the container uuid); they are ``PlaylistItemTree`` and have
+        # no ``children`` (only the root ``PlaylistTree`` does), so this is a
+        # single-level scan — sync-created playlists are top-level containers.
+        try:
+            for node in self.plugin.connection.api.session.playlist_tree.children:
+                try:
+                    if str(node.value_uuid) == actor_uuid:
+                        return node.uuid
+                except Exception:
+                    continue
+        except Exception:
+            _log_exc("_container_uuid_for_playlist: failed to walk playlist_tree")
+        return None
+
+    def poll_deleted_playlists(self) -> None:
+        """Detect synced playlists/timelines deleted in xStudio and broadcast removal.
+
+        Counterpart to :meth:`poll_new_playlists`. Enumerates the live
+        ``session.playlists`` to learn which container identities still exist,
+        then broadcasts ``REMOVE_TIMELINE`` for any tracked entry whose native
+        identity is gone. Liveness is judged from the live enumeration (not by
+        poking the stored, possibly-dead actor) so a deleted playlist's actor
+        read cannot freeze the poll thread.
+        """
+        if not self.plugin.manager:
+            return
+        if self.plugin.manager.status != STATE_SYNCED:
+            return
+        try:
+            playlists = self.plugin.connection.api.session.playlists
+        except Exception:
+            return
+
+        live_uuids: set[str] = set()
+        enumerated = False
+        for playlist in playlists:
+            try:
+                live_uuids.add(str(playlist.uuid))
+                for c in playlist.containers:
+                    if isinstance(c, Timeline):
+                        live_uuids.add(str(c.uuid))
+                enumerated = True
+            except Exception:
+                continue
+        # Guard against a transient empty/failed scan wiping every timeline.
+        if not enumerated:
+            return
+
+        for tl_guid, (pl, xs_tl) in list(self.plugin._sync_playlists.items()):
+            try:
+                native = str(xs_tl.uuid) if xs_tl is not None else str(pl.uuid)
+            except Exception:
+                native = None
+            if native is not None and native in live_uuids:
+                continue  # still present
+            self._purge_local_playlist_entry(tl_guid)
+            try:
+                self.plugin.manager.broadcast_remove_timeline(tl_guid)
+            except Exception:
+                _log_exc(f"poll_deleted_playlists: broadcast failed for {tl_guid[:8]}")
+            _log(
+                f"Playlist/timeline {tl_guid[:8]} deleted in xStudio "
+                f"→ removal broadcast"
+            )
+
     # ── sequence media polls ───────────────────────────────────────────
 
     def poll_sequence_new_media(self, only_guid: str | None = None) -> None:

@@ -56,6 +56,13 @@ class SyncPlayer:
         self._play_replace_source_guid = True
         self._own_network = False
 
+        # Post-playback drain: after the last event is sent, linger (servicing
+        # the network but sending nothing) so trailing checkpoints can validate
+        # and peers can apply the final events — e.g. a REMOVE_TIMELINE that is
+        # the last recorded event — before the harness tears the apps down.
+        self._drain_seconds: float = 0.0
+        self._drain_deadline: float | None = None
+
         # Peer-join gate: hold playback until a STATE_SNAPSHOT has been sent
         # and a configurable delay has elapsed.
         self._wait_for_peer = False
@@ -187,6 +194,7 @@ class SyncPlayer:
         wait_for_peer: bool = False,
         min_peer_count: int = 1,
         post_snapshot_delay: float = 3.0,
+        drain_seconds: float = 0.0,
     ) -> None:
         """Initialize non-blocking procedural playback.
 
@@ -227,6 +235,8 @@ class SyncPlayer:
         self._play_speed = speed
         self._play_loop = loop
         self._play_replace_source_guid = replace_source_guid
+        self._drain_seconds = drain_seconds
+        self._drain_deadline = None
         self._playing = True
 
     def tick(self) -> bool:
@@ -287,10 +297,22 @@ class SyncPlayer:
             if self._play_loop:
                 self._play_start_time = time.time()
                 self._play_index = 0
-            else:
-                self._playing = False
-                self._close_own_network()
-                return False
+                return True
+            # All events sent. Linger for the drain window so trailing
+            # checkpoints can validate and peers can apply the final events
+            # (e.g. a REMOVE_TIMELINE that is the last recorded event) before
+            # the harness tears them down. _process_network_requests (above)
+            # keeps servicing joiners during the drain; the wall clock keeps
+            # advancing current_offset so the runner reaches post-event
+            # checkpoints.
+            if self._drain_seconds > 0.0:
+                if self._drain_deadline is None:
+                    self._drain_deadline = time.time() + self._drain_seconds
+                if time.time() < self._drain_deadline:
+                    return True
+            self._playing = False
+            self._close_own_network()
+            return False
 
         return True
 

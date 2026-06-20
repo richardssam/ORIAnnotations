@@ -446,6 +446,37 @@ class RenameTimeline(ProtocolMessage):
         )
 
 
+@register
+@dataclass
+class RemoveTimeline(ProtocolMessage):
+    """Removes an existing timeline from all peers.
+
+    Carries only the GUID — peers already hold the timeline, so no OTIO payload
+    is needed.  Receivers that do not hold the GUID treat it as a no-op.
+    """
+
+    SCHEMA = "TIMELINE_1.0"
+    EVENT = "REMOVE_TIMELINE"
+
+    timeline_guid: str = doc_field(doc="GUID of the timeline to remove.")
+    sync_timestamp: "float | None" = doc_field(
+        default=None, doc="Epoch seconds when the message was sent."
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "timeline_guid": self.timeline_guid,
+            "sync_timestamp": self.sync_timestamp,
+        }
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "RemoveTimeline":
+        return cls(
+            timeline_guid=data.get("timeline_guid"),
+            sync_timestamp=data.get("sync_timestamp"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Settings family — declare known fields, tolerate extras (hot paths)
 # ---------------------------------------------------------------------------

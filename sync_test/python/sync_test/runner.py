@@ -349,13 +349,44 @@ class TestRunner:
                     "from recording."
                 )
 
+                # Drain window: the last replayed event may sit *after* the last
+                # validation checkpoint, or a trailing checkpoint may sit after
+                # the last replayed event (e.g. a post-delete STATE_SNAPSHOT that
+                # asserts a REMOVE_TIMELINE took effect). Without a drain the
+                # player stops the instant its last event is sent and the harness
+                # tears the apps down before they apply it or before that
+                # checkpoint is reached. Linger long enough for the wall clock to
+                # pass the last checkpoint + validation delay, plus settle margin.
+                last_event_offset = (
+                    player.events[-1]["time_offset"] if player.events else 0.0
+                )
+                last_cp_offset = max(
+                    [c["time_offset"] for c in checkpoints]
+                    + [c["time_offset"] for c in state_checkpoints]
+                    + [0.0]
+                )
+                drain_seconds = max(
+                    _MIN_DRAIN_SECONDS,
+                    (last_cp_offset - last_event_offset)
+                    + checkpoint_validation_delay
+                    + _DRAIN_SETTLE_MARGIN,
+                )
+                logging.info(
+                    f"Post-playback drain: {drain_seconds:.1f}s "
+                    f"(last event t={last_event_offset:.1f}s, "
+                    f"last checkpoint t={last_cp_offset:.1f}s)."
+                )
+
                 # Start player FIRST so it claims master before any app launches.
                 # Apps that connect afterwards will send STATE_REQUEST and receive
                 # the recording's STATE_SNAPSHOT from the player.
                 import threading
 
                 logging.info(f"Starting playback (waiting for {len(apps)} peer(s))...")
-                player.start_playback(speed=1.0, wait_for_peer=True, min_peer_count=len(apps), post_snapshot_delay=2.0)
+                player.start_playback(
+                    speed=1.0, wait_for_peer=True, min_peer_count=len(apps),
+                    post_snapshot_delay=2.0, drain_seconds=drain_seconds,
+                )
 
                 def player_thread_func():
                     while playing_state["playing"]:
@@ -784,6 +815,13 @@ _STRUCTURAL_SCHEMAS = {"OTIO_SESSION_1.0", "TIMELINE_1.0", "SELECTION_1.0"}
 # mid-scrub before a jump back to 0) gets validated right as the next change
 # lands, and the live apps have already followed the recording onward.
 _FRAME_HOLD_SAFETY_MARGIN = 1.5
+
+# Post-playback drain (see run_test). Minimum lingering time after the last
+# replayed event so the final events always get settle time, and the extra
+# margin added beyond (last_checkpoint - last_event + validation_delay) so the
+# trailing checkpoint validates comfortably before the player stops.
+_MIN_DRAIN_SECONDS = 3.0
+_DRAIN_SETTLE_MARGIN = 2.0
 
 
 def derive_state_checkpoints(jsonl_path, validation_delay=0.0):

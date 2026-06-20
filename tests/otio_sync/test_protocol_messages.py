@@ -334,3 +334,171 @@ def test_protocol_module_importable_without_opentimelineio():
     )
     assert out.returncode == 0, out.stderr
     assert "ok" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# RemoveTimeline — message + reference-aware teardown
+# ---------------------------------------------------------------------------
+
+
+def _seq_timeline(name, tl_guid, clip_guid):
+    """Build a one-track, one-clip sequence timeline with explicit sync GUIDs."""
+    tl = otio.schema.Timeline(name)
+    tl.metadata["sync"] = {"guid": tl_guid}
+    track = otio.schema.Track("V1")
+    clip = otio.schema.Clip(
+        name="c.mov",
+        media_reference=otio.schema.ExternalReference(target_url="/c.mov"),
+    )
+    clip.metadata["sync"] = {"guid": clip_guid}
+    track.append(clip)
+    tl.tracks.append(track)
+    return tl
+
+
+def test_remove_timeline_message_roundtrip_and_registry():
+    payload = {"timeline_guid": "G", "sync_timestamp": 1.0}
+    assert pm.RemoveTimeline.from_payload(payload).to_payload() == payload
+    assert pm.message_for("TIMELINE_1.0", "REMOVE_TIMELINE") is pm.RemoveTimeline
+
+
+def test_remove_timeline_scoped_object_map_teardown():
+    """Removing one timeline drops only its subtree GUIDs; survivors untouched."""
+    mgr, _ = _make_synced_manager()
+    tl_a = _seq_timeline("A", "guid-a", "clip-a")
+    tl_b = _seq_timeline("B", "guid-b", "clip-b")
+    mgr.register_timeline(tl_a)
+    mgr.register_timeline(tl_b)
+
+    a_guids = mgr._subtree_guids(tl_a)
+    b_guids = mgr._subtree_guids(tl_b)
+    assert a_guids <= set(mgr._object_map)
+    assert b_guids <= set(mgr._object_map)
+
+    res = mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "guid-a"},
+    ))
+    assert res is not None and res[0] == "remove_timeline"
+
+    assert "guid-a" not in mgr._timelines
+    assert "guid-b" in mgr._timelines
+    # Survivor's object-map entries intact; removed subtree fully gone.
+    assert b_guids <= set(mgr._object_map)
+    assert a_guids.isdisjoint(set(mgr._object_map))
+
+
+def test_remove_timeline_cascades_clip_timelines():
+    """Deleting a sequence drops the clip-annotation timelines its clips own."""
+    mgr, _ = _make_synced_manager()
+    tl = _seq_timeline("Seq", "seq-guid", "clip-x")
+    mgr.register_timeline(tl)
+
+    clip_tl_guid = mgr.get_or_create_clip_timeline("clip-x")
+    assert clip_tl_guid in mgr._timelines
+    assert "clip-x" in mgr._clip_timelines
+
+    mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "seq-guid"},
+    ))
+
+    assert clip_tl_guid not in mgr._timelines
+    assert "clip-x" not in mgr._clip_timelines
+    # No clip-map entry may reference the removed subtree.
+    assert clip_tl_guid not in mgr._clip_timelines.values()
+
+
+def test_remove_active_timeline_clears_active_without_successor():
+    mgr, _ = _make_synced_manager()
+    mgr.register_timeline(_seq_timeline("A", "guid-a", "clip-a"))
+    mgr.register_timeline(_seq_timeline("B", "guid-b", "clip-b"))
+    # First registered becomes active.
+    assert mgr.active_timeline_guid == "guid-a"
+
+    # Removing a non-active timeline leaves active unchanged.
+    mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "guid-b"},
+    ))
+    assert mgr.active_timeline_guid == "guid-a"
+
+    # Removing the active timeline clears it to None (no successor named).
+    mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "guid-a"},
+    ))
+    assert mgr.active_timeline_guid is None
+
+
+def test_remove_unknown_timeline_is_noop():
+    mgr, _ = _make_synced_manager()
+    mgr.register_timeline(_seq_timeline("A", "guid-a", "clip-a"))
+    before = dict(mgr._object_map)
+
+    res = mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "nope"},
+    ))
+    assert res is None
+    assert mgr._object_map == before
+    assert "guid-a" in mgr._timelines
+
+
+def test_remove_timeline_returns_host_action_with_timeline():
+    mgr, _ = _make_synced_manager()
+    tl = _seq_timeline("A", "guid-a", "clip-a")
+    mgr.register_timeline(tl)
+
+    res = mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REMOVE_TIMELINE", {"timeline_guid": "guid-a"},
+    ))
+    assert res == ("remove_timeline", tl)
+
+
+def test_broadcast_remove_timeline_envelope_and_local_teardown():
+    mgr, net = _make_synced_manager()
+    mgr.register_timeline(_seq_timeline("A", "guid-a", "clip-a"))
+
+    mgr.broadcast_remove_timeline("guid-a")
+
+    # Local state torn down.
+    assert "guid-a" not in mgr._timelines
+    # Exactly one REMOVE_TIMELINE envelope on the wire, JSON-safe.
+    assert len(net.sent) == 1
+    env = net.sent[0]
+    assert env["payload"]["command_schema"] == "TIMELINE_1.0"
+    assert env["payload"]["command"]["event"] == "REMOVE_TIMELINE"
+    assert env["payload"]["command"]["payload"]["timeline_guid"] == "guid-a"
+    json.dumps(env)
+
+
+def test_broadcast_remove_unknown_timeline_sends_nothing():
+    mgr, net = _make_synced_manager()
+    mgr.broadcast_remove_timeline("nope")
+    assert net.sent == []
+
+
+def test_two_peer_add_two_remove_one():
+    """End-to-end: master adds two sequences then removes one; the peer drops
+    only that timeline and the survivor remains active on the master."""
+    m_net, p_net = FakeNetwork(), FakeNetwork()
+    master = SyncManager(session_id="s", self_guid="master", network=m_net)
+    peer = SyncManager(session_id="s", self_guid="peer", network=p_net)
+    master.status = peer.status = STATE_SYNCED
+
+    def deliver(src_net, dst):
+        for env in src_net.sent:
+            dst.apply_patch(env)
+        src_net.sent.clear()
+
+    master.register_timeline(_seq_timeline("A", "guid-a", "clip-a"))
+    master.register_timeline(_seq_timeline("B", "guid-b", "clip-b"))
+    master.broadcast_add_timeline("guid-a")
+    master.broadcast_add_timeline("guid-b")
+    deliver(m_net, peer)
+    assert {"guid-a", "guid-b"} <= set(peer._timelines)
+
+    # Remove the non-active timeline on the master.
+    master.broadcast_remove_timeline("guid-b")
+    assert "guid-b" not in master._timelines
+    assert master.active_timeline_guid == "guid-a"  # survivor stays active
+
+    deliver(m_net, peer)
+    assert "guid-b" not in peer._timelines
+    assert "guid-a" in peer._timelines

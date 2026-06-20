@@ -229,7 +229,7 @@
 </head>
 <body>
     <div class="container">
-        <nav class="sidebar"><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Selection</h2><ul><li><a href="#selection-set">SelectionSet</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul></nav>
+        <nav class="sidebar"><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Selection</h2><ul><li><a href="#selection-set">SelectionSet</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#remove-timeline">RemoveTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul></nav>
         <main class="content"><div class="section"><div class="intro-content"><h1>OTIO Sync Protocol</h1>
 <p>This project synchronises live review sessions (playback, selection, and
 annotations) between hosts such as OpenRV and xStudio. It is built on two
@@ -426,9 +426,13 @@ transport messages when annotation data needs to travel between peers.</p>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.AnnotationEffect(name=<span class="py-string">'Annotation'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, commands=[])</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.AnnotationEffect(
+    name=<span class="py-string">"Annotation"</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, commands=[]
+)
+</pre>
                     </div>
                 </div>
                 <div id="annotation-effect-with_stroke_python" class="example-content">
@@ -436,9 +440,30 @@ event = otio.schema.schemadef.AnnotationEffect(name=<span class="py-string">'Ann
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.AnnotationEffect(name=<span class="py-string">'Review Annotations'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, commands=[otio.schema.schemadef.PaintStart(uuid=<span class="py-string">'paint_stroke_uuid_001'</span>, friendly_name=<span class="py-string">'Director'</span>, participant_hash=<span class="py-string">'d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'color'</span>, brush=<span class="py-string">'circle'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, hold=<span class=<span class="py-string">"py-keyword"</span>>False</span>, ghost=<span class=<span class="py-string">"py-keyword"</span>>True</span>, ghost_before=<span class="py-number">3</span>, ghost_after=<span class="py-number">3</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)])</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.AnnotationEffect(
+    name=<span class="py-string">"Review Annotations"</span>,
+    visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    commands=[
+        otio.schema.schemadef.PaintStart(
+            uuid=<span class="py-string">"paint_stroke_uuid_001"</span>,
+            friendly_name=<span class="py-string">"Director"</span>,
+            participant_hash=<span class="py-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+            rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+            type=<span class="py-string">"color"</span>,
+            brush=<span class="py-string">"circle"</span>,
+            visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+            hold=<span class=<span class="py-string">"py-keyword"</span>>False</span>,
+            ghost=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+            ghost_before=<span class="py-number">3</span>,
+            ghost_after=<span class="py-number">3</span>,
+            timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z"</span>,
+        )
+    ],
+)
+</pre>
                     </div>
                 </div></div>
         <div id="paint-start" class="section">
@@ -529,14 +554,112 @@ event = otio.schema.schemadef.AnnotationEffect(name=<span class="py-string">'Rev
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-start"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-start', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker')">Red Marker</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'red_marker_python')">Red Marker (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser')">Eraser</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-start', 'eraser_python')">Eraser (Python)</button></div>
+                <div id="paint-start-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Patrick Chevalier"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-number">3</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-number">3</span>,
+  <span class="json-key">"hold"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
                 <div id="paint-start-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'paint_stroke_uuid_001'</span>, friendly_name=<span class="py-string">'Patrick Chevalier'</span>, participant_hash=<span class="py-string">'d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'color'</span>, brush=<span class="py-string">'circle'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">0.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), hold=<span class=<span class="py-string">"py-keyword"</span>>False</span>, ghost=<span class=<span class="py-string">"py-keyword"</span>>True</span>, ghost_before=<span class="py-number">3</span>, ghost_after=<span class="py-number">3</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=<span class="py-number">0</span>,
+    uuid=<span class="py-string">"paint_stroke_uuid_001"</span>,
+    friendly_name=<span class="py-string">"Patrick Chevalier"</span>,
+    participant_hash=<span class="py-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    type=<span class="py-string">"color"</span>,
+    brush=<span class="py-string">"circle"</span>,
+    visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=<span class="py-number">0.0</span>, rate=<span class="py-number">24.0</span>),
+        duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>),
+    ),
+    hold=<span class=<span class="py-string">"py-keyword"</span>>False</span>,
+    ghost=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    ghost_before=<span class="py-number">3</span>,
+    ghost_after=<span class="py-number">3</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-start-red_marker" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"gaussian"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Jane Doe"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"hold"</span>: <span class="json-boolean">true</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">5.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"abc123def456ghi789"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">30</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_002"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
                     </div>
                 </div>
                 <div id="paint-start-red_marker_python" class="example-content">
@@ -544,9 +667,66 @@ event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0<
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'paint_stroke_uuid_002'</span>, friendly_name=<span class="py-string">'Jane Doe'</span>, participant_hash=<span class="py-string">'abc123def456ghi789'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'color'</span>, brush=<span class="py-string">'gaussian'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">5.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), hold=<span class=<span class="py-string">"py-keyword"</span>>True</span>, ghost=<span class=<span class="py-string">"py-keyword"</span>>False</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">30</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=<span class="py-number">0</span>,
+    uuid=<span class="py-string">"paint_stroke_uuid_002"</span>,
+    friendly_name=<span class="py-string">"Jane Doe"</span>,
+    participant_hash=<span class="py-string">"abc123def456ghi789"</span>,
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    type=<span class="py-string">"color"</span>,
+    brush=<span class="py-string">"gaussian"</span>,
+    visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=<span class="py-number">5.0</span>, rate=<span class="py-number">24.0</span>),
+        duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>),
+    ),
+    hold=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    ghost=<span class=<span class="py-string">"py-keyword"</span>>False</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">30</span>Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-start-eraser" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
+  <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"John Smith"</span>,
+  <span class="json-key">"ghost"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_after"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"ghost_before"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"hold"</span>: <span class="json-null">null</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">10.0</span>
+    }
+  },
+  <span class="json-key">"participant_hash"</span>: <span class="json-string">"xyz789abc123"</span>,
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"type"</span>: <span class="json-string">"erase"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"eraser_stroke_uuid_003"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
                     </div>
                 </div>
                 <div id="paint-start-eraser_python" class="example-content">
@@ -554,9 +734,25 @@ event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0<
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintStart(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'eraser_stroke_uuid_003'</span>, friendly_name=<span class="py-string">'John Smith'</span>, participant_hash=<span class="py-string">'xyz789abc123'</span>, rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>], type=<span class="py-string">'erase'</span>, brush=<span class="py-string">'circle'</span>, visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">10.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">15</span>:<span class="py-number">00</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintStart(
+    source_index=<span class="py-number">0</span>,
+    uuid=<span class="py-string">"eraser_stroke_uuid_003"</span>,
+    friendly_name=<span class="py-string">"John Smith"</span>,
+    participant_hash=<span class="py-string">"xyz789abc123"</span>,
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>],
+    type=<span class="py-string">"erase"</span>,
+    brush=<span class="py-string">"circle"</span>,
+    visible=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=<span class="py-number">10.0</span>, rate=<span class="py-number">24.0</span>),
+        duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>),
+    ),
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">15</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="paint-vertices" class="section">
@@ -583,14 +779,76 @@ Grouping paint vertices together to form a stroke, and be a little more efficien
                         <td><span class="type-badge">list</span></td>
                         <td>The sizes of the paint stroke</td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-vertices"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertices', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertices', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertices', 'large_stroke')">Large Stroke</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertices', 'large_stroke_python')">Large Stroke (Python)</button></div>
+                <div id="paint-vertices-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+  <span class="json-key">"size"</span>: [
+    0.009,
+    0.009,
+    0.009,
+    0.009
+  ],
+  <span class="json-key">"x"</span>: [
+    0.0,
+    0.1,
+    0.2,
+    0.3
+  ],
+  <span class="json-key">"y"</span>: [
+    0.0,
+    0.05,
+    0.0,
+    -0.05
+  ]
+}</pre>
+                    </div>
+                </div>
                 <div id="paint-vertices-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.05</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.05</span>], size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>])</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintVertices(
+    x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.05</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.05</span>], size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>]
+)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-vertices-large_stroke" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+  <span class="json-key">"size"</span>: [
+    0.012,
+    0.011,
+    0.01,
+    0.01,
+    0.011,
+    0.012
+  ],
+  <span class="json-key">"x"</span>: [
+    0.0,
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1.0
+  ],
+  <span class="json-key">"y"</span>: [
+    0.0,
+    0.1,
+    0.2,
+    0.1,
+    0.0,
+    -0.1
+  ]
+}</pre>
                     </div>
                 </div>
                 <div id="paint-vertices-large_stroke_python" class="example-content">
@@ -598,9 +856,15 @@ event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span>, <span class="py-number">0.2</span>, <span class="py-number">0.4</span>, <span class="py-number">0.6</span>, <span class="py-number">0.8</span>, <span class="py-number">1.0</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>], size=[<span class="py-number">0.012</span>, <span class="py-number">0.011</span>, <span class="py-number">0.01</span>, <span class="py-number">0.01</span>, <span class="py-number">0.011</span>, <span class="py-number">0.012</span>])</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintVertices(
+    x=[<span class="py-number">0.0</span>, <span class="py-number">0.2</span>, <span class="py-number">0.4</span>, <span class="py-number">0.6</span>, <span class="py-number">0.8</span>, <span class="py-number">1.0</span>],
+    y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>],
+    size=[<span class="py-number">0.012</span>, <span class="py-number">0.011</span>, <span class="py-number">0.01</span>, <span class="py-number">0.01</span>, <span class="py-number">0.011</span>, <span class="py-number">0.012</span>],
+)
+</pre>
                     </div>
                 </div></div>
         <div id="paint-vertex" class="section">
@@ -626,14 +890,38 @@ event = otio.schema.schemadef.PaintVertices(x=[<span class="py-number">0.0</span
                         <td><span class="type-badge">float</span></td>
                         <td>The size of the point vertex</td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-paint-vertex"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertex', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-vertex', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertex', 'eraser_vertex')">Eraser Vertex</button><button class="example-tab " onclick="switchExampleTab(event, 'paint-vertex', 'eraser_vertex_python')">Eraser Vertex (Python)</button></div>
+                <div id="paint-vertex-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertex.1"</span>,
+  <span class="json-key">"size"</span>: <span class="json-number">0.009</span>,
+  <span class="json-key">"x"</span>: <span class="json-number">0.15</span>,
+  <span class="json-key">"y"</span>: <span class="json-number">-0.08</span>
+}</pre>
+                    </div>
+                </div>
                 <div id="paint-vertex-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">0.15</span>, y=<span class="py-number">-0.08</span>, size=<span class="py-number">0.009</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">0.15</span>, y=<span class="py-number">-0.08</span>, size=<span class="py-number">0.009</span>)
+</pre>
+                    </div>
+                </div>
+                <div id="paint-vertex-eraser_vertex" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertex.1"</span>,
+  <span class="json-key">"size"</span>: <span class="json-number">0.015</span>,
+  <span class="json-key">"x"</span>: <span class="json-number">-0.25</span>,
+  <span class="json-key">"y"</span>: <span class="json-number">0.1</span>
+}</pre>
                     </div>
                 </div>
                 <div id="paint-vertex-eraser_vertex_python" class="example-content">
@@ -641,9 +929,11 @@ event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">0.15</span>,
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">-0.25</span>, y=<span class="py-number">0.1</span>, size=<span class="py-number">0.015</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintVertex(x=<span class="py-number">-0.25</span>, y=<span class="py-number">0.1</span>, size=<span class="py-number">0.015</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="paint-points" class="section">
@@ -686,14 +976,77 @@ Attribute:
                         <td><span class="type-badge">str</span></td>
                         <td>timestamp is an ISO 8601 formatted string representing the time of the change.</td>
                     </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-paint-points"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-points', 'default_python')">Default (Python)</button></div>
+                <div id="paint-points-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintPoint.1"</span>,
+  <span class="json-key">"layer_range"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TimeRange.1"</span>,
+    <span class="json-key">"duration"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">1.0</span>
+    },
+    <span class="json-key">"start_time"</span>: {
+      <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RationalTime.1"</span>,
+      <span class="json-key">"rate"</span>: <span class="json-number">24.0</span>,
+      <span class="json-key">"value"</span>: <span class="json-number">0.0</span>
+    }
+  },
+  <span class="json-key">"points"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+    <span class="json-key">"size"</span>: [
+      0.009,
+      0.009,
+      0.009,
+      0.009,
+      0.009
+    ],
+    <span class="json-key">"x"</span>: [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4
+    ],
+    <span class="json-key">"y"</span>: [
+      0.0,
+      0.1,
+      0.0,
+      0.0,
+      -0.1
+    ]
+  },
+  <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00.500</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
                 <div id="paint-points-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintPoints(source_index=<span class="py-number">0</span>, uuid=<span class="py-string">'paint_stroke_uuid_001'</span>, layer_range=otio.opentime.TimeRange(start_time=otio.opentime.RationalTime(value=<span class="py-number">0.0</span>, rate=<span class="py-number">24.0</span>), duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>)), points=otio.schema.schemadef.PaintVertices(size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>], x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>, <span class="py-number">0.4</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>]), timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00.500</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintPoints(
+    source_index=<span class="py-number">0</span>,
+    uuid=<span class="py-string">"paint_stroke_uuid_001"</span>,
+    layer_range=otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(value=<span class="py-number">0.0</span>, rate=<span class="py-number">24.0</span>),
+        duration=otio.opentime.RationalTime(value=<span class="py-number">1.0</span>, rate=<span class="py-number">24.0</span>),
+    ),
+    points=otio.schema.schemadef.PaintVertices(
+        size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>],
+        x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>, <span class="py-number">0.4</span>],
+        y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>],
+    ),
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00.500</span>Z"</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="paint-end" class="section">
@@ -719,14 +1072,58 @@ event = otio.schema.schemadef.PaintPoints(source_index=<span class="py-number">0
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-paint-end"><button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'paint-end', 'default_python')">Default (Python)</button></div>
+                <div id="paint-end-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintEnd.1"</span>,
+  <span class="json-key">"points"</span>: {
+    <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+    <span class="json-key">"size"</span>: [
+      0.009,
+      0.009,
+      0.009,
+      0.009,
+      0.009
+    ],
+    <span class="json-key">"x"</span>: [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4
+    ],
+    <span class="json-key">"y"</span>: [
+      0.0,
+      0.1,
+      0.0,
+      0.0,
+      -0.1
+    ]
+  },
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">01</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"paint_stroke_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
                 <div id="paint-end-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.PaintEnd(uuid=<span class="py-string">'paint_stroke_uuid_001'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">01</span>Z'</span>, points=otio.schema.schemadef.PaintVertices(size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>], x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>, <span class="py-number">0.4</span>], y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>]))</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.PaintEnd(
+    uuid=<span class="py-string">"paint_stroke_uuid_001"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">01</span>Z"</span>,
+    points=otio.schema.schemadef.PaintVertices(
+        size=[<span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>, <span class="py-number">0.009</span>],
+        x=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.2</span>, <span class="py-number">0.3</span>, <span class="py-number">0.4</span>],
+        y=[<span class="py-number">0.0</span>, <span class="py-number">0.1</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">-0.1</span>],
+    ),
+)
+</pre>
                     </div>
                 </div></div>
         <div id="text-annotation" class="section">
@@ -792,14 +1189,82 @@ event = otio.schema.schemadef.PaintEnd(uuid=<span class="py-string">'paint_strok
                         <td><span class="type-badge">str</span></td>
                         <td></td>
                     </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-text-annotation"><button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'text-annotation', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note')">Approval Note</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'approval_note_python')">Approval Note (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note')">Rotated Note</button><button class="example-tab " onclick="switchExampleTab(event, 'text-annotation', 'rotated_note_python')">Rotated Note (Python)</button></div>
+                <div id="text-annotation-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Arial"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">24.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Director"</span>,
+  <span class="json-key">"position"</span>: [
+    5.5,
+    2.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.0</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.2</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Fix the lighting in this shot"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_001"</span>
+}</pre>
+                    </div>
+                </div>
                 <div id="text-annotation-default_python" class="example-content">
                     <div class="code-block">
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_annotation_uuid_001'</span>, friendly_name=<span class="py-string">'Director'</span>, position=[<span class="py-number">5.5</span>, <span class="py-number">2.0</span>], rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], text=<span class="py-string">'Fix the lighting <span class="py-keyword">in</span> this shot'</span>, spacing=<span class="py-number">1.2</span>, font_size=<span class="py-number">24.0</span>, scale=<span class="py-number">1.0</span>, rotation=<span class="py-number">0.0</span>, font=<span class="py-string">'Arial'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid=<span class="py-string">"text_annotation_uuid_001"</span>,
+    friendly_name=<span class="py-string">"Director"</span>,
+    position=[<span class="py-number">5.5</span>, <span class="py-number">2.0</span>],
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    text=<span class="py-string">"Fix the lighting <span class="</span>py-keyword<span class="py-string">">in</span> this shot"</span>,
+    spacing=<span class="py-number">1.2</span>,
+    font_size=<span class="py-number">24.0</span>,
+    scale=<span class="py-number">1.0</span>,
+    rotation=<span class="py-number">0.0</span>,
+    font=<span class="py-string">"Arial"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-approval_note" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Helvetica"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">36.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"Producer"</span>,
+  <span class="json-key">"position"</span>: [
+    -6.0,
+    -3.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    0.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">0.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.5</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.0</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Approved!"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">20</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_002"</span>
+}</pre>
                     </div>
                 </div>
                 <div id="text-annotation-approval_note_python" class="example-content">
@@ -807,9 +1272,50 @@ event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_annotation_uuid_002'</span>, friendly_name=<span class="py-string">'Producer'</span>, position=[<span class="py-number">-6.0</span>, <span class="py-number">-3.0</span>], rgba=[<span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], text=<span class="py-string">'Approved!'</span>, spacing=<span class="py-number">1.0</span>, font_size=<span class="py-number">36.0</span>, scale=<span class="py-number">1.5</span>, rotation=<span class="py-number">0.0</span>, font=<span class="py-string">'Helvetica'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">20</span>:<span class="py-number">00</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid=<span class="py-string">"text_annotation_uuid_002"</span>,
+    friendly_name=<span class="py-string">"Producer"</span>,
+    position=[<span class="py-number">-6.0</span>, <span class="py-number">-3.0</span>],
+    rgba=[<span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    text=<span class="py-string">"Approved!"</span>,
+    spacing=<span class="py-number">1.0</span>,
+    font_size=<span class="py-number">36.0</span>,
+    scale=<span class="py-number">1.5</span>,
+    rotation=<span class="py-number">0.0</span>,
+    font=<span class="py-string">"Helvetica"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">20</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="text-annotation-rotated_note" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"TextAnnotation.1"</span>,
+  <span class="json-key">"font"</span>: <span class="json-string">"Impact"</span>,
+  <span class="json-key">"font_size"</span>: <span class="json-number">28.0</span>,
+  <span class="json-key">"friendly_name"</span>: <span class="json-string">"VFX Supervisor"</span>,
+  <span class="json-key">"position"</span>: [
+    0.0,
+    0.0
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"rotation"</span>: <span class="json-number">15.0</span>,
+  <span class="json-key">"scale"</span>: <span class="json-number">1.2</span>,
+  <span class="json-key">"spacing"</span>: <span class="json-number">1.1</span>,
+  <span class="json-key">"text"</span>: <span class="json-string">"Add more explosion here"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">18</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"text_annotation_uuid_003"</span>
+}</pre>
                     </div>
                 </div>
                 <div id="text-annotation-rotated_note_python" class="example-content">
@@ -817,9 +1323,23 @@ event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                         <pre><span class="py-comment"># OTIO SyncEvent (serialized <span class=<span class="py-string">"py-keyword"</span>>as</span> OpenTimelineIO object)</span>
 <span class=<span class="py-string">"py-keyword"</span>>import</span> opentimelineio <span class=<span class="py-string">"py-keyword"</span>>as</span> otio
-SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">'SyncEvent'</span>)
 
-event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_annotation_uuid_003'</span>, friendly_name=<span class="py-string">'VFX Supervisor'</span>, position=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>], rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>], text=<span class="py-string">'Add more explosion here'</span>, spacing=<span class="py-number">1.1</span>, font_size=<span class="py-number">28.0</span>, scale=<span class="py-number">1.2</span>, rotation=<span class="py-number">15.0</span>, font=<span class="py-string">'Impact'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">18</span>:<span class="py-number">00</span>Z'</span>)</pre>
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.TextAnnotation(
+    uuid=<span class="py-string">"text_annotation_uuid_003"</span>,
+    friendly_name=<span class="py-string">"VFX Supervisor"</span>,
+    position=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>],
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    text=<span class="py-string">"Add more explosion here"</span>,
+    spacing=<span class="py-number">1.1</span>,
+    font_size=<span class="py-number">28.0</span>,
+    scale=<span class="py-number">1.2</span>,
+    rotation=<span class="py-number">15.0</span>,
+    font=<span class="py-string">"Impact"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">18</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="partial-annotation" class="section">
@@ -872,7 +1392,13 @@ event = otio.schema.schemadef.TextAnnotation(uuid=<span class="py-string">'text_
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> PartialAnnotation
 
-msg = PartialAnnotation(clip_guid=<span class="py-string">'clip-guid-<span class="py-number">001</span>'</span>, frame=<span class="py-number">12.0</span>, fps=<span class="py-number">24.0</span>, events=[{<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'PaintStart.1'</span>, <span class="py-string">'uuid'</span>: <span class="py-string">'stroke-<span class="py-number">001</span>'</span>}])</pre>
+msg = PartialAnnotation(
+    clip_guid=<span class="py-string">"clip-guid-<span class="py-number">001</span>"</span>,
+    frame=<span class="py-number">12.0</span>,
+    fps=<span class="py-number">24.0</span>,
+    events=[{<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"PaintStart.1"</span>, <span class="py-string">"uuid"</span>: <span class="py-string">"stroke-<span class="py-number">001</span>"</span>}],
+)
+</pre>
                     </div>
                 </div></div>
         <div id="insert-child" class="section">
@@ -923,7 +1449,13 @@ msg = PartialAnnotation(clip_guid=<span class="py-string">'clip-guid-<span class
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> InsertChild
 
-msg = InsertChild(parent_uuid=<span class="py-string">'track-guid-<span class="py-number">001</span>'</span>, index=<span class="py-number">-1</span>, child_data={<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'Clip.1'</span>, <span class="py-string">'name'</span>: <span class="py-string">'New Clip'</span>}, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = InsertChild(
+    parent_uuid=<span class="py-string">"track-guid-<span class="py-number">001</span>"</span>,
+    index=<span class="py-number">-1</span>,
+    child_data={<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"Clip.1"</span>, <span class="py-string">"name"</span>: <span class="py-string">"New Clip"</span>},
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="move-child" class="section">
@@ -971,7 +1503,13 @@ msg = InsertChild(parent_uuid=<span class="py-string">'track-guid-<span class="p
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> MoveChild
 
-msg = MoveChild(parent_uuid=<span class="py-string">'track-guid-<span class="py-number">001</span>'</span>, child_uuid=<span class="py-string">'clip-guid-<span class="py-number">001</span>'</span>, to_index=<span class="py-number">2</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = MoveChild(
+    parent_uuid=<span class="py-string">"track-guid-<span class="py-number">001</span>"</span>,
+    child_uuid=<span class="py-string">"clip-guid-<span class="py-number">001</span>"</span>,
+    to_index=<span class="py-number">2</span>,
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="remove-child" class="section">
@@ -1013,7 +1551,12 @@ msg = MoveChild(parent_uuid=<span class="py-string">'track-guid-<span class="py-
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> RemoveChild
 
-msg = RemoveChild(parent_uuid=<span class="py-string">'track-guid-<span class="py-number">001</span>'</span>, child_uuid=<span class="py-string">'clip-guid-<span class="py-number">001</span>'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = RemoveChild(
+    parent_uuid=<span class="py-string">"track-guid-<span class="py-number">001</span>"</span>,
+    child_uuid=<span class="py-string">"clip-guid-<span class="py-number">001</span>"</span>,
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="replace-annotation-commands" class="section">
@@ -1060,7 +1603,12 @@ msg = RemoveChild(parent_uuid=<span class="py-string">'track-guid-<span class="p
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> ReplaceAnnotationCommands
 
-msg = ReplaceAnnotationCommands(annotation_clip_guid=<span class="py-string">'ann-clip-<span class="py-number">001</span>'</span>, commands=[{<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'TextAnnotation.1'</span>, <span class="py-string">'text'</span>: <span class="py-string">'Fix lighting'</span>}], sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = ReplaceAnnotationCommands(
+    annotation_clip_guid=<span class="py-string">"ann-clip-<span class="py-number">001</span>"</span>,
+    commands=[{<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"TextAnnotation.1"</span>, <span class="py-string">"text"</span>: <span class="py-string">"Fix lighting"</span>}],
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="set-property" class="section">
@@ -1108,7 +1656,13 @@ msg = ReplaceAnnotationCommands(annotation_clip_guid=<span class="py-string">'an
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> SetProperty
 
-msg = SetProperty(target_uuid=<span class="py-string">'obj-guid-<span class="py-number">001</span>'</span>, path=<span class="py-string">'name'</span>, value=<span class="py-string">'Renamed Clip'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = SetProperty(
+    target_uuid=<span class="py-string">"obj-guid-<span class="py-number">001</span>"</span>,
+    path=<span class="py-string">"name"</span>,
+    value=<span class="py-string">"Renamed Clip"</span>,
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="selection-set" class="section">
@@ -1150,7 +1704,10 @@ msg = SetProperty(target_uuid=<span class="py-string">'obj-guid-<span class="py-
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> SelectionSet
 
-msg = SelectionSet(clip_guid=<span class="py-string">'clip-guid-<span class="py-number">001</span>'</span>, view_mode=<span class="py-string">'sequence'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = SelectionSet(
+    clip_guid=<span class="py-string">"clip-guid-<span class="py-number">001</span>"</span>, view_mode=<span class="py-string">"sequence"</span>, sync_timestamp=<span class="py-number">1738339200.0</span>
+)
+</pre>
                     </div>
                 </div></div>
         <div id="i-am-master" class="section">
@@ -1180,7 +1737,8 @@ msg = SelectionSet(clip_guid=<span class="py-string">'clip-guid-<span class="py-
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> IAmMaster
 
-msg = IAmMaster(master_guid=<span class="py-string">'peer-master-<span class="py-number">001</span>'</span>)</pre>
+msg = IAmMaster(master_guid=<span class="py-string">"peer-master-<span class="py-number">001</span>"</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="new-participant" class="section">
@@ -1201,7 +1759,8 @@ msg = IAmMaster(master_guid=<span class="py-string">'peer-master-<span class="py
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> NewParticipant
 
-msg = NewParticipant(timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">05</span>Z'</span>)</pre>
+msg = NewParticipant(timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">05</span>Z"</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="new-presenter" class="section">
@@ -1232,7 +1791,11 @@ msg = NewParticipant(timestamp=<span class="py-string">'<span class="py-number">
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> NewPresenter
 
-msg = NewPresenter(presenter_hash=<span class="py-string">'d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
+msg = NewPresenter(
+    presenter_hash=<span class="py-string">"d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="shared-key-request" class="section">
@@ -1263,7 +1826,11 @@ msg = NewPresenter(presenter_hash=<span class="py-string">'d3447b5cb61b41de73a2d
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> SharedKeyRequest
 
-msg = SharedKeyRequest(key=<span class="py-string">'-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...\n-----END PUBLIC KEY-----'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z'</span>)</pre>
+msg = SharedKeyRequest(
+    key=<span class="py-string">"-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...\n-----END PUBLIC KEY-----"</span>,
+    timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">00</span>Z"</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="shared-key-response" class="section">
@@ -1294,7 +1861,10 @@ msg = SharedKeyRequest(key=<span class="py-string">'-----BEGIN PUBLIC KEY-----\n
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> SharedKeyResponse
 
-msg = SharedKeyResponse(key=<span class="py-string">'encrypted_shared_key_base64_encoded_string'</span>, timestamp=<span class="py-string">'<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">01</span>Z'</span>)</pre>
+msg = SharedKeyResponse(
+    key=<span class="py-string">"encrypted_shared_key_base64_encoded_string"</span>, timestamp=<span class="py-string">"<span class="py-number">2025</span>-<span class="py-number">01</span>-<span class="py-number">31</span>T16:<span class="py-number">14</span>:<span class="py-number">01</span>Z"</span>
+)
+</pre>
                     </div>
                 </div></div>
         <div id="state-request" class="section">
@@ -1330,7 +1900,8 @@ msg = SharedKeyResponse(key=<span class="py-string">'encrypted_shared_key_base64
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> StateRequest
 
-msg = StateRequest(target_guid=<span class="py-string">'peer-master-<span class="py-number">001</span>'</span>, requester_guid=<span class="py-string">'peer-abc123'</span>)</pre>
+msg = StateRequest(target_guid=<span class="py-string">"peer-master-<span class="py-number">001</span>"</span>, requester_guid=<span class="py-string">"peer-abc123"</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="state-snapshot" class="section">
@@ -1393,7 +1964,13 @@ msg = StateRequest(target_guid=<span class="py-string">'peer-master-<span class=
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> StateSnapshot
 
-msg = StateSnapshot(target_guid=<span class="py-string">'peer-abc123'</span>, timelines={<span class="py-string">'tl-guid-<span class="py-number">1</span>'</span>: {<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'Timeline.1'</span>, <span class="py-string">'name'</span>: <span class="py-string">'Sequence <span class="py-number">1</span>'</span>}}, active_timeline_guid=<span class="py-string">'tl-guid-<span class="py-number">1</span>'</span>, snapshot_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = StateSnapshot(
+    target_guid=<span class="py-string">"peer-abc123"</span>,
+    timelines={<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>: {<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"Timeline.1"</span>, <span class="py-string">"name"</span>: <span class="py-string">"Sequence <span class="py-number">1</span>"</span>}},
+    active_timeline_guid=<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>,
+    snapshot_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="who-is-master" class="section">
@@ -1423,7 +2000,8 @@ msg = StateSnapshot(target_guid=<span class="py-string">'peer-abc123'</span>, ti
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> WhoIsMaster
 
-msg = WhoIsMaster(requester_guid=<span class="py-string">'peer-abc123'</span>)</pre>
+msg = WhoIsMaster(requester_guid=<span class="py-string">"peer-abc123"</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="display-settings-set" class="section">
@@ -1480,7 +2058,10 @@ msg = WhoIsMaster(requester_guid=<span class="py-string">'peer-abc123'</span>)</
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> DisplaySettingsSet
 
-msg = DisplaySettingsSet(pan=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>], zoom=<span class="py-number">1.0</span>, exposure=<span class="py-number">0.5</span>, channel=<span class="py-string">'RGBA'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = DisplaySettingsSet(
+    pan=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>], zoom=<span class="py-number">1.0</span>, exposure=<span class="py-number">0.5</span>, channel=<span class="py-string">"RGBA"</span>, sync_timestamp=<span class="py-number">1738339200.0</span>
+)
+</pre>
                     </div>
                 </div></div>
         <div id="playback-settings-set" class="section">
@@ -1538,7 +2119,14 @@ msg = DisplaySettingsSet(pan=[<span class="py-number">0.0</span>, <span class="p
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> PlaybackSettingsSet
 
-msg = PlaybackSettingsSet(playing=<span class=<span class="py-string">"py-keyword"</span>>True</span>, current_time={<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'RationalTime.1'</span>, <span class="py-string">'value'</span>: <span class="py-number">48.0</span>, <span class="py-string">'rate'</span>: <span class="py-number">24.0</span>}, looping=<span class=<span class="py-string">"py-keyword"</span>>False</span>, timeline_guid=<span class="py-string">'tl-guid-<span class="py-number">1</span>'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = PlaybackSettingsSet(
+    playing=<span class=<span class="py-string">"py-keyword"</span>>True</span>,
+    current_time={<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"RationalTime.1"</span>, <span class="py-string">"value"</span>: <span class="py-number">48.0</span>, <span class="py-string">"rate"</span>: <span class="py-number">24.0</span>},
+    looping=<span class=<span class="py-string">"py-keyword"</span>>False</span>,
+    timeline_guid=<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>,
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
                     </div>
                 </div></div>
         <div id="add-timeline" class="section">
@@ -1583,7 +2171,49 @@ msg = PlaybackSettingsSet(playing=<span class=<span class="py-string">"py-keywor
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> AddTimeline
 
-msg = AddTimeline(timeline_guid=<span class="py-string">'tl-guid-<span class="py-number">1</span>'</span>, timeline={<span class="py-string">'OTIO_SCHEMA'</span>: <span class="py-string">'Timeline.1'</span>, <span class="py-string">'name'</span>: <span class="py-string">'Sequence <span class="py-number">1</span>'</span>}, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = AddTimeline(
+    timeline_guid=<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>,
+    timeline={<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"Timeline.1"</span>, <span class="py-string">"name"</span>: <span class="py-string">"Sequence <span class="py-number">1</span>"</span>},
+    sync_timestamp=<span class="py-number">1738339200.0</span>,
+)
+</pre>
+                    </div>
+                </div></div>
+        <div id="remove-timeline" class="section">
+            <h2>RemoveTimeline</h2>
+            <span class="schema-label">TIMELINE_1.0</span><span class="event-label">event: REMOVE_TIMELINE</span>
+            <div class="description">Removes an existing timeline from all peers.</div>
+            <h3>Parameters</h3>
+            <table class="params-table">
+                <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td><code>timeline_guid</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>GUID of the timeline to remove.</td>
+                    </tr>
+                    <tr>
+                        <td><code>sync_timestamp</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">'float | None'</span></td>
+                        <td>Epoch seconds when the message was sent.</td>
+                    </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-remove-timeline"><button class="example-tab active" onclick="switchExampleTab(event, 'remove-timeline', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'remove-timeline', 'default_python')">Default (Python)</button></div>
+                <div id="remove-timeline-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"timeline_guid"</span>: <span class="json-string">"tl-guid-1"</span>,
+  <span class="json-key">"sync_timestamp"</span>: <span class="json-number">1738339200.0</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="remove-timeline-default_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># Protocol Message (transport layer)</span>
+<span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> RemoveTimeline
+
+msg = RemoveTimeline(timeline_guid=<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)
+</pre>
                     </div>
                 </div></div>
         <div id="rename-timeline" class="section">
@@ -1625,7 +2255,10 @@ msg = AddTimeline(timeline_guid=<span class="py-string">'tl-guid-<span class="py
                         <pre><span class="py-comment"># Protocol Message (transport layer)</span>
 <span class=<span class="py-string">"py-keyword"</span>>from</span> otio_sync_core.protocol_messages <span class=<span class="py-string">"py-keyword"</span>>import</span> RenameTimeline
 
-msg = RenameTimeline(timeline_guid=<span class="py-string">'tl-guid-<span class="py-number">1</span>'</span>, name=<span class="py-string">'Reel <span class="py-number">2</span> — Director Cut'</span>, sync_timestamp=<span class="py-number">1738339200.0</span>)</pre>
+msg = RenameTimeline(
+    timeline_guid=<span class="py-string">"tl-guid-<span class="py-number">1</span>"</span>, name=<span class="py-string">"Reel <span class="py-number">2</span> — Director Cut"</span>, sync_timestamp=<span class="py-number">1738339200.0</span>
+)
+</pre>
                     </div>
                 </div></div></main>
     </div>

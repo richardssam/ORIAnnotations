@@ -105,3 +105,9 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
+  - name: "delete_timeline"
+    recording: "recordings/delete_timeline.jsonl"
+    script_driven: false
+    apps:
+      - "openrv"
+      - "xstudio"

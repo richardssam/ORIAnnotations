@@ -76,6 +76,12 @@ protocol_messages:
       name: "Reel 2 — Director Cut"
       sync_timestamp: 1738339200.0
 
+  RemoveTimeline:
+    _category: Timeline
+    default:
+      timeline_guid: "tl-guid-1"
+      sync_timestamp: 1738339200.0
+
   PlaybackSettingsSet:
     _category: Settings
     default:

@@ -422,6 +422,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 _log(f"ERROR in _check_sequence_reorders: {e}\n{traceback.format_exc()}")
             self.sequence._poll_new_sequences()
             self.sequence._poll_sequence_renames()
+            self.sequence._poll_deleted_sequences()
             self.display._broadcast_display_state()
 
     def _handle_action(self, action, data):
@@ -472,6 +473,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self._rv_updating = True
             try:
                 self.sequence._create_rv_sequence_for_timeline(data)
+            finally:
+                self._rv_updating = False
+        elif action == "remove_timeline":
+            self._rv_updating = True
+            try:
+                self.sequence._delete_rv_sequence_for_timeline(data)
             finally:
                 self._rv_updating = False
         elif action == "timeline_renamed":

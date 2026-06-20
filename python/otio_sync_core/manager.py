@@ -28,6 +28,7 @@ from .protocol_messages import (
     InsertChild,
     PartialAnnotation,
     PlaybackSettingsSet,
+    RemoveTimeline,
     RenameTimeline,
     ReplaceAnnotationCommands,
     SelectionSet,
@@ -176,6 +177,7 @@ class SyncManager:
             ("SELECTION_1.0", "SET"): self._h_selection_set,
             ("TIMELINE_1.0", "ADD_TIMELINE"): self._h_add_timeline,
             ("TIMELINE_1.0", "RENAME_TIMELINE"): self._h_rename_timeline,
+            ("TIMELINE_1.0", "REMOVE_TIMELINE"): self._h_remove_timeline,
             ("Annotation.1", "PARTIAL"): self._h_partial_annotation,
             ("OTIO_SESSION_1.0", "SET_PROPERTY"): self._h_otio_session,
             ("OTIO_SESSION_1.0", "INSERT_CHILD"): self._h_otio_session,
@@ -420,6 +422,31 @@ class SyncManager:
             )
         )
 
+    def broadcast_remove_timeline(self, tl_guid: str) -> None:
+        """Remove a timeline locally and broadcast the removal to all peers.
+
+        Symmetric to :meth:`broadcast_add_timeline`.  Performs the same
+        reference-aware teardown as the receive handler (single-timeline
+        object-map cleanup plus clip-annotation cascade), then sends a
+        ``REMOVE_TIMELINE`` message so all peers drop the timeline too.
+
+        Per the host ordering contract, callers should move the on-screen
+        source to a surviving timeline *before* calling this, so the removed
+        timeline is not the active one except when it is the last remaining.
+
+        :param tl_guid: GUID of the timeline to remove.
+        """
+        if not self.network or self.status != STATE_SYNCED:
+            return
+        if self._remove_timeline_local(tl_guid) is None:
+            return
+        self._send_message(
+            RemoveTimeline(
+                timeline_guid=tl_guid,
+                sync_timestamp=time.time(),
+            )
+        )
+
     def reset_timelines(self) -> None:
         """Clear all registered timelines, the object map, and the active GUID.
 
@@ -430,6 +457,89 @@ class SyncManager:
         self._object_map.clear()
         self._clip_timelines.clear()
         self.active_timeline_guid = None
+
+    @staticmethod
+    def _subtree_guids(item: otio.core.SerializableObject) -> set[str]:
+        """Return the sync GUIDs of *item* and every OTIO object beneath it.
+
+        Walks the same structure as :meth:`Patcher.traverse_and_map` so the
+        set matches exactly what was inserted into ``_object_map`` on register.
+
+        :param item: Root OTIO object to traverse.
+        :returns: Set of sync GUID strings found in the subtree.
+        """
+        def _walk(node: otio.core.SerializableObject):
+            yield node
+            if hasattr(node, "tracks"):
+                stack = node.tracks
+                yield stack
+                for child in stack:
+                    yield from _walk(child)
+            elif hasattr(node, "__iter__") and not isinstance(node, str):
+                for child in node:
+                    yield from _walk(child)
+
+        guids: set[str] = set()
+        for obj in _walk(item):
+            if not isinstance(obj, otio.core.SerializableObject):
+                continue
+            guid = obj.metadata.get("sync", {}).get("guid")
+            if guid:
+                guids.add(guid)
+        return guids
+
+    def _purge_timeline_state(self, tl_guid: str) -> None:
+        """Remove one timeline's own state without touching other timelines.
+
+        Removes only the GUIDs in this timeline's subtree from the shared
+        ``_object_map`` (never a clear-all), drops the ``_timelines`` entry, and
+        removes any ``_clip_timelines`` reverse entry pointing at it.
+
+        :param tl_guid: GUID of the timeline whose state to purge.
+        """
+        tl = self._timelines.get(tl_guid)
+        if tl is not None:
+            for guid in self._subtree_guids(tl):
+                self._object_map.pop(guid, None)
+        self._timelines.pop(tl_guid, None)
+        for clip_guid, ct_guid in list(self._clip_timelines.items()):
+            if ct_guid == tl_guid:
+                del self._clip_timelines[clip_guid]
+
+    def _remove_timeline_local(
+        self, tl_guid: str
+    ) -> "otio.schema.Timeline | None":
+        """Reference-aware teardown of a single timeline and its clip timelines.
+
+        Cascade-deletes the clip-annotation timelines owned by clips in this
+        timeline's subtree (per-clip-instance GUIDs, so no cross-sequence
+        sharing), purges each from ``_object_map``/``_timelines``/
+        ``_clip_timelines``, and clears ``active_timeline_guid`` to ``None`` if
+        it pointed at the removed timeline — never naming a successor, since the
+        active timeline is re-asserted by the next ``PlaybackSettingsSet``.
+
+        :param tl_guid: GUID of the timeline to remove.
+        :returns: The removed timeline, or ``None`` if the GUID was unknown.
+        """
+        tl = self._timelines.get(tl_guid)
+        if tl is None:
+            return None
+        subtree = self._subtree_guids(tl)
+        cascade = [
+            ct_guid
+            for clip_guid, ct_guid in self._clip_timelines.items()
+            if clip_guid in subtree
+        ]
+        for ct_guid in cascade:
+            self._purge_timeline_state(ct_guid)
+        self._purge_timeline_state(tl_guid)
+        if self.active_timeline_guid == tl_guid:
+            self.active_timeline_guid = None
+        _log(
+            f"remove_timeline: {tl_guid[:8]} "
+            f"(+{len(cascade)} clip timeline(s) cascaded)"
+        )
+        return tl
 
     @staticmethod
     def _derive_guid(key: str) -> str:
@@ -1354,6 +1464,15 @@ class SyncManager:
             tl.name = new_name
             _log(f"RENAME_TIMELINE: {tl_guid[:8]} → {new_name!r}")
         return ("timeline_renamed", data)
+
+    def _h_remove_timeline(
+        self, msg: RemoveTimeline, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        tl = self._remove_timeline_local(msg.timeline_guid)
+        if tl is None:
+            # Unknown / already-removed GUID — idempotent no-op.
+            return None
+        return ("remove_timeline", tl)
 
     def _h_partial_annotation(
         self, msg: PartialAnnotation, data: dict[str, Any], source: str

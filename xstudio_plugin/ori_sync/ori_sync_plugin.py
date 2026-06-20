@@ -635,6 +635,7 @@ class ORISyncPlugin(PluginBase):
                 if now - self.structure._last_structure_scan >= 1.0:
                     self.structure.poll_new_playlists()
                     self.structure.poll_playlist_renames()
+                    self.structure.poll_deleted_playlists()
                     self.structure._last_structure_scan = now
 
                 # 7. Deferred snapshot responses
@@ -674,6 +675,8 @@ class ORISyncPlugin(PluginBase):
                 self.playback.resolve_and_broadcast_selection()
             elif cmd == "sync_container":
                 self.structure.execute_sync_container(payload.get("tl_guid"))
+            elif cmd == "remove_timeline":
+                self.structure.delete_local_container(payload.get("tl_guid"))
         except Exception:
             _log_exc(f"Command {cmd!r} failed")
 
@@ -760,6 +763,15 @@ class ORISyncPlugin(PluginBase):
             # Both master and client create the local playlist/timeline so
             # any peer can receive new timelines regardless of master status.
             self._cmd_queue.put(("load_timelines", {}))
+
+        elif action == "remove_timeline":
+            # A sequence/playlist timeline was deleted on a remote peer.
+            # `data` is the removed OTIO timeline; tear down the local
+            # container on the poll thread via the command queue (the xStudio
+            # session mutation must not run on the network thread).
+            tl_guid = data.metadata.get("sync", {}).get("guid") if data is not None else None
+            if tl_guid:
+                self._cmd_queue.put(("remove_timeline", {"tl_guid": tl_guid}))
 
         elif action == "timeline_renamed":
             tl_guid = data.get("timeline_guid")
