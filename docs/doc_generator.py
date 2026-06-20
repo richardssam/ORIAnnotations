@@ -52,6 +52,7 @@ class SchemaClass:
     category: str
     source_type: str = "otio"   # "otio" | "protocol"
     event: str = ""             # protocol-only: event name
+    envelope_schema: str = ""   # protocol-only: legacy top-level "schema" key
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +305,7 @@ def collect_protocol_messages(protocol_config: Dict[str, Any]) -> List[SchemaCla
             category=category,
             source_type="protocol",
             event=event,
+            envelope_schema=getattr(cls, "ENVELOPE_SCHEMA", None) or "",
         ))
     schemas.sort(key=lambda s: (s.category, s.schema_label, s.event))
     return schemas
@@ -394,13 +396,41 @@ class ExampleGenerator:
 
     # --- Protocol examples ---
 
-    def generate_protocol_json_example(self, class_name: str, example_name: str = "default") -> Optional[str]:
-        """Generate protocol message JSON example from config params."""
+    def generate_protocol_json_example(
+        self,
+        class_name: str,
+        example_name: str = "default",
+        schema_label: str = "",
+        event: str = "",
+        envelope_schema: str = "",
+    ) -> Optional[str]:
+        """Generate a protocol message JSON example, wrapped in the wire envelope.
+
+        The config params are the message ``payload``; here they are nested inside
+        the same envelope the manager sends on the wire (``session`` /
+        ``source_guid`` / ``payload.command_schema`` / ``payload.command.event`` /
+        ``payload.command.payload``), so the docs show exactly what travels over
+        RabbitMQ rather than the bare payload.
+        """
         params = self._get_protocol_params(class_name, example_name)
         if params is None:
             return None
         try:
-            json_str = json.dumps(params, indent=2)
+            envelope: Dict[str, Any] = {
+                "session": "default_session",
+                "source_guid": "9bf2-4cd6-...-786d",
+                "payload": {
+                    "command_schema": schema_label,
+                    "command": {
+                        "event": event,
+                        "payload": params,
+                    },
+                },
+            }
+            # One message (I_AM_MASTER) also carries a legacy top-level "schema".
+            if envelope_schema:
+                envelope["schema"] = envelope_schema
+            json_str = json.dumps(envelope, indent=2)
             return self._format_json_with_highlighting(json_str)
         except Exception as e:
             print(f"Warning: Could not generate protocol JSON example for {class_name}: {e}")
@@ -493,13 +523,41 @@ class ExampleGenerator:
         highlighted = re.sub(r':\s*(null)', r': <span class="json-null">\1</span>', highlighted)
         return highlighted
 
+    _PY_KEYWORDS = {
+        "def", "class", "return", "if", "else", "elif", "for", "while", "import",
+        "from", "as", "with", "try", "except", "finally", "pass", "break",
+        "continue", "in", "is", "not", "and", "or", "lambda", "yield", "global",
+        "nonlocal", "assert", "del", "raise", "True", "False", "None",
+    }
+
+    # Single-pass tokenizer: comments / strings / numbers / words. Highlighting
+    # in one pass (instead of chained re.sub calls) prevents a later pass from
+    # matching the markup an earlier pass inserted — e.g. the string pass
+    # wrapping the "py-keyword" class attribute of a keyword span.
+    _PY_TOKEN_RE = re.compile(
+        r"(?P<comment>\#[^\n]*)"
+        r"|(?P<string>'[^']*'|\"[^\"]*\")"
+        r"|(?P<number>(?<![\w.])-?\d+\.?\d*)"
+        r"|(?P<word>\b\w+\b)"
+    )
+
     def _format_python_with_highlighting(self, code: str) -> str:
-        keywords = r"\b(def|class|return|if|else|elif|for|while|import|from|as|with|try|except|finally|pass|break|continue|in|is|not|and|or|lambda|yield|global|nonlocal|assert|del|raise|True|False|None)\b"
-        code = re.sub(keywords, r'<span class="py-keyword">\1</span>', code)
-        code = re.sub(r"(\'[^\']*\'|\"[^\"]*\")", r'<span class="py-string">\1</span>', code)
-        code = re.sub(r"(?<![\w.])(-?\d+\.?\d*)", r'<span class="py-number">\1</span>', code)
-        code = re.sub(r"(#.*)", r'<span class="py-comment">\1</span>', code)
-        return code
+        code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        def repl(m: "re.Match") -> str:
+            kind = m.lastgroup
+            text = m.group()
+            if kind == "comment":
+                return f'<span class="py-comment">{text}</span>'
+            if kind == "string":
+                return f'<span class="py-string">{text}</span>'
+            if kind == "number":
+                return f'<span class="py-number">{text}</span>'
+            if kind == "word" and text in self._PY_KEYWORDS:
+                return f'<span class="py-keyword">{text}</span>'
+            return text
+
+        return self._PY_TOKEN_RE.sub(repl, code)
 
     def _format_param_str(self, params: dict) -> str:
         """Format params dict as keyword arguments string (simple repr, no OTIO resolution)."""
@@ -922,7 +980,13 @@ class HTMLDocGenerator:
         for i, ex_name in enumerate(example_names):
             active = "active" if i == 0 else ""
             if schema.source_type == "protocol":
-                json_content = self.example_generator.generate_protocol_json_example(schema.name, ex_name)
+                json_content = self.example_generator.generate_protocol_json_example(
+                    schema.name,
+                    ex_name,
+                    schema_label=schema.schema_label,
+                    event=schema.event,
+                    envelope_schema=schema.envelope_schema,
+                )
                 py_content = self.example_generator.generate_protocol_python_example(schema.name, ex_name)
             else:
                 json_content = self.example_generator.generate_example(schema.name, ex_name)
