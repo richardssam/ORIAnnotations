@@ -1104,16 +1104,20 @@ class SyncManager:
     ) -> "str | None":
         """Build an annotation clip and insert it via the standard patch path.
 
-        Annotations are expressed as ``insert_child`` patches so that all peers
-        apply them through the same code path as any other timeline mutation.
+        Called on pen-up/debounce to permanently commit the completed stroke
+        or caption. Annotations are expressed as ``insert_child`` patches so
+        that all peers apply them through the same code path as any other
+        timeline mutation.
 
         The annotation track mirrors the structure produced by
         :meth:`ORIAnnotations.ReviewItem._export_otio_media`: each annotated
         frame is a 1-frame :class:`~opentimelineio.schema.Clip` and the gaps
         between annotated frames are :class:`~opentimelineio.schema.Gap` objects
-        whose duration is ``frame − track_end`` frames.  A second stroke on an
-        already-annotated frame merges its commands into the existing clip rather
-        than inserting a duplicate.
+        whose duration is ``frame − track_end`` frames.
+
+        If an annotation already exists at this frame, the new commands are
+        merged (appended) into the existing clip's metadata using a delta
+        clip sent via :class:`InsertChild` rather than inserting a duplicate clip.
 
         :param annotation_track_guid: GUID of the target Annotations track.
         :param clip_guid: GUID of the media clip being annotated.
@@ -1179,8 +1183,8 @@ class SyncManager:
     ) -> None:
         """Broadcast a mid-stroke partial annotation to peers (visual only, no timeline persistence).
 
-        Called periodically while the user is drawing a stroke, before pen-up.
-        Peers render the stroke visually but do **not** write it to the OTIO
+        Called periodically while the user is actively drawing a stroke, before pen-up.
+        Peers render the transient stroke visually but do **not** write it to the OTIO
         timeline — that happens on pen-up via :meth:`broadcast_add_annotation`.
 
         :param clip_guid: Sync GUID of the media clip being annotated.
@@ -1204,8 +1208,9 @@ class SyncManager:
     ) -> None:
         """Replace all annotation_commands on an existing clip and broadcast to peers.
 
-        Used when the user edits text in an annotation in place — the command
-        count stays the same but the text content changes.  Sends a
+        Used when the user edits or modifies an existing committed annotation in-place
+        (e.g., editing text/captions or dragging/moving them) where the command
+        list changes but the clip structure remains. Sends a
         ``REPLACE_ANNOTATION_COMMANDS`` message so peers replace the full
         command list rather than appending a delta.
 

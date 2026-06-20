@@ -651,8 +651,11 @@ class SelectionSet(ProtocolMessage):
 class PartialAnnotation(ProtocolMessage):
     """Mid-stroke partial annotation (visual preview, not persisted).
 
-    Hot path: fires repeatedly while a stroke is being drawn.  No validation or
-    reflective serialization is performed.
+    Hot path: fires repeatedly while a stroke is being drawn (before pen-up).
+    Peers render the transient stroke visually, but do not write it to the local
+    OTIO timeline. On pen-up/completion, a full stroke is committed via
+    :class:`InsertChild` instead. No validation or reflective serialization is
+    performed.
     """
 
     SCHEMA = "Annotation.1"
@@ -832,7 +835,12 @@ class RemoveChild(ProtocolMessage):
 @register
 @dataclass
 class ReplaceAnnotationCommands(ProtocolMessage):
-    """Replaces the full annotation-command list on an annotation clip."""
+    """Replaces the full annotation-command list on an annotation clip.
+
+    Used when modifying/updating existing committed annotations in-place
+    (e.g., editing text/captions or dragging/moving them), rather than
+    appending a delta or committing a new stroke.
+    """
 
     SCHEMA = "OTIO_SESSION_1.0"
     EVENT = "REPLACE_ANNOTATION_COMMANDS"
