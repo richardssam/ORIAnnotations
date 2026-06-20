@@ -43,8 +43,8 @@ class RabbitMQNetwork:
     ``source_guid`` matches *self_guid* is silently discarded before being
     enqueued.
 
-    :param host: RabbitMQ broker hostname or IP.
-    :param port: RabbitMQ broker AMQP port.
+    :param host: RabbitMQ broker hostname, IP, or full AMQP/AMQPS URL.
+    :param port: RabbitMQ broker AMQP port (ignored if host is a URL).
     :param session_id: Logical session name; used to derive the exchange name.
     :param self_guid: GUID of the local peer used to filter own messages.
         Auto-generated if not provided.
@@ -89,9 +89,19 @@ class RabbitMQNetwork:
         """
         while not self._stop_event.is_set():
             try:
-                connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=self.host, port=self.port)
-                )
+                if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
+                    params = pika.URLParameters(self.host)
+                    if self.host.startswith("amqps://"):
+                        # Bypass SSL verification for local development or when requested via query param
+                        if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
+                            import ssl
+                            context = ssl.create_default_context()
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                            params.ssl_options = pika.SSLOptions(context)
+                else:
+                    params = pika.ConnectionParameters(host=self.host, port=self.port)
+                connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.exchange_declare(
                     exchange=self.exchange_name, exchange_type='fanout'
@@ -150,9 +160,19 @@ class RabbitMQNetwork:
         """
         while not self._stop_event.is_set():
             try:
-                connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=self.host, port=self.port)
-                )
+                if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
+                    params = pika.URLParameters(self.host)
+                    if self.host.startswith("amqps://"):
+                        # Bypass SSL verification for local development or when requested via query param
+                        if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
+                            import ssl
+                            context = ssl.create_default_context()
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                            params.ssl_options = pika.SSLOptions(context)
+                else:
+                    params = pika.ConnectionParameters(host=self.host, port=self.port)
+                connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.exchange_declare(
                     exchange=self.exchange_name, exchange_type='fanout'

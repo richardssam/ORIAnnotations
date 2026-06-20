@@ -22,6 +22,16 @@ cd docs
 make html
 ```
 
+## RabbitMQ Broker Setup
+
+Real-time synchronization between review sessions relies on RabbitMQ as the central messaging broker. 
+
+See **[docs/rabbitmq_setup.md](file:///Users/sam/git/ORIAnnotations/docs/rabbitmq_setup.md)** for detailed instructions on:
+* Setting up a secure, public-facing broker on OCI (Always Free Tier).
+* Configuring a secure local instance (macOS/Homebrew) running over AMQPS.
+* Application-level connection URL formatting.
+
+
 ## Example OTIO files
 
    * [examples/testexport/annotationreview.otio](https://github.com/richardssam/ORIAnnotations/tree/main/examples) is an example OTIO annotation file.

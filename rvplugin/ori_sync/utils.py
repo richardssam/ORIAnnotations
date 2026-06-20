@@ -111,7 +111,7 @@ def _parse_ori_session(env_val):
     """
     default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
     if ":" in env_val:
-        host, name = env_val.split(":", 1)
+        host, name = env_val.rsplit(":", 1)
         return (host or default_host, name)
     return (default_host, env_val)
 
