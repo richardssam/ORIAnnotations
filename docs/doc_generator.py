@@ -18,6 +18,7 @@ Usage:
 
 import ast
 import argparse
+import inspect
 import re
 import json
 import sys
@@ -290,7 +291,7 @@ def collect_protocol_messages(protocol_config: Dict[str, Any]) -> List[SchemaCla
     for (schema, event), cls in pm.registered_messages().items():
         entry = protocol_config.get(cls.__name__, {}) or {}
         category = entry.get("_category", "Uncategorized")
-        description = (cls.__doc__ or "").strip().split("\n\n")[0].strip()
+        description = inspect.cleandoc(cls.__doc__ or "").strip()
         fields = cls.doc_fields()
         parameters = [
             Parameter(name=name, type_hint=ftype, description=doc, required=False)

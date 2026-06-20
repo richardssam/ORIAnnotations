@@ -37,7 +37,7 @@ class AnnotationEffect(otio.schema.Effect):
     _name = "AnnotationEffect"
 
     def __init__(
-        self, name: str = "", visible: bool = True, layers: list | None = None
+        self, name: str = "", visible: bool = True, layers: list | None = None, commands: list | None = None
     ) -> None:
         super().__init__(name=name, effect_name="Annotation.1")
         self.visible = visible
@@ -623,7 +623,7 @@ class PaintVertex(otio.core.SerializableObject):
 class PaintPoints(SyncEvent):
     """A schema for the event system to denote when adding onto a paint stroke.
 
-    Attribute:
+    Attributes:
        source_index:
        uuid (str): The UUID of the initial brush stroke.
        layer_range:
