@@ -247,10 +247,31 @@ class SequenceSyncController:
                     fps = media_fps
             except Exception:
                 pass
+            # The media's available_range must reflect its embedded timecode,
+            # not a hardcoded frame 0. sourceMediaInfo reports startFrame/endFrame
+            # derived from the QuickTime's timecode track (a movie whose timecode
+            # starts at 01:00:00:00 @24fps reports startFrame=86400). Hardcoding 0
+            # made peers (xStudio) place the clip at frame 0 and mis-size the
+            # timeline. This mirrors RV's own otio_writer (_create_media_reference).
+            start_frame = 0
+            try:
+                info = rv.commands.sourceMediaInfo(file_source_node)
+                src_start = info.get("startFrame")
+                src_end = info.get("endFrame")
+                if src_start is not None:
+                    start_frame = int(src_start)
+                # Prefer the true media extent for the available_range duration;
+                # fall back to the EDL frame count only when endFrame is unknown.
+                if src_start is not None and src_end is not None:
+                    num_frames = int(src_end) - int(src_start) + 1
+            except Exception:
+                pass
             if num_frames is None:
                 num_frames = int(fps)  # 1-second fallback
             duration = otio.opentime.RationalTime(num_frames, fps)
-            time_range = otio.opentime.TimeRange(otio.opentime.RationalTime(0, fps), duration)
+            time_range = otio.opentime.TimeRange(
+                otio.opentime.RationalTime(start_frame, fps), duration
+            )
             clip = otio.schema.Clip(
                 name=os.path.basename(path),
                 media_reference=otio.schema.ExternalReference(target_url=path, available_range=time_range)
@@ -669,9 +690,11 @@ class SequenceSyncController:
         # Rescan after addSource calls.
         path_to_sg = self._path_to_source_group_map()
         seq_sources = [path_to_sg[p] for p in all_paths if p in path_to_sg]
-        if not seq_sources:
-            _log(f"_create_rv_sequence_for_timeline: no source groups mapped for '{tl.name}'")
-            return
+        # Note: an empty seq_sources is valid here — a peer can create an empty
+        # sequence (e.g. xStudio's "Sequence 1" with no clips yet). We still
+        # create the RVSequenceGroup so the sequence appears in RV; clips arrive
+        # later via INSERT_CHILD (_apply_insert_child). Returning early here was
+        # the cause of empty peer sequences never showing up in RV.
 
         try:
             seq_node = rv.commands.newNode("RVSequenceGroup", tl.name)
