@@ -25,7 +25,7 @@ class AppSpawner:
         os.makedirs(self.logs_dir, exist_ok=True)
         self.base_dir = base_dir
 
-    def launch(self, app_name, http_port):
+    def launch(self, app_name, http_port, session_file=None):
         log_path = os.path.join(self.logs_dir, f"{app_name}_{http_port}.log")
         log_file = open(log_path, 'w')
         self.log_files.append(log_file)
@@ -35,8 +35,10 @@ class AppSpawner:
             xstudio_bin = self.executables.get("xstudio", "xstudio")
             python_bin = self.executables.get("xstudio_python", "python3")
             
-            # Launch XStudio
+            # Launch XStudio, optionally opening a pre-loaded session fixture.
             cmd = [xstudio_bin]
+            if session_file:
+                cmd.append(os.path.abspath(session_file))
             logging.info(f"Launching XStudio. Logging to {log_path}")
             # Configure environment variables for the plugins
             env = os.environ.copy()
@@ -112,7 +114,12 @@ class AppSpawner:
                 f"hook.start_openrv_inspector({http_port})"
             )
             openrv_bin = self.executables.get("openrv", "rv")
-            cmd = [openrv_bin, "-pyeval", pyeval_cmd]
+            # Session file (if any) goes before -pyeval so RV loads it first,
+            # then the inspector hook attaches to the already-populated session.
+            cmd = [openrv_bin]
+            if session_file:
+                cmd.append(os.path.abspath(session_file))
+            cmd += ["-pyeval", pyeval_cmd]
             logging.info(f"Launching OpenRV on port {http_port}. Logging to {log_path}")
             
             env = os.environ.copy()
@@ -130,8 +137,13 @@ class AppSpawner:
         else:
             raise ValueError(f"Unknown app: {app_name}")
 
-        # Wait for the app and inspector to fully initialize
-        time.sleep(2.0)
+        # When a session fixture is loaded, wait long enough that this app wins
+        # the 2-second master-discovery race before the next app starts. Without
+        # this, the fixture app can lose master to a faster-starting empty peer,
+        # causing the peer (with no content) to broadcast an empty snapshot and
+        # the fixture app's OTIO to sync incorrectly.
+        startup_wait = 5.0 if session_file else 2.0
+        time.sleep(startup_wait)
 
     def __enter__(self):
         return self

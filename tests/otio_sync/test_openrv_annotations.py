@@ -49,13 +49,16 @@ sys.modules['rv.qt_utils'] = MagicMock()
 import opentimelineio as otio
 from plugin import OpenRVSyncPlugin
 
-# Ensure SyncEvent schema is registered (force reload manifest to avoid pytest alphabetical load caching issues)
+# Ensure SyncEvent schema is registered (force reload manifest only if not already registered to avoid pytest alphabetical load caching issues)
 try:
-    import opentimelineio.plugins.manifest as otio_manifest
-    otio_manifest._MANIFEST = None
     otio.schema.schemadef.module_from_name('SyncEvent')
-except Exception as e:
-    print(f"Warning: failed to force load SyncEvent: {e}")
+except Exception:
+    try:
+        import opentimelineio.plugins.manifest as otio_manifest
+        otio_manifest._MANIFEST = None
+        otio.schema.schemadef.module_from_name('SyncEvent')
+    except Exception as e:
+        print(f"Warning: failed to force load SyncEvent: {e}")
 
 class TestOpenRVAnnotations(unittest.TestCase):
     def setUp(self):
@@ -119,6 +122,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
 
         # Mock clip guid & track guid resolution
         plugin.playback._clip_guid_for_media_path = MagicMock(return_value="test-clip-guid-456")
+        plugin.playback._clip_guid_for_media_and_frame = MagicMock(return_value="test-clip-guid-456")
         plugin.annotation._find_annotation_track_guid_for_clip = MagicMock(return_value="test-track-guid-789")
 
         # --- TEST BROADCAST (SEND) ---

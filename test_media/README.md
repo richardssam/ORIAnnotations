@@ -1,6 +1,11 @@
 # ORIAnnotations Test Media
 
-Scripts and configs that produce the standard test media for the ORIAnnotations sync test suite. All source material comes from Netflix open content on public S3 — no credentials required.
+Two scripts produce the test media used by the ORIAnnotations sync test suite:
+
+| Script | Media | Source |
+|--------|-------|--------|
+| `create_test_media.sh` | Real-footage QuickTimes (sparks, StEM2 clips) | Netflix open content on public S3 |
+| `create_otio_test_media.py` | Synthetic OTIO test sequences A/B/C/D | Generated locally — no download |
 
 ## Prerequisites
 
@@ -58,16 +63,75 @@ test_media/
 │   │   ├── chimera_wind/      # PNGs, frames 66600–66699 (sRGB, source 59.94fps)
 │   │   ├── chimera_cars/      # PNGs, frames 2500–2599   (sRGB, source 23.98fps)
 │   │   ├── chimera_dancers/   # PNGs, frames 21800–21899 (sRGB, source 59.94fps)
-│   │   └── chimera_fountains/ # PNGs, frames 5400–5499   (sRGB, source 23.98fps)
-│   └── encoded/
-│       ├── sparks.mov
-│       ├── chimera_wind.mov
-│       ├── chimera_cars.mov
-│       ├── chimera_dancers.mov
-│       └── chimera_fountains.mov
+│   │   ├── chimera_fountains/ # PNGs, frames 5400–5499   (sRGB, source 23.98fps)
+│   │   ├── seq_A/             # PNGs, frames 100–119 (synthetic, 24fps)
+│   │   ├── seq_B/             # PNGs, frames 100–119 (synthetic, 24fps)
+│   │   ├── seq_C/             # PNGs, frames 100–119 (synthetic, 24fps)
+│   │   └── seq_D/             # PNGs, frames 100–119 (synthetic, 24fps)
+│   ├── encoded/
+│   │   ├── sparks.mov
+│   │   ├── chimera_wind.mov
+│   │   ├── chimera_cars.mov
+│   │   ├── chimera_dancers.mov
+│   │   ├── chimera_fountains.mov
+│   │   ├── seq_A.mov          # ProRes, 24fps, TC 00:00:04:04
+│   │   ├── seq_B.mov
+│   │   ├── seq_C.mov
+│   │   └── seq_D.mov
+│   ├── otio_test_quicktime.otio   # 20-clip timeline referencing seq_*.mov
+│   └── otio_test_imageseq.otio   # 20-clip timeline referencing PNG sequences
 ```
 
 All `source/` content is gitignored.
+
+---
+
+## OTIO synthetic test media (`create_otio_test_media.py`)
+
+Generates four lightweight synthetic image sequences (A/B/C/D) and two OTIO timeline files.
+No downloads required — everything is rendered locally from Pillow.
+
+Requires `Pillow >= 10`, `opentimelineio` (both in the project `.venv`), and `ffmpeg` on PATH.
+Set `FFMPEG_BIN=/path/to/ffmpeg` to use a non-default binary.
+
+### Running the OTIO script
+
+```bash
+cd test_media/
+python create_otio_test_media.py
+```
+
+The script is idempotent — re-running skips any step whose output already exists.
+
+Flags: `--skip-frames` / `--skip-encode` / `--skip-otio` skip individual phases.
+
+Example with a custom ffmpeg:
+
+```bash
+FFMPEG_BIN=/path/to/ffmpeg python create_otio_test_media.py
+```
+
+### Frame content
+
+Each 1280×720 PNG frame has a white background with black text:
+
+- **Large centered label** — sequence name (A, B, C, or D)
+- **Frame: NNN** — absolute frame number (100–119)
+- **Rel: N** — relative frame index, 0-based (0–19)
+
+### OTIO timeline structure
+
+Both OTIO files contain a single video track with **20 clips**, each 1 frame at 24fps.
+Clips alternate A→B→C→D. Clip `i` (0-indexed) references sequence `[A,B,C,D][i % 4]`
+at `source_range.start_time = RationalTime(100 + i, 24)`.
+
+Example: the 4th clip (index 3) is sequence D at frame 103; the 5th clip (index 4) is
+sequence A at frame 104.
+
+Media paths are **relative** to `test_media/source/`, so the files are portable as long
+as the `source/` directory structure is intact.
+
+---
 
 ## Timecode reference
 

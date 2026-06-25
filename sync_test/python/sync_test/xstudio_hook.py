@@ -227,6 +227,31 @@ def execute_xstudio_command(payload, port):
                         return {"action": action, "status": "success"}
             raise ValueError(f"Could not find media matching name: {name}")
 
+        elif action == "export_otio":
+            # Export the on-screen timeline's OTIO. xStudio's to_otio_string()
+            # drops metadata, but the sync test compares only the (guid-free)
+            # cut structure, so that is fine here.
+            from xstudio.api.session.playlist import Timeline
+            path = payload.get("filepath")
+            timeline = None
+            container = conn.api.session.viewed_container
+            if isinstance(container, Timeline):
+                timeline = container
+            else:
+                # Fall back to the first timeline found on any playlist.
+                for pl in conn.api.session.playlists:
+                    for child in getattr(pl, "timelines", None) or []:
+                        timeline = child
+                        break
+                    if timeline:
+                        break
+            if timeline is None:
+                raise ValueError("No timeline available to export")
+            otio_str = timeline.to_otio_string()
+            with open(path, "w") as f:
+                f.write(otio_str)
+            return {"action": action, "status": "success", "filepath": path}
+
         raise ValueError(f"Unknown action: {action}")
     except Exception as e:
         logging.error(f"Error in execute_xstudio_command: {e}")

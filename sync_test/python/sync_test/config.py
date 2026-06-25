@@ -26,7 +26,8 @@ class SyncTestConfig:
             recording = t.get('recording')
             apps = t.get('apps', [])
             
-            if not name or not recording:
+            script_driven = t.get('script_driven', False)
+            if not name or (not recording and not script_driven):
                 logging.warning("Skipping test with missing 'name' or 'recording'")
                 continue
                 

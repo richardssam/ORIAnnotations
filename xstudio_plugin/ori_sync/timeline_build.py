@@ -165,7 +165,8 @@ class TimelineBuildController:
                 try:
                     playlist = plugin.connection.api.session.create_playlist(playlist_name)[1]
                     xs_timeline = playlist.create_timeline(timeline_name)[1]
-                    otio_str = otio.adapters.write_to_string(otio_tl, "otio_json")
+                    _load_tl = plugin.media.prepare_otio_for_load(otio_tl)
+                    otio_str = otio.adapters.write_to_string(_load_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
                     plugin.structure._xs_sequence_track_names[guid] = None
                     plugin._sync_playlists[guid] = (playlist, xs_timeline)

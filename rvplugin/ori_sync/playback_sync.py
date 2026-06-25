@@ -22,6 +22,29 @@ class PlaybackSyncController:
         self._last_broadcast_clip_guid = None
         self._sequence_selection_applied_at = 0.0
 
+    def _frame_base(self):
+        """Return the RV frame that corresponds to protocol position 0.
+
+        The wire protocol carries a **0-based offset into the current view**
+        (xStudio's playhead position).  RV's equivalent is ``frame - frameStart``,
+        where ``frameStart`` is the first frame of the view's range:
+
+        * a normal no-timecode source/sequence starts at frame 1 (the historic
+          hard-coded ``- 1``);
+        * an OTIO-imported sequence is built from an EDL whose ``frame`` array
+          starts at 0;
+        * a source view of timecode-bearing media (e.g. ``seq_D.mov`` spanning
+          frames 100-119) starts at 100.
+
+        Reading ``frameStart()`` makes the conversion correct in every case and
+        is identical to the old ``- 1`` for the no-timecode media the native
+        tests use.  Falls back to 1 if the range can't be read.
+        """
+        try:
+            return int(rv.commands.frameStart())
+        except Exception:
+            return 1
+
     def _broadcast_playback(self):
         if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
             return
@@ -35,12 +58,13 @@ class PlaybackSyncController:
 
         view = rv.commands.viewNode()
         timeline_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view) or self.plugin.sync_manager.active_timeline_guid
-        _log(f"SEND playback playing={playing} frame={current_frame} fps={fps} view={view} tl={timeline_guid}")
+        base = self._frame_base()
+        _log(f"SEND playback playing={playing} frame={current_frame} base={base} fps={fps} view={view} tl={timeline_guid}")
         state = {
             "playing": playing,
             "current_time": {
                 "OTIO_SCHEMA": "RationalTime.1",
-                "value": float(current_frame - 1),
+                "value": float(current_frame - base),
                 "rate": float(fps),
             },
             "looping": looping,
@@ -52,9 +76,7 @@ class PlaybackSyncController:
     def _apply_playback(self, data):
         playing = data.get("playing", False)
         current_time = data.get("current_time", {})
-        target_frame = int(current_time.get("value", 0)) + 1  # protocol is 0-indexed; RV is 1-based
         timeline_guid = data.get("timeline_guid")
-        _log(f"RECV playback playing={playing} frame={target_frame} tl={timeline_guid}")
 
         # Determine whether this timeline_guid corresponds to a real RV node.
         # Virtual clip timelines (created by get_or_create_clip_timeline on the
@@ -78,6 +100,14 @@ class PlaybackSyncController:
                         _log(f"RECV view_change to {rv_node}")
                         rv.commands.setViewNode(rv_node)
                         break
+
+        # Resolve the frame base AFTER any view switch so frameStart() reflects
+        # the view the frame actually targets (a timecode source starts at 100,
+        # an OTIO sequence at 0, a normal view at 1).  Protocol value is a 0-based
+        # offset into that view.
+        base = self._frame_base()
+        target_frame = int(current_time.get("value", 0)) + base
+        _log(f"RECV playback playing={playing} frame={target_frame} base={base} value={current_time.get('value')} tl={timeline_guid}")
 
         # Don't override a sequence-selection frame that was just applied — the
         # sender broadcasts source-local frame=0 immediately after selecting a clip
@@ -182,6 +212,18 @@ class PlaybackSyncController:
                      if rv.commands.nodeType(n) != "RVSourceGroup"),
                     None
                 )
+            if seq_node is None and target_tl_guid:
+                # OTIO-origin timelines are not in _rv_node_to_timeline_guid —
+                # they are tracked in _otio_guid_to_root (Stack → Sequence).
+                # Use the inner RVSequenceGroup so setViewNode/setFrame work.
+                root = self.plugin.sequence._otio_guid_to_root.get(target_tl_guid)
+                if root and rv.commands.nodeType(root) == "RVStackGroup":
+                    inputs = self.plugin.sequence._get_sequence_inputs(root)
+                    seq_node = next(
+                        (n for n in inputs
+                         if rv.commands.nodeType(n) == "RVSequenceGroup"),
+                        root,
+                    )
 
             _log(
                 f"RECV selection seq: seq_node={seq_node} start_frame={start_frame}"
@@ -197,25 +239,18 @@ class PlaybackSyncController:
                 self.plugin._rv_updating = True
                 try:
                     rv.commands.setViewNode(seq_node)
-                    current_frame = rv.commands.frame()
-                    if start_frame <= current_frame <= end_frame:
-                        # Already within this clip's range — stay at the current
-                        # frame rather than jumping back to the clip's start.
-                        # This prevents selection broadcasts during annotation from
-                        # resetting the playhead to frame 1.
-                        _log(
-                            f"RECV selection seq: applied setViewNode={seq_node}"
-                            f" (staying at frame {current_frame},"
-                            f" within clip range {start_frame}-{end_frame})"
-                        )
-                    else:
-                        rv.commands.setFrame(start_frame)
-                        _log(
-                            f"RECV selection seq: applied setViewNode={seq_node}"
-                            f" setFrame={start_frame}"
-                        )
+                    # Frame positioning is NOT done here.  In a cut sequence the
+                    # authoritative frame comes from the concurrent playback message
+                    # (current_time.value in the timeline's coordinate space), which
+                    # the playback handler already applied.  The clip guid in a
+                    # selection identifies WHICH clip is active (for annotation
+                    # binding), but the same media file can appear at many positions
+                    # in the sequence — seeking by guid-derived position would jump
+                    # to the wrong occurrence.  setViewNode above is enough to switch
+                    # into the sequence node; the playback handler owns the frame.
+                    _log(f"RECV selection seq: applied setViewNode={seq_node} (frame owned by playback handler)")
                 except Exception as e:
-                    _log(f"RECV selection seq: error applying setViewNode/setFrame: {e}")
+                    _log(f"RECV selection seq: error applying setViewNode: {e}")
                 finally:
                     self.plugin._rv_updating = False
             else:
@@ -253,6 +288,42 @@ class PlaybackSyncController:
                         return guid
         _log("LOOKUP CLIP: NO MATCH FOUND")
         return None
+
+    def _clip_guid_for_media_and_frame(self, media_path, media_frame):
+        """Return the OTIO clip guid for the occurrence of media_path covering media_frame.
+
+        For OTIO cut sequences the same file can appear at multiple positions with
+        different source_range values.  We pick the clip whose source_range contains
+        media_frame (the absolute media/timecode frame stored in RV paint node names).
+        Falls back to the first path-match for native single-occurrence timelines or
+        when no source_range covers the frame.
+        """
+        import os
+        norm = os.path.abspath(_media_path(media_path))
+        fallback = None
+        for guid, obj in self.plugin.sync_manager._object_map.items():
+            if not isinstance(obj, otio.schema.Clip):
+                continue
+            ref = obj.media_reference
+            if not isinstance(ref, otio.schema.ExternalReference):
+                continue
+            ref_norm = os.path.abspath(_media_path(ref.target_url))
+            if ref.target_url != media_path and ref_norm != norm:
+                continue
+            if fallback is None:
+                fallback = guid
+            sr = obj.source_range
+            if sr is not None:
+                start = int(sr.start_time.value)
+                end = start + int(sr.duration.value) - 1
+                if start <= int(media_frame) <= end:
+                    _log(f"LOOKUP CLIP (frame={media_frame}): matched occurrence {guid} [{start}..{end}]")
+                    return guid
+        if fallback:
+            _log(f"LOOKUP CLIP (frame={media_frame}): no source_range match, using fallback {fallback}")
+        else:
+            _log(f"LOOKUP CLIP (frame={media_frame}): NO MATCH FOUND")
+        return fallback
 
     def on_selection_changed(self, event):
         if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:

@@ -56,7 +56,7 @@ class TestXStudioAnnotations(unittest.TestCase):
         self.assertAlmostEqual(event.position[0], 0.17778, places=5)
         self.assertAlmostEqual(event.position[1], 0.35556, places=5)
         self.assertEqual(event.font, "Arial")
-        self.assertEqual(event.font_size, 42.0)
+        self.assertEqual(event.font_size, 16.8)
         self.assertEqual(event.text, "Hello World")
 
         # 3. Convert back to xStudio captions

@@ -9,11 +9,16 @@ from utils import _log, _show_warning, _parse_ori_session, _media_path, _is_medi
 try:
     from otio_sync_core import SyncManager, RabbitMQNetwork
     from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED
+    from otio_sync_core.protocol_messages import timeline_origin, ORIGIN_OTIO_IMPORT
     import opentimelineio as otio
 except ImportError as e:
     SyncManager = None
     RabbitMQNetwork = None
     _log(f"Import error: {e}")
+
+    def timeline_origin(_tl):
+        return "native"
+    ORIGIN_OTIO_IMPORT = "otio_import"
 
 try:
     from PySide2 import QtCore
@@ -346,6 +351,25 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         """Initialise the session as the first participant (Master)."""
         self.sync_manager.is_master = True
         self.sync_manager._set_status(STATE_SYNCED)
+        self._deferred_master_init()
+
+    def _deferred_master_init(self, attempt=0):
+        """Build the initial timelines, deferring while an OTIO import expands.
+
+        RV expands an imported ``.otio`` asynchronously; snapshotting before the
+        ``tracks`` Stack has materialized would register empty/partial state
+        (the old retry-on-empty heuristic). Poll a bounded number of times until
+        expansion settles, then run the normal init.
+        """
+        if self.sequence._otio_expansion_pending() and attempt < 40:
+            if attempt == 0:
+                _log("OTIO import expanding — deferring master init")
+            if QtCore:
+                QtCore.QTimer.singleShot(
+                    250, lambda: self._deferred_master_init(attempt + 1)
+                )
+                return
+            # No Qt scheduler available — fall through and init with what's there.
 
         try:
             fps = rv.commands.fps()
@@ -360,11 +384,18 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 for tl in self.sync_manager._timelines.values()
                 for tr in tl.tracks
             )
-            if total_clips == 0:
+            # Only retry the native scan when there is genuinely nothing yet AND
+            # no OTIO import is in play (an OTIO-only session legitimately has no
+            # native timelines — its content is synced via the snapshot model).
+            if total_clips == 0 and not self.sequence._otio_stack_groups():
                 _log("No clips found on init — scheduling graph-settled retry")
                 QtCore.QTimer.singleShot(500, self.sequence._retry_init_timelines)
         else:
             self.sequence._init_single_timeline(fps)
+
+        # Mirror any OTIO-imported Stacks into the sync manager as snapshot
+        # timelines (whole-OTIO model), built via RV's native otio_writer.
+        self.sequence.init_otio_timelines()
 
         self.sync_manager.broadcast_master_response()
         self.annotation._import_existing_rv_annotations()
@@ -423,6 +454,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self.sequence._poll_new_sequences()
             self.sequence._poll_sequence_renames()
             self.sequence._poll_deleted_sequences()
+            self.sequence.check_otio_snapshots()
             self.display._broadcast_display_state()
 
     def _handle_action(self, action, data):
@@ -472,7 +504,18 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         elif action == "add_timeline":
             self._rv_updating = True
             try:
-                self.sequence._create_rv_sequence_for_timeline(data)
+                # OTIO-origin timelines are rebuilt via RV's native reader
+                # (full Stack/EDL fidelity); native ones use the flat builder.
+                if timeline_origin(data) == ORIGIN_OTIO_IMPORT:
+                    self.sequence.apply_otio_snapshot(data)
+                else:
+                    self.sequence._create_rv_sequence_for_timeline(data)
+            finally:
+                self._rv_updating = False
+        elif action == "replace_timeline":
+            self._rv_updating = True
+            try:
+                self.sequence.apply_otio_snapshot(data)
             finally:
                 self._rv_updating = False
         elif action == "remove_timeline":
@@ -530,6 +573,19 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.playback.on_selection_changed(event)
 
     def on_rv_graph_state_change(self, event):
+        # Mark OTIO snapshots dirty on structural graph changes so the next poll
+        # re-exports and diffs (gates the whole-timeline serialization off the
+        # hot path). Reading contents does not consume the event.
+        try:
+            contents = event.contents()
+            if contents and (
+                "SEQUENCES" in contents   # clip EDL / cut-trim changes (5.2)
+                or "STACKS" in contents   # structural topology changes
+                or "SOURCES" in contents  # media swap on an existing source (5.1)
+            ):
+                self.sequence._otio_dirty = True
+        except Exception:
+            pass
         # Color changes (ocio.inColorSpace) are consumed here; everything else
         # falls through to the annotation handler.
         if self.color.on_graph_state_change(event):

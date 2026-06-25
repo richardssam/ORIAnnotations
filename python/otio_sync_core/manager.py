@@ -31,6 +31,7 @@ from .protocol_messages import (
     RemoveTimeline,
     RenameTimeline,
     ReplaceAnnotationCommands,
+    ReplaceTimeline,
     SelectionSet,
     SetProperty,
     StateRequest,
@@ -178,6 +179,7 @@ class SyncManager:
             ("TIMELINE_1.0", "ADD_TIMELINE"): self._h_add_timeline,
             ("TIMELINE_1.0", "RENAME_TIMELINE"): self._h_rename_timeline,
             ("TIMELINE_1.0", "REMOVE_TIMELINE"): self._h_remove_timeline,
+            ("TIMELINE_1.0", "REPLACE_TIMELINE"): self._h_replace_timeline,
             ("Annotation.1", "PARTIAL"): self._h_partial_annotation,
             ("OTIO_SESSION_1.0", "SET_PROPERTY"): self._h_otio_session,
             ("OTIO_SESSION_1.0", "INSERT_CHILD"): self._h_otio_session,
@@ -447,6 +449,35 @@ class SyncManager:
             )
         )
 
+    def broadcast_replace_timeline(self, tl_guid: str) -> None:
+        """Push a wholesale replacement of a timeline's structure to all peers.
+
+        Used for topology changes on OTIO-origin timelines (clip insert/remove,
+        large re-edit), where rebuilding from the full OTIO via the native reader
+        is cheaper and higher-fidelity than a stream of per-child patches.  The
+        caller is expected to have already re-registered the updated timeline
+        locally (e.g. re-exported via RV's ``create_timeline_from_node``), so
+        this re-maps the local object map and sends the current timeline.
+
+        Unlike :meth:`broadcast_add_timeline`, peers that already hold the GUID
+        do **not** ignore this message — they replace their copy.
+
+        :param tl_guid: GUID of the timeline to push.
+        """
+        if not self.network or self.status != STATE_SYNCED:
+            return
+        tl = self._timelines.get(tl_guid)
+        if tl is None:
+            return
+        self._replace_timeline_local(tl_guid, tl)
+        self._send_message(
+            ReplaceTimeline(
+                timeline_guid=tl_guid,
+                timeline=tl,
+                sync_timestamp=time.time(),
+            )
+        )
+
     def reset_timelines(self) -> None:
         """Clear all registered timelines, the object map, and the active GUID.
 
@@ -539,6 +570,35 @@ class SyncManager:
             f"remove_timeline: {tl_guid[:8]} "
             f"(+{len(cascade)} clip timeline(s) cascaded)"
         )
+        return tl
+
+    def _replace_timeline_local(
+        self, tl_guid: str, tl: "otio.schema.Timeline"
+    ) -> "otio.schema.Timeline":
+        """Wholesale-replace a timeline's structure, preserving object GUIDs.
+
+        Re-maps the new timeline's subtree into ``_object_map`` and purges any
+        GUIDs that were present in the old structure but not the new one (e.g.
+        clips removed by the edit), so attribute patches cannot resolve to a
+        stale object.  GUIDs that persist across the replace (carried in each
+        object's ``metadata.sync.guid``) keep their bindings — annotations keyed
+        by clip GUID survive.  Unlike :meth:`_remove_timeline_local`, this does
+        **not** cascade-delete clip-annotation timelines for persisting clips.
+        An unknown GUID is simply created.
+
+        :param tl_guid: GUID of the timeline being replaced (or created).
+        :param tl: The new OTIO timeline.
+        :returns: The new timeline.
+        """
+        old = self._timelines.get(tl_guid)
+        if old is not None and old is not tl:
+            stale = self._subtree_guids(old) - self._subtree_guids(tl)
+            for g in stale:
+                self._object_map.pop(g, None)
+        self._timelines[tl_guid] = tl
+        self._traverse_and_map(tl)
+        if self.active_timeline_guid is None:
+            self.active_timeline_guid = tl_guid
         return tl
 
     @staticmethod
@@ -1478,6 +1538,20 @@ class SyncManager:
             # Unknown / already-removed GUID — idempotent no-op.
             return None
         return ("remove_timeline", tl)
+
+    def _h_replace_timeline(
+        self, msg: ReplaceTimeline, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        tl_guid = msg.timeline_guid
+        if not tl_guid or not msg.timeline:
+            return None
+        tl = msg.as_otio()
+        self._replace_timeline_local(tl_guid, tl)
+        _log(
+            f"REPLACE_TIMELINE: {tl_guid[:8]} name={tl.name!r} "
+            f"(wholesale structure replace)"
+        )
+        return ("replace_timeline", tl)
 
     def _h_partial_annotation(
         self, msg: PartialAnnotation, data: dict[str, Any], source: str

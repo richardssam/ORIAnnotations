@@ -502,3 +502,172 @@ def test_two_peer_add_two_remove_one():
     deliver(m_net, peer)
     assert "guid-b" not in peer._timelines
     assert "guid-a" in peer._timelines
+
+
+# ---------------------------------------------------------------------------
+# Timeline origin marker
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_origin_reads_marker_and_defaults_native():
+    # OTIO object carrying the marker.
+    tl = otio.schema.Timeline("seq")
+    tl.metadata["sync"] = {"origin": pm.ORIGIN_OTIO_IMPORT}
+    assert pm.timeline_origin(tl) == pm.ORIGIN_OTIO_IMPORT
+
+    # Wire-form dict carrying the marker.
+    wire = {"metadata": {"sync": {"origin": pm.ORIGIN_OTIO_IMPORT}}}
+    assert pm.timeline_origin(wire) == pm.ORIGIN_OTIO_IMPORT
+
+    # Missing marker / missing metadata / None all read as native.
+    assert pm.timeline_origin(otio.schema.Timeline("bare")) == pm.ORIGIN_NATIVE
+    assert pm.timeline_origin({"metadata": {}}) == pm.ORIGIN_NATIVE
+    assert pm.timeline_origin({}) == pm.ORIGIN_NATIVE
+    assert pm.timeline_origin(None) == pm.ORIGIN_NATIVE
+
+
+def test_timeline_origin_travels_inside_serialized_timeline():
+    """The marker lives in timeline.metadata, so it rides any OTIO-bearing
+    message for free — no dedicated envelope field needed."""
+    tl = otio.schema.Timeline("seq")
+    tl.metadata["sync"] = {"guid": "g", "origin": pm.ORIGIN_OTIO_IMPORT}
+
+    recv = pm.AddTimeline.from_payload(
+        pm.AddTimeline(timeline_guid="g", timeline=tl).to_payload()
+    )
+    assert pm.timeline_origin(recv.as_otio()) == pm.ORIGIN_OTIO_IMPORT
+
+
+# ---------------------------------------------------------------------------
+# ReplaceTimeline — message + wholesale structure replace
+# ---------------------------------------------------------------------------
+
+
+def _seq_timeline_clips(name, tl_guid, track_guid, clips):
+    """Build a one-track timeline with explicit GUIDs on tl, track, and clips.
+
+    :param clips: list of ``(clip_name, clip_guid)`` tuples.
+    """
+    tl = otio.schema.Timeline(name)
+    tl.metadata["sync"] = {"guid": tl_guid}
+    track = otio.schema.Track("V1")
+    track.metadata["sync"] = {"guid": track_guid}
+    for cname, cguid in clips:
+        clip = otio.schema.Clip(
+            name=cname,
+            media_reference=otio.schema.ExternalReference(target_url=f"/{cname}"),
+        )
+        clip.metadata["sync"] = {"guid": cguid}
+        track.append(clip)
+    tl.tracks.append(track)
+    return tl
+
+
+def test_replace_timeline_message_roundtrip_and_registry():
+    payload = {"timeline_guid": "G", "timeline": {"k": 1}, "sync_timestamp": 1.0}
+    assert pm.ReplaceTimeline.from_payload(payload).to_payload() == payload
+    assert pm.message_for("TIMELINE_1.0", "REPLACE_TIMELINE") is pm.ReplaceTimeline
+
+
+def test_replace_timeline_overwrites_and_preserves_persisting_guids():
+    """Replacing a timeline drops removed clips' GUIDs, keeps persisting ones,
+    and maps newly-added clips."""
+    mgr, _ = _make_synced_manager()
+    v1 = _seq_timeline_clips(
+        "Seq", "tl-1", "trk-1", [("x.mov", "clip-x"), ("y.mov", "clip-y")]
+    )
+    mgr.register_timeline(v1)
+    assert {"clip-x", "clip-y"} <= set(mgr._object_map)
+
+    # v2 keeps clip-y, drops clip-x, adds clip-z — same timeline + track GUID.
+    v2 = _seq_timeline_clips(
+        "Seq", "tl-1", "trk-1", [("y.mov", "clip-y"), ("z.mov", "clip-z")]
+    )
+    res = mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REPLACE_TIMELINE",
+        {"timeline_guid": "tl-1", "timeline": _otio_dict(v2)},
+    ))
+    assert res is not None and res[0] == "replace_timeline"
+
+    assert "clip-x" not in mgr._object_map  # removed clip purged
+    assert "clip-y" in mgr._object_map      # persisting clip retained
+    assert "clip-z" in mgr._object_map      # new clip mapped
+    # The held timeline is the replacement.
+    held = mgr._timelines["tl-1"]
+    assert [c.name for c in held.tracks[0]] == ["y.mov", "z.mov"]
+
+
+def test_replace_timeline_unlike_add_does_not_skip_known_guid():
+    """AddTimeline is a no-op for a known GUID; ReplaceTimeline overwrites it."""
+    mgr, _ = _make_synced_manager()
+    mgr.register_timeline(_seq_timeline_clips("A", "tl-1", "trk-1", [("a.mov", "clip-a")]))
+
+    v2 = _seq_timeline_clips("A2", "tl-1", "trk-1", [("b.mov", "clip-b")])
+    mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REPLACE_TIMELINE",
+        {"timeline_guid": "tl-1", "timeline": _otio_dict(v2)},
+    ))
+    assert mgr._timelines["tl-1"].name == "A2"
+    assert "clip-b" in mgr._object_map and "clip-a" not in mgr._object_map
+
+
+def test_replace_timeline_unknown_guid_creates_it():
+    mgr, _ = _make_synced_manager()
+    v = _seq_timeline_clips("New", "tl-new", "trk", [("c.mov", "clip-c")])
+    res = mgr.apply_patch(_envelope(
+        "TIMELINE_1.0", "REPLACE_TIMELINE",
+        {"timeline_guid": "tl-new", "timeline": _otio_dict(v)},
+    ))
+    assert res is not None and res[0] == "replace_timeline"
+    assert "tl-new" in mgr._timelines
+    assert "clip-c" in mgr._object_map
+
+
+def test_broadcast_replace_timeline_envelope_and_remap():
+    mgr, net = _make_synced_manager()
+    mgr.register_timeline(_seq_timeline_clips("A", "tl-1", "trk-1", [("a.mov", "clip-a")]))
+
+    mgr.broadcast_replace_timeline("tl-1")
+
+    assert len(net.sent) == 1
+    env = net.sent[0]
+    assert env["payload"]["command_schema"] == "TIMELINE_1.0"
+    assert env["payload"]["command"]["event"] == "REPLACE_TIMELINE"
+    assert env["payload"]["command"]["payload"]["timeline_guid"] == "tl-1"
+    json.dumps(env)  # no objects leak onto the wire
+
+
+def test_broadcast_replace_unknown_timeline_sends_nothing():
+    mgr, net = _make_synced_manager()
+    mgr.broadcast_replace_timeline("nope")
+    assert net.sent == []
+
+
+def test_two_peer_replace_topology_end_to_end():
+    """Master pushes a wholesale replace; the peer rebuilds the structure."""
+    m_net, p_net = FakeNetwork(), FakeNetwork()
+    master = SyncManager(session_id="s", self_guid="master", network=m_net)
+    peer = SyncManager(session_id="s", self_guid="peer", network=p_net)
+    master.status = peer.status = STATE_SYNCED
+
+    def deliver(src_net, dst):
+        for env in src_net.sent:
+            dst.apply_patch(env)
+        src_net.sent.clear()
+
+    master.register_timeline(
+        _seq_timeline_clips("Seq", "tl-1", "trk-1", [("a.mov", "clip-a")])
+    )
+    master.broadcast_add_timeline("tl-1")
+    deliver(m_net, peer)
+    assert "clip-a" in peer._object_map
+
+    # Master edits topology: swap the timeline object for a 2-clip version, then push.
+    master._timelines["tl-1"] = _seq_timeline_clips(
+        "Seq", "tl-1", "trk-1", [("a.mov", "clip-a"), ("b.mov", "clip-b")]
+    )
+    master.broadcast_replace_timeline("tl-1")
+    deliver(m_net, peer)
+
+    assert [c.name for c in peer._timelines["tl-1"].tracks[0]] == ["a.mov", "b.mov"]
+    assert {"clip-a", "clip-b"} <= set(peer._object_map)

@@ -42,14 +42,27 @@ class AnnotationSyncController:
         if "_p_" in node_name:
             seq_name = node_name.split("_p_")[0]
             display_slot = node_name.split("_p_")[1]
-            try:
-                for n in rv.commands.nodesInGroup(display_slot):
-                    if rv.commands.nodeType(n) == "RVFileSource":
-                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                        if path:
-                            return path
-            except Exception:
-                pass
+            # Probe the slot node itself, plus — for OTIO sequences whose slot is
+            # the source's switch group (e.g. "sourceGroup000011_switchGroup") —
+            # the wrapped source group and the switch group's connected inputs.
+            candidates = [display_slot]
+            if display_slot.endswith("_switchGroup"):
+                candidates.append(display_slot[: -len("_switchGroup")])
+                try:
+                    conns = rv.commands.nodeConnections(display_slot)
+                    if conns and conns[0]:
+                        candidates.extend(conns[0])
+                except Exception:
+                    pass
+            for cand in candidates:
+                try:
+                    for n in rv.commands.nodesInGroup(cand):
+                        if rv.commands.nodeType(n) == "RVFileSource":
+                            path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                            if path:
+                                return path
+                except Exception:
+                    pass
             m = re.match(r'^sourceGroup(\d+)$', display_slot)
             if m:
                 slot_idx = int(m.group(1))
@@ -144,8 +157,6 @@ class AnnotationSyncController:
         fps = payload.get("fps", 25.0)
         events_raw = payload.get("events", [])
 
-        rv_frame = int(frame_val) + 1  # OTIO 0-indexed → RV 1-indexed
-
         media_clip = self.plugin.sync_manager._object_map.get(clip_guid) if clip_guid else None
         if not isinstance(media_clip, otio.schema.Clip):
             return
@@ -153,6 +164,18 @@ class AnnotationSyncController:
         if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
             return
         media_path = _media_path(ref.target_url)
+
+        # Convert clip-local OTIO frame (0-indexed) to the RV paint frame.
+        # In RV's OTIO-imported sequences the paint frame IS the source timecode
+        # frame (e.g. 110), which equals source_range.start + clip_local.  For
+        # native no-timecode media (source_range.start ≤ 1) the paint frame is
+        # 1-indexed clip-local, so fall back to clip_local + 1.
+        clip_local = int(frame_val)
+        _sr = media_clip.source_range
+        if _sr is not None and int(_sr.start_time.value) > 1:
+            rv_frame = int(_sr.start_time.value) + clip_local
+        else:
+            rv_frame = clip_local + 1
 
         try:
             otio.schema.schemadef.module_from_name('SyncEvent')
@@ -192,7 +215,7 @@ class AnnotationSyncController:
                 continue
 
             points_flat = [v for pair in zip(pts_ev.points.x, pts_ev.points.y) for v in pair]
-            node = self._find_paint_node_for_media(media_path, rv_frame)
+            node = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
             if not node:
                 continue
 
@@ -246,8 +269,6 @@ class AnnotationSyncController:
         """
         clip_guid = ann_clip.metadata.get("clip_guid")
         events_data = ann_clip.metadata.get("annotation_commands", [])
-        rv_frame = (int(ann_clip.source_range.start_time.value) + 1
-                    if ann_clip.source_range else 1)
 
         media_clip = self.plugin.sync_manager._object_map.get(clip_guid) if clip_guid else None
         if not isinstance(media_clip, otio.schema.Clip):
@@ -258,6 +279,17 @@ class AnnotationSyncController:
             _log(f"RECV annotation: clip {clip_guid} has no ExternalReference")
             return
         media_path = _media_path(ref.target_url)
+
+        # Convert clip-local OTIO frame (0-indexed) to the RV paint frame.
+        # RV's OTIO sequences store paint at the source timecode frame
+        # (source_range.start + clip_local).  Native no-timecode falls back to
+        # 1-indexed clip-local (source_range.start ≤ 1).
+        _clip_local = int(ann_clip.source_range.start_time.value) if ann_clip.source_range else 0
+        _sr = media_clip.source_range
+        if _sr is not None and int(_sr.start_time.value) > 1:
+            rv_frame = int(_sr.start_time.value) + _clip_local
+        else:
+            rv_frame = _clip_local + 1
 
         try:
             otio.schema.schemadef.module_from_name('SyncEvent')
@@ -270,7 +302,7 @@ class AnnotationSyncController:
         event_groups = {}
         rendered = 0
         # Cache the paint node once for the UUID-existence checks below.
-        _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame)
+        _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
         for ev in events_data:
             try:
                 if isinstance(ev, (dict, collections.abc.Mapping)):
@@ -316,6 +348,7 @@ class AnnotationSyncController:
                     self._apply_text_annotation({
                         "media_path": media_path,
                         "frame": rv_frame,
+                        "clip_guid": clip_guid,
                         "node_name": None,
                         "position": list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0],
                         "color": list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0],
@@ -348,7 +381,7 @@ class AnnotationSyncController:
             if ev_uuid and ev_uuid in self._partial_pen_nodes:
                 # A partial render already placed this stroke; update its final
                 # points in-place rather than creating a duplicate pen node.
-                node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame)
+                node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
                 pen_node = self._partial_pen_nodes.pop(ev_uuid)
                 if node and rv.commands.propertyExists(f"{node}.{pen_node}.points"):
                     points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
@@ -365,6 +398,7 @@ class AnnotationSyncController:
             self._apply_annotation({
                 "media_path": media_path,
                 "frame": rv_frame,
+                "clip_guid": clip_guid,
                 "node_name": None,
                 "points": points_flat,
                 "color": list(start_event.rgba),
@@ -401,9 +435,6 @@ class AnnotationSyncController:
         """
         clip_guid = ann_clip.metadata.get("clip_guid")
         events_data = ann_clip.metadata.get("annotation_commands", [])
-        rv_frame = (int(ann_clip.source_range.start_time.value) + 1
-                    if ann_clip.source_range else 1)
-        
         incoming_text_uuids = set()
 
         media_clip = self.plugin.sync_manager._object_map.get(clip_guid) if clip_guid else None
@@ -413,9 +444,16 @@ class AnnotationSyncController:
         ref = media_clip.media_reference
         if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
             return
+
+        _clip_local = int(ann_clip.source_range.start_time.value) if ann_clip.source_range else 0
+        _sr = media_clip.source_range
+        if _sr is not None and int(_sr.start_time.value) > 1:
+            rv_frame = int(_sr.start_time.value) + _clip_local
+        else:
+            rv_frame = _clip_local + 1
         media_path = _media_path(ref.target_url)
 
-        node = self._find_paint_node_for_media(media_path, rv_frame)
+        node = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
         if not node:
             _log(f"RECV annotation replace: no paint node for media_path={media_path} frame={rv_frame}")
             return
@@ -524,7 +562,7 @@ class AnnotationSyncController:
         if QtCore:
             QtCore.QTimer.singleShot(0, rv.commands.redraw)
 
-    def _find_paint_node_for_media(self, media_path, frame):
+    def _find_paint_node_for_media(self, media_path, frame, clip_guid=None):
         """Find the local RVPaint node for a given media path and frame.
 
         Must use metaEvaluateClosestByType to get the sequence-level paint node
@@ -532,22 +570,49 @@ class AnnotationSyncController:
         node found inside the source group (e.g. sourceGroup000000_paint).  The
         source-level node is invisible in sequence view, so strokes written there
         never appear when the user is watching a sequence.
+
+        When *clip_guid* is the specific OTIO clip occurrence (not just the first
+        path-match), pass it here so the sequence-frame calculation uses that
+        clip's range_in_parent.start rather than the first occurrence's (which
+        can differ by many frames in a cut sequence with repeated media).
+        frameStart() — 0 for OTIO sequences, 1 for native — replaces the
+        historic hardcoded +1 so the formula is correct in both contexts.
         """
-        # frame is source-local (1-indexed).
-        # We need to map it to a sequence frame (1-indexed) if a sequence view is active.
         seq_frame = frame
         if self.plugin.sync_manager:
-            clip_guid = self.plugin.playback._clip_guid_for_media_path(media_path)
             if clip_guid:
-                clip = self.plugin.sync_manager._object_map.get(clip_guid)
-                if clip and clip.parent():
-                    try:
-                        range_in_parent = clip.trimmed_range_in_parent()
-                        if range_in_parent:
-                            start_val = range_in_parent.start_time.value
-                            seq_frame = int(start_val + (frame - 1)) + 1
-                    except Exception as e:
-                        _log(f"  _find_paint_node: could not get sequence frame: {e}")
+                # Derive the sequence-position frame for metaEvaluateClosestByType.
+                # The caller's `frame` is the STORAGE frame (source timecode, e.g. 110),
+                # which is out of range for the sequence EDL (0-19).  We need the
+                # SEQUENCE POSITION (e.g. 10) so metaEval finds the right slot.
+                # Formula: seq_frame = rip.start + clip_local + frameStart
+                # where clip_local = frame - source_range.start (timecode) or frame-1 (native).
+                try:
+                    clip = self.plugin.sync_manager._object_map.get(clip_guid)
+                    if clip and clip.parent():
+                        rip = clip.trimmed_range_in_parent()
+                        if rip is not None:
+                            sr = clip.source_range
+                            frame_base = self.plugin.playback._frame_base()
+                            if sr is not None and int(sr.start_time.value) > 1:
+                                clip_local = frame - int(sr.start_time.value)
+                            else:
+                                clip_local = frame - 1
+                            seq_frame = int(rip.start_time.value) + clip_local + frame_base
+                except Exception as e:
+                    _log(f"  _find_paint_node: could not derive seq_frame from clip_guid: {e}")
+            else:
+                lookup_guid = self.plugin.playback._clip_guid_for_media_path(media_path)
+                if lookup_guid:
+                    clip = self.plugin.sync_manager._object_map.get(lookup_guid)
+                    if clip and clip.parent():
+                        try:
+                            range_in_parent = clip.trimmed_range_in_parent()
+                            if range_in_parent:
+                                start_val = range_in_parent.start_time.value
+                                seq_frame = int(start_val + (frame - 1)) + 1
+                        except Exception as e:
+                            _log(f"  _find_paint_node: could not get sequence frame: {e}")
 
         eval_infos = rv.commands.metaEvaluateClosestByType(seq_frame, "RVPaint")
         _log(f"  _find_paint_node: metaEval local_frame={frame} seq_frame={seq_frame} → {[e.get('node') for e in eval_infos] if eval_infos else None}")
@@ -576,8 +641,9 @@ class AnnotationSyncController:
             cap = data.get("cap", 1)
             node_name = data.get("node_name")
             media_path = data.get("media_path")
+            ann_clip_guid = data.get("clip_guid")
             _log(f"RECV annotation frame={frame} brush={brush} node={node_name} npts={len(points) // 2 if points else 0}")
-            node = self._find_paint_node_for_media(media_path, frame)
+            node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
             _log(f"  _apply_annotation: using node={node}")
             if not node:
                 # Last resort: sender's node name verbatim
@@ -674,9 +740,10 @@ class AnnotationSyncController:
             soft_deleted = data.get("softDeleted", 0)
             node_name = data.get("node_name")
             media_path = data.get("media_path")
+            ann_clip_guid = data.get("clip_guid")
 
             _log(f"RECV text annotation frame={frame} text={text} uuid={uuid_val}")
-            node = self._find_paint_node_for_media(media_path, frame)
+            node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
             _log(f"  _apply_text_annotation: using node={node}")
             if not node:
                 if node_name and rv.commands.nodeExists(node_name):
@@ -907,12 +974,17 @@ class AnnotationSyncController:
             if not media_path:
                 _log("REPLACE TEXT: no media_path")
                 return
-            clip_guid = self.plugin.playback._clip_guid_for_media_path(media_path)
+            clip_guid = self.plugin.playback._clip_guid_for_media_and_frame(media_path, frame)
             if not clip_guid:
                 _log("REPLACE TEXT: no clip_guid")
                 return
-            
-            otio_frame = frame - 1 if frame > 0 else 0
+
+            clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
+            sr = getattr(clip_obj, 'source_range', None)
+            if sr is not None and int(sr.start_time.value) > 1:
+                otio_frame = max(0, frame - int(sr.start_time.value))
+            else:
+                otio_frame = frame - 1 if frame > 0 else 0
             ann_clip_guid = self.plugin.sync_manager.annotation_clip_guid_at(clip_guid, otio_frame)
             _log(f"REPLACE TEXT: ann_clip_guid={ann_clip_guid}")
             if ann_clip_guid:
@@ -959,9 +1031,9 @@ class AnnotationSyncController:
                 _log("SEND annotation skipped: could not resolve media_path")
                 return
 
-            clip_guid = self.plugin.playback._clip_guid_for_media_path(media_path)
+            clip_guid = self.plugin.playback._clip_guid_for_media_and_frame(media_path, frame)
             if not clip_guid:
-                _log(f"SEND annotation skipped: no clip_guid for media_path={media_path}")
+                _log(f"SEND annotation skipped: no clip_guid for media_path={media_path} frame={frame}")
                 return
             annotation_track_guid = self.plugin.sync_manager.annotation_track_guid_for_clip(
                 clip_guid,
@@ -972,8 +1044,17 @@ class AnnotationSyncController:
                 return
 
             fps = rv.commands.fps()
-            # RV frames are 1-indexed; OTIO clip-local time is 0-indexed
-            otio_frame = frame - 1 if frame > 0 else 0
+            # Convert the paint-node media frame to a clip-local OTIO frame.
+            # For timecode media the paint frame is the absolute media frame (e.g. 110)
+            # and source_range.start is also 110, so clip-local = frame - start.
+            # For native no-timecode (source_range.start in [0,1]), fall back to
+            # frame - 1 (the existing correct behaviour).
+            clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
+            sr = getattr(clip_obj, 'source_range', None)
+            if sr is not None and int(sr.start_time.value) > 1:
+                otio_frame = max(0, frame - int(sr.start_time.value))
+            else:
+                otio_frame = frame - 1 if frame > 0 else 0
             if partial:
                 self.plugin.sync_manager.broadcast_partial_annotation(
                     clip_guid=clip_guid,

@@ -325,6 +325,28 @@ class MediaMapController:
         clip URL differs slightly from the already-imported media URI.
         """
         otio_copy = otio_tl.deepcopy()
+        # Strip the synthetic annotations-only track injected by RV's
+        # _stamp_sync_identity.  That track has a sync guid and no
+        # ExternalReference clips; it is not a real media track and must not
+        # reach load_otio (it would show up as a spurious video track in
+        # xStudio's OTIO export).  We distinguish it from any legitimate
+        # user-created track by requiring BOTH the sync marker AND the absence
+        # of ExternalReference clips — a real track with that name would have
+        # actual media clips.
+        def _is_injected_ann_track(t):
+            if not t.metadata.get("sync", {}).get("guid"):
+                return False
+            for child in t:
+                if isinstance(child, otio.schema.Clip) and isinstance(
+                    getattr(child, "media_reference", None),
+                    otio.schema.ExternalReference,
+                ):
+                    return False
+            return True
+
+        otio_copy.tracks[:] = [
+            t for t in otio_copy.tracks if not _is_injected_ann_track(t)
+        ]
         for track in otio_copy.tracks:
             if track.kind != otio.schema.TrackKind.Video:
                 continue

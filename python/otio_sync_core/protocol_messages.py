@@ -376,6 +376,44 @@ class SharedKeyResponse(ProtocolMessage):
 
 
 # ---------------------------------------------------------------------------
+# Timeline origin
+#
+# A timeline's sync model is selected by its origin, carried inside the
+# timeline's own ``metadata.sync.origin`` (so it travels for free inside any
+# serialized timeline — StateSnapshot, AddTimeline, ReplaceTimeline).  Peers
+# read it to route: OTIO-imported timelines use whole-OTIO snapshot pushes for
+# topology changes; native timelines use per-child patches.  A timeline lacking
+# the marker is treated as native for backward-compatibility with older peers.
+# ---------------------------------------------------------------------------
+
+#: Origin marker value for timelines expanded from an imported ``.otio`` file.
+ORIGIN_OTIO_IMPORT = "otio_import"
+#: Origin marker value (and default) for ad-hoc / native clip-list timelines.
+ORIGIN_NATIVE = "native"
+
+
+def timeline_origin(timeline: Any) -> str:
+    """Return a timeline's ``metadata.sync.origin``, defaulting to native.
+
+    Accepts either an OTIO ``Timeline`` object or its wire-form dict, so the
+    rule lives in exactly one place for both send and receive sides.  Any
+    timeline without the marker (older peers, native timelines) reads as
+    :data:`ORIGIN_NATIVE`.
+
+    :param timeline: An OTIO ``Timeline`` (has ``.metadata``) or a wire dict.
+    :returns: The origin marker string.
+    """
+    metadata = getattr(timeline, "metadata", None)
+    if metadata is None and isinstance(timeline, dict):
+        metadata = timeline.get("metadata")
+    try:
+        origin = metadata["sync"]["origin"]
+    except (KeyError, TypeError):
+        return ORIGIN_NATIVE
+    return origin or ORIGIN_NATIVE
+
+
+# ---------------------------------------------------------------------------
 # Timeline family — TIMELINE_1.0
 # ---------------------------------------------------------------------------
 
@@ -475,6 +513,55 @@ class RemoveTimeline(ProtocolMessage):
             timeline_guid=data.get("timeline_guid"),
             sync_timestamp=data.get("sync_timestamp"),
         )
+
+
+@register
+@dataclass
+class ReplaceTimeline(ProtocolMessage):
+    """Wholesale replacement of a timeline's structure ("brute-force push").
+
+    Carries a complete OTIO timeline and replaces the target's structure on each
+    peer in one shot, rather than as incremental child mutations.  Used for
+    topology changes (clip insert/remove, large re-edit) on OTIO-origin
+    timelines, where reconstructing the structure via RV's native OTIO reader is
+    cheaper and higher-fidelity than a stream of per-child patches.
+
+    Distinct from :class:`AddTimeline` (which models a *new* timeline and is a
+    no-op when the GUID already exists): ``REPLACE_TIMELINE`` deliberately
+    overwrites an existing timeline.  Each object's ``metadata.sync.guid`` in the
+    pushed timeline is preserved so attribute patches and annotations stay
+    resolvable across the replace.  Applying to an unknown GUID creates it.
+    """
+
+    SCHEMA = "TIMELINE_1.0"
+    EVENT = "REPLACE_TIMELINE"
+
+    timeline_guid: str = doc_field(doc="GUID of the timeline to replace (or create).")
+    timeline: Any = doc_field(
+        doc="Full OTIO timeline (object on send, wire dict on receive)."
+    )
+    sync_timestamp: "float | None" = doc_field(
+        default=None, doc="Epoch seconds when the message was sent."
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "timeline_guid": self.timeline_guid,
+            "timeline": _to_wire(self.timeline),
+            "sync_timestamp": self.sync_timestamp,
+        }
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "ReplaceTimeline":
+        return cls(
+            timeline_guid=data.get("timeline_guid"),
+            timeline=data.get("timeline"),
+            sync_timestamp=data.get("sync_timestamp"),
+        )
+
+    def as_otio(self) -> Any:
+        """Return the OTIO timeline, deserializing if still in wire form."""
+        return _from_wire(self.timeline)
 
 
 # ---------------------------------------------------------------------------

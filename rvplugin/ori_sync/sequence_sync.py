@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import copy
 import collections.abc
 from collections import Counter
 import rv.commands
@@ -14,7 +16,32 @@ try:
 except ImportError:
     STATE_SYNCED = "synced"
 
+try:
+    from otio_sync_core.protocol_messages import ORIGIN_NATIVE, ORIGIN_OTIO_IMPORT
+except ImportError:
+    ORIGIN_NATIVE = "native"
+    ORIGIN_OTIO_IMPORT = "otio_import"
+
+# RV's native OTIO reader/writer (the `otio_reader` rv-package). Imported
+# defensively: a build without the package must degrade to native handling
+# rather than crash, so OTIO-origin timelines are simply not snapshot-synced.
+try:
+    import otio_reader as rv_otio_reader
+    import otio_writer as rv_otio_writer
+except Exception:  # pragma: no cover - depends on the RV runtime
+    rv_otio_reader = None
+    rv_otio_writer = None
+
 from utils import _log, _log_exc, _media_path, _is_media_track
+
+#: RV's built-in default containers, never treated as shared sync timelines.
+_DEFAULT_CONTAINERS = ("defaultSequence", "defaultStack")
+#: ``otio`` component properties RV's otio_reader stamps on an imported Stack.
+#: ``timeline_name`` is written whenever the timeline has a name (so it is
+#: present even when the source .otio carried empty metadata), making it the
+#: most reliable OTIO-origin marker; the metadata variants appear only when the
+#: source objects had non-empty metadata.
+_OTIO_STACK_MARKERS = ("otio.timeline_name", "otio.timeline_metadata", "otio.metadata")
 
 
 class SequenceSyncController:
@@ -26,6 +53,15 @@ class SequenceSyncController:
         self._sequence_settle_until = {}
         self._active_media_track_guid = None
         self._track = None
+        # OTIO-origin snapshot sync state (§4):
+        #   _otio_stack_to_guid : RVStackGroup node -> timeline guid it maps to
+        #   _otio_last_export   : timeline guid -> last-broadcast serialized OTIO
+        #   _otio_guid_to_root  : timeline guid -> applied root node (peer side)
+        #   _otio_dirty         : set by STACKS/SEQUENCES graph events to gate diffs
+        self._otio_stack_to_guid = {}
+        self._otio_last_export = {}
+        self._otio_guid_to_root = {}
+        self._otio_dirty = True
 
     @staticmethod
     def _normalize_seq_name(name):
@@ -69,6 +105,408 @@ class SequenceSyncController:
                 return guid
         return None
 
+    # ------------------------------------------------------------------
+    # OTIO-origin detection (RV's otio_reader expands an imported .otio into
+    # a `tracks` RVStackGroup → RVSequenceGroup graph; these helpers tell that
+    # graph apart from native ad-hoc clip lists so the two are routed to
+    # different sync models).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_default_container(node):
+        """True if *node* is one of RV's built-in default containers."""
+        return node in _DEFAULT_CONTAINERS
+
+    @staticmethod
+    def _is_placeholder_movie(movie):
+        """True if *movie* is the transient ``blank,otioFile=…`` import proxy.
+
+        RV's otio_reader first loads an imported ``.otio`` as a blank movieproc
+        placeholder, then expands it.  The placeholder (and any leftover ``blank,``
+        proc) is never real media and must never become a clip/timeline.
+        """
+        return bool(movie) and movie.startswith("blank,")
+
+    @staticmethod
+    def _is_otio_stack(node):
+        """True if *node* is an RVStackGroup produced by an OTIO import.
+
+        Detected by the ``otio`` component RV's reader stamps on the stack —
+        most reliably ``otio.timeline_name`` (written whenever the timeline has
+        a name, so present even when the source ``.otio`` had empty metadata).
+        ``defaultStack`` is excluded.
+        """
+        try:
+            if rv.commands.nodeType(node) != "RVStackGroup" or node == "defaultStack":
+                return False
+            return any(
+                rv.commands.propertyExists(f"{node}.{p}") for p in _OTIO_STACK_MARKERS
+            )
+        except Exception:
+            return False
+
+    def _otio_stack_groups(self):
+        """Return all RVStackGroups that originated from an OTIO import."""
+        try:
+            return [n for n in rv.commands.nodesOfType("RVStackGroup") if self._is_otio_stack(n)]
+        except Exception:
+            return []
+
+    def _node_otio_metadata(self, node):
+        """Return the OTIO metadata dict RV stored on *node*, or ``{}``.
+
+        Reads the JSON the reader serialized into ``<node>.otio.timeline_metadata``
+        (stack/timeline level) or ``<node>.otio.metadata`` (track/clip level).
+        Carries the ``sync`` block — including ``guid`` and ``origin`` — back out
+        across a round-trip.
+        """
+        for prop in ("otio.timeline_metadata", "otio.metadata"):
+            full = f"{node}.{prop}"
+            try:
+                if rv.commands.propertyExists(full):
+                    val = rv.commands.getStringProperty(full)
+                    if val and val[0]:
+                        return json.loads(val[0])
+            except Exception:
+                pass
+        return {}
+
+    def _is_otio_origin_sequence(self, seq_group):
+        """True if *seq_group* is a track inside an OTIO-imported Stack.
+
+        Such sequences (e.g. the ``Video`` track of an imported timeline) are
+        synced via the whole-OTIO snapshot model, not the native per-child path,
+        so the native scans skip them.
+        """
+        for stack in self._otio_stack_groups():
+            if seq_group in self._get_sequence_inputs(stack):
+                return True
+        return False
+
+    def _is_syncable_native_sequence(self, seq_group):
+        """True if *seq_group* should be synced through the native patch model.
+
+        Excludes OTIO-origin track sequences (handled by the snapshot model) and
+        RV's ``defaultSequence`` whenever an OTIO import is present (there it
+        holds only the blank import placeholder; the real content lives in the
+        Stack).  With no OTIO import, ``defaultSequence`` is the legitimate
+        native working timeline and is kept.
+        """
+        if self._is_default_container(seq_group):
+            return not self._otio_stack_groups()
+        return not self._is_otio_origin_sequence(seq_group)
+
+    def _otio_expansion_pending(self):
+        """True if an OTIO import is mid-expansion and not yet ready to snapshot.
+
+        RV loads an imported ``.otio`` asynchronously (a ``blank,otioFile=…``
+        placeholder source appears first, then ``after_progressive_loading``
+        expands it into the ``tracks`` Stack).  Expansion is pending while a
+        placeholder source exists but no OTIO Stack with a populated track has
+        materialized yet — callers must defer snapshotting until it clears.
+        """
+        try:
+            sources = rv.commands.nodesOfType("RVFileSource")
+        except Exception:
+            return False
+        has_placeholder = False
+        for n in sources:
+            try:
+                movie = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+            except Exception:
+                continue
+            if self._is_placeholder_movie(movie):
+                has_placeholder = True
+                break
+        if not has_placeholder:
+            return False
+        # Placeholder present — expansion is done only once an OTIO Stack exists
+        # whose track sequence already has source inputs.
+        for stack in self._otio_stack_groups():
+            for seq in self._get_sequence_inputs(stack):
+                if self._get_sequence_inputs(seq):
+                    return False
+        return True
+
+    # ------------------------------------------------------------------
+    # OTIO-origin snapshot sync (§4): export via RV's otio_writer, diff and
+    # push whole-OTIO replacements on topology change, apply via otio_reader.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _otio_rw_available():
+        """True if RV's native OTIO reader and writer both imported."""
+        return rv_otio_reader is not None and rv_otio_writer is not None
+
+    def _stamp_sync_identity(self, tl, root_node):
+        """Stamp deterministic sync GUIDs + origin marker onto an exported OTIO.
+
+        A fresh import (from a ``.otio`` with empty metadata) carries no sync
+        GUIDs, so we derive them from stable keys both peers compute identically:
+        the timeline name, the track position, and — for clips — the normalized
+        media path plus the clip's position and in-point (the same media appears
+        at several cuts, so path alone is not unique). Media ``target_url``s are
+        normalized to absolute paths so peers can resolve them without the
+        import's relative-path context. Pre-existing GUIDs (from a prior
+        round-trip) are preserved.
+        """
+        mgr = self.plugin.sync_manager
+        derive = mgr._derive_guid
+        name = tl.name or root_node
+        sync = tl.metadata.setdefault("sync", {})
+        sync.setdefault("guid", derive(f"rv_otio:{name}"))
+        sync["origin"] = ORIGIN_OTIO_IMPORT
+        # The RV writer sets global_start_time to the first clip's source in-point
+        # (e.g., 100 for media with embedded timecode starting at frame 100).
+        # xStudio respects this and counts its internal playhead from 100, making
+        # xStudio's frame 0 correspond to sequence position 100 — a ~100-frame sync
+        # offset.  For sequence frame sync the timeline always starts at position 0,
+        # regardless of where in the source media the clips read from.
+        tl.global_start_time = None
+        for ti, track in enumerate(tl.tracks):
+            track.metadata.setdefault("sync", {}).setdefault(
+                "guid", derive(f"rv_otio_track:{name}:{ti}:{track.name}")
+            )
+            for ci, child in enumerate(track):
+                if not isinstance(child, otio.schema.Clip):
+                    continue
+                ref = child.media_reference
+                if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
+                    norm = _media_path(ref.target_url)
+                    ref.target_url = norm
+                    start = int(child.source_range.start_time.value) if child.source_range else 0
+                    child.metadata.setdefault("sync", {}).setdefault(
+                        "guid", derive(f"rv_clip:{norm}:{ti}:{ci}:{start}")
+                    )
+        # Give the timeline a logical Annotations track (matching native
+        # timelines) so annotations have a home: annotation_track_guid_for_clip
+        # looks for a track named "Annotations" in the clip's timeline.  This
+        # track holds annotation clips only — it is stripped before
+        # create_rv_node_from_otio (see apply_otio_snapshot) because it carries
+        # no real media and must not be rebuilt as an RV node; annotations render
+        # onto RV paint nodes instead.
+        if not any("annotation" in (t.name or "").lower() for t in tl.tracks):
+            ann_track = otio.schema.Track("Annotations")
+            ann_track.metadata["sync"] = {"guid": derive(f"rv_otio_ann:{name}")}
+            tl.tracks.append(ann_track)
+
+    def _export_otio_stack(self, stack_node):
+        """Export an OTIO-origin RVStackGroup to a guid-stamped OTIO Timeline."""
+        if not rv_otio_writer:
+            return None
+        try:
+            tl = rv_otio_writer.create_timeline_from_node(stack_node)
+        except Exception as e:
+            # sourceMediaInfo may not be ready yet if called during initial load;
+            # caller retries on the next dirty tick — log without stack trace.
+            _log(f"_export_otio_stack: create_timeline_from_node({stack_node}) not ready: {e}")
+            return None
+        if not tl:
+            return None
+        self._stamp_sync_identity(tl, stack_node)
+        return tl
+
+    @staticmethod
+    def _serialize_otio(tl):
+        """Serialize an OTIO timeline to its canonical wire string for diffing."""
+        try:
+            return otio.adapters.write_to_string(tl, "otio_json", indent=-1)
+        except Exception:
+            return None
+
+    def init_otio_timelines(self):
+        """Register (and broadcast) every OTIO-imported Stack as a snapshot timeline.
+
+        Called once expansion has settled (§2 wait). Each imported Stack becomes
+        one OTIO-origin timeline synced via the whole-OTIO model; its node graph
+        is left intact (RV already built it correctly) — we only mirror it into
+        the sync manager.
+        """
+        if not self._otio_rw_available():
+            _log("init_otio_timelines: RV otio reader/writer unavailable — skipping")
+            return
+        mgr = self.plugin.sync_manager
+        for stack in self._otio_stack_groups():
+            tl = self._export_otio_stack(stack)
+            if not tl:
+                continue
+            guid = tl.metadata["sync"]["guid"]
+            if guid in mgr._timelines:
+                continue
+            mgr.register_timeline(tl)
+            self._otio_stack_to_guid[stack] = guid
+            self._otio_guid_to_root[guid] = stack
+            self._otio_last_export[guid] = self._serialize_otio(tl)
+            mgr.broadcast_add_timeline(guid)
+            _log(f"init_otio_timelines: registered '{tl.name}' {guid[:8]} from {stack}")
+
+    def check_otio_snapshots(self):
+        """Diff each OTIO Stack against its last export; push on topology change.
+
+        Only the master runs this. Peers must never broadcast OTIO changes — they
+        only receive and apply. Without this gate, a peer that imported an OTIO
+        file would echo ADD_TIMELINE back to the master, which would re-broadcast
+        it, causing duplicate Stack/Sequence nodes from repeated
+        ``create_rv_node_from_otio`` calls.
+
+        Gated on the ``_otio_dirty`` flag (set by STACKS/SEQUENCES graph events)
+        so the whole-timeline serialization does not run every poll tick. A clip
+        insert/remove/large re-edit changes the serialized structure and triggers
+        a ``REPLACE_TIMELINE`` push; a brand-new Stack triggers ``ADD_TIMELINE``.
+        """
+        mgr = self.plugin.sync_manager
+        if not mgr or mgr.status != STATE_SYNCED or not self._otio_rw_available():
+            return
+        if not mgr.is_master:
+            self._otio_dirty = False  # clear flag but never broadcast as peer
+            return
+        if not self._otio_dirty:
+            return
+        self._otio_dirty = False
+        for stack in self._otio_stack_groups():
+            tl = self._export_otio_stack(stack)
+            if not tl:
+                self._otio_dirty = True  # media not ready yet — retry next tick
+                continue
+            guid = tl.metadata["sync"]["guid"]
+            wire = self._serialize_otio(tl)
+            if guid not in mgr._timelines:
+                mgr.register_timeline(tl)
+                self._otio_stack_to_guid[stack] = guid
+                self._otio_guid_to_root[guid] = stack
+                self._otio_last_export[guid] = wire
+                mgr.broadcast_add_timeline(guid)
+                _log(f"check_otio_snapshots: new OTIO timeline {guid[:8]} broadcast")
+            elif self._otio_last_export.get(guid) != wire:
+                self._otio_last_export[guid] = wire
+                # Remap object_map to the new structure (preserves persisting
+                # clip guids), then push the wholesale replacement to peers.
+                mgr._replace_timeline_local(guid, tl)
+                mgr.broadcast_replace_timeline(guid)
+                _log(f"check_otio_snapshots: topology change → replace push {guid[:8]}")
+
+    def apply_otio_snapshot(self, tl):
+        """Build/replace RV nodes for a received OTIO-origin timeline.
+
+        Uses RV's native ``create_rv_node_from_otio`` so the Stack→Sequence→EDL
+        graph (and any CDL/retime/annotation the writer captured) is reconstructed
+        with full fidelity. On replace, the previously-applied root is torn down
+        first. Runs under ``addSourceBegin/End`` like RV's own importer.
+        """
+        if not self._otio_rw_available():
+            _log("apply_otio_snapshot: RV otio_reader unavailable — cannot apply")
+            return
+        guid = tl.metadata.get("sync", {}).get("guid")
+        old_root = self._otio_guid_to_root.get(guid)
+        if old_root:
+            try:
+                # Also delete the sequence nodes that were inputs to the stack.
+                # deleteNode on the stack alone leaves RVSequenceGroup children
+                # orphaned in the node graph; they accumulate as Video, Video000002,
+                # … on each REPLACE_TIMELINE apply.  Source groups are NOT deleted
+                # here — they may be shared and are managed by addSource/deleteNode
+                # elsewhere.
+                try:
+                    inputs, _ = rv.commands.nodeConnections(old_root)
+                    for child in (inputs or []):
+                        if rv.commands.nodeType(child) == "RVSequenceGroup":
+                            rv.commands.deleteNode(child)
+                except Exception:
+                    pass
+                rv.commands.deleteNode(old_root)
+                self._otio_stack_to_guid.pop(old_root, None)
+            except Exception as e:
+                _log(f"apply_otio_snapshot: could not delete old root {old_root}: {e}")
+        # Strip the logical Annotations track before the reader: it carries only
+        # annotation clips (no media), so create_rv_node_from_otio would try to
+        # build source nodes for them.  The full timeline (with the track) stays
+        # registered in the manager for annotation_track_guid_for_clip; here we
+        # only rebuild the media tracks into RV nodes.
+        reader_tl = tl
+        try:
+            if any("annotation" in (t.name or "").lower() for t in tl.tracks):
+                reader_tl = copy.deepcopy(tl)
+                keep = [t for t in reader_tl.tracks if "annotation" not in (t.name or "").lower()]
+                reader_tl.tracks[:] = keep
+        except Exception as e:
+            _log(f"apply_otio_snapshot: could not strip annotation track: {e}")
+            reader_tl = tl
+        try:
+            rv.commands.addSourceBegin()
+            try:
+                root = rv_otio_reader.create_rv_node_from_otio(reader_tl, {"otio_file": None})
+            finally:
+                rv.commands.addSourceEnd()
+        except Exception as e:
+            _log_exc(f"apply_otio_snapshot: create_rv_node_from_otio failed: {e}")
+            return
+        if not root:
+            _log("apply_otio_snapshot: reader returned no root node")
+            return
+        self._otio_guid_to_root[guid] = root
+        self._otio_stack_to_guid[root] = guid
+        # Mark this as the active timeline so state reporters (get_openrv_state)
+        # report the OTIO name consistently across master and peer.
+        self.plugin.sync_manager.active_timeline_guid = guid
+        # Replay any annotations that were already bound to clips in this
+        # timeline. Suppress the echo guard first so the replayed strokes
+        # aren't re-broadcast as new local events (same pattern used by
+        # _rebuild_rv_session for native timelines).
+        self._replay_otio_annotations(tl)
+        # Establish the diff baseline from this peer's own re-export of the new
+        # nodes, so the graph change we just caused does not echo a push back.
+        exported = self._export_otio_stack(root)
+        self._otio_last_export[guid] = (
+            self._serialize_otio(exported) if exported else self._serialize_otio(tl)
+        )
+        try:
+            rv.commands.setViewNode(root)
+            rv.commands.redraw()
+        except Exception:
+            pass
+        _log(f"apply_otio_snapshot: built nodes for {guid[:8]} root={root}")
+
+    def _replay_otio_annotations(self, tl):
+        """Re-apply any persisted annotations for clips in *tl* onto new RV nodes.
+
+        Called from :meth:`apply_otio_snapshot` after ``create_rv_node_from_otio``
+        builds a fresh node graph.  The paint nodes are empty at that point; this
+        replays annotation commands from every clip timeline whose media clip
+        belongs to *tl*, so annotations survive a ``REPLACE_TIMELINE`` apply.
+
+        Echo suppression (:attr:`~AnnotationSyncController._ignore_annotations_until`)
+        is set before replaying so the strokes are not re-broadcast as new local
+        events.
+        """
+        mgr = self.plugin.sync_manager
+        try:
+            self.plugin.annotation._ignore_annotations_until = (
+                __import__("time").time() + 1.5
+            )
+            for track in tl.tracks:
+                for clip in track:
+                    if not isinstance(clip, otio.schema.Clip):
+                        continue
+                    clip_guid = clip.metadata.get("sync", {}).get("guid")
+                    if not clip_guid:
+                        continue
+                    ann_tl_guid = mgr._clip_timelines.get(clip_guid)
+                    if not ann_tl_guid:
+                        continue
+                    ann_tl = mgr._timelines.get(ann_tl_guid)
+                    if not ann_tl:
+                        continue
+                    for ann_track in ann_tl.tracks:
+                        for ann_clip in ann_track:
+                            if (isinstance(ann_clip, otio.schema.Clip)
+                                    and "annotation_commands" in ann_clip.metadata):
+                                try:
+                                    self.plugin.annotation._apply_annotation_render(ann_clip)
+                                except Exception as e:
+                                    _log(f"_replay_otio_annotations: render failed: {e}")
+        except Exception as e:
+            _log(f"_replay_otio_annotations: {e}")
+
     def _init_timelines_from_sequences(self, seq_groups, fps):
         """Create one OTIO timeline per RVSequenceGroup and register each."""
         try:
@@ -79,6 +517,11 @@ class SequenceSyncController:
         source_groups_set = set(rv.commands.nodesOfType("RVSourceGroup"))
 
         for seq_group in seq_groups:
+            # OTIO-origin track sequences are synced via the snapshot model and
+            # RV's default containers are not shared timelines — skip both here.
+            if not self._is_syncable_native_sequence(seq_group):
+                _log(f"Skipping non-native sequence '{seq_group}' (OTIO-origin or default)")
+                continue
             try:
                 seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
             except Exception:
@@ -144,6 +587,9 @@ class SequenceSyncController:
             timeline.metadata.setdefault("sync", {})["guid"] = (
                 self.plugin.sync_manager._derive_guid(f"rv_sequence:{seq_name}")
             )
+            # Route marker: these are native ad-hoc clip lists; OTIO-imported
+            # timelines are built from the Stack and marked otio_import (§4).
+            timeline.metadata["sync"]["origin"] = ORIGIN_NATIVE
             self.plugin.sync_manager.register_timeline(timeline)
             # Read UUIDs back after registration (assigned by _ensure_guid_and_map)
             track_guid = media_track.metadata["sync"]["guid"]
@@ -180,6 +626,7 @@ class SequenceSyncController:
         timeline.metadata.setdefault("sync", {})["guid"] = (
             self.plugin.sync_manager._derive_guid(f"rv_sequence:{timeline.name}")
         )
+        timeline.metadata["sync"]["origin"] = ORIGIN_NATIVE
         self.plugin.sync_manager.register_timeline(timeline)
         self._active_media_track_guid = media_track.metadata["sync"]["guid"]
         self._track = media_track
@@ -192,7 +639,16 @@ class SequenceSyncController:
             pass
 
     def _retry_init_timelines(self):
-        """Re-scan source groups after the RV node graph has had time to settle."""
+        """Re-scan source groups after the RV node graph has had time to settle.
+
+        This is the native fast-load retry (ad-hoc clip lists whose media had
+        not finished loading at init). It is a no-op for OTIO-imported sessions:
+        their timelines are owned by the snapshot model, and the destructive
+        ``reset_timelines`` below must not clobber them.
+        """
+        if self._otio_stack_groups():
+            _log("Retry init skipped — OTIO import present (snapshot model owns it)")
+            return
         try:
             fps = rv.commands.fps()
         except Exception:
@@ -236,6 +692,10 @@ class SequenceSyncController:
         try:
             path = rv.commands.getStringProperty(f"{file_source_node}.media.movie")[0]
             if not path:
+                return None
+            # Never turn the transient OTIO import placeholder into a clip.
+            if self._is_placeholder_movie(path):
+                _log(f"_make_clip: skipping OTIO import placeholder {file_source_node}")
                 return None
             if not path.startswith(("http://", "https://", "file://")) and not os.path.isabs(path):
                 path = os.path.abspath(path)
@@ -378,7 +838,7 @@ class SequenceSyncController:
                 for n in rv.commands.nodesInGroup(sg):
                     if rv.commands.nodeType(n) == "RVFileSource":
                         path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                        if path:
+                        if path and not self._is_placeholder_movie(path):
                             mapping[_media_path(path)] = sg
             except Exception:
                 pass
@@ -540,6 +1000,10 @@ class SequenceSyncController:
         for seq_group in seq_groups:
             if seq_group in self._rv_node_to_timeline_guid:
                 continue
+            # OTIO-origin track sequences and RV default containers are not
+            # native timelines — the snapshot model owns the former.
+            if not self._is_syncable_native_sequence(seq_group):
+                continue
             # New sequence group not yet tracked — register and broadcast it.
             try:
                 seq_name = rv.commands.getStringProperty(f"{seq_group}.ui.name")[0]
@@ -584,6 +1048,7 @@ class SequenceSyncController:
             timeline.metadata.setdefault("sync", {})["guid"] = (
                 self.plugin.sync_manager._derive_guid(f"rv_sequence:{seq_name}")
             )
+            timeline.metadata["sync"]["origin"] = ORIGIN_NATIVE
             self.plugin.sync_manager.register_timeline(timeline)
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
@@ -850,6 +1315,19 @@ class SequenceSyncController:
             tl for tl in self.plugin.sync_manager._timelines.values()
             if not tl.metadata.get("xs_flat_playlist")
         ]
+        if not timelines:
+            return
+
+        # OTIO-origin timelines are rebuilt with full fidelity via RV's native
+        # reader (Stack/EDL/CDL), not the flat builder below. Apply them here and
+        # drop them from the flat path.
+        otio_origin = [
+            tl for tl in timelines
+            if tl.metadata.get("sync", {}).get("origin") == ORIGIN_OTIO_IMPORT
+        ]
+        for tl in otio_origin:
+            self.apply_otio_snapshot(tl)
+        timelines = [tl for tl in timelines if tl not in otio_origin]
         if not timelines:
             return
 

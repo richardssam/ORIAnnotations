@@ -282,16 +282,22 @@ class TestRunner:
             logging.error(f"Test '{test_name}' not found in configuration.")
             return False
 
-        recording_path = os.path.join(os.path.dirname(self.config_path), test_data['recording'])
         apps = test_data['apps']
-
         script_driven = script_driven or test_data.get('script_driven', False)
+        recording = test_data.get('recording')
+        recording_path = (
+            os.path.join(os.path.dirname(self.config_path), recording)
+            if recording else None
+        )
 
         # Annotations only flow in playback (non-script) mode. Script-driven runs
         # replay *derived media commands* (add/delete media), never the
         # recording's Annotation.1 events — so a recording that merely happens to
         # contain annotations must not make the presence check expect them.
-        expect_annotations = (not script_driven) and recording_has_annotations(recording_path)
+        expect_annotations = (
+            (not script_driven) and recording_path is not None
+            and recording_has_annotations(recording_path)
+        )
 
         # Allow per-test overrides for checkpoint tuning
         checkpoint_validation_delay = test_data.get('checkpoint_validation_delay', checkpoint_validation_delay)
@@ -325,10 +331,13 @@ class TestRunner:
                         if cmd.get("action") == "add_media" and cmd.get("url") and not os.path.isabs(cmd["url"]):
                             cmd["url"] = os.path.join(repo_root, cmd["url"])
                         commands.append(cmd)
-                else:
+                elif recording_path:
                     logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")
                     commands = derive_commands_from_recording(recording_path)
                     logging.info(f"Derived {len(commands)} commands.")
+                else:
+                    logging.info("Running in script-driven mode with no commands (fixture-only test).")
+                    commands = []
             else:
                 player = SyncPlayer(session_id=session_id)
                 player.load_recording(recording_path)
@@ -399,8 +408,14 @@ class TestRunner:
 
             app_ports = []
             free_ports = _find_free_ports(len(apps))
-            for app_name, port in zip(apps, free_ports):
-                spawner.launch(app_name, port)
+            # ``fixtures`` is a parallel list to ``apps``; entry may be None.
+            fixtures = test_data.get("fixtures", [])
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+            for i, (app_name, port) in enumerate(zip(apps, free_ports)):
+                fixture = fixtures[i] if i < len(fixtures) else None
+                if fixture and not os.path.isabs(fixture):
+                    fixture = os.path.join(repo_root, fixture)
+                spawner.launch(app_name, port, session_file=fixture)
                 app_ports.append((app_name, port))
 
             logging.info("Apps launched. Waiting for all apps to connect...")
@@ -436,8 +451,9 @@ class TestRunner:
                         break
                     time.sleep(1.0)
 
-                logging.info("Command sequence completed. Waiting for convergence...")
-                time.sleep(3.0)
+                convergence_wait = float(test_data.get("convergence_wait", 3.0))
+                logging.info(f"Command sequence completed. Waiting {convergence_wait}s for convergence...")
+                time.sleep(convergence_wait)
                 playing_state["playing"] = False
 
             while playing_state["playing"]:
@@ -607,6 +623,59 @@ class TestRunner:
                     fail_reason = msg
                 else:
                     logging.info("✅ Apps agree on timeline structure (full-state consensus)")
+
+            # OTIO structural comparison (§9.5): export the timeline from every
+            # app and compare it against a reference .otio file.  Triggered when
+            # the yaml test has an ``otio_compare`` block:
+            #   otio_compare:
+            #     reference: "test_media/source/otio_test_quicktime.otio"
+            #     export_delay: 4.0   # optional extra settle time
+            if not failed and "otio_compare" in test_data:
+                try:
+                    from sync_test.otio_compare import load_cut_structure, compare
+                    otio_cfg = test_data["otio_compare"]
+                    ref_path = otio_cfg.get("reference", "")
+                    if not os.path.isabs(ref_path):
+                        ref_path = os.path.join(repo_root, ref_path)
+                    export_delay = float(otio_cfg.get("export_delay", 3.0))
+                    logging.info(
+                        f"OTIO compare: waiting {export_delay}s for sync to settle..."
+                    )
+                    time.sleep(export_delay)
+                    ref_struct = load_cut_structure(ref_path)
+                    for app_name, port in app_ports:
+                        export_path = os.path.join(
+                            spawner.logs_dir, f"{app_name}_{port}_export.otio"
+                        )
+                        res = self.send_command(port, {
+                            "action": "export_otio",
+                            "filepath": export_path,
+                        })
+                        if "error" in res:
+                            logging.error(
+                                f"❌ FAIL: {app_name} export_otio failed: "
+                                f"{res['error']}"
+                            )
+                            failed = True
+                            continue
+                        import opentimelineio as otio
+                        candidate = otio.adapters.read_from_file(export_path)
+                        equal, diffs = compare(ref_struct, candidate)
+                        if equal:
+                            logging.info(
+                                f"✅ {app_name} OTIO export matches reference "
+                                f"'{os.path.basename(ref_path)}'"
+                            )
+                        else:
+                            logging.error(
+                                f"❌ FAIL: {app_name} OTIO export differs from "
+                                f"reference '{os.path.basename(ref_path)}':\n"
+                                + "\n".join(f"  {d}" for d in diffs)
+                            )
+                            failed = True
+                except Exception as e:
+                    logging.error(f"❌ FAIL: otio_compare block raised: {e}", exc_info=True)
+                    failed = True
 
             # Save session states
             for name, port in app_ports:

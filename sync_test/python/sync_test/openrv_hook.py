@@ -204,6 +204,28 @@ def execute_openrv_command(payload):
         rv.commands.saveSession(path)
         return {"action": action, "status": "success"}
 
+    elif action == "export_otio":
+        # Export the current OTIO timeline via RV's native otio_writer so the
+        # sync test can compare it (guid/path-tolerant) against the reference.
+        import otio_writer
+        import opentimelineio as otio
+        path = payload.get("filepath")
+        # Prefer an OTIO-imported Stack (the `tracks` RVStackGroup, marked with an
+        # otio.* component); fall back to the current view node.
+        markers = ("otio.timeline_name", "otio.timeline_metadata", "otio.metadata")
+        root = None
+        for n in rv.commands.nodesOfType("RVStackGroup"):
+            if n == "defaultStack":
+                continue
+            if any(rv.commands.propertyExists(f"{n}.{p}") for p in markers):
+                root = n
+                break
+        if root is None:
+            root = rv.commands.viewNode()
+        timeline = otio_writer.create_timeline_from_node(root)
+        otio.adapters.write_to_file(timeline, path)
+        return {"action": action, "status": "success", "root": root, "filepath": path}
+
     elif action == "delete_media":
         name = payload.get("name")
         import os

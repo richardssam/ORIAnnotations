@@ -41,7 +41,7 @@ tests:
       - "openrv"
       - "openrv"
   - name: "delete_media_openrv"
-    recording: "recordings/delete_media_notc.jsonl"
+    #recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
     commands:
       - action: "add_media"
@@ -58,7 +58,7 @@ tests:
       - "openrv"
       - "openrv"
   - name: "delete_media_xstudio"
-    recording: "recordings/delete_media_notc.jsonl"
+    #recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
     commands:
       - action: "add_media"
@@ -83,7 +83,7 @@ tests:
       - "xstudio"
   - name: "xstudio_selects"
     recording: "recordings/xstudio_selects.jsonl"
-    script_driven: true
+    #script_driven: true
     apps:
       - "openrv"
       - "xstudio"
@@ -111,3 +111,57 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
+
+  # OTIO import sync tests (§9 of otio-import-sync change).
+  # Fixture: examples/otio_sample.rv is otio_test_quicktime.otio already imported into RV.
+  # Both tests confirm the full round-trip: imported OTIO → sync → peer export ≈ reference.
+  - name: "otio_import_rv_to_rv"
+    script_driven: true
+    convergence_wait: 8.0
+    fixtures:
+      - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
+      - null                        # app[1]: RV peer starts empty, receives via sync
+    otio_compare:
+      reference: "test_media/source/otio_test_quicktime.otio"
+      export_delay: 5.0
+    apps:
+      - "openrv"
+      - "openrv"
+
+  - name: "otio_import_rv_to_xstudio"
+    script_driven: true
+    convergence_wait: 8.0
+    fixtures:
+      - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
+      - null                        # app[1]: xStudio peer starts empty, receives via sync
+    otio_compare:
+      reference: "test_media/source/otio_test_quicktime.otio"
+      export_delay: 5.0
+    apps:
+      - "openrv"
+      - "xstudio"
+
+  - name: "otio_import_xstudio_to_rv"
+    script_driven: true
+    convergence_wait: 8.0
+    fixtures:
+      - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
+      - null                        # app[1]: xStudio peer starts empty, receives via sync
+    otio_compare:
+      reference: "test_media/source/otio_test_quicktime.otio"
+      export_delay: 5.0
+    apps:
+      - "openrv"
+      - "xstudio"
+  - name: "otio_import_rv_to_xstudio"
+    script_driven: true
+    convergence_wait: 8.0
+    fixtures:
+      - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
+      - null                        # app[1]: xStudio peer starts empty, receives via sync
+    otio_compare:
+      reference: "test_media/source/otio_test_quicktime.otio"
+      export_delay: 5.0
+    apps:
+      - "xstudio"
+      - "openrv"
