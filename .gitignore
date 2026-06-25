@@ -1,0 +1,63 @@
+# Python
+*.pyc
+__pycache__/
+.venv
+
+# macOS
+.DS_Store
+
+# IDE / Agent
+.vscode/
+.agent
+.claude
+
+# Logs
+*.log
+
+# Session & debug files (root-level only)
+/*.jsonl
+/*.otio
+/*.xst
+/*.rv
+/*.json
+/*.rvpkg
+
+# Output directories
+testoutput/
+test_integration_output/
+xstudio_output/
+batch_output/
+
+# Build outputs
+#docs/html/
+docs/doctrees/
+#*.rvpkg
+
+# Vendored dependencies (built by makepackage)
+rvplugin/ori_sync/pika/
+rvplugin/ori_annotations/pika/
+
+# Plugin test artifacts
+rvplugin/ori_annotations/testexport/
+rvplugin/ori_sync/testexport/
+rvplugin/ori_sync/testoutput.*
+rvplugin/ori_annotations/deletetest/
+
+# Test media build cache
+test_media/source/exr_tmp
+
+# OTIO schema plugin cache
+otio_event_plugin/schemadefs/__pycache__
+
+# Nuke Studio (exploratory, no code yet)
+nuke_studio/
+
+# Temporary run/test directories
+foo_annotations/
+scratch/
+blank_test.png
+tests/test_inspect.py
+*.bak
+
+
+

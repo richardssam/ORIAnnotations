@@ -24,11 +24,15 @@ python -m sync_recorder.recorder --session review-session --output my_recording.
 ```
 
 Options:
+
 - `--session`: The ID of the session to record (default: `otio-sync-demo`).
-- `--host`: RabbitMQ host (default: `localhost`).
+- `--host`: RabbitMQ host (default: `127.0.0.1`).
 - `--port`: RabbitMQ port (default: `5672`).
 - `-o`, `--output`: Path to write the output JSON Lines file (Required).
 - `--no-handshake`: Disables initial state capture. By default, when starting, the recorder requests the current timeline snapshot from the session master and records it as the first event.
+- `--periodic-state`: Periodically request a fresh `STATE_SNAPSHOT` from the master at settle points. Intended for the `sync_test` framework to validate live client state. Off by default.
+- `--min-silence SECONDS`: Stream-silence required before an active periodic state request is issued (default: `1.5`). Only relevant with `--periodic-state`.
+- `--min-interval SECONDS`: Minimum seconds between active periodic state requests (default: `5.0`). Only relevant with `--periodic-state`.
 
 ### Replaying a Recording
 
@@ -39,17 +43,21 @@ python -m sync_recorder.player --session review-session --input my_recording.jso
 ```
 
 Options:
+
 - `--session`: The ID of the session to play back to (default: `otio-sync-demo`).
-- `--host`: RabbitMQ host (default: `localhost`).
+- `--host`: RabbitMQ host (default: `127.0.0.1`).
 - `--port`: RabbitMQ port (default: `5672`).
 - `-i`, `--input`: Path to the recording file to play back (Required).
 - `--speed`: Playback speed multiplier, e.g. `2.0` plays twice as fast (default: `1.0`).
 - `--loop`: Loops playback indefinitely.
 - `--keep-guids`: Keeps original source GUIDs instead of replacing them with the player's own unique GUID.
+- `--wait-for-peer`: Hold playback until a peer has joined and received the `STATE_SNAPSHOT`, then wait `--post-snapshot-delay` seconds before sending the first recorded event. The player will also start early if it detects peer activity before the delay expires.
+- `--post-snapshot-delay SECONDS`: Seconds to wait after delivering the state snapshot before playback begins (default: `3.0`). Only used with `--wait-for-peer`.
 
 ### Session Initialization & Replay Handshake
 
 For a joining peer (like an empty OpenRV session) to successfully apply replayed events, its internal timeline structure and GUIDs must match the recording. The package handles this automatically using a Master/Joiner handshake:
+
 1. **Initial State Capture**: When `SyncRecorder` starts, it automatically queries the active master for a `STATE_SNAPSHOT` and records it at the beginning of the file.
 2. **Master Simulation**: When `SyncPlayer` plays back a recording that contains a `STATE_SNAPSHOT`, it runs as a master simulator. It listens for `WHO_IS_MASTER` and `STATE_REQUEST` messages from new peers. When a joining peer requests state, the player dynamically intercepts the request and serves the recorded `STATE_SNAPSHOT` targeted to the peer's GUID with updated timestamps. This initializes the peer with the correct timelines, tracks, and GUIDs, allowing subsequent annotations and playhead updates to apply perfectly.
 

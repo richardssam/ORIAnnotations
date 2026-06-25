@@ -47,126 +47,16 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "python"))
 import opentimelineio as otio
 import ORIAnnotations
 
-# Access the SyncEvent schema module (loaded via the plugin manifest)
-SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
+from otio_sync_core.annotation_builder import (
+    px_to_norm,
+    line_pts,
+    pressure_sizes,
+    bezier_curve,
+    make_stroke,
+    make_text,
+    ts,
+)
 
-# ─── Coordinate helpers ───────────────────────────────────────────────────────
-
-def px_to_norm(px, py, width, height):
-    """Pixel → RV paint normalised coordinates.
-    RV normalises by image width: x ∈ [-0.5, 0.5], y ∈ [-h/(2w), h/(2w)].
-    """
-    nx = (px - width  / 2.0) / height
-    ny = -((py - height / 2.0) / height)
-    return float(nx), float(ny)
-
-
-def line_pts(x0, y0, x1, y1, n=24):
-    """Return *n* evenly-spaced pixel points along the segment."""
-    return [
-        (x0 + (x1 - x0) * i / (n - 1), y0 + (y1 - y0) * i / (n - 1))
-        for i in range(n)
-    ]
-
-def pressure_sizes(base_size, n, variation=1.6):
-    """Sizes that swell from thin → thick → thin (simulates pen pressure).
-    Normalised so the peak value is exactly base_size.
-    """
-    peak = 0.5 + variation
-    return [
-        base_size * (0.5 + variation * math.sin(math.pi * i / max(n - 1, 1))) / peak
-        for i in range(n)
-    ]
-
-
-
-def ts():
-    return datetime.now().isoformat()
-
-
-# ─── OTIO event builders ──────────────────────────────────────────────────────
-
-def make_stroke(points_px, width, height, rgba, brush_size,
-                brush="circle", varying_pressure=False):
-    """
-    Build [PaintStart, PaintPoints, PaintEnd] OTIO objects for one stroke.
-
-    points_px : list of (pixel_x, pixel_y)
-    rgba      : [r, g, b, a]  (0-1 floats)
-    brush_size: normalised radius (e.g. 0.02 ≈ 2 % of half-height)
-    """
-    stroke_id = str(uuid.uuid4())
-    n = len(points_px)
-
-    xs, ys, sizes = [], [], []
-    pressure = pressure_sizes(brush_size, n) if varying_pressure else [brush_size] * n
-
-    for i, (px, py) in enumerate(points_px):
-        nx, ny = px_to_norm(px, py, width, height)
-        xs.append(nx)
-        ys.append(ny)
-        sizes.append(float(pressure[i]))
-
-    events = []
-
-    # PaintStart
-    start = json.dumps({
-        "OTIO_SCHEMA":  "PaintStart.1",
-        "brush":        brush,
-        "friendly_name": "testchart_generator",
-        "rgba":         [float(c) for c in rgba],
-        "source_index": 0,
-        "timestamp":    ts(),
-        "type":         "color",
-        "uuid":         stroke_id,
-        "visible":      True,
-    })
-    events.append(otio.adapters.read_from_string(start, adapter_name="otio_json"))
-
-    # PaintPoints  (uses PaintVertices array format)
-    pts = json.dumps({
-        "OTIO_SCHEMA":  "PaintPoint.1",
-        "source_index": 0,
-        "uuid":         stroke_id,
-        "timestamp":    ts(),
-        "points": {
-            "OTIO_SCHEMA": "PaintVertices.1",
-            "x":    xs,
-            "y":    ys,
-            "size": sizes,
-        },
-    })
-    events.append(otio.adapters.read_from_string(pts, adapter_name="otio_json"))
-
-    # PaintEnd
-    end = json.dumps({
-        "OTIO_SCHEMA": "PaintEnd.1",
-        "uuid":        stroke_id,
-        "timestamp":   ts(),
-    })
-    events.append(otio.adapters.read_from_string(end, adapter_name="otio_json"))
-
-    return events
-
-
-def make_text(px, py, width, height, text, rgba, font_size=50.0):
-    """Build a single TextAnnotation event."""
-    nx, ny = px_to_norm(px, py, width, height)
-    j = json.dumps({
-        "OTIO_SCHEMA":   "TextAnnotation.1",
-        "uuid":          str(uuid.uuid4()),
-        "rgba":          [float(c) for c in rgba],
-        "friendly_name": "testchart_generator",
-        "text":          text,
-        "position":      [nx, ny],
-        "font_size":     float(font_size),
-        "scale":         1.0,
-        "rotation":      0.0,
-        "spacing":       1.0,
-        "font":          "monospace",
-        "timestamp":     ts(),
-    })
-    return [otio.adapters.read_from_string(j, adapter_name="otio_json")]
 
 
 # ─── Reference line coordinates ───────────────────────────────────────────────
@@ -665,14 +555,7 @@ def vector_thickness_annotations():
     return ev
 
 
-def bezier_curve(p0, p1, p2, p3, n=50):
-    pts = []
-    for i in range(n):
-        t = i / (n - 1)
-        x = (1-t)**3 * p0[0] + 3*(1-t)**2 * t * p1[0] + 3*(1-t) * t**2 * p2[0] + t**3 * p3[0]
-        y = (1-t)**3 * p0[1] + 3*(1-t)**2 * t * p1[1] + 3*(1-t) * t**2 * p2[1] + t**3 * p3[1]
-        pts.append((x, y))
-    return pts
+
 
 
 def join_segments(segs):

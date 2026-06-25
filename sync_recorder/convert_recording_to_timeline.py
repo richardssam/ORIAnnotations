@@ -10,10 +10,39 @@ import os
 import pathlib
 import sys
 
-# Ensure we can import otio_sync_core
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "python"))
+# Ensure we can import otio_sync_core and sibling folders
+project_root = pathlib.Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "python"))
+
+# Setup OTIO plugin manifest path
+manifest_file = project_root / "otio_event_plugin" / "plugin_manifest.json"
+if manifest_file.exists():
+    manifest_path_str = str(manifest_file.resolve())
+    existing = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
+    if manifest_path_str not in existing:
+        os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = (
+            existing + os.pathsep + manifest_path_str if existing else manifest_path_str
+        )
 
 import opentimelineio as otio
+
+# Force manifest reload to register SyncEvent schema plugin only if not already registered
+try:
+    otio.schema.schemadef.module_from_name('SyncEvent')
+except Exception:
+    try:
+        import opentimelineio.plugins.manifest as otio_manifest
+        otio_manifest._MANIFEST = None
+        otio.schema.schemadef.module_from_name('SyncEvent')
+    except Exception as e:
+        sys.stderr.write(f"Warning: failed to force load SyncEvent schemadef: {e}\n")
+
+from PIL import Image
+from otio_sync_core.patcher import OTIOPatcher
+from otio_sync_core.protocol_messages import ProtocolMessage
+from sync_recorder.annotation_renderer import render_annotations
+
 
 
 class VisualSegment:
@@ -42,6 +71,78 @@ class VisualSegment:
         )
 
 
+def resolve_local_path(target_url: str) -> str | None:
+    """Resolve a target_url string into a local file system path."""
+    if not target_url:
+        return None
+    path_str = target_url
+    if path_str.startswith("file://localhost"):
+        path_str = path_str[len("file://localhost"):]
+    elif path_str.startswith("file://"):
+        path_str = path_str[len("file://"):]
+    if not path_str.startswith("/") and os.name != "nt":
+        path_str = "/" + path_str
+    return path_str
+
+
+def get_media_resolution(clip: otio.schema.Clip) -> tuple[int, int]:
+    """Determine width and height for a clip, reading from file if it is an image."""
+    is_portrait = "portrait" in clip.name.lower()
+    ref = clip.media_reference
+    if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
+        local_path = resolve_local_path(ref.target_url)
+        if local_path and os.path.exists(local_path):
+            if local_path.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp")):
+                try:
+                    with Image.open(local_path) as img:
+                        return img.size
+                except Exception:
+                    pass
+            if "portrait" in local_path.lower():
+                is_portrait = True
+    return (1080, 1920) if is_portrait else (1920, 1080)
+
+
+def get_commands_signature(cmds: list[Any] | None) -> tuple[Any, ...] | None:
+    """Compute a stable signature identifying unique drawing states on a frame."""
+    if not cmds:
+        return None
+    from otio_sync_core.manager import sync_event_schema
+    sig = []
+    for cmd in cmds:
+        schema = sync_event_schema(cmd)
+        uuid_val = getattr(cmd, "uuid", None)
+        if uuid_val is None and isinstance(cmd, dict):
+            uuid_val = cmd.get("uuid")
+
+        text = getattr(cmd, "text", None)
+        if text is None and isinstance(cmd, dict):
+            text = cmd.get("text")
+
+        rgba = getattr(cmd, "rgba", None)
+        if rgba is None and isinstance(cmd, dict):
+            rgba = cmd.get("rgba")
+        rgba_tuple = tuple(rgba) if rgba else None
+
+        position = getattr(cmd, "position", None)
+        if position is None and isinstance(cmd, dict):
+            position = cmd.get("position")
+        position_tuple = tuple(position) if position else None
+
+        sig.append((schema, uuid_val, text, rgba_tuple, position_tuple))
+    return tuple(sig)
+
+
+def get_commands_hash(cmds: list[Any] | None) -> str:
+    """Compute a stable hash identifying unique drawing states on a frame."""
+    import hashlib
+    sig = get_commands_signature(cmds)
+    if not sig:
+        return "empty"
+    sig_str = str(sig)
+    return hashlib.md5(sig_str.encode("utf-8")).hexdigest()[:8]
+
+
 def convert_recording(
     recording_path: str,
     output_path: str,
@@ -60,6 +161,7 @@ def convert_recording(
         lines = f.readlines()
 
     timeline_map: dict[str, otio.schema.Timeline] = {}
+    patcher = OTIOPatcher()
     template_clips: dict[str, otio.schema.Clip] = {}
 
     active_timeline_guid = None
@@ -70,6 +172,9 @@ def convert_recording(
     fps = 24.0
 
     segments: list[VisualSegment] = []
+    clip_frame_offsets: dict[str, float] = {}
+    partial_annotations: dict[str, dict[int, dict[str, Any]]] = {}
+
 
     # Segment tracking state variables
     current_segment_clip_guid = None
@@ -169,6 +274,68 @@ def convert_recording(
             delta_rt = otio.opentime.RationalTime(duration_t, 1.0).rescaled_to(current_segment_playhead.rate)
             current_segment_playhead += delta_rt
 
+    annotation_histories = {}
+    last_recorded_signatures = {}
+
+    def update_annotation_histories(t_offset: float) -> None:
+        committed_by_cg_frame = {}
+        for tl in timeline_map.values():
+            for clip in tl.find_clips():
+                if "clip_guid" in clip.metadata and "annotation_commands" in clip.metadata:
+                    cg = clip.metadata["clip_guid"]
+                    if clip.source_range:
+                        frame = int(clip.source_range.start_time.value)
+                        commands = clip.metadata["annotation_commands"]
+                        if commands:
+                            frame_dict = committed_by_cg_frame.setdefault(cg, {}).setdefault(frame, {})
+                            clip_strokes = {}
+                            for cmd in commands:
+                                uuid_val = cmd.get("uuid") if isinstance(cmd, dict) else getattr(cmd, "uuid", None)
+                                if uuid_val:
+                                    clip_strokes.setdefault(uuid_val, []).append(cmd)
+                            for uuid_val, stroke_cmds in clip_strokes.items():
+                                frame_dict[uuid_val] = stroke_cmds
+
+        all_keys = set()
+        for cg, frames in committed_by_cg_frame.items():
+            for frame in frames:
+                all_keys.add((cg, frame))
+        for cg, frames in partial_annotations.items():
+            for frame in frames:
+                all_keys.add((cg, frame))
+
+        for cg, frame in all_keys:
+            strokes_dict = {}
+            if cg in committed_by_cg_frame and frame in committed_by_cg_frame[cg]:
+                strokes_dict.update(committed_by_cg_frame[cg][frame])
+
+            if cg in partial_annotations and frame in partial_annotations[cg]:
+                for uuid_val, stroke_cmds in partial_annotations[cg][frame].items():
+                    if uuid_val not in strokes_dict:
+                        strokes_dict[uuid_val] = stroke_cmds
+
+            flat_cmds = []
+            for stroke_cmds in strokes_dict.values():
+                flat_cmds.extend(stroke_cmds)
+
+            sig = get_commands_signature(flat_cmds)
+            last_sig = last_recorded_signatures.get((cg, frame))
+            if sig != last_sig:
+                last_recorded_signatures[(cg, frame)] = sig
+                annotation_histories.setdefault((cg, frame), []).append((t_offset, flat_cmds))
+
+    def get_annotations_at_time(cg: str, frame: int, query_t: float) -> list[Any]:
+        history = annotation_histories.get((cg, frame))
+        if not history:
+            return []
+        active_cmds = []
+        for t_entry, cmds in history:
+            if t_entry <= query_t:
+                active_cmds = cmds
+            else:
+                break
+        return active_cmds
+
     # Parse JSONL lines sequentially
     for line in lines:
         line_str = line.strip()
@@ -188,8 +355,14 @@ def convert_recording(
         evt = inner.get("command", {}).get("event")
         payload_data = inner.get("command", {}).get("payload", {})
 
-        # Flush visual state up to this event
-        flush_segment(t)
+        # Flush visual state up to this event only for playback, selection, or snapshot events
+        is_playback_event = (
+            (cmd == "LiveSession.1" and evt == "STATE_SNAPSHOT") or
+            (cmd == "PLAYBACK_SETTINGS_1.0" and evt == "SET") or
+            (cmd == "SELECTION_1.0" and evt == "SET")
+        )
+        if is_playback_event:
+            flush_segment(t)
 
         # Update timeline structures and registry
         if cmd == "LiveSession.1" and evt == "STATE_SNAPSHOT":
@@ -198,6 +371,7 @@ def convert_recording(
                 try:
                     tl = otio.adapters.read_from_string(json.dumps(tl_dict), "otio_json")
                     timeline_map[guid] = tl
+                    patcher.traverse_and_map(tl)
                     for clip in tl.find_clips():
                         if "sync" in clip.metadata and "guid" in clip.metadata["sync"]:
                             clip_uuid = clip.metadata["sync"]["guid"]
@@ -233,6 +407,7 @@ def convert_recording(
                 try:
                     tl = otio.adapters.read_from_string(json.dumps(tl_dict), "otio_json")
                     timeline_map[guid] = tl
+                    patcher.traverse_and_map(tl)
                     for clip in tl.find_clips():
                         if "sync" in clip.metadata and "guid" in clip.metadata["sync"]:
                             clip_uuid = clip.metadata["sync"]["guid"]
@@ -247,12 +422,86 @@ def convert_recording(
                 try:
                     tl = otio.adapters.read_from_string(json.dumps(tl_dict), "otio_json")
                     timeline_map[guid] = tl
+                    patcher.traverse_and_map(tl)
                     for clip in tl.find_clips():
                         if "sync" in clip.metadata and "guid" in clip.metadata["sync"]:
                             clip_uuid = clip.metadata["sync"]["guid"]
                             template_clips[clip_uuid] = clip
                 except Exception:
                     pass
+
+        elif cmd == "OTIO_SESSION_1.0":
+            if evt == "INSERT_CHILD":
+                child_data = payload_data.get("child_data", {})
+                if child_data and child_data.get("OTIO_SCHEMA") == "Clip.2":
+                    meta = child_data.get("metadata", {})
+                    cg = meta.get("clip_guid")
+                    sr = child_data.get("source_range")
+                    if cg and sr:
+                        drw_frame = sr.get("start_time", {}).get("value")
+                        if drw_frame is not None:
+                            clip_rel_frame = playhead_frame
+                            if active_view_mode == "sequence" and active_timeline_guid:
+                                tl = timeline_map.get(active_timeline_guid)
+                                if tl:
+                                    seq_start = get_clip_sequence_start_time(tl, cg)
+                                    if seq_start is not None:
+                                        clip_rel_frame = playhead_frame - seq_start.value
+                            offset = float(drw_frame) - clip_rel_frame
+                            template_clip = template_clips.get(cg)
+                            duration = 100.0
+                            if template_clip:
+                                if template_clip.source_range:
+                                    duration = template_clip.source_range.duration.value
+                                elif template_clip.media_reference and template_clip.media_reference.available_range:
+                                    duration = template_clip.media_reference.available_range.duration.value
+                            if abs(offset) <= duration:
+                                offset = 0.0
+                            clip_frame_offsets[cg] = offset
+
+            from otio_sync_core.protocol_messages import message_for
+            msg_cls = message_for(cmd, evt)
+            if msg_cls:
+                try:
+                    msg = msg_cls.from_payload(payload_data)
+                    patcher.apply_patch(msg)
+                except Exception:
+                    pass
+
+        elif cmd == "Annotation.1":
+            cg = payload_data.get("clip_guid")
+            drw_frame = payload_data.get("frame")
+            events = payload_data.get("events", [])
+            if cg and drw_frame is not None:
+                if events:
+                    frame_num = int(drw_frame)
+                    payload_strokes = {}
+                    for ev in events:
+                        uuid_val = ev.get("uuid") if isinstance(ev, dict) else getattr(ev, "uuid", None)
+                        if uuid_val:
+                            payload_strokes.setdefault(uuid_val, []).append(ev)
+                    for uuid_val, stroke_cmds in payload_strokes.items():
+                        partial_annotations.setdefault(cg, {}).setdefault(frame_num, {})[uuid_val] = stroke_cmds
+
+                clip_rel_frame = playhead_frame
+                if active_view_mode == "sequence" and active_timeline_guid:
+                    tl = timeline_map.get(active_timeline_guid)
+                    if tl:
+                        seq_start = get_clip_sequence_start_time(tl, cg)
+                        if seq_start is not None:
+                            clip_rel_frame = playhead_frame - seq_start.value
+                offset = float(drw_frame) - clip_rel_frame
+                template_clip = template_clips.get(cg)
+                duration = 100.0
+                if template_clip:
+                    if template_clip.source_range:
+                        duration = template_clip.source_range.duration.value
+                    elif template_clip.media_reference and template_clip.media_reference.available_range:
+                        duration = template_clip.media_reference.available_range.duration.value
+                if abs(offset) <= duration:
+                    offset = 0.0
+                clip_frame_offsets[cg] = offset
+
 
         elif cmd == "PLAYBACK_SETTINGS_1.0" and evt == "SET":
             playing = payload_data.get("playing", False)
@@ -279,6 +528,9 @@ def convert_recording(
                 if template_clip.source_range:
                     current_segment_playhead = otio.opentime.RationalTime(0.0, template_clip.source_range.start_time.rate)
 
+        # Update annotation history state after processing this event
+        update_annotation_histories(t)
+
     # Final flush at end of file
     if lines:
         try:
@@ -294,7 +546,8 @@ def convert_recording(
 
     for segment in segments:
         duration_sec = segment.end_t - segment.start_t
-        if duration_sec <= 0.0:
+        duration_frames = int(round(duration_sec * segment.fps))
+        if duration_frames <= 0:
             continue
 
         template_clip = template_clips.get(segment.clip_guid)
@@ -311,17 +564,117 @@ def convert_recording(
         )
 
         media_start = otio.opentime.RationalTime(segment.start_frame, segment.fps)
-        media_dur = otio.opentime.RationalTime(duration_sec * segment.fps, segment.fps)
+        media_dur = otio.opentime.RationalTime(duration_frames, segment.fps)
         new_clip.source_range = otio.opentime.TimeRange(start_time=media_start, duration=media_dur)
 
         if not segment.playing:
             # Add freeze-frame TimeWarp effect
             freeze_effect = otio.schema.LinearTimeWarp(time_scalar=0.0)
             new_clip.effects.append(freeze_effect)
-
         bg_track.append(new_clip)
 
     timeline.tracks.append(bg_track)
+
+    # Determine subfolder for PNG files
+    output_path_obj = pathlib.Path(output_path)
+    output_dir = output_path_obj.parent
+    output_stem = output_path_obj.stem
+    annotations_dir = output_dir / f"{output_stem}_annotations"
+    os.makedirs(annotations_dir, exist_ok=True)
+
+    # Reconstruct Annotations Overlay Track
+    overlay_track = otio.schema.Track("Annotations Overlay")
+    active_segments = [s for s in segments if (s.end_t - s.start_t) > 0.0]
+
+    # We iterate over the background clips to align annotation clips perfectly
+    for segment, bg_clip in zip(active_segments, bg_track):
+        fps = segment.fps
+        clip_guid = segment.clip_guid
+        duration_sec = segment.end_t - segment.start_t
+        duration_frames = int(round(duration_sec * fps))
+        if duration_frames <= 0:
+            continue
+
+        res_w, res_h = get_media_resolution(bg_clip)
+        offset = clip_frame_offsets.get(clip_guid, 0.0)
+
+        # Build list of frame info: (F, sig, cmds) for each frame in the segment
+        frames_sigs = []
+        for offset_idx in range(duration_frames):
+            # Query time is the middle of the frame interval
+            t_query = segment.start_t + (offset_idx + 0.5) / fps
+            
+            # Determine F (the media frame)
+            if segment.playing:
+                F = int(round(segment.start_frame + offset_idx + offset))
+            else:
+                F = int(round(segment.start_frame + offset))
+            
+            cmds = get_annotations_at_time(clip_guid, F, t_query)
+            sig = get_commands_signature(cmds)
+            frames_sigs.append((F, sig, cmds))
+
+        # Group consecutive frames with the same signature
+        groups = []
+        curr_group = []
+        for F, sig, cmds in frames_sigs:
+            if not curr_group:
+                curr_group = [(F, sig, cmds)]
+            elif curr_group[0][1] == sig:
+                curr_group.append((F, sig, cmds))
+            else:
+                groups.append(curr_group)
+                curr_group = [(F, sig, cmds)]
+        if curr_group:
+            groups.append(curr_group)
+
+        for grp in groups:
+            grp_start_frame = grp[0][0]
+            grp_sig = grp[0][1]
+            grp_cmds = grp[0][2]
+            grp_len = len(grp)
+
+            if grp_sig is None:
+                overlay_track.append(otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0, fps),
+                        duration=otio.opentime.RationalTime(grp_len, fps)
+                    )
+                ))
+            else:
+                grp_hash = get_commands_hash(grp_cmds)
+                png_name = f"{clip_guid}_{grp_start_frame}_{grp_hash}.png"
+                png_path = annotations_dir / png_name
+                if not png_path.exists():
+                    print(f"[INFO] Rendering annotation frame: {png_path}")
+                    img = render_annotations(grp_cmds, res_w, res_h)
+                    img.save(png_path)
+                else:
+                    print(f"[INFO] Skipping rendering, frame already exists: {png_path}")
+
+                rel_target_url = f"{output_stem}_annotations/{png_name}"
+                overlay_clip = otio.schema.Clip(
+                    name=f"Annotation Overlay ({png_name})",
+                    media_reference=otio.schema.ExternalReference(target_url=rel_target_url),
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0, fps),
+                        duration=otio.opentime.RationalTime(grp_len, fps)
+                    )
+                )
+                # Use LinearTimeWarp(0.0) to hold the static image frame
+                overlay_clip.effects.append(otio.schema.LinearTimeWarp(time_scalar=0.0))
+                overlay_track.append(overlay_clip)
+
+    # Only append the overlay track if it contains actual annotation clips
+    if any(isinstance(child, otio.schema.Clip) for child in overlay_track):
+        timeline.tracks.append(overlay_track)
+    else:
+        # Clean up empty directory if no annotations were generated
+        try:
+            if os.path.exists(annotations_dir) and not os.listdir(annotations_dir):
+                os.rmdir(annotations_dir)
+        except Exception:
+            pass
 
     # Save to file
     otio.adapters.write_to_file(timeline, output_path)

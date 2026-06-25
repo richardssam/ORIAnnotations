@@ -276,6 +276,7 @@ class TimelineBuildController:
                         except Exception:
                             plugin.structure._xs_sequence_media_names[tl_guid] = set()
                         plugin.structure.subscribe_timeline_item_events(tl_guid, xs_tl)
+                        plugin.structure.subscribe_sequence_playlist_events(tl_guid, playlist)
                         try:
                             flat_tl = self.build_otio_from_playlist_media(playlist)
                             if flat_tl is not None:

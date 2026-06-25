@@ -13,6 +13,10 @@ from xstudio.api.session.playlist.timeline import Timeline
 from xstudio.core import (
     event_atom, item_atom, media_content_changed_atom, change_atom,
 )
+try:
+    from xstudio.core import add_media_atom as _add_media_atom
+except ImportError:
+    _add_media_atom = None
 from otio_sync_core.manager import STATE_SYNCED
 from .utils import _log, _log_exc, _uri_to_posix_path
 
@@ -33,6 +37,7 @@ class StructureSyncController:
         self._xs_sequence_track_names: dict[str, list | None] = {}
         self._xs_media_order: dict[str, list] = {}
         self._timeline_item_sub_ids: dict = {}
+        self._sequence_playlist_sub_ids: dict = {}
         self._timeline_item_dirty: set = set()
         self._timeline_item_lock = threading.Lock()
         self._test_container_sub_id = None
@@ -47,6 +52,7 @@ class StructureSyncController:
         self._xs_sequence_track_names.clear()
         self._xs_media_order.clear()
         self._timeline_item_sub_ids.clear()
+        self._sequence_playlist_sub_ids.clear()
         with self._timeline_item_lock:
             self._timeline_item_dirty.clear()
         self._test_container_sub_id = None
@@ -73,6 +79,40 @@ class StructureSyncController:
             _log(f"[2F] subscribed to item_atom events for timeline {tl_guid[:8]}")
         except Exception:
             _log_exc(f"[2F] subscribe_to_event_group failed for timeline {tl_guid[:8]}")
+
+    def subscribe_sequence_playlist_events(self, tl_guid: str, xs_playlist) -> None:
+        """Subscribe to *xs_playlist*'s event group for a sequence timeline.
+
+        When the user drags media from the playlist panel into the sequence
+        track, xStudio fires ``add_media_atom`` on the Playlist container (not
+        the Timeline).  This subscription catches that signal and routes it to
+        ``execute_sync_container`` so the REPLACE_TIMELINE broadcast fires.
+
+        :param tl_guid: Sync GUID of the sequence timeline.
+        :param xs_playlist: The parent Playlist object for this timeline.
+        """
+        if tl_guid in self._sequence_playlist_sub_ids:
+            return
+        try:
+            cb = functools.partial(self._on_sequence_playlist_event, tl_guid)
+            sub_id = self.plugin.subscribe_to_event_group(xs_playlist, cb)
+            self._sequence_playlist_sub_ids[tl_guid] = sub_id
+            _log(f"[2F] subscribed to playlist events for sequence {tl_guid[:8]}")
+        except Exception:
+            _log_exc(f"[2F] subscribe_to_event_group(playlist) failed for sequence {tl_guid[:8]}")
+
+    def _on_sequence_playlist_event(self, tl_guid: str, event) -> None:
+        """Handle Playlist-level events (add_media_atom) for a sequence timeline."""
+        if time.monotonic() < self.plugin._structural_mutation_suppress_until:
+            return
+        if not (len(event) > 1 and isinstance(event[0], event_atom)):
+            return
+        is_add_media = _add_media_atom is not None and isinstance(event[1], _add_media_atom)
+        is_media_change = isinstance(event[1], media_content_changed_atom)
+        if not (is_add_media or is_media_change):
+            return
+        _log(f"[2F] playlist add_media/media_changed for sequence {tl_guid[:8]} — queuing sync_container")
+        self.plugin._cmd_queue.put(("sync_container", {"tl_guid": tl_guid}))
 
     # ── test container event ───────────────────────────────────────────
 
@@ -618,6 +658,7 @@ class StructureSyncController:
                     except Exception:
                         self._xs_sequence_media_names[tl_guid] = set()
                     self.subscribe_timeline_item_events(tl_guid, xs_tl)
+                    self.subscribe_sequence_playlist_events(tl_guid, playlist)
                     self.plugin.manager.broadcast_add_timeline(tl_guid)
                     _log(
                         f"New sequence timeline {xs_tl.name!r}"
@@ -679,6 +720,12 @@ class StructureSyncController:
         if sub_id:
             try:
                 self.plugin.unsubscribe_from_event_group(sub_id)
+            except Exception:
+                pass
+        pl_sub_id = self._sequence_playlist_sub_ids.pop(tl_guid, None)
+        if pl_sub_id:
+            try:
+                self.plugin.unsubscribe_from_event_group(pl_sub_id)
             except Exception:
                 pass
 
