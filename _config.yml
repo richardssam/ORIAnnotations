@@ -1,1 +1,5 @@
+remote_theme: just-the-docs/just-the-docs
 include [docs]
+exclude ["test_media/sources"]
+
+title: "ORI Annotations Documentation "
