@@ -1,4 +1,4 @@
-remote_theme: just-the-docs/just-the-docs
+theme: cayman
 include [docs]
 exclude ["test_media/sources"]
 
