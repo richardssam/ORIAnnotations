@@ -13,5 +13,6 @@ exclude:
   - Makefile
   - docs/conf.py
   - test_media/sources
+  - openspec
 
 title: "ORI Annotations Documentation"
