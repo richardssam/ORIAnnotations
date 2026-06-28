@@ -1,3 +1,8 @@
+---
+layout: default
+title: How to configure rabbitmq
+---
+
 # RabbitMQ Setup and Security Guide
 
 This document outlines the setup, configuration, and security practices for running RabbitMQ as the backend messaging broker for the ORIAnnotations sync plugins.

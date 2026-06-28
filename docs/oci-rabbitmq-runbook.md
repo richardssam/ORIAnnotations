@@ -1,3 +1,8 @@
+---
+layout: default
+title: How to install rabbitmq on Oracle Cloud Infrastructure
+---
+
 # RabbitMQ on OCI Always Free (US West / San Jose) \- Build Runbook
 
 A step-by-step plan to stand up a single RabbitMQ broker in Oracle Cloud Infrastructure, kept inside the Always Free compute tier, in the region closest to Los Angeles.
