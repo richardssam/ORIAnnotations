@@ -281,15 +281,97 @@ docker exec rabbitmq rabbitmqctl list_users
 
 ---
 
-## 10\. TLS and the management UI (recommended)
+## 10\. Public access
 
-Plaintext UI (15672) and AMQP (5672) stay bound to localhost. Expose only TLS.
+Plaintext UI (15672) and AMQP (5672) stay bound to localhost at all times.
 
-1. **DNS prerequisite.** Point a hostname (for example `rabbit.yourdomain.com`) at the reserved public IP. Caddy needs this to get a Let's Encrypt certificate.  
-     
-2. **Front the management UI with Caddy** (automatic HTTPS on 443):  
-     
-   `~/rabbit/Caddyfile`:
+### 10A. SSH tunnel (admin and testing)
+
+Forward both ports to your laptop over SSH without opening any firewall rules:
+
+```shell
+ssh -i ~/.ssh/id_rsa \
+    -L 15672:127.0.0.1:15672 \
+    -L 5673:127.0.0.1:5672 \
+    opc@RESERVED_PUBLIC_IP
+```
+
+- Management UI: `http://localhost:15672`
+- AMQP (plaintext, tunnel-encrypted): `amqp://admin:PASSWORD@localhost:5673`
+
+### 10B. AMQPS with self-signed certificate (direct app access)
+
+Use this when apps need to connect without an SSH tunnel. Port 5671 is exposed publicly but restricted by IP in the OCI security list and host firewall.
+
+**1. Generate a self-signed certificate on the server:**
+
+```shell
+mkdir -p /opt/rabbit/certs
+openssl req -x509 -newkey rsa:4096 \
+    -keyout /opt/rabbit/certs/server.key \
+    -out /opt/rabbit/certs/server.crt \
+    -days 3650 -nodes \
+    -subj "/CN=rabbit-01" \
+    -addext "subjectAltName=IP:RESERVED_PUBLIC_IP"
+cp /opt/rabbit/certs/server.crt /opt/rabbit/certs/ca.crt
+```
+
+**2. Create `/opt/rabbit/rabbitmq.conf`:**
+
+```
+vm_memory_high_watermark.relative = 0.6
+
+listeners.ssl.default = 5671
+ssl_options.certfile   = /certs/server.crt
+ssl_options.keyfile    = /certs/server.key
+ssl_options.cacertfile = /certs/ca.crt
+ssl_options.verify     = verify_none
+ssl_options.fail_if_no_peer_cert = false
+```
+
+**3. Update `/opt/rabbit/docker-compose.yml`** to expose port 5671 and mount the certs and config:
+
+```
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+      - "5671:5671"                                        # add
+    volumes:
+      - rabbit-data:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro    # add
+      - ./certs:/certs:ro                                  # add
+```
+
+**4. Open the OCI security list** (Networking > VCN > public subnet security list):
+
+| Source CIDR | Protocol | Dest port | Purpose |
+| :---- | :---- | :---- | :---- |
+| `APP.CIDR/xx` | TCP | 5671 | AMQPS for app clients |
+
+**5. Open the host firewall:**
+
+```shell
+sudo firewall-cmd --permanent --add-port=5671/tcp
+sudo firewall-cmd --reload
+```
+
+**6. Restart the broker:**
+
+```shell
+docker compose up -d
+```
+
+**Client connection URL.** Because the certificate is self-signed, clients must opt out of certificate verification. The ORIAnnotations plugins support this via a query parameter:
+
+```
+amqps://USERNAME:PASSWORD@RESERVED_PUBLIC_IP:5671/?verify=ignore
+```
+
+### 10C. Management UI via Caddy (optional, requires DNS)
+
+If you point a hostname at the reserved public IP, Caddy can front the management UI with a trusted Let's Encrypt certificate on port 443.
+
+`~/rabbit/Caddyfile`:
 
 ```
 rabbit.yourdomain.com {
@@ -297,27 +379,25 @@ rabbit.yourdomain.com {
 }
 ```
 
-   Add Caddy to the compose stack:
+Add Caddy to the compose stack:
 
-```
+```yaml
   caddy:
     image: caddy:latest
     container_name: caddy
     restart: unless-stopped
-    network_mode: host           # simplest path to reach 127.0.0.1:15672
+    network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
 ```
 
-   Add `caddy-data:` and `caddy-config:` under the top-level `volumes:` key. After the cert is issued you can remove port 80 from the firewall and security list (Caddy will renew using existing state, or reopen 80 briefly at renewal).
+Add `caddy-data:` and `caddy-config:` under the top-level `volumes:` key. Open port 80 temporarily for the initial cert issuance, then remove it once the cert is issued.
 
-   
+### 10D. Budget alarm
 
-3. **AMQPS certificates.** For app-facing AMQPS on 5671 you can either reuse the Caddy-obtained certificate (copy from the Caddy data volume into `./certs/` as `server.crt`/`server.key`) or generate an internal CA for client-cert auth. Place `server.crt`, `server.key`, and `ca.crt` in `~/rabbit/certs/`, then `docker compose restart rabbitmq`. Reference: RabbitMQ TLS Support docs.  
-     
-4. **Budget alarm.** Console: Billing & Cost Management \> Budgets \> create a budget with a low threshold and email alert, so any non-free resource is flagged immediately.
+Console: Billing & Cost Management \> Budgets \> create a budget with a low threshold and email alert so any non-free resource is caught immediately.
 
 ---
 
