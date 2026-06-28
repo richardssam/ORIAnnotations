@@ -1,5 +1,10 @@
 theme: cayman
 include [docs]
-exclude ["test_media/sources"]
+exclude:
+  - docs/html
+  - docs/source
+  - docs/doctrees
+  - Makefile
+  - docs/conf.py
 
 title: "ORI Annotations Documentation "
