@@ -1,6 +1,8 @@
-remote_theme: pages-themes/cayman@v0.2.0
+remote_theme: just-the-docs/just-the-docs
+color_scheme: dark
 plugins:
 - jekyll-remote-theme
+- jekyll-seo-tag
 
 include: [docs]
 
