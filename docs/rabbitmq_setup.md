@@ -14,7 +14,7 @@ Key constraints for this setup:
 * **Reverse Proxy**: Caddy handles Let's Encrypt certificate issuance and reverse-proxies the HTTP management UI.
 
 A step-by-step build plan for the OCI VM is detailed in:
-* **[OCI RabbitMQ Runbook](file:///Users/sam/git/ORIAnnotations/docs/oci-rabbitmq-runbook.md)**
+* **[OCI RabbitMQ Runbook](oci-rabbitmq-runbook.md)**
 
 ---
 
