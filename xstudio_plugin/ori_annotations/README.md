@@ -1,3 +1,8 @@
+---
+layout: default
+title: XStudio Plugins
+parent: ORI Annotations
+---
 # ORIAnnotations xSTUDIO Plugin
 
 Exports annotations (bookmarks) from xSTUDIO as an ORIAnnotations-compatible OTIO file that can be imported by the OpenRV plugin (`rvplugin/ori_annotations/ori_annotations_plugin.py`).

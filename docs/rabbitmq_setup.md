@@ -1,6 +1,8 @@
 ---
 layout: default
 title: How to configure rabbitmq
+parent: ORI Sync Tools
+nav_order: 2.6
 ---
 
 # RabbitMQ Setup and Security Guide

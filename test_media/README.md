@@ -1,3 +1,9 @@
+---
+layout: default
+title: Test Media for sync testing.
+parent: ORI Sync Tools
+---
+
 # ORIAnnotations Test Media
 
 Two scripts produce the test media used by the ORIAnnotations sync test suite:

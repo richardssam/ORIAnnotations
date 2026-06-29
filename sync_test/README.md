@@ -1,3 +1,10 @@
+---
+layout: default
+title: Sync Testing Framework.
+parent: ORI Sync Tools
+nav_order: 2.3
+---
+
 # UI Sync Test Framework
 
 The `sync_test` directory contains an automated integration testing framework for the ORIAnnotations UI synchronization pipeline. It ensures that peer applications (like xStudio and OpenRV) correctly exchange state (playhead position, active clip, annotations) over the RabbitMQ network.

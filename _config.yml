@@ -12,7 +12,8 @@ exclude:
   - docs/doctrees
   - Makefile
   - docs/conf.py
-  - test_media/sources
+  - examples
+  - test_media/source
   - openspec
 
 title: "ORI Annotations Documentation"

@@ -1,3 +1,9 @@
+---
+layout: default
+title: Annotation Test Charts.
+parent: ORI Annotations
+---
+
 # Test Chart Annotations Batch Processing
 
 This folder contains test charts and batch scripts to automate loading annotations from an OTIO file and exporting them as images in both **xStudio** and **OpenRV**.

@@ -1,3 +1,9 @@
+---
+layout: default
+title: OpenRV Sync Plugin
+parent: ORI Sync Tools
+---
+
 # OTIO Sync Plugin for OpenRV
 
 An OpenRV plugin that synchronises OTIO timeline state between multiple OpenRV instances in real time, using RabbitMQ as the message bus.

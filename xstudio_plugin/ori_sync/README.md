@@ -1,3 +1,8 @@
+---
+layout: default
+title: XStudio ORI Sync Plugin
+parent: ORI Sync Tools
+---
 # ORI Sync Review — xStudio Plugin
 
 Joins an ORI Sync session from xStudio, providing:

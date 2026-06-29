@@ -1,3 +1,8 @@
+---
+layout: default
+title: ORI Sync Recorder
+parent: ORI Sync Tools
+---
 # Sync Session Recorder & Player
 
 A utility package for recording and playing back network events broadcast in an OTIO sync session. This allows for testing, debugging, and simulating active review sessions.

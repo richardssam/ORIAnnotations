@@ -1,6 +1,8 @@
 ---
 layout: default
 title: How to install rabbitmq on Oracle Cloud Infrastructure
+parent: ORI Sync Tools
+nav_order: 2.6
 ---
 
 # RabbitMQ on OCI Always Free (US West / San Jose) \- Build Runbook
