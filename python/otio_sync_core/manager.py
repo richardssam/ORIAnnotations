@@ -1626,6 +1626,55 @@ class SyncManager:
 
         return app_events
 
+    # Latest-wins message schemas mapped to a per-schema coalesce threshold:
+    # within one drained batch, superseded messages of that schema are dropped
+    # only once the batch holds MORE than ``threshold`` of them.  This collapses
+    # a genuine backlog (fast producer outrunning the consumer) without throwing
+    # away the intermediate frames of a normal-rate stream — dropping those makes
+    # scrubbing visibly choppy.  Selection is pure latest-wins (threshold 0:
+    # always collapse); playback keeps every position until a real backlog forms.
+    _COALESCE_THRESHOLDS = {
+        "SELECTION_1.0": 0,
+        "PLAYBACK_SETTINGS_1.0": 12,
+    }
+
+    def _coalesce_payloads(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop superseded latest-wins messages once a backlog forms.
+
+        For each coalescible schema whose count in this batch exceeds its
+        threshold, keep only its last occurrence (in place); everything else —
+        sub-threshold streams, structural mutations, annotations — is preserved
+        in original order.
+        """
+        if len(payloads) <= 1:
+            return payloads
+        counts: dict[str, int] = {}
+        last_idx: dict[str, int] = {}
+        for i, p in enumerate(payloads):
+            schema = p.get("payload", {}).get("command_schema")
+            if schema in self._COALESCE_THRESHOLDS:
+                counts[schema] = counts.get(schema, 0) + 1
+                last_idx[schema] = i
+        # Only collapse schemas that have actually backed up past their threshold.
+        collapse = {
+            s for s, n in counts.items() if n > self._COALESCE_THRESHOLDS[s]
+        }
+        if not collapse:
+            return payloads
+        out: list[dict[str, Any]] = []
+        dropped = 0
+        for i, p in enumerate(payloads):
+            schema = p.get("payload", {}).get("command_schema")
+            if schema in collapse and last_idx[schema] != i:
+                dropped += 1
+                continue
+            out.append(p)
+        if dropped:
+            _log(f"coalesce: dropped {dropped} backlogged message(s) {sorted(collapse)}")
+        return out
+
     def receive_and_apply_all(self) -> list[tuple[str, Any]]:
         """Drain the network and apply every pending message.
 
@@ -1636,7 +1685,7 @@ class SyncManager:
         if not self.network:
             return []
         results: list[tuple[str, Any]] = []
-        for p in self.network.receive_payloads():
+        for p in self._coalesce_payloads(self.network.receive_payloads()):
             res = self.apply_patch(p)
             if res:
                 results.append(res)

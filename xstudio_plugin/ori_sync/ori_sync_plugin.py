@@ -39,7 +39,7 @@ timeout" for the full rule.
 """
 
 # utils performs the sys.path / OTIO_PLUGIN_MANIFEST_PATH setup as a side-effect.
-from .utils import _log, _log_exc, _parse_ori_session, QML_FOLDER, SESSION_DIALOG_QML  # noqa: E402
+from .utils import _log, _log_exc, _parse_ori_session, _uri_to_posix_path, QML_FOLDER, SESSION_DIALOG_QML  # noqa: E402
 from .media_map import MediaMapController  # noqa: E402
 from .timeline_build import TimelineBuildController  # noqa: E402
 from .display_sync import DisplaySyncController  # noqa: E402
@@ -177,6 +177,22 @@ class ORISyncPlugin(PluginBase):
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
         self._last_polled_playing: bool | None = None
+        # Monotonic deadline until which local playhead attribute_changed events
+        # are NOT re-broadcast.  Set on every remote playback apply: ph.position
+        # fires attribute_changed asynchronously, and during rapid scrubbing the
+        # single _last_applied_frame guard loses the race (a lagging callback for
+        # an older frame no longer matches), echoing positions back and creating
+        # a feedback loop.  A short rolling window suppresses those echoes while a
+        # peer is driving playback, without blocking genuine local scrubs once it
+        # stops (the window simply expires).
+        self._playback_apply_suppress_until: float = 0.0
+        # Monotonic deadline refreshed whenever we broadcast a *local* playhead
+        # move (scrubbing).  Used only to suppress selection-driven clip-start
+        # seeks while we are the one driving playback — a peer following our scrub
+        # crosses clip boundaries and echoes selections back, and applying those
+        # seeks would snap our own playhead to clip starts.  Kept separate from
+        # _playback_apply_suppress_until, which doubles as the broadcast echo guard.
+        self._local_scrub_active_until: float = 0.0
         # Monotonic timestamp of when playback last transitioned False→True.
         # Used to allow the first show_atom after play-start to broadcast even
         # though _last_polled_playing is already True (race-condition guard).
@@ -374,8 +390,15 @@ class ORISyncPlugin(PluginBase):
         self.manager.start_session()
 
         # Grab the current playhead and subscribe to its position events.
+        # subscribe_to_playhead_events() wires the playhead's attribute_changed
+        # callback (via the base __connect_to_playhead) to playhead_attribute_changed
+        # → on_playhead_attribute_changed, which is how scrub/position changes reach
+        # us and get broadcast.  (The base __connect_to_playhead had a bogus
+        # add_message_callback line referencing an undefined event_group, fixed in
+        # plugin_base.py; without that fix this call raises NameError.)
         try:
             self.playback.check_and_update_active_playhead()
+            self.subscribe_to_playhead_events()
         except Exception:
             _log_exc("Could not initialize active playhead at connect time")
 
@@ -401,23 +424,17 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("Could not subscribe to AnnotationsCore events")
 
-        # [TEST change_atom] Subscribe to the current viewed container's event
-        # group.  If change_atom fires reliably here we can replace the
-        # _poll_sequence_new_media poll with an event-driven path.
+        # Subscribe to the current viewed container's event group for add_media
+        # detection.  If there's no container yet (peer joined an empty session),
+        # on_global_playhead_event re-subscribes once one is viewed.
         try:
             container = self.playback.get_viewed_container_safe()
             if container:
-                self.structure._test_container_sub_id = self.subscribe_to_event_group(
-                    container, self._on_test_container_event
-                )
-                _log(
-                    f"[TEST change_atom] subscribed to viewed_container events"
-                    f" (type={type(container).__name__})"
-                )
+                self.structure.subscribe_viewed_container_events(container)
             else:
-                _log("[TEST change_atom] no viewed_container yet (session empty at connect time)")
+                _log("[2F] no viewed_container yet (session empty at connect time) — will subscribe on first view")
         except Exception:
-            _log_exc("[TEST change_atom] subscribe_to_event_group failed")
+            _log_exc("[2F] initial viewed-container subscribe failed")
 
         # Subscribe to viewed container selection actor
         try:
@@ -590,6 +607,18 @@ class ORISyncPlugin(PluginBase):
 
     def _poll_loop(self) -> None:
         """Background thread: blocks on command queue and processes ticks."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _timed(label: str):
+            _t0 = time.monotonic()
+            try:
+                yield
+            finally:
+                _dt = time.monotonic() - _t0
+                if _dt > 1.0:
+                    _log(f"[POLL-SLOW] {label} took {_dt:.1f}s")
+
         while not self._poll_stop.is_set():
             try:
                 # 1. Determine timeout based on active hot scanning (partial strokes)
@@ -598,44 +627,60 @@ class ORISyncPlugin(PluginBase):
                 # 2. Block on the queue to wait for events or ticks
                 try:
                     cmd, payload = self._cmd_queue.get(timeout=timeout)
-                    self._execute_command(cmd, payload)
-                    self._drain_cmd_queue()
+                    with _timed(f"cmd:{cmd}"):
+                        self._execute_command(cmd, payload)
+                    with _timed("drain_cmd_queue"):
+                        self._drain_cmd_queue()
                 except queue.Empty:
                     pass
 
                 # 3. Manager/network tick
                 if self.manager:
-                    for action, data in self.manager.tick():
-                        self._handle_manager_event(action, data)
+                    with _timed("manager.tick"):
+                        _events = self.manager.tick()
+                    for action, data in _events:
+                        with _timed(f"handle:{action}"):
+                            self._handle_manager_event(action, data)
 
                 # 4. Partial annotation / stroke hot scanning
-                self.annotation.hot_scan_active_annotation()
-                self.annotation.flush_pending_annotations()
+                with _timed("annotation.hot_scan"):
+                    self.annotation.hot_scan_active_annotation()
+                with _timed("annotation.flush"):
+                    self.annotation.flush_pending_annotations()
 
                 # 5. Deferred seek application
-                self.playback.apply_pending_seek()
+                with _timed("apply_pending_seek"):
+                    self.playback.apply_pending_seek()
 
                 # 6. Periodic display state (zoom) scan (0.5s interval)
                 now = time.monotonic()
                 if now - self.display._last_display_scan >= 0.5:
-                    self.display.poll_and_broadcast_display()
+                    with _timed("display.poll"):
+                        self.display.poll_and_broadcast_display()
                     self.display._last_display_scan = now
 
-                # 6.1. Periodic colour state scan (0.5s interval)
-                if now - self.color._last_color_scan >= 0.5:
-                    self.color.poll_and_broadcast_color()
+                # 6.1. Periodic colour state scan (2.0s interval — colour changes
+                # are infrequent and tolerate latency; a tight poll needlessly
+                # competes with structural/playback sync on the poll thread).
+                if now - self.color._last_color_scan >= 2.0:
+                    with _timed("color.poll"):
+                        self.color.poll_and_broadcast_color()
                     self.color._last_color_scan = now
 
                 # 6.2. Periodic full-state dump for the test inspector (0.5s).
                 if now - self._last_fullstate_write >= 0.5:
-                    self._write_fullstate_file()
+                    with _timed("fullstate_write"):
+                        self._write_fullstate_file()
                     self._last_fullstate_write = now
 
                 # 6.5. Periodic structure scan (1.0s interval)
                 if now - self.structure._last_structure_scan >= 1.0:
-                    self.structure.poll_new_playlists()
-                    self.structure.poll_playlist_renames()
-                    self.structure.poll_deleted_playlists()
+                    with _timed("structure.poll_new_playlists"):
+                        self.structure.poll_new_playlists()
+                    with _timed("structure.poll_playlist_renames"):
+                        self.structure.poll_playlist_renames()
+                    with _timed("structure.poll_deleted_playlists"):
+                        self.structure.poll_deleted_playlists()
                     self.structure._last_structure_scan = now
 
                 # 7. Deferred snapshot responses
@@ -666,7 +711,13 @@ class ORISyncPlugin(PluginBase):
                 self.disconnect()
             elif cmd == "broadcast_playback_state":
                 if self.manager and self.manager.status == STATE_SYNCED:
-                    self.manager.broadcast_playback_state(payload)
+                    # Resolve the timeline guid from what is *actually* viewed
+                    # (the sequence when scrubbing its timeline) rather than the
+                    # stale active_timeline_guid, which a prior clip selection may
+                    # have set to a transient per-clip timeline the peer lacks.
+                    # Cached (short TTL) so per-frame scrub broadcasts stay cheap.
+                    tl_guid = self.playback.cached_viewed_timeline_guid()
+                    self.manager.broadcast_playback_state(payload, timeline_guid=tl_guid)
             elif cmd == "broadcast_selection":
                 if self.manager and self.manager.status == STATE_SYNCED:
                     clip_guid, view_mode = payload
@@ -675,8 +726,28 @@ class ORISyncPlugin(PluginBase):
                 self.playback.resolve_and_broadcast_selection()
             elif cmd == "sync_container":
                 self.structure.execute_sync_container(payload.get("tl_guid"))
+            elif cmd == "sync_sequences":
+                # One-shot scan triggered by add_media_atom on the viewed
+                # container — detects clips dragged into any sequence track.
+                self.structure.poll_sequence_new_media()
+            elif cmd == "rebuild_sequence":
+                # Coalesced sequence reload: one load_otio for all clips that
+                # arrived in the batch, instead of one expensive reload per clip.
+                self.structure.execute_sequence_rebuild(payload.get("tl_guid"))
             elif cmd == "remove_timeline":
                 self.structure.delete_local_container(payload.get("tl_guid"))
+            elif cmd == "load_bin_media":
+                playlist = payload.get("playlist")
+                uris = payload.get("uris", [])
+                tl_guid = payload.get("tl_guid", "")
+                for _uri in uris:
+                    _path = _uri_to_posix_path(_uri)
+                    if _path:
+                        try:
+                            playlist.add_media(_path)
+                        except Exception:
+                            pass
+                _log(f"load_bin_media: added {len(uris)} clip(s) to bin for {tl_guid[:8]}")
         except Exception:
             _log_exc(f"Command {cmd!r} failed")
 
@@ -814,9 +885,6 @@ class ORISyncPlugin(PluginBase):
     def _on_global_playhead_event(self, event) -> None:
         self.playback.on_global_playhead_event(event)
 
-    def _on_position_event(self, event) -> None:
-        self.playback.on_position_event(event)
-
     def _on_selection_event(self, event) -> None:
         self.playback.on_selection_event(event)
 
@@ -828,6 +896,9 @@ class ORISyncPlugin(PluginBase):
 
     def _on_core_annotation_event(self, data) -> None:
         self.annotation.on_core_annotation_event(data)
+
+    def playhead_attribute_changed(self, attr, role) -> None:
+        self.playback.on_playhead_attribute_changed(attr, role)
 
 # ── xStudio entry points ───────────────────────────────────────────────────────
 

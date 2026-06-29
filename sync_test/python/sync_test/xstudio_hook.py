@@ -30,8 +30,9 @@ def _get_connection(port):
     if _global_conn is None:
         if Connection is None:
             raise RuntimeError("xstudio python API not found.")
-        _global_conn = Connection(auto_connect=False)
-        _global_conn.connect_remote("127.0.0.1", port)
+        conn = Connection(auto_connect=False)
+        conn.connect_remote("127.0.0.1", port)
+        _global_conn = conn
     return _global_conn
 
 def get_xstudio_state(port=14441):

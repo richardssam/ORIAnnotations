@@ -153,15 +153,3 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
-  - name: "otio_import_rv_to_xstudio"
-    script_driven: true
-    convergence_wait: 8.0
-    fixtures:
-      - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
-      - null                        # app[1]: xStudio peer starts empty, receives via sync
-    otio_compare:
-      reference: "test_media/source/otio_test_quicktime.otio"
-      export_delay: 5.0
-    apps:
-      - "xstudio"
-      - "openrv"

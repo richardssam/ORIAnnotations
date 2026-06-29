@@ -92,7 +92,6 @@ class RabbitMQNetwork:
                 if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
                     params = pika.URLParameters(self.host)
                     if self.host.startswith("amqps://"):
-                        # Bypass SSL verification for local development or when requested via query param
                         if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
                             import ssl
                             context = ssl.create_default_context()
@@ -163,7 +162,6 @@ class RabbitMQNetwork:
                 if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
                     params = pika.URLParameters(self.host)
                     if self.host.startswith("amqps://"):
-                        # Bypass SSL verification for local development or when requested via query param
                         if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
                             import ssl
                             context = ssl.create_default_context()

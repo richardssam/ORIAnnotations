@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """StructureSyncController — owns structural/playlist sync state and methods."""
 
+import copy
 import functools
 import json
 import os
@@ -11,7 +12,7 @@ from collections import Counter
 import opentimelineio as otio
 from xstudio.api.session.playlist.timeline import Timeline
 from xstudio.core import (
-    event_atom, item_atom, media_content_changed_atom, change_atom,
+    event_atom, item_atom, media_content_changed_atom,
 )
 try:
     from xstudio.core import add_media_atom as _add_media_atom
@@ -38,9 +39,21 @@ class StructureSyncController:
         self._xs_media_order: dict[str, list] = {}
         self._timeline_item_sub_ids: dict = {}
         self._sequence_playlist_sub_ids: dict = {}
+        # Maps a host playlist's sync guid → the local xStudio playlist we
+        # created for it, so multiple sequences sharing one parent playlist
+        # land in the same bin instead of spawning a duplicate per sequence.
+        self._parent_playlist_map: dict = {}
+        # Sequence guids with a pending coalesced rebuild.  Multiple INSERT_CHILDs
+        # for one timeline arrive together; we reload the xStudio sequence once
+        # (full load_otio + source-switch is ~slow in xStudio) instead of per clip.
+        self._pending_sequence_rebuilds: set = set()
         self._timeline_item_dirty: set = set()
         self._timeline_item_lock = threading.Lock()
         self._test_container_sub_id = None
+        # uuid of the container currently subscribed for add_media events, so the
+        # subscription can be re-established when the viewed container changes
+        # (e.g. a peer that joined an empty session and only later views media).
+        self._test_container_uuid: str | None = None
         self._pending_snapshot_requesters: list[str] = []
         self._last_structure_scan: float = 0.0
 
@@ -53,9 +66,12 @@ class StructureSyncController:
         self._xs_media_order.clear()
         self._timeline_item_sub_ids.clear()
         self._sequence_playlist_sub_ids.clear()
+        self._parent_playlist_map.clear()
+        self._pending_sequence_rebuilds.clear()
         with self._timeline_item_lock:
             self._timeline_item_dirty.clear()
         self._test_container_sub_id = None
+        self._test_container_uuid = None
         self._pending_snapshot_requesters.clear()
         self._last_structure_scan = 0.0
 
@@ -81,46 +97,77 @@ class StructureSyncController:
             _log_exc(f"[2F] subscribe_to_event_group failed for timeline {tl_guid[:8]}")
 
     def subscribe_sequence_playlist_events(self, tl_guid: str, xs_playlist) -> None:
-        """Subscribe to *xs_playlist*'s event group for a sequence timeline.
+        """No-op placeholder — see poll_sequence_new_media in the periodic poll.
 
-        When the user drags media from the playlist panel into the sequence
-        track, xStudio fires ``add_media_atom`` on the Playlist container (not
-        the Timeline).  This subscription catches that signal and routes it to
-        ``execute_sync_container`` so the REPLACE_TIMELINE broadcast fires.
-
-        :param tl_guid: Sync GUID of the sequence timeline.
-        :param xs_playlist: The parent Playlist object for this timeline.
+        Subscribing to the playlist event group for ``add_media_atom`` caused a
+        SIGSEGV in xStudio's pybind layer: when ``unsubscribe_from_event_group``
+        was called during flat→sequence cleanup, xStudio had a pending callback
+        delivery in flight for the same event group, producing a use-after-free.
+        Polling is safer — ``poll_sequence_new_media`` runs every 1 s instead.
         """
-        if tl_guid in self._sequence_playlist_sub_ids:
-            return
-        try:
-            cb = functools.partial(self._on_sequence_playlist_event, tl_guid)
-            sub_id = self.plugin.subscribe_to_event_group(xs_playlist, cb)
-            self._sequence_playlist_sub_ids[tl_guid] = sub_id
-            _log(f"[2F] subscribed to playlist events for sequence {tl_guid[:8]}")
-        except Exception:
-            _log_exc(f"[2F] subscribe_to_event_group(playlist) failed for sequence {tl_guid[:8]}")
 
-    def _on_sequence_playlist_event(self, tl_guid: str, event) -> None:
-        """Handle Playlist-level events (add_media_atom) for a sequence timeline."""
+    # ── viewed-container event ─────────────────────────────────────────
+
+    def subscribe_viewed_container_events(self, container) -> None:
+        """(Re)subscribe to *container*'s event group for add_media detection.
+
+        The viewed container can change after connect — most importantly, a peer
+        that joins an empty session has no container at connect time, then later
+        views/creates one.  Without re-subscribing, that peer never detects media
+        dragged into its own sequence.  Mirrors ``subscribe_container_selection``:
+        guarded by uuid, unsubscribes the previous one first.  Safe to tear down
+        now that the py_context broadcast_down_atom handler purges dead callbacks.
+        """
+        try:
+            container_uuid = str(container.uuid)
+        except Exception:
+            return
+        if container_uuid == self._test_container_uuid:
+            return
+        if self._test_container_sub_id is not None:
+            try:
+                self.plugin.unsubscribe_from_event_group(self._test_container_sub_id)
+            except Exception:
+                pass
+            self._test_container_sub_id = None
+        try:
+            self._test_container_sub_id = self.plugin.subscribe_to_event_group(
+                container, self.plugin._on_test_container_event
+            )
+            self._test_container_uuid = container_uuid
+            _log(
+                f"[2F] (re)subscribed to viewed-container events"
+                f" (type={type(container).__name__} uuid={container_uuid[:8]})"
+            )
+        except Exception:
+            _log_exc("[2F] subscribe_viewed_container_events failed")
+
+    def on_test_container_event(self, event) -> None:
+        """Handle events from the viewed container's event group.
+
+        This single subscription is created once at connect time and is never
+        torn down during a flat→sequence transition, which makes it the safe
+        place to detect ``add_media_atom`` — the signal xStudio fires on the
+        playlist when the user drags media into a sequence track.  (A dedicated
+        per-sequence playlist subscription crashed xStudio: unsubscribing it
+        during the flat→sequence actor swap delivered a broadcast_down_atom to
+        a torn-down callback.)  We enqueue a one-shot sequence scan in response.
+        """
         if time.monotonic() < self.plugin._structural_mutation_suppress_until:
             return
         if not (len(event) > 1 and isinstance(event[0], event_atom)):
             return
+        # DIAGNOSTIC: log the atom type of every viewed-container event so we can
+        # see what the (new) xStudio build fires when media is dragged into a
+        # sequence — the add_media detection below may be keyed on the wrong atom.
+        _t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
+        _log(f"[2F-DIAG] viewed-container event: t1={_t1} len={len(event)}")
         is_add_media = _add_media_atom is not None and isinstance(event[1], _add_media_atom)
         is_media_change = isinstance(event[1], media_content_changed_atom)
         if not (is_add_media or is_media_change):
             return
-        _log(f"[2F] playlist add_media/media_changed for sequence {tl_guid[:8]} — queuing sync_container")
-        self.plugin._cmd_queue.put(("sync_container", {"tl_guid": tl_guid}))
-
-    # ── test container event ───────────────────────────────────────────
-
-    def on_test_container_event(self, event) -> None:
-        """[TEST] Fires if subscribe_to_event_group + change_atom works."""
-        t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
-        is_change = len(event) > 1 and isinstance(event[1], change_atom)
-        _log(f"[TEST change_atom] event: len={len(event)}, t1={t1}, is_change_atom={is_change}")
+        _log("[2F] viewed-container add_media/media_changed — queuing sequence scan")
+        self.plugin._cmd_queue.put(("sync_sequences", None))
 
     # ── timeline item event ────────────────────────────────────────────
 
@@ -134,6 +181,12 @@ class StructureSyncController:
         """
         if time.monotonic() < self.plugin._structural_mutation_suppress_until:
             return
+
+        # DIAGNOSTIC: log every timeline event's shape so we can see what the
+        # (new) xStudio build fires when media is dragged into a sequence track —
+        # the item_atom/action filtering below may be missing the new signal.
+        _t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
+        _log(f"[2F-DIAG] timeline event tl={tl_guid[:8]} t1={_t1} len={len(event)}")
 
         if not (len(event) > 2 and isinstance(event[0], event_atom)):
             return
@@ -171,6 +224,7 @@ class StructureSyncController:
                     actions.append(c.get("action"))
 
         # IA_INSERT=6, IA_REMOVE=7, IA_SPLICE=8, IA_NAME=9, IA_DIRTY=20
+        _log(f"[2F-DIAG] timeline item_atom tl={tl_guid[:8]} actions={actions}")
         matching_actions = [a for a in actions if a in (6, 7, 8, 9, 20)]
         if not matching_actions:
             return
@@ -630,6 +684,22 @@ class StructureSyncController:
                     if tl is None:
                         continue
 
+                    # Stamp the playlist bin URIs so peers can populate their
+                    # bin with the same media when they receive ADD_TIMELINE.
+                    try:
+                        _bin_uris = []
+                        for _m in playlist.media:
+                            try:
+                                _uri = str(_m.media_source().media_reference.uri())
+                                if _uri:
+                                    _bin_uris.append(_uri)
+                            except Exception:
+                                pass
+                        if _bin_uris:
+                            tl.metadata["xs_bin_media"] = _bin_uris
+                    except Exception:
+                        pass
+
                     self.plugin.media.bootstrap_mapping(playlist, tl, xs_tl)
                     self.plugin.manager.register_timeline(tl)
                     self._xs_sequence_track_names[tl_guid] = None
@@ -867,8 +937,10 @@ class StructureSyncController:
             items = [(g, v) for g, v in items if g == only_guid]
 
         for tl_guid, (xs_playlist, xs_tl, known_names) in items:
+            _log(f"[2F] poll_sequence_new_media: tl={tl_guid[:8]} known={len(known_names)}")
             otio_tl = self.plugin.manager.timelines.get(tl_guid)
             if otio_tl is None:
+                _log(f"[2F] poll_sequence_new_media: tl={tl_guid[:8]} not in manager — skip")
                 continue
             video_track = next(
                 (t for t in otio_tl.tracks
@@ -963,21 +1035,33 @@ class StructureSyncController:
                     _log_exc(f"sequence new media: failed for {media.name!r}")
 
             # --- Additions (direct track dragging) ---
+            _log(
+                f"[2F] track path entry: tl={tl_guid[:8]}"
+                f" manager_clips={len([c for c in video_track if isinstance(c, otio.schema.Clip)])}"
+                f" bin_media={len(list(current_media))}"
+            )
             try:
                 xs_otio_str = xs_tl.to_otio_string()
                 xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
-                xs_video_track = next(
-                    (t for t in xs_tl_parsed.tracks
-                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
-                    next(
-                        (t for t in xs_tl_parsed.tracks
-                         if t.kind == otio.schema.TrackKind.Video),
-                        None,
-                    ),
+                _log(
+                    f"[2F] track path: tl={tl_guid[:8]} tracks={len(list(xs_tl_parsed.tracks))}"
+                    f" track_names={[t.name for t in xs_tl_parsed.tracks]}"
                 )
-                xs_clips = (
-                    [c for c in xs_video_track if isinstance(c, otio.schema.Clip)]
-                    if xs_video_track is not None else []
+                # Collect clips from ALL video-kind tracks except Annotations.
+                # xStudio places drag-dropped media in a new 'Dropped' track
+                # rather than the existing 'Video Track', so we must scan all.
+                xs_clips_ordered: list = []
+                for _trk in xs_tl_parsed.tracks:
+                    if _trk.kind != otio.schema.TrackKind.Video:
+                        continue
+                    if _trk.name == "Annotations":
+                        continue
+                    xs_clips_ordered.extend(
+                        c for c in _trk if isinstance(c, otio.schema.Clip)
+                    )
+                xs_clips = xs_clips_ordered
+                _log(
+                    f"[2F] track path: xs_clips={len(xs_clips)}"
                 )
             except Exception:
                 xs_clips = []
@@ -1021,6 +1105,17 @@ class StructureSyncController:
                 else:
                     # No match found in current manager clips -> this is a new track clip addition!
                     try:
+                        # The clip came from xs_tl_parsed (via a 'Dropped' or 'Video Track'
+                        # inside that parsed tree) and still has that track as its parent.
+                        # OTIO refuses to reparent a child that already has one, so we
+                        # deepcopy to get a detached clone before stamping and inserting.
+                        clip = copy.deepcopy(clip)
+                        # Clips dragged into a track come back from to_otio_string()
+                        # with an empty name — the name lives on the media reference,
+                        # not the clip.  Derive it from the media path so peers show
+                        # a proper clip name instead of a blank.
+                        if not clip.name and clip_path:
+                            clip.name = os.path.splitext(os.path.basename(clip_path))[0]
                         self.plugin.manager._ensure_guid_and_map(clip)
                         clip_guid = clip.metadata.get("sync", {}).get("guid")
 
@@ -1173,6 +1268,7 @@ class StructureSyncController:
         clip_guid = clip_obj.metadata.get("sync", {}).get("guid", "")
         if not clip_guid:
             return
+        _log(f"apply_remote_clip_insert: clip={clip_guid[:8]} name={clip_obj.name!r}")
         for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
             otio_tl = self.plugin.manager.timelines.get(tl_guid)
             if otio_tl is None:
@@ -1192,7 +1288,15 @@ class StructureSyncController:
                                     "Failed to reconcile playlist order after remote insert"
                                 )
                         else:
-                            self.apply_sequence_insert(tl_guid, otio_tl, xs_tl)
+                            # Debounce: enqueue ONE rebuild for this timeline no
+                            # matter how many clips arrive in the batch.  Each
+                            # apply_sequence_insert does a full load_otio +
+                            # source-switch (~slow in xStudio); doing it per clip
+                            # serialised ~18s rebuilds back-to-back.
+                            if tl_guid not in self._pending_sequence_rebuilds:
+                                self._pending_sequence_rebuilds.add(tl_guid)
+                                _log(f"apply_remote_clip_insert: queuing rebuild tl={tl_guid[:8]}")
+                                self.plugin._cmd_queue.put(("rebuild_sequence", {"tl_guid": tl_guid}))
                             # Keep known_names in sync so next poll doesn't
                             # re-broadcast this remote-received clip.
                             if tl_guid in self._xs_sequence_playlists:
@@ -1337,10 +1441,28 @@ class StructureSyncController:
         except Exception:
             _log_exc(f"flat playlist insert: add_media failed for {path!r}")
 
+    def execute_sequence_rebuild(self, tl_guid: str) -> None:
+        """Run a coalesced sequence rebuild queued by ``apply_remote_clip_insert``.
+
+        Clears the pending flag first so any insert arriving during the (slow)
+        reload re-queues a fresh rebuild, then reloads once from the manager's
+        current OTIO — reflecting every clip applied since the rebuild was queued.
+        """
+        self._pending_sequence_rebuilds.discard(tl_guid)
+        if not self.plugin.manager:
+            return
+        otio_tl = self.plugin.manager.timelines.get(tl_guid)
+        if otio_tl is None:
+            return
+        entry = self.plugin._sync_playlists.get(tl_guid)
+        xs_tl = entry[1] if entry else None
+        if xs_tl is None:
+            return
+        self.apply_sequence_insert(tl_guid, otio_tl, xs_tl)
+
     def apply_sequence_insert(
         self, tl_guid: str, otio_tl: "otio.schema.Timeline", xs_timeline
     ) -> None:
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Reload an xStudio sequence Timeline after a remote clip insertion.
 
         The manager has already inserted the new OTIO Clip into the track.
@@ -1350,21 +1472,49 @@ class StructureSyncController:
         :param otio_tl: Updated OTIO Timeline.
         :param xs_timeline: xStudio Timeline to reload.
         """
+        # Each INSERT_CHILD reloads the whole sequence via load_otio(clear=True).
+        # When inserts arrive spread out (not batched), an earlier suppression
+        # cooldown here dropped later clips, so we always rebuild.  The repeated
+        # rebuild is safe because we strip stale xstudio actor UUIDs below before
+        # load_otio, so fresh ClipActors are created each time (the ClipActor CAF
+        # errors came from reusing those stale UUIDs, not from rebuilding itself).
+        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        n_clips = sum(
+            1 for t in otio_tl.tracks
+            for c in t if isinstance(c, otio.schema.Clip)
+        )
+        _log(f"apply_sequence_insert: tl={tl_guid[:8]} clips={n_clips} xs_tl={xs_timeline is not None}")
         try:
+            _t0 = time.monotonic()
             prepared_otio = self.plugin.media.prepare_otio_for_load(otio_tl)
+            # Strip stale xstudio actor UUIDs from clips so load_otio creates
+            # fresh actors instead of trying to reuse ones from a previous load.
+            for _track in prepared_otio.tracks:
+                for _item in _track:
+                    if isinstance(_item, otio.schema.Clip):
+                        _item.metadata.pop("xstudio", None)
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
+            _t_prep = time.monotonic()
             self.plugin._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
+            _log(f"apply_sequence_insert: calling load_otio tl={tl_guid[:8]}")
             xs_timeline.load_otio(otio_str, clear=True)
+            _t_load = time.monotonic()
             if tl_guid in self.plugin._sync_playlists:
                 playlist = self.plugin._sync_playlists[tl_guid][0]
                 self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
+            _t_boot = time.monotonic()
             try:
                 self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
             except Exception:
                 pass
-            _log(f"sequence insert: reloaded timeline {tl_guid[:8]}")
+            _t_sos = time.monotonic()
+            _log(
+                f"sequence insert: reloaded timeline {tl_guid[:8]} — "
+                f"prep={_t_prep-_t0:.2f}s load_otio={_t_load-_t_prep:.2f}s "
+                f"bootstrap={_t_boot-_t_load:.2f}s set_on_screen={_t_sos-_t_boot:.2f}s"
+            )
         except Exception:
             self.plugin._reload_suppress_until = 0.0
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")

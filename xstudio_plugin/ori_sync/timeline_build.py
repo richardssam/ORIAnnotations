@@ -163,11 +163,51 @@ class TimelineBuildController:
                     _log_exc(f"Failed to create flat playlist for {playlist_name!r}")
             else:
                 try:
-                    playlist = plugin.connection.api.session.create_playlist(playlist_name)[1]
+                    # Reuse the existing local playlist when this sequence shares
+                    # a parent playlist with one we already created — otherwise a
+                    # second sequence spawns a duplicate bin folder.
+                    parent_guid = otio_tl.metadata.get("xs_parent_playlist_guid")
+                    playlist = None
+                    reused_playlist = False
+                    if parent_guid and parent_guid in plugin.structure._parent_playlist_map:
+                        playlist = plugin.structure._parent_playlist_map[parent_guid]
+                        reused_playlist = True
+                    # Also reuse a pre-existing synced playlist (e.g. our own
+                    # native bin that the remote sequence was built from) — the
+                    # parent guid is now the shared sync guid, so it matches the
+                    # key under which that playlist is registered.
+                    if playlist is None and parent_guid and parent_guid in plugin._sync_playlists:
+                        _existing_pl = plugin._sync_playlists[parent_guid][0]
+                        if _existing_pl is not None:
+                            playlist = _existing_pl
+                            reused_playlist = True
+                            plugin.structure._parent_playlist_map[parent_guid] = playlist
+                            # This bin is transitioning from flat to hosting a
+                            # remote sequence.  Drop its flat tracking so our own
+                            # poll_new_playlists doesn't re-detect the flat→sequence
+                            # change and broadcast a spurious REMOVE/ADD for it.
+                            plugin.structure._xs_flat_playlists.pop(parent_guid, None)
+                            plugin._sync_playlists.pop(parent_guid, None)
+                            _log(f"Reusing existing playlist for sequence (parent={parent_guid[:8]})")
+                    if playlist is None:
+                        playlist = plugin.connection.api.session.create_playlist(playlist_name)[1]
+                        if parent_guid:
+                            plugin.structure._parent_playlist_map[parent_guid] = playlist
                     xs_timeline = playlist.create_timeline(timeline_name)[1]
                     _load_tl = plugin.media.prepare_otio_for_load(otio_tl)
                     otio_str = otio.adapters.write_to_string(_load_tl, "otio_json")
                     xs_timeline.load_otio(otio_str, clear=True)
+                    # Populate the playlist bin with the host's bin media.
+                    # Deferred so load_otio (which clears first) runs first,
+                    # and so INSERT_CHILD isn't blocked by the slow add_media calls.
+                    # Skip when reusing a playlist — its bin is already populated.
+                    _bin_uris = otio_tl.metadata.get("xs_bin_media", [])
+                    if _bin_uris and not reused_playlist:
+                        plugin._cmd_queue.put(("load_bin_media", {
+                            "playlist": playlist,
+                            "uris": _bin_uris,
+                            "tl_guid": guid,
+                        }))
                     plugin.structure._xs_sequence_track_names[guid] = None
                     plugin._sync_playlists[guid] = (playlist, xs_timeline)
                     plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
@@ -415,6 +455,29 @@ class TimelineBuildController:
             tl_guid = str(xs_tl.uuid)
             tl.metadata.setdefault("sync", {})["guid"] = tl_guid
             tl.metadata["xs_playlist_name"] = playlist.name
+            # Stable, *shared* identity of the parent playlist so peers can group
+            # multiple sequences into one bin instead of duplicating it.  Prefer
+            # the playlist's sync guid (the same value on every peer) over the
+            # local xStudio uuid, which differs per peer — otherwise a peer that
+            # created the playlist locally can't match a remote sequence to it.
+            try:
+                _pl_uuid = str(playlist.uuid)
+            except Exception:
+                _pl_uuid = ""
+            _parent_guid = _pl_uuid
+            try:
+                for _g, _entry in self.plugin._sync_playlists.items():
+                    _pl = _entry[0] if isinstance(_entry, (tuple, list)) and _entry else None
+                    try:
+                        if _pl is not None and str(_pl.uuid) == _pl_uuid:
+                            _parent_guid = _g
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                _log_exc("build_single_sequence_otio: parent guid resolve failed")
+            if _parent_guid:
+                tl.metadata["xs_parent_playlist_guid"] = _parent_guid
 
             if not any(t.kind == otio.schema.TrackKind.Video for t in tl.tracks):
                 video_track = otio.schema.Track(name="Video", kind=otio.schema.TrackKind.Video)

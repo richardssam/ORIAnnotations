@@ -25,6 +25,17 @@ from .utils import _log, _log_exc, bounded, bounded_timeout
 # so a stale/destroyed actor fails fast and the poll thread keeps running.
 _PLAYHEAD_TIMEOUT_MS = 2000
 
+# Programmatically highlighting the selected clip inside a sequence track (via a
+# raw item_selection_atom send) crashes xStudio: the send into a recently-rebuilt
+# timeline races with that timeline's clip actors being torn down, and the
+# resulting broadcast_down_atom is delivered to a Python event callback that
+# segfaults (signal 11 in execute_event_callback).  The highlight is cosmetic —
+# the peer already switches to the sequence and seeks to the clip — so it is
+# disabled by default.  Re-enable only once the underlying actor-down crash is
+# resolved in xStudio.
+_ENABLE_TIMELINE_ITEM_HIGHLIGHT = False
+
+
 class PlaybackSyncController:
     """Owns playback and selection sync state and methods.
 
@@ -46,6 +57,9 @@ class PlaybackSyncController:
         self._last_remote_stop_at: float = 0.0
         self._last_sel_names = None
         self._last_src_names = None
+        self._last_playhead_check: float = 0.0
+        self._cached_viewed_tl_guid: str | None = None
+        self._cached_viewed_tl_at: float = 0.0
 
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
@@ -65,9 +79,30 @@ class PlaybackSyncController:
         self._last_remote_stop_at = 0.0
         self._last_sel_names = None
         self._last_src_names = None
+        self._last_playhead_check = 0.0
+        self._cached_viewed_tl_guid = None
+        self._cached_viewed_tl_at = 0.0
+
+    def cached_viewed_timeline_guid(self, ttl: float = 0.5) -> str | None:
+        """Return the viewed timeline guid, cached for *ttl* seconds.
+
+        ``get_local_viewed_timeline_guid`` does a blocking viewport read; calling
+        it on every playback broadcast throttles the scrub broadcast rate.  The
+        viewed timeline rarely changes mid-scrub, so a short TTL cache keeps
+        broadcasts cheap while still tracking container switches quickly.
+        """
+        now = time.monotonic()
+        if now - self._cached_viewed_tl_at < ttl and self._cached_viewed_tl_guid is not None:
+            return self._cached_viewed_tl_guid
+        guid = self.get_local_viewed_timeline_guid()
+        if guid is not None:
+            self._cached_viewed_tl_guid = guid
+            self._cached_viewed_tl_at = now
+        return guid
 
     # ── global playhead event ──────────────────────────────────────────
 
+    @bounded(_PLAYHEAD_TIMEOUT_MS)
     def on_global_playhead_event(self, event) -> None:
         """Track the on-screen playhead and detect locally-drawn annotations.
 
@@ -154,6 +189,35 @@ class PlaybackSyncController:
                             break
 
                 _is_seq_media = _seq_tl_guid is not None
+
+                # Normalize to the SEQUENCE clip's guid before broadcasting.  The
+                # same media is a separate OTIO object in the bin vs the sequence,
+                # with different sync guids; only the sequence clip's guid is shared
+                # across peers.  Selecting via the bin would otherwise broadcast the
+                # bin guid, which the peer (which only has the sequence) can't match
+                # — they end up "looking at something different".  Map bin↔sequence
+                # by media basename so both sides exchange the shared identity.
+                if _seq_tl_guid and _media_name_hint and self.plugin.manager:
+                    _seq_tl = self.plugin.manager.timelines.get(_seq_tl_guid)
+                    if _seq_tl is not None:
+                        _base = os.path.splitext(os.path.basename(_media_name_hint))[0].lower()
+                        _found = None
+                        for _track in _seq_tl.tracks:
+                            if _track.kind != otio.schema.TrackKind.Video:
+                                continue
+                            for _c in _track:
+                                if not isinstance(_c, otio.schema.Clip):
+                                    continue
+                                _cn = os.path.splitext(os.path.basename(_c.name or ""))[0].lower()
+                                if _cn == _base:
+                                    _found = _c.metadata.get("sync", {}).get("guid")
+                                    break
+                            if _found:
+                                break
+                        if _found and _found != clip_guid:
+                            _log(f"[SEL] normalize bin→sequence clip guid {str(clip_guid)[:8]}→{_found[:8]}")
+                            clip_guid = _found
+
                 # When xStudio is already in single-clip mode (PSM=False), any
                 # show_atom is a deliberate user click — use source mode regardless
                 # of whether the media belongs to a sequence playlist.
@@ -234,21 +298,24 @@ class PlaybackSyncController:
             try:
                 self.plugin.active_playhead = Playhead(self.plugin.connection, ph_remote)
                 _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
-                self.plugin.subscribe_to_playhead_events(ph_remote, self.plugin._on_position_event, auto_cancel=True)
-                _log("[position_atom] subscribed to playhead events")
             except Exception:
-                _log_exc("on_global_playhead_event: failed to update playhead and subscribe")
+                _log_exc("on_global_playhead_event: failed to update playhead")
 
-        # Subscribe to viewed container's selection actor events.
+        # Subscribe to viewed container's selection actor events, and its event
+        # group (for add_media detection).  Both re-subscribe when the viewed
+        # container changes — important for a peer that joined an empty session
+        # and only later views/creates a container.
         try:
             container = self.get_viewed_container_safe()
             if container:
                 self.subscribe_container_selection(container)
+                self.plugin.structure.subscribe_viewed_container_events(container)
         except Exception:
-            _log_exc("[SEL] Failed to subscribe to container selection events")
+            _log_exc("[SEL] Failed to subscribe to container events")
 
     # ── container selection subscription ──────────────────────────────
 
+    @bounded(_PLAYHEAD_TIMEOUT_MS)
     def subscribe_container_selection(self, container) -> None:
         """Subscribe to the container's selection actor to receive selection events."""
         try:
@@ -294,7 +361,15 @@ class PlaybackSyncController:
         ):
             return
         _log(f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution")
-        self.check_and_update_active_playhead()
+        # Throttle the blocking current_playhead() query: on_global_playhead_event
+        # already maintains active_playhead, so re-querying it on every selection
+        # event is redundant.  During a selection storm those per-event blocking
+        # reads stack into multi-second stalls (each bounded read costs up to its
+        # timeout).  At most once per second is plenty to catch a real change.
+        now = time.monotonic()
+        if now - self._last_playhead_check >= 1.0:
+            self._last_playhead_check = now
+            self.check_and_update_active_playhead()
         self.enqueue_selection_update()
 
     def enqueue_selection_update(self) -> None:
@@ -303,8 +378,9 @@ class PlaybackSyncController:
 
     # ── active playhead management ─────────────────────────────────────
 
+    @bounded(_PLAYHEAD_TIMEOUT_MS)
     def check_and_update_active_playhead(self) -> None:
-        """Query the active playhead from xStudio and subscribe to its events if changed."""
+        """Query the active playhead from xStudio and cache its reference if changed."""
         try:
             ph = self.plugin.current_playhead()
         except Exception:
@@ -314,13 +390,7 @@ class PlaybackSyncController:
             current_remote = getattr(self.plugin.active_playhead, "remote", None)
             if ph.remote != current_remote:
                 self.plugin.active_playhead = ph
-                try:
-                    self.plugin.subscribe_to_playhead_events(
-                        ph.remote, self.plugin._on_position_event, auto_cancel=True
-                    )
-                    _log(f"[position_atom] active playhead updated/subscribed: {ph.remote}")
-                except Exception:
-                    _log_exc("[position_atom] failed to subscribe to active playhead events")
+                _log(f"[position_atom] active playhead updated: {ph.remote}")
 
     def _reacquire_active_playhead(self) -> None:
         """Re-acquire a live playhead after the previous reference went stale.
@@ -329,31 +399,20 @@ class PlaybackSyncController:
         timed out.  ``current_playhead()`` queries the global-playhead-events
         actor (not the dead playhead), so it is safe; it is still bounded by a
         timeout in case that path is also slow.  On success the new playhead is
-        stored and re-subscribed for position events.
+        stored.
         """
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
                 ph = self.plugin.current_playhead()
                 if ph:
-                    self.plugin.subscribe_to_playhead_events(
-                        ph.remote, self.plugin._on_position_event, auto_cancel=True
-                    )
                     self.plugin.active_playhead = ph
                     _log(f"[position_atom] re-acquired live playhead: {ph.remote}")
         except Exception:
             _log_exc("_reacquire_active_playhead: failed")
 
-    def on_position_event(self, event) -> None:
+    def on_playhead_attribute_changed(self, attr, role) -> None:
         """Fires when playhead position or play state changes."""
-        if not (
-            len(event) > 2
-            and isinstance(event[0], event_atom)
-        ):
-            return
-
-        is_pos = isinstance(event[1], position_atom)
-        is_play = isinstance(event[1], play_forward_atom) or isinstance(event[1], play_atom)
-        if not (is_pos or is_play):
+        if attr.name not in ("Logical Frame", "playing"):
             return
 
         if not self.plugin.active_playhead:
@@ -369,8 +428,13 @@ class PlaybackSyncController:
         if frame < 0:
             return
 
-        # Echo guard: check if this is a remote-applied frame/state change
+        # Echo guard: a remote playback apply just moved our playhead.  The exact
+        # frame match handles the simple case; the rolling time window handles
+        # rapid scrubbing, where async attribute_changed callbacks lag behind
+        # _last_applied_frame and would otherwise echo stale frames back.
         if frame == self.plugin._last_applied_frame:
+            return
+        if time.monotonic() < self.plugin._playback_apply_suppress_until:
             return
 
         # Initialize play state on first run
@@ -405,10 +469,14 @@ class PlaybackSyncController:
             "looping": False,
         }
 
+        # Mark local playback as active so an echoed selection from a following
+        # peer doesn't seek our own playhead to a clip start mid-scrub.
+        self.plugin._local_scrub_active_until = time.monotonic() + 0.4
+
         # Enqueue the broadcast command to be processed asynchronously
         _log(
-            f"Event: queuing playback state broadcast frame={frame} playing={playing}"
-            f" (source_event={type(event[1]).__name__})"
+            f"Event: queuing playback state broadcast frame={frame} playing={playing} "
+            f"(source_attr={attr.name})"
         )
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
@@ -779,6 +847,10 @@ class PlaybackSyncController:
                 if not playing or playing_changed:
                     self.plugin._last_applied_frame = frame
                     self.plugin._last_polled_frame = frame
+                    # Suppress the echo: ph.position fires attribute_changed
+                    # asynchronously; refresh a rolling window so those callbacks
+                    # don't re-broadcast while a peer is driving playback.
+                    self.plugin._playback_apply_suppress_until = time.monotonic() + 0.4
                     ph.position = frame
         except Exception:
             # xStudio's UI uses the new live playhead; re-acquire it via the
@@ -836,6 +908,14 @@ class PlaybackSyncController:
         clip_guid = data.get("clip_guid", "")
         view_mode = data.get("view_mode", "source")
 
+        # Echo guard for ALL apply paths: switching the on-screen source / setting
+        # the selection below fires xStudio show_atom/selection events that our own
+        # handler would otherwise re-broadcast — bouncing the selection back to the
+        # sender.  When two peers start on different clips that produces an endless
+        # swap (each applies the other's selection and re-broadcasts its own).
+        # Suppress local selection broadcasts briefly while we apply this one.
+        self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+
         if not clip_guid:
             # Clear / container switch.
             _log(
@@ -858,11 +938,13 @@ class PlaybackSyncController:
                             if view_mode == "sequence" and tl:
                                 self.plugin.connection.api.session.set_on_screen_source(tl)
                                 _log("RECV selection clear: set_on_screen_source to timeline (Sequence)")
-                                try:
-                                    from xstudio.core import UuidActorVec
-                                    self.plugin.connection.send(tl.remote, item_selection_atom(), UuidActorVec())
-                                except Exception:
-                                    pass
+                                # Same crash risk as the highlight send — gated off.
+                                if _ENABLE_TIMELINE_ITEM_HIGHLIGHT:
+                                    try:
+                                        from xstudio.core import UuidActorVec
+                                        self.plugin.connection.send(tl.remote, item_selection_atom(), UuidActorVec())
+                                    except Exception:
+                                        pass
                                 # Restore sequence view: pinnedSourceMode=True pins the playhead
                                 # to the full timeline rather than any single selected media item.
                                 if self.plugin.active_playhead:
@@ -1020,42 +1102,55 @@ class PlaybackSyncController:
                         f"{getattr(playlist_xs_tl, 'name', '?')!r}"
                     )
                 elif is_multi_clip:
-                    # Multi-clip sequence: seek the playhead after the source switch
-                    # to avoid invalid_request errors.
-                    start_frame = 0
-                    try:
-                        start_frame = int(clip.range_in_parent().start_time.value)
-                    except Exception:
-                        # Fallback: Sum duration of all preceding items in the track
-                        otio_tl = (
-                            self.plugin.manager.timelines.get(matched_tl_guid)
-                            if self.plugin.manager else None
+                    # Multi-clip sequence selection.  When a peer is actively
+                    # driving playback (scrubbing), each clip-boundary crossing
+                    # fires a selection — but re-switching the on-screen source and
+                    # seeking to the new clip's start would yank the playhead off
+                    # the authoritative PLAYBACK_SETTINGS position and snap it to
+                    # the clip beginning.  We're already viewing the sequence and
+                    # the position channel positions us, so skip the whole apply
+                    # mid-scrub; only act on a genuine (non-playback) selection.
+                    _now = time.monotonic()
+                    if (_now < self.plugin._playback_apply_suppress_until
+                            or _now < self.plugin._local_scrub_active_until):
+                        _log("RECV selection: skipping sequence source-switch+seek (playback active)")
+                    else:
+                        # Seek the playhead after the source switch to avoid
+                        # invalid_request errors.
+                        start_frame = 0
+                        try:
+                            start_frame = int(clip.range_in_parent().start_time.value)
+                        except Exception:
+                            # Fallback: sum duration of all preceding items.
+                            otio_tl = (
+                                self.plugin.manager.timelines.get(matched_tl_guid)
+                                if self.plugin.manager else None
+                            )
+                            if otio_tl:
+                                for track in otio_tl.tracks:
+                                    if track.kind == otio.schema.TrackKind.Video:
+                                        current_time = 0
+                                        for item in track:
+                                            if item.metadata.get("sync", {}).get("guid") == clip_guid:
+                                                start_frame = current_time
+                                                break
+                                            sr = getattr(item, "source_range", None)
+                                            if sr is not None:
+                                                current_time += int(sr.duration.value)
+
+                        self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
+                        _log(
+                            f"RECV selection: set_on_screen_source (sequence) → "
+                            f"{getattr(playlist_xs_tl, 'name', '?')!r}"
                         )
-                        if otio_tl:
-                            for track in otio_tl.tracks:
-                                if track.kind == otio.schema.TrackKind.Video:
-                                    current_time = 0
-                                    for item in track:
-                                        if item.metadata.get("sync", {}).get("guid") == clip_guid:
-                                            start_frame = current_time
-                                            break
-                                        sr = getattr(item, "source_range", None)
-                                        if sr is not None:
-                                            current_time += int(sr.duration.value)
+                        # Defer the seek until Form-2 events have settled (~200 ms).
+                        self._pending_seek_frame = start_frame
+                        self._pending_seek_deadline = time.monotonic() + 0.300
 
-                    self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
-                    _log(
-                        f"RECV selection: set_on_screen_source (sequence) → "
-                        f"{getattr(playlist_xs_tl, 'name', '?')!r}"
-                    )
-
-                    # Defer the seek until Form-2 events have settled the playhead (~200 ms).
-                    self._pending_seek_frame = start_frame
-                    self._pending_seek_deadline = time.monotonic() + 0.300
-
-                    # Programmatically select/highlight the clip in the timeline track.
+                    # Programmatically select/highlight the clip in the timeline
+                    # track.  Disabled by default — see _ENABLE_TIMELINE_ITEM_HIGHLIGHT.
                     otio_tl = self.plugin.manager.timelines.get(matched_tl_guid) if self.plugin.manager else None
-                    if otio_tl:
+                    if _ENABLE_TIMELINE_ITEM_HIGHLIGHT and otio_tl:
                         target_track_idx = -1
                         target_child_idx = -1
                         for track_idx, track in enumerate(otio_tl.tracks):
