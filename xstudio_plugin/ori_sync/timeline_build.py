@@ -9,7 +9,69 @@ import time
 import opentimelineio as otio
 from xstudio.api.session.playlist.timeline import Timeline
 
-from .utils import _log, _log_exc, _uri_to_posix_path
+from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
+
+
+def _write_sync_item_props(xs_tl, tl, connection) -> None:
+    """Write ORI sync GUIDs from OTIO metadata into xStudio timeline item props.
+
+    Called immediately after GUID assignment so that subsequent
+    ``xs_tl.to_otio_string()`` exports carry ``metadata["sync"]["guid"]`` for
+    every track and clip, enabling stable identity without URL matching.
+
+    Walks ``xs_tl.tracks`` in lockstep with ``tl.tracks`` (both come from the
+    same ``to_otio_string()`` call, so ordering is identical).  Every
+    ``item_prop`` read/write is bounded to avoid a 100 s stale-actor hang;
+    failures are logged and skipped so a single bad item cannot stall the build.
+    """
+    try:
+        xs_tracks = xs_tl.tracks
+    except Exception:
+        _log_exc("_write_sync_item_props: failed to get xStudio tracks")
+        return
+
+    for xs_track, otio_track in zip(xs_tracks, list(tl.tracks)):
+        track_guid = otio_track.metadata.get("sync", {}).get("guid")
+        if track_guid:
+            try:
+                with bounded_timeout(connection, 2000):
+                    props = xs_track.item_prop
+                props.setdefault("sync", {})["guid"] = track_guid
+                with bounded_timeout(connection, 2000):
+                    xs_track.item_prop = props
+            except Exception:
+                _log_exc(
+                    f"_write_sync_item_props: track prop write failed"
+                    f" ({track_guid[:8]})"
+                )
+
+        try:
+            xs_children = xs_track.children
+        except Exception:
+            _log_exc(
+                f"_write_sync_item_props: failed to get children for track"
+                f" ({track_guid[:8] if track_guid else '?'})"
+            )
+            continue
+
+        otio_children = list(otio_track)
+        for xs_child, otio_child in zip(xs_children, otio_children):
+            if not isinstance(otio_child, otio.schema.Clip):
+                continue
+            clip_guid = otio_child.metadata.get("sync", {}).get("guid")
+            if not clip_guid:
+                continue
+            try:
+                with bounded_timeout(connection, 2000):
+                    props = xs_child.item_prop
+                props.setdefault("sync", {})["guid"] = clip_guid
+                with bounded_timeout(connection, 2000):
+                    xs_child.item_prop = props
+            except Exception:
+                _log_exc(
+                    f"_write_sync_item_props: clip prop write failed"
+                    f" ({clip_guid[:8]})"
+                )
 
 
 class TimelineBuildController:
@@ -289,6 +351,7 @@ class TimelineBuildController:
                                     clip_guid = hashlib.sha1(clip_seed.encode("utf-8")).hexdigest()
                                     child.metadata.setdefault("sync", {})["guid"] = clip_guid
                                     clip_idx += 1
+                        _write_sync_item_props(xs_tl, tl, plugin.connection)
                         _log(f"Built OTIO timeline: {tl.name!r} (parent playlist: {playlist.name!r})")
                         result.append(tl)
                         _media_tr_m = next(
@@ -512,6 +575,7 @@ class TimelineBuildController:
                         clip_guid = hashlib.sha1(clip_seed.encode("utf-8")).hexdigest()
                         child.metadata.setdefault("sync", {})["guid"] = clip_guid
                         clip_idx += 1
+            _write_sync_item_props(xs_tl, tl, self.plugin.connection)
             _log(f"build_single_sequence_otio: {tl.name!r}")
             return tl
         except Exception:

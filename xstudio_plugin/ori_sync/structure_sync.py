@@ -421,7 +421,22 @@ class StructureSyncController:
             current_order = []
 
             for clip in xs_clips:
-                clip_guid = None
+                # Primary: read sync GUID from item_prop-stamped metadata.
+                clip_guid = clip.metadata.get("sync", {}).get("guid")
+
+                if clip_guid:
+                    current_order.append(clip_guid)
+                    matched_mc = next(
+                        (mc for mc in pool
+                         if mc.metadata.get("sync", {}).get("guid") == clip_guid),
+                        None,
+                    )
+                    if matched_mc is not None:
+                        pool.remove(matched_mc)
+                    continue
+
+                # Fallback: URL/stem matching for clips not yet written by
+                # _write_sync_item_props (e.g. just dragged in this cycle).
                 clip_url = ""
                 if isinstance(clip.media_reference, otio.schema.ExternalReference):
                     clip_url = clip.media_reference.target_url or ""
@@ -1082,34 +1097,47 @@ class StructureSyncController:
             pool = list(manager_clips)
 
             for new_idx, clip in enumerate(xs_clips):
-                # Try to find a match in the manager clips pool
-                clip_url = ""
-                if isinstance(clip.media_reference, otio.schema.ExternalReference):
-                    clip_url = clip.media_reference.target_url or ""
-                clip_path = _uri_to_posix_path(clip_url)
-                norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
-                clip_stem = (
-                    os.path.splitext(os.path.basename(clip_path))[0].lower()
-                    if clip_path else ""
-                )
-
+                # Primary: match by sync GUID from item_prop-stamped metadata.
+                xs_clip_guid = clip.metadata.get("sync", {}).get("guid")
                 matched_mc = None
-                for mc in pool:
-                    mc_url = ""
-                    if isinstance(mc.media_reference, otio.schema.ExternalReference):
-                        mc_url = mc.media_reference.target_url or ""
-                    mc_path = _uri_to_posix_path(mc_url)
-                    norm_mc_path = os.path.normpath(mc_path) if mc_path else ""
-                    if norm_clip_path and norm_clip_path == norm_mc_path:
-                        matched_mc = mc
-                        break
-                    mc_stem = (
-                        os.path.splitext(os.path.basename(mc_path))[0].lower()
-                        if mc_path else ""
+                if xs_clip_guid:
+                    matched_mc = next(
+                        (mc for mc in pool
+                         if mc.metadata.get("sync", {}).get("guid") == xs_clip_guid),
+                        None,
                     )
-                    if clip_stem and clip_stem == mc_stem:
-                        matched_mc = mc
-                        break
+
+                if matched_mc is None:
+                    # Fallback: URL/stem matching for clips without an item_prop GUID.
+                    clip_url = ""
+                    if isinstance(clip.media_reference, otio.schema.ExternalReference):
+                        clip_url = clip.media_reference.target_url or ""
+                    clip_path = _uri_to_posix_path(clip_url)
+                    norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
+                    clip_stem = (
+                        os.path.splitext(os.path.basename(clip_path))[0].lower()
+                        if clip_path else ""
+                    )
+                    for mc in pool:
+                        mc_url = ""
+                        if isinstance(mc.media_reference, otio.schema.ExternalReference):
+                            mc_url = mc.media_reference.target_url or ""
+                        mc_path = _uri_to_posix_path(mc_url)
+                        norm_mc_path = os.path.normpath(mc_path) if mc_path else ""
+                        if norm_clip_path and norm_clip_path == norm_mc_path:
+                            matched_mc = mc
+                            break
+                        mc_stem = (
+                            os.path.splitext(os.path.basename(mc_path))[0].lower()
+                            if mc_path else ""
+                        )
+                        if clip_stem and clip_stem == mc_stem:
+                            matched_mc = mc
+                            break
+                else:
+                    clip_url = ""
+                    clip_path = ""
+                    norm_clip_path = ""
 
                 if matched_mc is not None:
                     pool.remove(matched_mc)
