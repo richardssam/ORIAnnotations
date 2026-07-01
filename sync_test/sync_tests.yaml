@@ -160,3 +160,10 @@ tests:
     apps:
       - "xstudio"
       - "xstudio"
+
+  - name: "color_tests"
+    recording: "recordings/color_tests.jsonl"
+    script_driven: false
+    apps:
+      - "xstudio"
+      - "openrv"
