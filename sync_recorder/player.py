@@ -411,35 +411,37 @@ class SyncPlayer:
 
     def _resolve_target_urls(self, payload: Any) -> Any:
         """Recursively find 'target_url' and resolve to absolute paths if they are relative and exist.
-        
+
         :param payload: Dict or list representing the message payload.
         :returns: The updated payload copy.
         """
-        import sys
         if isinstance(payload, dict):
             new_dict = {}
             for k, v in payload.items():
                 if k == "target_url" and isinstance(v, str):
-                    print(f"[DEBUG] Found target_url: {v} in cwd: {os.getcwd()}")
-                    sys.stdout.flush()
-                    if not os.path.isabs(v):
+                    if v.startswith("file:///"):
+                        # Fully-qualified absolute URI — pass through unchanged.
+                        new_dict[k] = v
+                    elif v.startswith("file:/"):
+                        # file:/ prefix signals a project-relative path.
+                        rel = v[len("file:/"):]
                         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                        abs_path = os.path.normpath(os.path.join(project_root, v))
-                        print(f"[DEBUG] Resolving to: {abs_path}")
-                        sys.stdout.flush()
+                        abs_path = os.path.normpath(os.path.join(project_root, rel))
                         if os.path.exists(abs_path):
-                            new_val = "file://" + abs_path if not abs_path.startswith("file://") else abs_path
-                            print(f"[DEBUG] File exists. Replaced with: {new_val}")
-                            sys.stdout.flush()
-                            new_dict[k] = new_val
+                            new_dict[k] = "file://" + abs_path
                         else:
                             print(f"[Warning] target_url '{v}' not found relative to project root {project_root}")
-                            sys.stdout.flush()
                             new_dict[k] = v
-                    else:
-                        print(f"[DEBUG] target_url is already absolute: {v}")
-                        sys.stdout.flush()
+                    elif os.path.isabs(v):
                         new_dict[k] = v
+                    else:
+                        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        abs_path = os.path.normpath(os.path.join(project_root, v))
+                        if os.path.exists(abs_path):
+                            new_dict[k] = "file://" + abs_path
+                        else:
+                            print(f"[Warning] target_url '{v}' not found relative to project root {project_root}")
+                            new_dict[k] = v
                 else:
                     new_dict[k] = self._resolve_target_urls(v)
             return new_dict
