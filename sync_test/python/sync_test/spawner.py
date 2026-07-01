@@ -36,7 +36,9 @@ class AppSpawner:
             python_bin = self.executables.get("xstudio_python", "python3")
             
             # Launch XStudio, optionally opening a pre-loaded session fixture.
-            cmd = [xstudio_bin]
+            # -n forces a new independent instance so that a second xStudio
+            # (or a pre-existing one left open) is never reused.
+            cmd = [xstudio_bin, "-n"]
             if session_file:
                 cmd.append(os.path.abspath(session_file))
             logging.info(f"Launching XStudio. Logging to {log_path}")
