@@ -153,3 +153,10 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
+
+  - name: "otio_xstudio_timeline_changes"
+    recording: "recordings/otio_xstudio_timeline_changes.jsonl"
+    script_driven: false
+    apps:
+      - "xstudio"
+      - "xstudio"
