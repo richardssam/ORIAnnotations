@@ -226,10 +226,13 @@ class StructureSyncController:
         # IA_INSERT=6, IA_REMOVE=7, IA_SPLICE=8, IA_NAME=9, IA_DIRTY=20
         _log(f"[2F-DIAG] timeline item_atom tl={tl_guid[:8]} actions={actions}")
         matching_actions = [a for a in actions if a in (6, 7, 8, 9, 20)]
+        # Trim/source_range edits fire item_atom with action=None (unrecognised code).
+        # For sequence timelines any non-empty item event is potentially structural.
+        is_sequence = tl_guid in self._xs_sequence_playlists
         if not matching_actions:
-            return
-
-        action = matching_actions[0]
+            if not (is_sequence and actions):
+                return
+        action = matching_actions[0] if matching_actions else None
         _log(
             f"[2F] item_atom fired for timeline {tl_guid[:8]} with action {action}"
             f" — queuing sync_container"
@@ -253,6 +256,7 @@ class StructureSyncController:
             self.poll_sequence_new_media(only_guid=tl_guid)
             self.poll_sequence_track_deletions(only_guid=tl_guid)
             self.poll_sequence_reorders(only_guid=tl_guid)
+            self.poll_sequence_source_ranges(only_guid=tl_guid)
         elif tl_guid in self._xs_flat_playlists:
             _log(f"[2F] Executing flat playlist sync_container for {tl_guid[:8]}")
             self.poll_flat_playlist_new_media(only_guid=tl_guid)
@@ -462,6 +466,13 @@ class StructureSyncController:
                 continue
 
             if len(current_order) != len(stored_order):
+                self._xs_media_order[tl_guid] = list(current_order)
+                continue
+
+            if set(current_order) != set(stored_order):
+                # Different clip GUIDs (not just different order) — the manager
+                # OTIO was replaced since the baseline was set.  Reset the
+                # baseline instead of broadcasting a bogus reorder.
                 self._xs_media_order[tl_guid] = list(current_order)
                 continue
 
@@ -1252,6 +1263,141 @@ class StructureSyncController:
                             break
 
             self._xs_sequence_track_names[tl_guid] = xs_clip_names
+
+    def poll_sequence_source_ranges(self, only_guid: str | None = None) -> None:
+        """Detect clip source_range changes (trims) in sequences and broadcast REPLACE_TIMELINE.
+
+        :param only_guid: When set, only checks the named timeline.
+        """
+        if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
+            return
+
+        items = list(self._xs_sequence_playlists.items())
+        if only_guid is not None:
+            items = [(g, v) for g, v in items if g == only_guid]
+
+        for tl_guid, tl_entry in items:
+            playlist, xs_tl = tl_entry[0], tl_entry[1]
+            if xs_tl is None:
+                continue
+            stored = self.plugin.manager.timelines.get(tl_guid)
+            if stored is None:
+                continue
+
+            try:
+                xs_otio_str = xs_tl.to_otio_string()
+                xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
+                xs_video_track = next(
+                    (t for t in xs_tl_parsed.tracks
+                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                    next(
+                        (t for t in xs_tl_parsed.tracks
+                         if t.kind == otio.schema.TrackKind.Video),
+                        None,
+                    ),
+                )
+            except Exception:
+                _log_exc(f"poll_sequence_source_ranges: to_otio_string failed for {tl_guid[:8]}")
+                continue
+
+            def _sr_fingerprint(video_track):
+                # Include both Clip source_ranges AND Gap durations so that
+                # repositioning a clip (which removes/adds/resizes Gaps) triggers
+                # a REPLACE_TIMELINE just like a source_range trim does.  Sort
+                # the result to make the comparison order-independent so pure
+                # clip reorders don't produce a spurious REPLACE_TIMELINE.
+                result = []
+                if video_track is None:
+                    return result
+                for c in video_track:
+                    if isinstance(c, otio.schema.Clip):
+                        sr = c.source_range
+                        result.append(('c', () if sr is None else (
+                            sr.start_time.value, sr.start_time.rate,
+                            sr.duration.value, sr.duration.rate)))
+                    elif isinstance(c, otio.schema.Gap):
+                        sr = c.source_range
+                        result.append(('g', () if sr is None else (
+                            sr.duration.value, sr.duration.rate)))
+                result.sort()
+                return result
+
+            stored_video_track = next(
+                (t for t in stored.tracks
+                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                next(
+                    (t for t in stored.tracks if t.kind == otio.schema.TrackKind.Video),
+                    None,
+                ),
+            )
+            if _sr_fingerprint(xs_video_track) == _sr_fingerprint(stored_video_track):
+                continue
+
+            _log(f"[2F] sequence {tl_guid[:8]} source_ranges changed — broadcasting REPLACE_TIMELINE")
+            try:
+                new_otio = self.plugin.builder.build_single_sequence_otio(playlist, xs_tl)
+                if new_otio is None:
+                    continue
+
+                # When xs_tl.to_otio_string() returns MissingReference clips (a
+                # client-loaded sequence where xStudio can't recover the original
+                # URLs), build_single_sequence_otio produces an unusable OTIO.
+                # Fall back: deep-copy the stored OTIO (which has valid
+                # ExternalReference URLs) and patch in the updated source_ranges
+                # from the xs-parsed OTIO by position.  This is safe here because
+                # the sorted-fingerprint guard above already suppresses this path
+                # for pure reorders — only SR changes reach this point, so the
+                # positional ordering of xs clips matches the stored OTIO.
+                new_video_track = next(
+                    (t for t in new_otio.tracks
+                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+                    next(
+                        (t for t in new_otio.tracks if t.kind == otio.schema.TrackKind.Video),
+                        None,
+                    ),
+                )
+                if new_video_track is not None:
+                    new_clips = [c for c in new_video_track if isinstance(c, otio.schema.Clip)]
+                    first_ref = getattr(new_clips[0], 'media_reference', None) if new_clips else None
+                    if new_clips and not isinstance(first_ref, otio.schema.ExternalReference):
+                        stored_clips = [
+                            c for c in (stored_video_track or [])
+                            if isinstance(c, otio.schema.Clip)
+                        ]
+                        if len(new_clips) == len(stored_clips):
+                            patched = copy.deepcopy(stored)
+                            patched_vt = next(
+                                (t for t in patched.tracks
+                                 if t.kind == otio.schema.TrackKind.Video
+                                 and t.name != "Annotations"),
+                                next(
+                                    (t for t in patched.tracks
+                                     if t.kind == otio.schema.TrackKind.Video),
+                                    None,
+                                ),
+                            )
+                            if patched_vt is not None:
+                                patched_clips = [
+                                    c for c in patched_vt if isinstance(c, otio.schema.Clip)
+                                ]
+                                for xs_c, p_c in zip(new_clips, patched_clips):
+                                    p_c.source_range = xs_c.source_range
+                                new_otio = patched
+                        else:
+                            _log(
+                                f"poll_sequence_source_ranges: clip count mismatch "
+                                f"({len(new_clips)} vs {len(stored_clips)}) for "
+                                f"{tl_guid[:8]}, skipping"
+                            )
+                            continue
+
+                if "xs_bin_media" in stored.metadata:
+                    new_otio.metadata["xs_bin_media"] = stored.metadata["xs_bin_media"]
+                self.plugin.manager.register_timeline(new_otio)
+                self.update_xs_media_order(tl_guid, new_otio)
+                self.plugin.manager.broadcast_replace_timeline(tl_guid)
+            except Exception:
+                _log_exc(f"poll_sequence_source_ranges: rebuild failed for {tl_guid[:8]}")
 
     # ── remote clip insert routing ─────────────────────────────────────
 

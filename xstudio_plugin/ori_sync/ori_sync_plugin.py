@@ -843,6 +843,14 @@ class ORISyncPlugin(PluginBase):
             if tl_guid:
                 self._cmd_queue.put(("remove_timeline", {"tl_guid": tl_guid}))
 
+        elif action == "replace_timeline":
+            # A peer pushed a wholesale structure replacement (e.g. clip trim).
+            # The manager has already updated _timelines[tl_guid]; rebuild the
+            # local xStudio timeline from the new OTIO.
+            tl_guid = data.metadata.get("sync", {}).get("guid") if data is not None else None
+            if tl_guid and tl_guid in self._sync_playlists:
+                self._cmd_queue.put(("rebuild_sequence", {"tl_guid": tl_guid}))
+
         elif action == "timeline_renamed":
             tl_guid = data.get("timeline_guid")
             new_name = data.get("name", "")

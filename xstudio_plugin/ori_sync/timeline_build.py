@@ -3,6 +3,7 @@
 """TimelineBuildController — OTIO timeline construction (master side)."""
 
 import hashlib
+import os
 import time
 
 import opentimelineio as otio
@@ -488,9 +489,26 @@ class TimelineBuildController:
                 track_guid = hashlib.sha1(track_seed.encode("utf-8")).hexdigest()
                 track.metadata.setdefault("sync", {})["guid"] = track_guid
                 clip_idx = 0
+                name_occurrence: dict = {}
                 for child in track:
                     if isinstance(child, otio.schema.Clip):
-                        clip_seed = f"{track_guid}:{clip_idx}:{child.name}"
+                        if not child.name:
+                            try:
+                                ref = child.media_reference
+                                if ref and hasattr(ref, "target_url") and ref.target_url:
+                                    child.name = os.path.splitext(
+                                        os.path.basename(ref.target_url)
+                                    )[0]
+                            except Exception:
+                                pass
+                        # Use name+occurrence (not track position) so GUIDs are
+                        # stable across reorders. Falls back to positional only
+                        # when clip has no resolvable name (e.g. MissingReference
+                        # on a client-loaded sequence).
+                        name = child.name or f"_clip_{clip_idx}"
+                        occ = name_occurrence.get(name, 0)
+                        name_occurrence[name] = occ + 1
+                        clip_seed = f"{track_guid}:{name}:{occ}"
                         clip_guid = hashlib.sha1(clip_seed.encode("utf-8")).hexdigest()
                         child.metadata.setdefault("sync", {})["guid"] = clip_guid
                         clip_idx += 1

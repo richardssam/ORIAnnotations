@@ -68,3 +68,43 @@ depend on API investigation first.
   `xstudio_live_review.py` uses `subscribe_to_event_group` with `change_atom`
   to detect when the viewed container changes.  We currently poll for this.
   If the event fires reliably, the container-change poll path can be removed.
+
+- [ ] **Fix client→host sequence sync (trims, repositioning, reorders)**
+
+  Changes made to a sequence timeline on a sync CLIENT (RV) do not reliably
+  reach the xStudio HOST.  There are two compounding losses in the
+  `to_otio_string()` round-trip that the polling code relies on:
+
+  1. **MissingReference** — clips loaded from an xStudio sequence have
+     `xstudio://` media URIs that RV cannot resolve; `to_otio_string()`
+     emits `MissingReference` for every clip.  `poll_sequence_reorders` uses
+     URL matching to detect reorders, so it always produces an empty
+     `current_order` and never broadcasts `MOVE_CHILD`.
+  2. **Metadata stripped** — xStudio's OTIO export copies no clip metadata,
+     so the sync GUIDs assigned in `timeline_build.py` do not survive the
+     round-trip.  Even if we switched from URL-based to GUID-based matching,
+     the exported OTIO would have no GUIDs to match on.
+
+  Gap-duration changes (clip repositioning within the timeline) are also
+  invisible to the source-range fingerprint and not captured by any other poll.
+
+  **Path A — fix xStudio's OTIO export (core C++ change):**
+  If `to_otio_string()` preserved clip metadata, sync GUIDs would survive and
+  GUID-based matching could replace URL-based matching.  Both reorder and
+  source-range polling would work correctly.  Requires a change to xStudio's
+  OTIO serializer.  *Ask the xStudio team: can clip metadata be preserved in
+  `to_otio_string()`, or is there an alternative export path that does so?*
+
+  **Path B — bypass OTIO round-trips with event-driven detection (plugin-only):**
+  xStudio fires `item_atom` events when clips are trimmed or moved.
+  `bootstrap_mapping` already builds a map from xStudio internal UUIDs to sync
+  GUIDs.  If the client subscribed to `item_atom` events and used that
+  UUID→sync-GUID map to identify which clip changed, it could query the clip's
+  current `source_range` and track position directly from the xStudio API (no
+  `to_otio_string()` needed) and broadcast the change.  This requires
+  confirming that the clip `source_range` and Gap neighbors are queryable from
+  Python without going through OTIO export (see `item_atom` question above).
+
+  Current state: HOST→CLIENT sync (all three operations) works.
+  CLIENT→HOST: none of the three operations (trim, reposition, reorder) is
+  reliably working.
