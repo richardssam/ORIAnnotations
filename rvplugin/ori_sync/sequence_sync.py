@@ -62,6 +62,11 @@ class SequenceSyncController:
         self._otio_last_export = {}
         self._otio_guid_to_root = {}
         self._otio_dirty = True
+        # Bin clip guid → media_path, populated from flat-playlist ADD_TIMELINE
+        # payloads and kept across REMOVE_TIMELINE so _switch_to_source_view can
+        # still resolve a bin clip guid after the flat playlist is replaced by a
+        # real sequence (which has different per-clip guids).
+        self._bin_guid_to_path = {}
 
     @staticmethod
     def _normalize_seq_name(name):
@@ -1129,8 +1134,17 @@ class SequenceSyncController:
         if not tl_guid:
             _log("_create_rv_sequence_for_timeline: no GUID on timeline")
             return
+        if tl_guid in self._rv_node_to_timeline_guid.values():
+            # Already have a local node for this guid (e.g. the default sequence
+            # that couldn't be deleted on REMOVE_TIMELINE).  Don't create a
+            # duplicate; the existing mapping is still valid.
+            _log(f"_create_rv_sequence_for_timeline: {tl_guid[:8]} already mapped — skipping")
+            return
 
         # Collect ordered media paths from the timeline's video tracks.
+        # For flat-playlist timelines, also cache clip guid → path so
+        # _switch_to_source_view can resolve bin clip guids after the playlist
+        # is replaced by a real sequence (which uses different per-clip guids).
         all_paths = []
         for track in tl.tracks:
             if not _is_media_track(track):
@@ -1140,7 +1154,11 @@ class SequenceSyncController:
                     continue
                 ref = child.media_reference
                 if isinstance(ref, otio.schema.ExternalReference) and ref.target_url:
-                    all_paths.append(_media_path(ref.target_url))
+                    norm = _media_path(ref.target_url)
+                    all_paths.append(norm)
+                    guid = child.metadata.get("sync", {}).get("guid")
+                    if guid and norm and tl.metadata.get("xs_flat_playlist"):
+                        self._bin_guid_to_path[guid] = norm
 
         if not all_paths:
             _log(f"_create_rv_sequence_for_timeline: no media in '{tl.name}'")
@@ -1204,13 +1222,17 @@ class SequenceSyncController:
                     f"RECV remove_timeline: deleted RVSequenceGroup "
                     f"'{seq_group}' for {tl_guid[:8]}"
                 )
+                # Only unmap after a successful delete.  If deleteNode fails
+                # (e.g. "can't delete default views"), keep the mapping so
+                # _poll_new_sequences doesn't re-broadcast the node as a new
+                # timeline on the next tick.
+                self._rv_node_to_timeline_guid.pop(seq_group, None)
+                self._sequence_input_order.pop(seq_group, None)
             except Exception as e:
                 _log_exc(
                     f"_delete_rv_sequence_for_timeline: failed to delete "
-                    f"'{seq_group}': {e}"
+                    f"'{seq_group}': {e} — keeping mapping to suppress re-broadcast"
                 )
-            self._rv_node_to_timeline_guid.pop(seq_group, None)
-            self._sequence_input_order.pop(seq_group, None)
         try:
             rv.commands.redraw()
         except Exception:
@@ -1305,17 +1327,40 @@ class SequenceSyncController:
                     return
         _log(f"RECV move_child: no media track found for parent_uuid={parent_uuid}")
 
+    def _load_sources_from_timelines(self, timelines):
+        """Call addSource for every unique clip path across *timelines*."""
+        already_loaded = {p for p in self._path_to_source_group_map()}
+        seen = set()
+        for tl in timelines:
+            for item in tl.tracks:
+                if not _is_media_track(item):
+                    continue
+                for child in item:
+                    if not isinstance(child, otio.schema.Clip):
+                        continue
+                    ref = child.media_reference
+                    if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
+                        continue
+                    norm = _media_path(ref.target_url)
+                    guid = child.metadata.get("sync", {}).get("guid")
+                    if guid and norm:
+                        self._bin_guid_to_path[guid] = norm
+                    if norm not in seen and norm not in already_loaded:
+                        seen.add(norm)
+                        rv.commands.addSource(norm)
+                        _log(f"Loading source: {norm}")
+
     def rebuild_rv_session(self):
         self._rebuild_rv_session()
 
     def _rebuild_rv_session(self):
         """Clear and rebuild the RV session based on the current OTIO timelines."""
         _log("Rebuilding RV session from OTIO snapshot...")
-        timelines = [
-            tl for tl in self.plugin.sync_manager._timelines.values()
-            if not tl.metadata.get("xs_flat_playlist")
-        ]
-        if not timelines:
+        all_tls = list(self.plugin.sync_manager._timelines.values())
+        flat_timelines = [tl for tl in all_tls if tl.metadata.get("xs_flat_playlist")]
+        timelines = [tl for tl in all_tls if not tl.metadata.get("xs_flat_playlist")]
+
+        if not timelines and not flat_timelines:
             return
 
         # OTIO-origin timelines are rebuilt with full fidelity via RV's native
@@ -1328,7 +1373,34 @@ class SequenceSyncController:
         for tl in otio_origin:
             self.apply_otio_snapshot(tl)
         timelines = [tl for tl in timelines if tl not in otio_origin]
+
         if not timelines:
+            # Snapshot contains only xs_flat_playlist timelines (xStudio bin).
+            # Load all clip sources so that source-mode view switching works, then
+            # map the existing RV default sequence to the flat playlist's guid so
+            # _poll_new_sequences doesn't broadcast it as a new empty timeline.
+            self._load_sources_from_timelines(flat_timelines)
+            path_to_sg = self._path_to_source_group_map()
+            _log(f"Flat-playlist rebuild: {len(path_to_sg)} source(s) loaded")
+            if flat_timelines:
+                flat_tl = flat_timelines[0]
+                flat_guid = flat_tl.metadata.get("sync", {}).get("guid")
+                if flat_guid:
+                    seq_groups = []
+                    try:
+                        seq_groups = rv.commands.nodesOfType("RVSequenceGroup")
+                    except Exception:
+                        pass
+                    for sg in seq_groups:
+                        if sg not in self._rv_node_to_timeline_guid:
+                            self._rv_node_to_timeline_guid[sg] = flat_guid
+                            self._sequence_input_order[sg] = self._get_sequence_inputs(sg)
+                            # Align ui.name with the xStudio timeline name so
+                            # _poll_sequence_renames doesn't see a mismatch and
+                            # broadcast a spurious rename to peers.
+                            self._set_sequence_ui_name(sg, flat_tl.name)
+                            _log(f"Flat-playlist rebuild: mapped {sg} → {flat_guid[:8]} name='{flat_tl.name}'")
+                            break
             return
 
         # Pass 1: load every unique path once.
@@ -1337,7 +1409,7 @@ class SequenceSyncController:
         already_loaded = {p for p in self._path_to_source_group_map()}
         all_paths_ordered = []   # preserves per-timeline clip order
         seen = set()
-        for timeline in timelines:
+        for timeline in timelines + flat_timelines:
             for item in timeline.tracks:
                 if not _is_media_track(item):
                     continue

@@ -142,20 +142,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.playback._last_selection = value
 
     @property
-    def _last_broadcast_clip_guid(self):
-        return self.playback._last_broadcast_clip_guid
-    @_last_broadcast_clip_guid.setter
-    def _last_broadcast_clip_guid(self, value):
-        self.playback._last_broadcast_clip_guid = value
-
-    @property
-    def _sequence_selection_applied_at(self):
-        return self.playback._sequence_selection_applied_at
-    @_sequence_selection_applied_at.setter
-    def _sequence_selection_applied_at(self, value):
-        self.playback._sequence_selection_applied_at = value
-
-    @property
     def _last_display_state(self):
         return self.display._last_display_state
     @_last_display_state.setter
@@ -468,8 +454,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 self.display._apply_display_state(data)
             finally:
                 self._rv_updating = False
-        elif action == "selection_changed":
-            self.playback._apply_selection(data)
         elif action == "annotation_commands_added":
             _merged_clip, delta_clip = data
             self._rv_updating = True
@@ -551,6 +535,22 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         event.reject()
 
     def on_rv_play_stop(self, event):
+        # If a peer said to loop and this looks like a natural clip-end (frame
+        # is at frameEnd, not a mid-clip user stop), restart play silently
+        # instead of broadcasting playing=False back.  When _rv_updating is True
+        # the stop came from our own apply code — never restart in that case.
+        if not self._rv_updating and self.playback._cur_looping:
+            try:
+                if rv.commands.frame() >= rv.commands.frameEnd():
+                    self._rv_updating = True
+                    try:
+                        rv.commands.play()
+                    finally:
+                        self._rv_updating = False
+                    event.reject()
+                    return
+            except Exception:
+                pass
         self.playback._broadcast_playback()
         event.reject()
 

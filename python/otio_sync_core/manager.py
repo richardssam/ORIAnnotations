@@ -32,7 +32,6 @@ from .protocol_messages import (
     RenameTimeline,
     ReplaceAnnotationCommands,
     ReplaceTimeline,
-    SelectionSet,
     SetProperty,
     StateRequest,
     StateSnapshot,
@@ -175,7 +174,6 @@ class SyncManager:
             ("LiveSession.1", "STATE_SNAPSHOT"): self._h_state_snapshot,
             ("PLAYBACK_SETTINGS_1.0", "SET"): self._h_playback_set,
             ("DISPLAY_SETTINGS_1.0", "SET"): self._h_display_set,
-            ("SELECTION_1.0", "SET"): self._h_selection_set,
             ("TIMELINE_1.0", "ADD_TIMELINE"): self._h_add_timeline,
             ("TIMELINE_1.0", "RENAME_TIMELINE"): self._h_rename_timeline,
             ("TIMELINE_1.0", "REMOVE_TIMELINE"): self._h_remove_timeline,
@@ -904,11 +902,17 @@ class SyncManager:
         state_dict: dict[str, Any],
         timeline_guid: str | None = None,
     ) -> None:
-        """Broadcast the current playback state to all peers.
+        """Broadcast the current view/playback state to all peers.
 
-        :param state_dict: Playback state fields (``playing``, ``current_time``,
-            ``looping``, etc.) as defined by the protocol.
-        :param timeline_guid: GUID of the timeline being played; falls back to
+        This is the single authoritative view-state message (SELECTION_1.0 is
+        retired): besides ``playing``/``current_time``/``looping`` it carries the
+        view-state fields ``view_mode`` ("sequence"|"source") and ``clip_guid``
+        when the caller includes them in *state_dict* (they round-trip through
+        ``PlaybackSettingsSet.from_payload``).
+
+        :param state_dict: View/playback fields — ``playing``, ``current_time``,
+            ``looping``, and optionally ``view_mode`` and ``clip_guid``.
+        :param timeline_guid: GUID of the timeline being viewed; falls back to
             :attr:`active_timeline_guid`.
         """
         if self._is_syncing or not self.network:
@@ -917,6 +921,40 @@ class SyncManager:
         inner["sync_timestamp"] = time.time()
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
         self._send_message(PlaybackSettingsSet.from_payload(inner))
+
+    def clip_guid_at_frame(
+        self, timeline_guid: "str | None", frame: int
+    ) -> "str | None":
+        """Return the sync GUID of the clip active at *frame* in a sequence.
+
+        In sequence view-mode the active clip is a derived property of the
+        playhead position (see the unify-view-state-sync change): we walk the
+        timeline's non-Annotations video track, summing each clip's
+        ``source_range`` duration, and return the GUID of the clip whose span
+        contains *frame*.  This is identical on every peer regardless of
+        per-peer clip GUIDs, which is why it is authoritative over a transmitted
+        ``clip_guid`` in sequence mode.
+
+        :param timeline_guid: GUID of the sequence timeline.
+        :param frame: Sequence-relative frame (0-based).
+        :returns: Clip sync GUID, or ``None`` if no clip covers the frame.
+        """
+        if not timeline_guid:
+            return None
+        tl = self._timelines.get(timeline_guid)
+        if tl is None:
+            return None
+        for track in tl.tracks:
+            if track.kind != otio.schema.TrackKind.Video or track.name == "Annotations":
+                continue
+            t = 0
+            for child in track:
+                sr = getattr(child, "source_range", None)
+                dur = int(sr.duration.value) if sr is not None else 0
+                if isinstance(child, otio.schema.Clip) and t <= frame < t + dur:
+                    return child.metadata.get("sync", {}).get("guid")
+                t += dur
+        return None
 
     def broadcast_display_state(self, state_dict: dict[str, Any]) -> None:
         """Broadcast the current display state to all peers and persist it.
@@ -1300,21 +1338,6 @@ class SyncManager:
             sync_timestamp=time.time(),
         ))
 
-    def broadcast_selection(self, clip_guid: str, view_mode: str = "source") -> None:
-        """Broadcast the selected clip GUID to all peers.
-
-        :param clip_guid: OTIO sync GUID of the selected clip.  Receivers
-            map this back to their local representation (RV source group,
-            xStudio playlist position, etc.) before applying.
-        :param view_mode: View mode string ("source" or "sequence").
-        :type view_mode: str
-        """
-        if self._is_syncing or not self.network or self.status != STATE_SYNCED:
-            return
-        self._send_message(SelectionSet(
-            clip_guid=clip_guid, view_mode=view_mode, sync_timestamp=time.time(),
-        ))
-
     def broadcast_move_child(
         self, parent_uuid: str, child_uuid: str, to_index: int
     ) -> None:
@@ -1447,6 +1470,10 @@ class SyncManager:
         self, msg: PlaybackSettingsSet, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
         self.playback_state = data
+        # Track the active clip from the unified view-state so passive peers
+        # (e.g. the sync viewer) can highlight it even while paused.  This used
+        # to live in the retired SELECTION_1.0 handler.
+        self.selected_clip_guid = msg.clip_guid or None
         # Sync active_timeline_guid so passive peers (e.g. the sync viewer)
         # automatically follow the master when it switches between sequences.
         # Skip clip-level timelines: those are single-clip artefacts that live
@@ -1479,14 +1506,6 @@ class SyncManager:
             except Exception as e:
                 _log(f"on_display_changed callback error: {e}")
         return ("display_settings", data)
-
-    def _h_selection_set(
-        self, msg: SelectionSet, data: dict[str, Any], source: str
-    ) -> "tuple[str, Any] | None":
-        # Track the clip the master has selected so the sync viewer can
-        # highlight it even when scrubbing is paused.
-        self.selected_clip_guid = msg.clip_guid or None
-        return ("selection_changed", data)
 
     def _h_add_timeline(
         self, msg: AddTimeline, data: dict[str, Any], source: str
@@ -1575,7 +1594,7 @@ class SyncManager:
         * ``state_request_received`` → **returned to caller**; the master must
           respond by calling :meth:`send_state_snapshot`.
 
-        Application-level events (``playback_settings``, ``selection_changed``,
+        Application-level events (``playback_settings``,
         ``annotation_*``, ``insert_child``, …) are returned so the caller can
         react to them.  Playback updates are also delivered through the
         :meth:`on_playback_changed` callback if one is registered.
@@ -1631,10 +1650,9 @@ class SyncManager:
     # only once the batch holds MORE than ``threshold`` of them.  This collapses
     # a genuine backlog (fast producer outrunning the consumer) without throwing
     # away the intermediate frames of a normal-rate stream — dropping those makes
-    # scrubbing visibly choppy.  Selection is pure latest-wins (threshold 0:
-    # always collapse); playback keeps every position until a real backlog forms.
+    # scrubbing visibly choppy.  The unified view-state (PLAYBACK_SETTINGS_1.0)
+    # keeps every position until a real backlog forms.
     _COALESCE_THRESHOLDS = {
-        "SELECTION_1.0": 0,
         "PLAYBACK_SETTINGS_1.0": 12,
     }
 

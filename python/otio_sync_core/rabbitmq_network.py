@@ -19,6 +19,49 @@ def _log(msg: str) -> None:
         _logger.debug(msg)
 
 
+def _get_connection_params(host: str, port: int) -> pika.ConnectionParameters | pika.URLParameters:
+    if host.startswith("amqp://") or host.startswith("amqps://"):
+        url_str = host
+        ignore_verify = False
+        cacertfile = None
+        certfile = None
+        keyfile = None
+
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+        parsed = urlparse(url_str)
+        if parsed.query:
+            qparams = parse_qsl(parsed.query)
+            cleaned = []
+            for k, v in qparams:
+                if k in ("verify", "ssl_verify") and v in ("ignore", "false"):
+                    ignore_verify = True
+                elif k == "cacertfile":
+                    cacertfile = v
+                elif k == "certfile":
+                    certfile = v
+                elif k == "keyfile":
+                    keyfile = v
+                else:
+                    cleaned.append((k, v))
+            url_str = urlunparse(parsed._replace(query=urlencode(cleaned)))
+
+        params = pika.URLParameters(url_str)
+        if host.startswith("amqps://"):
+            import ssl
+            context = ssl.create_default_context()
+            if ignore_verify or "localhost" in url_str or "127.0.0.1" in url_str:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            if cacertfile:
+                context.load_verify_locations(cafile=cacertfile)
+            if certfile:
+                context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+            params.ssl_options = pika.SSLOptions(context)
+        return params
+    else:
+        return pika.ConnectionParameters(host=host, port=port)
+
+
 class RabbitMQNetwork:
     """RabbitMQ network backend for OTIO Sync.
 
@@ -89,17 +132,7 @@ class RabbitMQNetwork:
         """
         while not self._stop_event.is_set():
             try:
-                if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
-                    params = pika.URLParameters(self.host)
-                    if self.host.startswith("amqps://"):
-                        if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
-                            import ssl
-                            context = ssl.create_default_context()
-                            context.check_hostname = False
-                            context.verify_mode = ssl.CERT_NONE
-                            params.ssl_options = pika.SSLOptions(context)
-                else:
-                    params = pika.ConnectionParameters(host=self.host, port=self.port)
+                params = _get_connection_params(self.host, self.port)
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.exchange_declare(
@@ -159,17 +192,7 @@ class RabbitMQNetwork:
         """
         while not self._stop_event.is_set():
             try:
-                if self.host.startswith("amqp://") or self.host.startswith("amqps://"):
-                    params = pika.URLParameters(self.host)
-                    if self.host.startswith("amqps://"):
-                        if "localhost" in self.host or "127.0.0.1" in self.host or "verify=ignore" in self.host or "ssl_verify=false" in self.host:
-                            import ssl
-                            context = ssl.create_default_context()
-                            context.check_hostname = False
-                            context.verify_mode = ssl.CERT_NONE
-                            params.ssl_options = pika.SSLOptions(context)
-                else:
-                    params = pika.ConnectionParameters(host=self.host, port=self.port)
+                params = _get_connection_params(self.host, self.port)
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.exchange_declare(

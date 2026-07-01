@@ -1,4 +1,3 @@
-import time
 import rv.commands
 
 try:
@@ -11,7 +10,7 @@ try:
 except ImportError:
     STATE_SYNCED = "synced"
 
-from utils import _log, _media_path
+from utils import _log, _log_exc, _media_path
 
 
 class PlaybackSyncController:
@@ -19,8 +18,21 @@ class PlaybackSyncController:
         self.plugin = plugin
         self._last_broadcast_frame = -1
         self._last_selection = []
-        self._last_broadcast_clip_guid = None
-        self._sequence_selection_applied_at = 0.0
+        # Current local view (what we are broadcasting); mirrors the xStudio
+        # plugin's _cur_view_mode/_cur_clip_guid so every PLAYBACK_SETTINGS
+        # message — including pure position updates — carries the view too.
+        self._cur_view_mode = "sequence"
+        self._cur_clip_guid = None
+        # Last loop state received from a peer — used to restart RV when the
+        # clip ends naturally (play-once boundary) but the peer said to loop.
+        self._cur_looping = True
+        # Last view-state actually applied from a remote message, used to
+        # detect real transitions (mode/clip/timeline change) vs. a clip
+        # changing under continuous playhead motion in sequence mode, which
+        # must NOT re-trigger a view switch (position is authoritative there).
+        self._last_applied_view_mode = None
+        self._last_applied_clip_guid = None
+        self._last_applied_tl_guid = None
 
     def _frame_base(self):
         """Return the RV frame that corresponds to protocol position 0.
@@ -59,7 +71,11 @@ class PlaybackSyncController:
         view = rv.commands.viewNode()
         timeline_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view) or self.plugin.sync_manager.active_timeline_guid
         base = self._frame_base()
-        _log(f"SEND playback playing={playing} frame={current_frame} base={base} fps={fps} view={view} tl={timeline_guid}")
+        _log(
+            f"SEND playback playing={playing} frame={current_frame} base={base}"
+            f" fps={fps} view={view} tl={timeline_guid}"
+            f" mode={self._cur_view_mode} clip={(self._cur_clip_guid or '')[:8]}"
+        )
         state = {
             "playing": playing,
             "current_time": {
@@ -69,37 +85,73 @@ class PlaybackSyncController:
             },
             "looping": looping,
             "timeline_guid": timeline_guid,
+            # Carry the current view alongside every position update (not just
+            # explicit view-state changes) so a peer receiving a pure scrub/play
+            # update also keeps the right mode/clip — single broadcast path (D4).
+            "view_mode": self._cur_view_mode,
+            "clip_guid": self._cur_clip_guid,
         }
         self.plugin.sync_manager.broadcast_playback_state(state)
         self._last_broadcast_frame = current_frame
 
+    def broadcast_view_state(self, clip_guid, view_mode):
+        """Broadcast an explicit view-state change (clip and/or mode switch).
+
+        This is the single source of a view-affecting broadcast: every local
+        event that changes what we're viewing (RV's view-changed/selection-
+        changed events) funnels through here, mirroring the xStudio plugin's
+        ``broadcast_view_state``.  Position-only updates ride ``_cur_view_mode``/
+        ``_cur_clip_guid`` via ``_broadcast_playback`` instead of duplicating
+        this logic.
+        """
+        if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
+            return
+        self._cur_view_mode = view_mode
+        self._cur_clip_guid = clip_guid or None
+        self._broadcast_playback()
+
     def _apply_playback(self, data):
-        playing = data.get("playing", False)
-        current_time = data.get("current_time", {})
+        """Apply an incoming unified view-state message (SELECTION_1.0 retired).
+
+        Applies, atomically:
+        * the **view** — when ``view_mode``/``clip_guid``/``timeline_guid``
+          actually transition, switch the RV view node; a clip-only change
+          while the timeline is unchanged in sequence mode is NOT a transition
+          (position is authoritative there — see D2), so it does not re-switch.
+        * the **position** — ``current_time`` always wins once any view switch
+          above has landed, so the frame is never raced against a separate
+          selection-apply (one apply path — D4).
+        """
+        view_mode = data.get("view_mode")
+        clip_guid = data.get("clip_guid")
         timeline_guid = data.get("timeline_guid")
 
-        # Determine whether this timeline_guid corresponds to a real RV node.
-        # Virtual clip timelines (created by get_or_create_clip_timeline on the
-        # sender side) have no RV node — they carry clip-local frame numbers
-        # that must not overwrite a sequence-level frame set by _apply_selection.
-        known_tl_guids = set(self.plugin.sequence._rv_node_to_timeline_guid.values())
-        tl_is_real_node = (not timeline_guid or timeline_guid in known_tl_guids)
+        if view_mode is not None:
+            mode_changed = view_mode != self._last_applied_view_mode
+            clip_changed = clip_guid != self._last_applied_clip_guid
+            tl_changed = timeline_guid != self._last_applied_tl_guid
+            try:
+                if view_mode == "sequence":
+                    if mode_changed or tl_changed:
+                        self._switch_to_sequence_view(timeline_guid)
+                elif view_mode == "source":
+                    if mode_changed or clip_changed:
+                        self._switch_to_source_view(clip_guid)
+            except Exception:
+                _log_exc("apply view-state: view switch failed")
+            self._last_applied_view_mode = view_mode
+            self._last_applied_clip_guid = clip_guid
+            self._last_applied_tl_guid = timeline_guid
+            # Sync _cur_* immediately so on_rv_frame_changed / on_rv_play_start
+            # callbacks that fire during the frame/play calls below broadcast the
+            # right mode instead of echoing stale "sequence" state back to peers.
+            self._cur_view_mode = view_mode
+            self._cur_clip_guid = clip_guid or None
 
-        if timeline_guid:
-            current_view = rv.commands.viewNode()
-            # Only switch timeline view when the current node is already a known
-            # timeline/sequence node that maps to a *different* timeline.  If the
-            # user has double-clicked into a source group (source view), do not
-            # pull them back to the sequence — that would undo a SELECTION apply.
-            current_is_source_group = (
-                rv.commands.nodeType(current_view) == "RVSourceGroup"
-            )
-            if not current_is_source_group and tl_is_real_node:
-                for rv_node, tl_guid in self.plugin.sequence._rv_node_to_timeline_guid.items():
-                    if tl_guid == timeline_guid and current_view != rv_node:
-                        _log(f"RECV view_change to {rv_node}")
-                        rv.commands.setViewNode(rv_node)
-                        break
+        playing = data.get("playing", False)
+        looping = data.get("looping", True)
+        self._cur_looping = looping
+        current_time = data.get("current_time", {})
 
         # Resolve the frame base AFTER any view switch so frameStart() reflects
         # the view the frame actually targets (a timecode source starts at 100,
@@ -107,116 +159,52 @@ class PlaybackSyncController:
         # offset into that view.
         base = self._frame_base()
         target_frame = int(current_time.get("value", 0)) + base
-        _log(f"RECV playback playing={playing} frame={target_frame} base={base} value={current_time.get('value')} tl={timeline_guid}")
+        _log(
+            f"RECV playback playing={playing} looping={looping} frame={target_frame} base={base}"
+            f" value={current_time.get('value')} tl={timeline_guid} mode={view_mode}"
+        )
 
-        # Don't override a sequence-selection frame that was just applied — the
-        # sender broadcasts source-local frame=0 immediately after selecting a clip
-        # in sequence mode, which would reset RV to frame 1 instead of the clip's
-        # sequence-global start frame.
-        seq_sel_age = time.monotonic() - self._sequence_selection_applied_at
-        if tl_is_real_node and rv.commands.frame() != target_frame and seq_sel_age > 0.5:
-            rv.commands.setFrame(target_frame)
-        elif not tl_is_real_node and rv.commands.frame() != target_frame:
-            rv.commands.setFrame(target_frame)
-        is_playing = rv.commands.isPlaying()
-        if playing and not is_playing:
-            rv.commands.play()
-        elif not playing and is_playing:
-            rv.commands.stop()
+        # Suppress on_rv_frame_changed / on_rv_play_start during mechanical apply
+        # so they don't echo back to peers — _broadcast_playback checks _rv_updating.
+        self.plugin._rv_updating = True
+        try:
+            # Sync RV's loop mode so it doesn't fire spurious playing=False at the
+            # clip boundary and cause the peer to stop — playMode 0 = loop, 1 = once.
+            target_play_mode = 0 if looping else 1
+            try:
+                if rv.commands.playMode() != target_play_mode:
+                    rv.commands.setPlayMode(target_play_mode)
+                    _log(f"RECV playback: set playMode={target_play_mode} (looping={looping})")
+            except Exception:
+                _log_exc("RECV playback: setPlayMode failed")
+            if rv.commands.frame() != target_frame:
+                rv.commands.setFrame(target_frame)
+            is_playing = rv.commands.isPlaying()
+            if playing and not is_playing:
+                rv.commands.play()
+            elif not playing and is_playing:
+                rv.commands.stop()
+        finally:
+            self.plugin._rv_updating = False
 
-    def _apply_selection(self, data):
-        clip_guid = data.get("clip_guid", "")
+    def _switch_to_sequence_view(self, timeline_guid):
+        """Switch the RV view to the RVSequenceGroup for *timeline_guid*.
 
-        view_mode = data.get("view_mode", "source")
-        if not clip_guid:
-            # Clear: return to sequence/timeline view.
-            _log(f"RECV selection: clear → sequence view (mode={view_mode})")
-            self._last_broadcast_clip_guid = None
-            seq_node = next(
-                (n for n in self.plugin.sequence._rv_node_to_timeline_guid
-                 if rv.commands.nodeType(n) != "RVSourceGroup"),
-                None
-            )
-            if seq_node:
-                seq_tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(seq_node)
-                if seq_tl_guid:
-                    self.plugin.sync_manager.active_timeline_guid = seq_tl_guid
-                self.plugin._rv_updating = True
-                try:
-                    rv.commands.setViewNode(seq_node)
-                finally:
-                    self.plugin._rv_updating = False
-            return
-
-        # Find the media path for this GUID then look up the local source group.
-        clip = self.plugin.sync_manager._object_map.get(clip_guid) if self.plugin.sync_manager else None
-        if clip is None or not isinstance(clip, otio.schema.Clip):
-            _log(f"RECV selection: clip_guid={clip_guid} not found in object_map")
-            return
-        ref = clip.media_reference
-        if not isinstance(ref, otio.schema.ExternalReference):
-            return
-        media_path = _media_path(ref.target_url)
-        source_group = self.plugin.sequence._path_to_source_group_map().get(media_path)
-        if not source_group:
-            _log(f"RECV selection: no source group for {media_path}")
-            return
-        _log(f"RECV selection: clip '{clip.name}' guid={clip_guid[:8]} mode={view_mode} → source_group={source_group}")
-
-        # sequence mode: stay in the sequence view and seek to the clip's start frame.
-        if view_mode == "sequence":
-            # Walk all OTIO timelines to find which one contains this clip and at
-            # what frame offset.  Track the timeline GUID so we can pick the
-            # matching RVSequenceGroup instead of arbitrarily grabbing the first one.
-            start_frame = 1
-            end_frame = 1
-            target_tl_guid = None
-            for tl_guid_iter, tl in self.plugin.sync_manager.timelines.items():
-                found = False
-                for track in tl.tracks:
-                    if track.kind != otio.schema.TrackKind.Video:
-                        continue
-                    elapsed = 0
-                    for child in track:
-                        if child.metadata.get("sync", {}).get("guid") == clip_guid:
-                            start_frame = elapsed + 1  # RV frames are 1-indexed
-                            try:
-                                clip_len = int(child.trimmed_range().duration.value)
-                            except Exception:
-                                clip_len = 0
-                            end_frame = start_frame + max(clip_len - 1, 0)
-                            found = True
-                            break
-                        try:
-                            elapsed += int(child.trimmed_range().duration.value)
-                        except Exception:
-                            pass
-                    if found:
-                        break
-                if found:
-                    target_tl_guid = tl_guid_iter
+        No seek happens here — in sequence mode position is authoritative and
+        is applied right after this returns, by the caller (D2).
+        """
+        seq_node = None
+        if timeline_guid:
+            for rv_node, tl_guid_map in self.plugin.sequence._rv_node_to_timeline_guid.items():
+                if (tl_guid_map == timeline_guid
+                        and rv.commands.nodeType(rv_node) != "RVSourceGroup"):
+                    seq_node = rv_node
                     break
-
-            # Resolve the RVSequenceGroup that owns this timeline.
-            seq_node = None
-            if target_tl_guid:
-                for rv_node, tl_guid_map in self.plugin.sequence._rv_node_to_timeline_guid.items():
-                    if (tl_guid_map == target_tl_guid
-                            and rv.commands.nodeType(rv_node) != "RVSourceGroup"):
-                        seq_node = rv_node
-                        break
             if seq_node is None:
-                # Fallback: first non-source-group node (single-sequence sessions).
-                seq_node = next(
-                    (n for n in self.plugin.sequence._rv_node_to_timeline_guid
-                     if rv.commands.nodeType(n) != "RVSourceGroup"),
-                    None
-                )
-            if seq_node is None and target_tl_guid:
                 # OTIO-origin timelines are not in _rv_node_to_timeline_guid —
                 # they are tracked in _otio_guid_to_root (Stack → Sequence).
                 # Use the inner RVSequenceGroup so setViewNode/setFrame work.
-                root = self.plugin.sequence._otio_guid_to_root.get(target_tl_guid)
+                root = self.plugin.sequence._otio_guid_to_root.get(timeline_guid)
                 if root and rv.commands.nodeType(root) == "RVStackGroup":
                     inputs = self.plugin.sequence._get_sequence_inputs(root)
                     seq_node = next(
@@ -224,51 +212,58 @@ class PlaybackSyncController:
                          if rv.commands.nodeType(n) == "RVSequenceGroup"),
                         root,
                     )
-
-            _log(
-                f"RECV selection seq: seq_node={seq_node} start_frame={start_frame}"
-                f" end_frame={end_frame}"
-                f" target_tl={target_tl_guid[:8] if target_tl_guid else None}"
+        if seq_node is None:
+            # Fallback: first non-source-group node (single-sequence sessions).
+            seq_node = next(
+                (n for n in self.plugin.sequence._rv_node_to_timeline_guid
+                 if rv.commands.nodeType(n) != "RVSourceGroup"),
+                None
             )
-            if seq_node:
-                seq_tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(seq_node)
-                if seq_tl_guid:
-                    self.plugin.sync_manager.active_timeline_guid = seq_tl_guid
-                self._last_broadcast_clip_guid = clip_guid
-                self._sequence_selection_applied_at = time.monotonic()
-                self.plugin._rv_updating = True
-                try:
-                    rv.commands.setViewNode(seq_node)
-                    # Frame positioning is NOT done here.  In a cut sequence the
-                    # authoritative frame comes from the concurrent playback message
-                    # (current_time.value in the timeline's coordinate space), which
-                    # the playback handler already applied.  The clip guid in a
-                    # selection identifies WHICH clip is active (for annotation
-                    # binding), but the same media file can appear at many positions
-                    # in the sequence — seeking by guid-derived position would jump
-                    # to the wrong occurrence.  setViewNode above is enough to switch
-                    # into the sequence node; the playback handler owns the frame.
-                    _log(f"RECV selection seq: applied setViewNode={seq_node} (frame owned by playback handler)")
-                except Exception as e:
-                    _log(f"RECV selection seq: error applying setViewNode: {e}")
-                finally:
-                    self.plugin._rv_updating = False
-            else:
-                _log("RECV selection seq: no seq_node found — cannot seek")
+        if seq_node is None:
+            _log(f"apply view-state: no seq_node found for timeline {timeline_guid}")
             return
+        seq_tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(seq_node)
+        if seq_tl_guid:
+            self.plugin.sync_manager.active_timeline_guid = seq_tl_guid
+        self.plugin._rv_updating = True
+        try:
+            rv.commands.setViewNode(seq_node)
+            _log(f"apply view-state: sequence → {seq_node} ({(timeline_guid or '')[:8]})")
+        finally:
+            self.plugin._rv_updating = False
 
-        # source mode: switch active_timeline_guid to the clip's own timeline.
+    def _switch_to_source_view(self, clip_guid):
+        """Switch the RV view to the source group for *clip_guid* (source mode)."""
+        if not clip_guid:
+            _log("apply view-state: source mode with empty clip_guid — ignoring")
+            return
+        clip = self.plugin.sync_manager._object_map.get(clip_guid) if self.plugin.sync_manager else None
+        if clip is None or not isinstance(clip, otio.schema.Clip):
+            # Bin clip guid: xStudio sometimes sends the flat-playlist clip guid
+            # (which is purged from object_map when the playlist is replaced by a
+            # real sequence).  Fall back to the cached bin guid → path mapping.
+            media_path = self.plugin.sequence._bin_guid_to_path.get(clip_guid)
+            if not media_path:
+                _log(f"apply view-state: clip_guid={clip_guid} not found in object_map or bin cache")
+                return
+            _log(f"apply view-state: resolving bin clip_guid={clip_guid[:8]} via bin cache → {media_path}")
+        else:
+            ref = clip.media_reference
+            if not isinstance(ref, otio.schema.ExternalReference):
+                return
+            media_path = _media_path(ref.target_url)
+        source_group = self.plugin.sequence._path_to_source_group_map().get(media_path)
+        if not source_group:
+            _log(f"apply view-state: no source group for {media_path}")
+            return
         clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
         if clip_tl_guid:
             self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
-
-        # Set echo guard before setViewNode so after-graph-view-change doesn't
-        # re-broadcast the remote-applied selection.
-        self._last_broadcast_clip_guid = clip_guid
         self.plugin._rv_updating = True
         try:
             rv.commands.setViewNode(source_group)
             rv.commands.setFrame(1)  # jump to first frame of this source
+            _log(f"apply view-state: source → {source_group} (clip {clip_guid[:8]})")
         finally:
             self.plugin._rv_updating = False
 
@@ -335,8 +330,9 @@ class PlaybackSyncController:
             return
         self._last_selection = selection
         # Map each selected source group to an OTIO clip GUID and broadcast the
-        # first one.  RV's "selection" can be a list of source-group nodes; the
-        # other peers only care about which clip the user is looping over.
+        # first one as a highlight (the view mode doesn't change — RV's native
+        # "selection" is a loop/highlight concept, not a view switch; see
+        # design.md's resolved highlight-only note).
         sg_to_path = {v: k for k, v in self.plugin.sequence._path_to_source_group_map().items()}
         for node in selection:
             media_path = sg_to_path.get(node)
@@ -345,8 +341,8 @@ class PlaybackSyncController:
                 if clip_guid:
                     _clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
                     _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
-                    _log(f"SEND selection [selection-change]: clip '{_clip_label}' guid={clip_guid[:8]} node={node}")
-                    self.plugin.sync_manager.broadcast_selection(clip_guid)
+                    _log(f"SEND view-state [selection-change]: clip '{_clip_label}' guid={clip_guid[:8]} node={node}")
+                    self.broadcast_view_state(clip_guid, self._cur_view_mode)
                     break
         event.reject()
 
@@ -355,41 +351,30 @@ class PlaybackSyncController:
             event.reject()
             return
         view = rv.commands.viewNode()
-        # Timeline switch: view node is a sequence group.
         tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view)
-        if tl_guid and tl_guid != self.plugin.sync_manager.active_timeline_guid:
-            self.plugin.sync_manager.active_timeline_guid = tl_guid
-            _log(f"SEND view_change view={view} tl={tl_guid}")
-            self._broadcast_playback()
-        # Clip selection: user double-clicked into a source group (source view).
-        # Map source group → media path → OTIO clip GUID and broadcast.
-        if rv.commands.nodeType(view) == "RVSourceGroup":
+        if tl_guid and rv.commands.nodeType(view) != "RVSourceGroup":
+            # Sequence/timeline view — covers both switching to a different
+            # sequence and returning from a source (clip) view.
+            if tl_guid != self.plugin.sync_manager.active_timeline_guid or self._cur_view_mode != "sequence":
+                self.plugin.sync_manager.active_timeline_guid = tl_guid
+                _log(f"SEND view-state [sequence]: view={view} tl={tl_guid}")
+                self.broadcast_view_state(None, "sequence")
+        elif rv.commands.nodeType(view) == "RVSourceGroup":
+            # Clip selection: user double-clicked into a source group.
+            # Map source group → media path → OTIO clip GUID and broadcast.
             sg_to_path = {v: k for k, v in self.plugin.sequence._path_to_source_group_map().items()}
             media_path = sg_to_path.get(view)
             if media_path:
                 clip_guid = self._clip_guid_for_media_path(media_path)
-                if clip_guid and clip_guid != self._last_broadcast_clip_guid:
+                if clip_guid and clip_guid != self._cur_clip_guid:
                     _clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
                     _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
-                    _log(f"SEND selection [view-change]: clip '{_clip_label}' guid={clip_guid[:8]} view={view}")
+                    _log(f"SEND view-state [source]: clip '{_clip_label}' guid={clip_guid[:8]} view={view}")
                     is_new = clip_guid not in self.plugin.sync_manager._clip_timelines
                     clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
                     if clip_tl_guid:
                         if is_new:
                             self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
                         self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
-                    self.plugin.sync_manager.broadcast_selection(clip_guid)
-                    self._last_broadcast_clip_guid = clip_guid
-        elif view in self.plugin.sequence._rv_node_to_timeline_guid and self._last_broadcast_clip_guid:
-            # Returned to sequence/timeline view — restore sequence active_timeline_guid
-            # and broadcast clear so peers exit single-clip mode.
-            _tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view)
-            _tl = self.plugin.sync_manager.timelines.get(_tl_guid) if _tl_guid else None
-            _tl_name = getattr(_tl, "name", None) or view
-            _log(f"SEND selection [view-change]: clear → sequence '{_tl_name}' (view={view})")
-            seq_tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view)
-            if seq_tl_guid:
-                self.plugin.sync_manager.active_timeline_guid = seq_tl_guid
-            self.plugin.sync_manager.broadcast_selection("", view_mode="sequence")
-            self._last_broadcast_clip_guid = None
+                    self.broadcast_view_state(clip_guid, "source")
         event.reject()

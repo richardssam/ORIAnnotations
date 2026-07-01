@@ -41,13 +41,14 @@ class AnnotationEffect(otio.schema.Effect):
     ) -> None:
         super().__init__(name=name, effect_name="Annotation.1")
         self.visible = visible
+        self.commands = commands if commands is not None else []
         self.layers = layers if layers is not None else []
 
-    _visible = otio.core.serializable_field(
+    visible = otio.core.serializable_field(
         "visible", required_type=bool, doc=("visible: expects either true or false")
     )
 
-    _commands = otio.core.serializable_field(
+    commands = otio.core.serializable_field(
         "commands", required_type=list, doc=("commands: expects a list of sync commands")
     )
 

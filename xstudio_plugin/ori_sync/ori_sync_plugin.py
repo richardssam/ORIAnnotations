@@ -651,6 +651,8 @@ class ORISyncPlugin(PluginBase):
                 # 5. Deferred seek application
                 with _timed("apply_pending_seek"):
                     self.playback.apply_pending_seek()
+                with _timed("flush_pending_scrub_broadcast"):
+                    self.playback.flush_pending_scrub_broadcast()
 
                 # 6. Periodic display state (zoom) scan (0.5s interval)
                 now = time.monotonic()
@@ -718,10 +720,6 @@ class ORISyncPlugin(PluginBase):
                     # Cached (short TTL) so per-frame scrub broadcasts stay cheap.
                     tl_guid = self.playback.cached_viewed_timeline_guid()
                     self.manager.broadcast_playback_state(payload, timeline_guid=tl_guid)
-            elif cmd == "broadcast_selection":
-                if self.manager and self.manager.status == STATE_SYNCED:
-                    clip_guid, view_mode = payload
-                    self.manager.broadcast_selection(clip_guid, view_mode=view_mode)
             elif cmd == "resolve_selection":
                 self.playback.resolve_and_broadcast_selection()
             elif cmd == "sync_container":
@@ -824,8 +822,9 @@ class ORISyncPlugin(PluginBase):
         elif action == "display_settings":
             self.display.apply_display_state(data)
 
-        elif action == "selection_changed":
-            self.playback.apply_selection(data)
+        # selection_changed is retired — view/selection is now folded into the
+        # PLAYBACK_SETTINGS view-state, applied by playback.apply_playback_state
+        # via the on_playback_changed callback.
 
         elif action == "add_timeline":
             # A new sequence/playlist timeline arrived from a remote peer.

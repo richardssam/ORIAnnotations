@@ -25,6 +25,12 @@ from .utils import _log, _log_exc, bounded, bounded_timeout
 # so a stale/destroyed actor fails fast and the poll thread keeps running.
 _PLAYHEAD_TIMEOUT_MS = 2000
 
+# Minimum interval (s) between position-only scrub broadcasts.  xStudio fires a
+# "Logical Frame" attribute change per rendered frame while dragging the
+# playhead (~60 Hz); peers don't need updates that often, and the flood backs
+# up the single poll thread on the receiving end.  ~20 Hz stays visually smooth.
+_SCRUB_BROADCAST_INTERVAL = 0.05
+
 # Programmatically highlighting the selected clip inside a sequence track (via a
 # raw item_selection_atom send) crashes xStudio: the send into a recently-rebuilt
 # timeline races with that timeline's clip actors being torn down, and the
@@ -60,6 +66,36 @@ class PlaybackSyncController:
         self._last_playhead_check: float = 0.0
         self._cached_viewed_tl_guid: str | None = None
         self._cached_viewed_tl_at: float = 0.0
+        # Current local view state (unify-view-state-sync): the mode and active
+        # clip we last observed locally, so the position-change broadcast can
+        # carry them in the single PLAYBACK_SETTINGS view-state message.
+        self._cur_view_mode: str = "sequence"
+        self._cur_clip_guid: "str | None" = None
+        # Last remote view (mode, clip) we applied, so apply only re-switches the
+        # on-screen source / mode when it actually changes (the frame updates
+        # every message but the view rarely does).
+        self._last_applied_view_mode: "str | None" = None
+        self._last_applied_clip_guid: "str | None" = None
+        self._last_applied_tl_guid: "str | None" = None
+        # Timestamp until which remote view-switch messages are suppressed after a
+        # local user action (view selection / double-click).  Prevents in-flight
+        # stale remote messages from hijacking the local selection the user just made.
+        self._local_view_action_until: float = 0.0
+        # Extended clip-specific echo guard: when apply_selection sets a remote
+        # clip, the resulting show_atom can be delayed by POLL-SLOW (2+ s) and
+        # outlast the short _selection_broadcast_suppress_until window.  Track the
+        # exact guid and a longer window so the delayed show_atom is still caught.
+        self._applied_clip_echo_guid: "str | None" = None
+        self._applied_clip_echo_until: float = 0.0
+        # Scrub-broadcast throttle: xStudio fires a "Logical Frame" attribute
+        # change per rendered frame while dragging the playhead (~60 Hz), far
+        # faster than peers need to stay in sync.  Position-only updates are
+        # rate-limited to _SCRUB_BROADCAST_INTERVAL; the most recent state is
+        # held in _pending_scrub_state and flushed by the poll loop once its
+        # deadline passes, so the final scrub position is never dropped.
+        self._last_scrub_broadcast_at: float = 0.0
+        self._pending_scrub_state: "dict | None" = None
+        self._pending_scrub_due: float = 0.0
 
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
@@ -82,6 +118,17 @@ class PlaybackSyncController:
         self._last_playhead_check = 0.0
         self._cached_viewed_tl_guid = None
         self._cached_viewed_tl_at = 0.0
+        self._cur_view_mode = "sequence"
+        self._cur_clip_guid = None
+        self._last_applied_view_mode = None
+        self._last_applied_clip_guid = None
+        self._last_applied_tl_guid = None
+        self._local_view_action_until = 0.0
+        self._applied_clip_echo_guid = None
+        self._applied_clip_echo_until = 0.0
+        self._last_scrub_broadcast_at = 0.0
+        self._pending_scrub_state = None
+        self._pending_scrub_due = 0.0
 
     def cached_viewed_timeline_guid(self, ttl: float = 0.5) -> str | None:
         """Return the viewed timeline guid, cached for *ttl* seconds.
@@ -129,9 +176,20 @@ class PlaybackSyncController:
                 is_timeline = getattr(self.plugin, "_viewport_container_is_timeline", False)
                 _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
                 _media_name_hint = None
+                # Resolve via the timeline actually on screen right now, not
+                # manager.active_timeline_guid — that field is only updated by
+                # this same handler (further below) and a few apply paths, so it
+                # still holds the *previous* selection's value while this event
+                # is being processed.  Same xStudio media UUID can be registered
+                # under multiple owning timelines (e.g. once as a standalone
+                # bin/individual-clip entry, again as a sequence clip after the
+                # clip is folded into a sequence); sync_guid_for_xs_uuid's
+                # unscoped fallback scan would otherwise return whichever one
+                # was registered first — the stale bin guid — instead of the
+                # sequence's own clip guid that peers actually share.
                 clip_guid = self.plugin.media.sync_guid_for_xs_uuid(
                     media_uuid_str,
-                    self.plugin.manager.active_timeline_guid if self.plugin.manager else None
+                    self.cached_viewed_timeline_guid(ttl=0.1),
                 )
                 if clip_guid:
                     media_obj = (
@@ -162,6 +220,20 @@ class PlaybackSyncController:
                 if clip_guid and self.plugin.manager:
                     for _tg, _tl in list(self.plugin.manager.timelines.items()):
                         if _tl.metadata.get("xs_flat_playlist"):
+                            continue
+                        # Skip dynamic single-clip timelines (created lazily by
+                        # get_or_create_clip_timeline for clip-level annotation
+                        # bookkeeping).  They hold exactly one clip — a copy of
+                        # whatever sequence/bin clip was last selected — and are
+                        # not real sequences.  Without this check, once any clip
+                        # had been individually selected this session, its
+                        # leftover clip-timeline entry made every later
+                        # selection of that same clip look like "media inside a
+                        # sequence" (_is_seq_media=True), wrongly triggering the
+                        # "playing through sequence" suppression and silently
+                        # dropping the selection broadcast even with no sequence
+                        # ever created.
+                        if _tl.metadata.get("clip_timeline_for"):
                             continue
                         for _track in _tl.tracks:
                             if _track.kind == otio.schema.TrackKind.Video:
@@ -212,17 +284,41 @@ class PlaybackSyncController:
                                 if _cn == _base:
                                     _found = _c.metadata.get("sync", {}).get("guid")
                                     break
+                                # Fallback: match by ExternalReference basename for
+                                # xStudio-origin sequence clips whose name is empty.
+                                _mr = getattr(_c, "media_reference", None)
+                                if isinstance(_mr, otio.schema.ExternalReference):
+                                    _ref_base = os.path.splitext(
+                                        os.path.basename(_mr.target_url or "")
+                                    )[0].lower()
+                                    if _ref_base and _ref_base == _base:
+                                        _found = _c.metadata.get("sync", {}).get("guid")
+                                        break
                             if _found:
                                 break
                         if _found and _found != clip_guid:
                             _log(f"[SEL] normalize bin→sequence clip guid {str(clip_guid)[:8]}→{_found[:8]}")
                             clip_guid = _found
 
-                # When xStudio is already in single-clip mode (PSM=False), any
-                # show_atom is a deliberate user click — use source mode regardless
-                # of whether the media belongs to a sequence playlist.
+                # Determine view_mode from what is actually being viewed, in
+                # priority order:
+                #   1. PSM=False  → an isolated single clip → "source".
+                #   2. viewing a Timeline container → "sequence".
+                #   3. viewing a Playlist container (the bin) → "source", even if
+                #      the media also appears in a sequence — selecting it in the
+                #      bin is a source/bin selection, not a sequence selection.
+                #      (Keying off "_is_seq_media" here mislabelled bin clicks as
+                #      mode=sequence and desynced the peers.)
+                #   4. fallback when container type is unknown.
                 _in_single_clip = (self._last_pinned_source_mode is False)
-                view_mode = "source" if _in_single_clip else ("sequence" if _is_seq_media else "source")
+                if _in_single_clip:
+                    view_mode = "source"
+                elif is_timeline:
+                    view_mode = "sequence"
+                elif is_playlist:
+                    view_mode = "source"
+                else:
+                    view_mode = "sequence" if _is_seq_media else "source"
                 # Track unconditionally — PSM True→False handler reads this to
                 # broadcast mode=source even when the show_atom was not suppressed.
                 if _media_name_hint:
@@ -233,6 +329,18 @@ class PlaybackSyncController:
                 # select_all() / set_on_screen_source in apply_selection.
                 if time.monotonic() < self.plugin._selection_broadcast_suppress_until:
                     _log("[SEL] → suppressed (echo guard)")
+                    return
+                # Extended clip-specific guard: a POLL-SLOW can delay the show_atom
+                # by 2+ s, past the short time window above.  If this show_atom is
+                # for the exact clip we most recently applied remotely, suppress it
+                # (it's the delayed echo, not a new local action).  A local switch
+                # to a *different* clip is not suppressed (different guid).
+                if (
+                    clip_guid
+                    and clip_guid == self._applied_clip_echo_guid
+                    and time.monotonic() < self._applied_clip_echo_until
+                ):
+                    _log("[SEL] → suppressed (delayed clip echo)")
                     return
                 # Suppress show_atoms fired while xStudio's sequence is playing
                 # through clips — those aren't user selections, they're scan-through
@@ -261,8 +369,8 @@ class PlaybackSyncController:
                         clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
                         if clip_tl_guid:
                             self.plugin.manager.active_timeline_guid = clip_tl_guid
-                    self.plugin.manager.broadcast_selection(clip_guid, view_mode=view_mode)
-                    _log(f"[SEL] → broadcast clip {clip_guid[:8]} mode={view_mode}")
+                    self.broadcast_view_state(clip_guid, view_mode)
+                    _log(f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}")
                 return
 
             if time.monotonic() < self.plugin._reload_suppress_until:
@@ -458,7 +566,9 @@ class PlaybackSyncController:
         self.plugin._last_polled_playing = playing
         self.plugin._last_polled_frame = frame
 
-        # Construct playback state payload
+        # Construct the unified view-state payload (position + current view).
+        # The view_mode/clip_guid describe what we are currently viewing so a
+        # peer receiving this position update also keeps the correct mode/clip.
         state = {
             "playing": playing,
             "current_time": {
@@ -466,17 +576,56 @@ class PlaybackSyncController:
                 "value": float(frame),
                 "rate": fps,
             },
-            "looping": False,
+            "looping": self._get_loop_mode(),
+            "view_mode": self._cur_view_mode,
+            "clip_guid": self._cur_clip_guid,
         }
 
         # Mark local playback as active so an echoed selection from a following
         # peer doesn't seek our own playhead to a clip start mid-scrub.
         self.plugin._local_scrub_active_until = time.monotonic() + 0.4
 
+        # Position-only updates while paused (scrubbing) are rate-limited:
+        # xStudio fires one of these per rendered frame (~60 Hz) while dragging
+        # the playhead, far more than a peer needs to stay in sync, and the
+        # flood makes the receiver fall behind and apply a backlog of already-
+        # stale positions.  Play/pause transitions always go out immediately;
+        # the latest throttled position is held in _pending_scrub_state and
+        # flushed by the poll loop so the final scrub position is never lost.
+        now = time.monotonic()
+        if not playing and not playing_changed:
+            if now - self._last_scrub_broadcast_at < _SCRUB_BROADCAST_INTERVAL:
+                self._pending_scrub_state = state
+                self._pending_scrub_due = self._last_scrub_broadcast_at + _SCRUB_BROADCAST_INTERVAL
+                return
+        self._pending_scrub_state = None
+        self._last_scrub_broadcast_at = now
+
         # Enqueue the broadcast command to be processed asynchronously
         _log(
             f"Event: queuing playback state broadcast frame={frame} playing={playing} "
             f"(source_attr={attr.name})"
+        )
+        self.plugin._cmd_queue.put(("broadcast_playback_state", state))
+
+    def flush_pending_scrub_broadcast(self) -> None:
+        """Send the most recently throttled scrub position once its deadline passes.
+
+        Called from the poll loop.  Without this, a scrub that stops right after
+        a throttled (unsent) position update would leave peers one position
+        behind indefinitely, since no further attribute_changed event would
+        arrive to trigger the send.
+        """
+        if self._pending_scrub_state is None:
+            return
+        if time.monotonic() < self._pending_scrub_due:
+            return
+        state = self._pending_scrub_state
+        self._pending_scrub_state = None
+        self._last_scrub_broadcast_at = time.monotonic()
+        _log(
+            f"Event: queuing playback state broadcast frame={state['current_time']['value']:.0f} "
+            f"playing={state['playing']} (source_attr=scrub-flush)"
         )
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
@@ -629,8 +778,8 @@ class PlaybackSyncController:
                                 seq_tl_guid = self.plugin.manager.sequence_timeline_guid
                                 if seq_tl_guid:
                                     self.plugin.manager.active_timeline_guid = seq_tl_guid
-                                self.plugin.manager.broadcast_selection("")
-                                _log("[SEL] → broadcast selection clear (returned to sequence view)")
+                                self.broadcast_view_state(None, "sequence")
+                                _log("[SEL] → broadcast view-state: sequence (returned to sequence view)")
                             elif psm is False:
                                 # User double-clicked a clip — xStudio enters single-clip
                                 # mode.  The show_atom fired ~80 ms ago (suppressed or not);
@@ -653,8 +802,10 @@ class PlaybackSyncController:
                                         _ctg = self.plugin.manager.get_or_create_clip_timeline(_cg)
                                         if _ctg:
                                             self.plugin.manager.active_timeline_guid = _ctg
-                                        self.plugin.manager.broadcast_selection(_cg, view_mode="source")
-                                        _log(f"[SEL] PSM True→False: broadcast {_cg[:8]} mode=source")
+                                        # xStudio auto-plays on double-click, so tell remote
+                                        # peers to also start playing immediately.
+                                        self.broadcast_view_state(_cg, "source", playing_override=True)
+                                        _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} mode=source playing=True")
                                     else:
                                         _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
                                 else:
@@ -667,6 +818,17 @@ class PlaybackSyncController:
             _log_exc(f"[SEL] poll failed: {e}")
 
     # ── playback state ─────────────────────────────────────────────────
+
+    def _get_loop_mode(self) -> bool:
+        """Return True if the playhead loop mode is "Loop", False otherwise."""
+        ph = self.plugin.active_playhead
+        if not ph:
+            return False
+        try:
+            mode = ph.get_attribute("Loop Mode")
+            return str(mode).strip() == "Loop"
+        except Exception:
+            return False
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def current_playback_state(self) -> dict | None:
@@ -684,10 +846,45 @@ class PlaybackSyncController:
                     "value": float(frame),
                     "rate": fps,
                 },
-                "looping": False,
+                "looping": self._get_loop_mode(),
             }
         except Exception:
             return None
+
+    def broadcast_view_state(
+        self,
+        clip_guid: "str | None",
+        view_mode: str,
+        playing_override: "bool | None" = None,
+    ) -> None:
+        """Broadcast the unified view-state (selection + playback) message.
+
+        The retired SELECTION_1.0 is folded into PLAYBACK_SETTINGS: this sends the
+        current playhead position/play state together with ``view_mode`` and
+        ``clip_guid`` so one message fully describes what this peer is viewing.
+        Also records the current view locally so subsequent position-change
+        broadcasts carry the same mode/clip.
+        """
+        if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
+            return
+        self._cur_view_mode = view_mode
+        self._cur_clip_guid = clip_guid or None
+        # This is a LOCAL user action — guard against in-flight remote messages
+        # (sent before the remote knew about this local change) overriding it.
+        # Only set the guard when not inside a remote-apply echo suppression window
+        # (i.e., this broadcast is genuinely local, not an echo of a remote apply).
+        if time.monotonic() >= self.plugin._selection_broadcast_suppress_until:
+            self._local_view_action_until = time.monotonic() + 1.0
+        state = self.current_playback_state() or {
+            "playing": False,
+            "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
+            "looping": self._get_loop_mode(),
+        }
+        state["view_mode"] = view_mode
+        state["clip_guid"] = clip_guid or None
+        if playing_override is not None:
+            state["playing"] = playing_override
+        self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
     # ── viewport helpers ───────────────────────────────────────────────
 
@@ -764,22 +961,135 @@ class PlaybackSyncController:
 
             return container_uuid
 
+    def _apply_sequence_view(self, tl_guid: "str | None") -> bool:
+        """Switch the on-screen source to the sequence identified by *tl_guid*.
+
+        Sequence mode is addressed by the **shared** sequence ``timeline_guid``,
+        not by clip guid — clip guids differ per peer (bin/sequence/clip-timeline
+        are distinct OTIO objects), so a clip-based search fails ("no playlist
+        found") for a peer's sequence.  The sequence guid is the same on every
+        peer, so we look it up directly in ``_sync_playlists`` and show it.
+
+        :returns: True if the sequence was found and shown; False to let the
+            caller fall back to the clip-based path.
+        """
+        if not (tl_guid and self.plugin.manager
+                and tl_guid in self.plugin._sync_playlists):
+            return False
+        pl, tl = self.plugin._sync_playlists[tl_guid]
+        target = tl if tl is not None else pl
+        if target is None:
+            return False
+        self.plugin.manager.active_timeline_guid = tl_guid
+        # Suppress the show_atom burst the switch fires from echoing back.
+        self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+        try:
+            self.plugin.connection.api.session.viewed_container = target
+            self.plugin.connection.api.session.set_on_screen_source(target)
+            if self.plugin.active_playhead:
+                try:
+                    self.plugin._applying_pinned_mode = True
+                    self.plugin.active_playhead.set_attribute("Pinned Source Mode", True)
+                    self._last_pinned_source_mode = True
+                finally:
+                    self.plugin._applying_pinned_mode = False
+            _log(
+                f"apply view-state: sequence → {getattr(target, 'name', '?')!r}"
+                f" ({tl_guid[:8]})"
+            )
+            return True
+        except Exception:
+            _log_exc("apply view-state: sequence switch failed")
+            return False
+
     # ── apply remote playback state ───────────────────────────────────
 
     def apply_playback_state(self, state: dict) -> None:
-        """Apply an incoming playback state dict to the local xStudio playhead.
+        """Apply an incoming unified view-state to the local xStudio session.
 
-        Called from the poll thread via the ``on_playback_changed`` callback.
-        xStudio's actor-based attribute writes are thread-safe.
+        Called from the poll thread via the ``on_playback_changed`` callback for
+        every PLAYBACK_SETTINGS message — which is now the single view-state
+        message (SELECTION_1.0 retired).  It applies, atomically:
+
+        * the **view** — when ``view_mode``/``clip_guid`` change, switch the
+          on-screen source / mode via the (tested) selection-apply logic; and
+        * the **position** — the message ``current_time`` is authoritative, so
+          the selection-apply's own clip-start seek is suppressed (see the
+          playback-active guard) and the frame from the message wins.
 
         Updates ``_last_applied_frame``, ``_last_polled_frame``, and
-        ``_last_polled_playing`` so that the poll does not echo remote applies
-        back to the session.
+        ``_last_polled_playing`` so the poll does not echo remote applies back.
         """
         if not self.plugin.active_playhead:
             return
 
+        # 1. View switch (mode / active clip).  Switch the on-screen source only
+        #    when it actually changes:
+        #      * mode changed (sequence↔source), or
+        #      * source mode and the isolated clip changed.
+        #    Crucially, in SEQUENCE mode the active clip changes continuously as
+        #    the playhead scrubs across cuts — but the source stays the sequence
+        #    and the clip is derived from the frame, so a clip-only change must
+        #    NOT re-switch or seek (that was the clip-start jump).  After a real
+        #    switch we cancel any clip-start seek it queued, because the message
+        #    frame below is the authoritative position in both modes.
+        view_mode = state.get("view_mode")
+        clip_guid = state.get("clip_guid")
+        view_tl_guid = state.get("timeline_guid")
+        if view_mode is not None:
+            mode_changed = view_mode != self._last_applied_view_mode
+            clip_changed = clip_guid != self._last_applied_clip_guid
+            tl_changed = view_tl_guid != self._last_applied_tl_guid
+            # Guard: if the local user just made a view selection, in-flight remote
+            # messages from BEFORE the remote knew about it can arrive and hijack
+            # the local selection.  Suppress remote view switches for ~1 s after
+            # the local action.  (Only the view switch is suppressed — the position/
+            # play path below still applies if the timeline matches.)
+            if (
+                time.monotonic() < self._local_view_action_until
+                and (mode_changed or clip_changed or tl_changed)
+                and (view_mode != self._cur_view_mode or clip_guid != self._cur_clip_guid)
+            ):
+                _log(
+                    f"apply_playback_state: skipping view switch"
+                    f" (local action guard active, remote={view_mode}/{(clip_guid or '')[:8]},"
+                    f" local={self._cur_view_mode}/{(self._cur_clip_guid or '')[:8]})"
+                )
+                # Skip the view switch; fall through to position/play if timeline matches.
+                view_mode = None  # neutralise the view block below
+            # Switch the on-screen source when:
+            #   * mode flips (sequence↔source),
+            #   * source mode and the isolated clip changes, or
+            #   * sequence mode and the *sequence* (timeline) changes — opening a
+            #     different sequence.  A clip-only change inside one sequence
+            #     (scrubbing across cuts) does NOT switch.
+            if view_mode == "sequence":
+                # Switch to the sequence by its shared timeline guid (robust to
+                # per-peer clip-guid differences).  Only on a real transition:
+                # mode flip or a different sequence — not on clip changes while
+                # scrubbing one sequence.
+                if mode_changed or tl_changed:
+                    if not self._apply_sequence_view(view_tl_guid):
+                        # Fall back to the clip-based path if the sequence guid
+                        # isn't registered locally for some reason.
+                        try:
+                            self.apply_selection({"clip_guid": clip_guid or "", "view_mode": "sequence"})
+                        except Exception:
+                            _log_exc("apply_playback_state: sequence view switch failed")
+                    self._pending_seek_frame = None
+            elif view_mode == "source":
+                if mode_changed or clip_changed:
+                    try:
+                        self.apply_selection({"clip_guid": clip_guid or "", "view_mode": "source"})
+                    except Exception:
+                        _log_exc("apply_playback_state: source view switch failed")
+                    self._pending_seek_frame = None
+            self._last_applied_view_mode = view_mode
+            self._last_applied_clip_guid = clip_guid
+            self._last_applied_tl_guid = view_tl_guid
+
         incoming_tl_guid = state.get("timeline_guid")
+        _tl_mismatch = False
         if incoming_tl_guid and self.plugin.manager:
             # Check against target active_timeline_guid first (handles the selection change transition)
             if incoming_tl_guid != self.plugin.manager.active_timeline_guid:
@@ -794,13 +1104,19 @@ class PlaybackSyncController:
                 except Exception:
                     local_tl_guid = None
                 if local_tl_guid and local_tl_guid != incoming_tl_guid:
+                    _tl_mismatch = True
                     _log(
                         f"RECV playback state: mismatched timeline_guid"
                         f" (local={local_tl_guid[:8]},"
                         f" target={self.plugin.manager.active_timeline_guid[:8]},"
-                        f" incoming={incoming_tl_guid[:8]}) — ignoring"
+                        f" incoming={incoming_tl_guid[:8]})"
                     )
-                    return
+        # If timelines mismatch, still apply a play command — a view switch may
+        # have just landed and the local guid is still catching up.  Drop only the
+        # seek (frame) when mismatched; do not silently drop playing=True.
+        if _tl_mismatch and not state.get("playing", False):
+            _log("RECV playback state: mismatched timeline_guid — ignoring (not playing)")
+            return
 
         playing = state.get("playing", False)
         current_time = state.get("current_time", {})
@@ -843,8 +1159,10 @@ class PlaybackSyncController:
                     if playing:
                         self.plugin._playing_started_at = time.monotonic()
                     ph.playing = playing
-                # Apply position if we are paused, or the play/pause state changed.
-                if not playing or playing_changed:
+                # Apply position if we are paused, or the play/pause state changed,
+                # but NOT when the timeline guid mismatched (the view switch has not
+                # finished landing — seeking on the wrong timeline would be wrong).
+                if (not playing or playing_changed) and not _tl_mismatch:
                     self.plugin._last_applied_frame = frame
                     self.plugin._last_polled_frame = frame
                     # Suppress the echo: ph.position fires attribute_changed
@@ -1046,8 +1364,26 @@ class PlaybackSyncController:
 
         matched_tl_guid = None  # set during pass-2 fallback
         if playlist is None:
+            # Build a reverse map: OTIO guid → (xs_parent_guid, pl, xs_tl) so we can
+            # cross-reference _sync_playlists (keyed by xs_parent_guid) against
+            # manager.timelines (keyed by OTIO guid).  For sequences these two guids
+            # differ, which is why the old direct timelines.get(tl_guid) lookup
+            # silently returned None and skipped every sequence entry.
+            _otio_key_to_sync = {}
+            if self.plugin.manager:
+                for _otg, _otl in list(self.plugin.manager.timelines.items()):
+                    _xsp = _otl.metadata.get("xs_parent_playlist_guid") or _otg
+                    _otio_key_to_sync[_otg] = _xsp
+
             for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
-                otio_tl = self.plugin.manager.timelines.get(tl_guid)
+                # Try direct lookup first; fall back to scanning for a timeline
+                # whose xs_parent_playlist_guid matches this _sync_playlists key.
+                otio_tl = self.plugin.manager.timelines.get(tl_guid) if self.plugin.manager else None
+                if otio_tl is None and self.plugin.manager:
+                    for _otg, _xsp in _otio_key_to_sync.items():
+                        if _xsp == tl_guid:
+                            otio_tl = self.plugin.manager.timelines.get(_otg)
+                            break
                 if otio_tl is None:
                     continue
                 for track in otio_tl.tracks:
@@ -1060,6 +1396,32 @@ class PlaybackSyncController:
                     if playlist:
                         break
                 if playlist:
+                    break
+
+        # Pass-3: name-based fallback — if guid search still finds nothing (e.g.
+        # the sequence OTIO wasn't rebuilt yet), search all individual playlists
+        # for a single-clip entry whose clip name matches, then use set_selection.
+        if playlist is None and clip_stem and self.plugin.manager:
+            for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
+                try:
+                    pl_media = list(pl.media)
+                except Exception:
+                    continue
+                if len(pl_media) != 1:
+                    continue
+                m_name = getattr(pl_media[0], "name", "") or ""
+                if (
+                    os.path.splitext(os.path.basename(m_name))[0].lower()
+                    == clip_stem.lower()
+                ):
+                    playlist = pl
+                    playlist_xs_tl = xs_tl
+                    matched_tl_guid = tl_guid
+                    use_source = True
+                    _log(
+                        f"RECV selection: Pass-3 name match → {getattr(pl, 'name', '?')!r}"
+                        f" for {clip_stem!r}"
+                    )
                     break
 
         if playlist is not None:
@@ -1096,56 +1458,55 @@ class PlaybackSyncController:
 
                 if use_source and playlist_xs_tl is not None:
                     # Single-clip individual playlist: just show it.
+                    # Suppress the show_atom burst set_on_screen_source fires so it
+                    # doesn't echo back to the peer that sent us this selection.
+                    self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._applied_clip_echo_guid = clip_guid
+                    self._applied_clip_echo_until = time.monotonic() + 3.0
                     self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
                     _log(
                         f"RECV selection: set_on_screen_source (individual) → "
                         f"{getattr(playlist_xs_tl, 'name', '?')!r}"
                     )
                 elif is_multi_clip:
-                    # Multi-clip sequence selection.  When a peer is actively
-                    # driving playback (scrubbing), each clip-boundary crossing
-                    # fires a selection — but re-switching the on-screen source and
-                    # seeking to the new clip's start would yank the playhead off
-                    # the authoritative PLAYBACK_SETTINGS position and snap it to
-                    # the clip beginning.  We're already viewing the sequence and
-                    # the position channel positions us, so skip the whole apply
-                    # mid-scrub; only act on a genuine (non-playback) selection.
-                    _now = time.monotonic()
-                    if (_now < self.plugin._playback_apply_suppress_until
-                            or _now < self.plugin._local_scrub_active_until):
-                        _log("RECV selection: skipping sequence source-switch+seek (playback active)")
-                    else:
-                        # Seek the playhead after the source switch to avoid
-                        # invalid_request errors.
-                        start_frame = 0
-                        try:
-                            start_frame = int(clip.range_in_parent().start_time.value)
-                        except Exception:
-                            # Fallback: sum duration of all preceding items.
-                            otio_tl = (
-                                self.plugin.manager.timelines.get(matched_tl_guid)
-                                if self.plugin.manager else None
-                            )
-                            if otio_tl:
-                                for track in otio_tl.tracks:
-                                    if track.kind == otio.schema.TrackKind.Video:
-                                        current_time = 0
-                                        for item in track:
-                                            if item.metadata.get("sync", {}).get("guid") == clip_guid:
-                                                start_frame = current_time
-                                                break
-                                            sr = getattr(item, "source_range", None)
-                                            if sr is not None:
-                                                current_time += int(sr.duration.value)
-
-                        self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
-                        _log(
-                            f"RECV selection: set_on_screen_source (sequence) → "
-                            f"{getattr(playlist_xs_tl, 'name', '?')!r}"
+                    # Multi-clip sequence selection: switch the on-screen source to
+                    # the sequence.  Called only on a genuine view transition (the
+                    # unified apply skips clip-only changes during a sequence scrub),
+                    # and the clip-start seek queued here is cancelled by
+                    # apply_playback_state — the message frame is authoritative — so
+                    # this no longer fights the scrub position.
+                    start_frame = 0
+                    try:
+                        start_frame = int(clip.range_in_parent().start_time.value)
+                    except Exception:
+                        # Fallback: sum duration of all preceding items.
+                        otio_tl = (
+                            self.plugin.manager.timelines.get(matched_tl_guid)
+                            if self.plugin.manager else None
                         )
-                        # Defer the seek until Form-2 events have settled (~200 ms).
-                        self._pending_seek_frame = start_frame
-                        self._pending_seek_deadline = time.monotonic() + 0.300
+                        if otio_tl:
+                            for track in otio_tl.tracks:
+                                if track.kind == otio.schema.TrackKind.Video:
+                                    current_time = 0
+                                    for item in track:
+                                        if item.metadata.get("sync", {}).get("guid") == clip_guid:
+                                            start_frame = current_time
+                                            break
+                                        sr = getattr(item, "source_range", None)
+                                        if sr is not None:
+                                            current_time += int(sr.duration.value)
+
+                    self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._applied_clip_echo_guid = clip_guid
+                    self._applied_clip_echo_until = time.monotonic() + 3.0
+                    self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
+                    _log(
+                        f"RECV selection: set_on_screen_source (sequence) → "
+                        f"{getattr(playlist_xs_tl, 'name', '?')!r}"
+                    )
+                    # Defer the seek until Form-2 events have settled (~200 ms).
+                    self._pending_seek_frame = start_frame
+                    self._pending_seek_deadline = time.monotonic() + 0.300
 
                     # Programmatically select/highlight the clip in the timeline
                     # track.  Disabled by default — see _ENABLE_TIMELINE_ITEM_HIGHLIGHT.
@@ -1198,6 +1559,8 @@ class PlaybackSyncController:
                     # Suppress the show_atom that fires from set_selection so it doesn't
                     # echo back to the peer that just sent us this selection.
                     self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._applied_clip_echo_guid = clip_guid
+                    self._applied_clip_echo_until = time.monotonic() + 3.0
                     self.plugin.connection.api.session.set_on_screen_source(playlist)
                     media, _ = self.plugin.media.media_for_sync_guid(clip_guid)
                     if media:

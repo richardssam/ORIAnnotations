@@ -588,7 +588,18 @@ class PlaybackSettingsSet(ProtocolMessage):
     )
     looping: "bool | None" = doc_field(default=None, doc="Whether playback loops.")
     timeline_guid: "str | None" = doc_field(
-        default=None, doc="GUID of the timeline being played."
+        default=None, doc="GUID of the timeline being viewed/played."
+    )
+    view_mode: "str | None" = doc_field(
+        default=None,
+        doc='View mode: "sequence" (position authoritative, clip derived from '
+            'the frame) or "source" (clip_guid authoritative, current_time is the '
+            'in-clip offset).',
+    )
+    clip_guid: "str | None" = doc_field(
+        default=None,
+        doc="Active clip sync GUID. Authoritative in source mode; confirmation/"
+            "highlight only in sequence mode (never seeked to).",
     )
     sync_timestamp: "float | None" = doc_field(
         default=None, doc="Epoch seconds when the message was sent."
@@ -601,6 +612,8 @@ class PlaybackSettingsSet(ProtocolMessage):
         "current_time",
         "looping",
         "timeline_guid",
+        "view_mode",
+        "clip_guid",
         "sync_timestamp",
     )
 
@@ -614,6 +627,10 @@ class PlaybackSettingsSet(ProtocolMessage):
             payload["looping"] = self.looping
         if self.timeline_guid is not None:
             payload["timeline_guid"] = self.timeline_guid
+        if self.view_mode is not None:
+            payload["view_mode"] = self.view_mode
+        if self.clip_guid is not None:
+            payload["clip_guid"] = self.clip_guid
         if self.sync_timestamp is not None:
             payload["sync_timestamp"] = self.sync_timestamp
         payload.update(self.extras)
@@ -627,6 +644,8 @@ class PlaybackSettingsSet(ProtocolMessage):
             current_time=data.get("current_time"),
             looping=data.get("looping"),
             timeline_guid=data.get("timeline_guid"),
+            view_mode=data.get("view_mode"),
+            clip_guid=data.get("clip_guid"),
             sync_timestamp=data.get("sync_timestamp"),
             extras=extras,
         )
@@ -694,38 +713,13 @@ class DisplaySettingsSet(ProtocolMessage):
 
 
 # ---------------------------------------------------------------------------
-# Selection family — SELECTION_1.0
+# Selection family — RETIRED
+#
+# SELECTION_1.0 / SelectionSet was removed in the unify-view-state-sync change.
+# Selection state (active clip + sequence/source view mode) is now carried by the
+# view-state fields ``view_mode`` and ``clip_guid`` on PLAYBACK_SETTINGS_1.0, so
+# there is a single authoritative view-state message instead of two channels.
 # ---------------------------------------------------------------------------
-
-
-@register
-@dataclass
-class SelectionSet(ProtocolMessage):
-    """Broadcasts the clip the master has selected and the active view mode."""
-
-    SCHEMA = "SELECTION_1.0"
-    EVENT = "SET"
-
-    clip_guid: str = doc_field(doc="Sync GUID of the selected clip ('' to clear).")
-    view_mode: str = doc_field(default="source", doc='View mode: "source" or "sequence".')
-    sync_timestamp: "float | None" = doc_field(
-        default=None, doc="Epoch seconds when the message was sent."
-    )
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "clip_guid": self.clip_guid,
-            "view_mode": self.view_mode,
-            "sync_timestamp": self.sync_timestamp,
-        }
-
-    @classmethod
-    def from_payload(cls, data: dict[str, Any]) -> "SelectionSet":
-        return cls(
-            clip_guid=data.get("clip_guid"),
-            view_mode=data.get("view_mode", "source"),
-            sync_timestamp=data.get("sync_timestamp"),
-        )
 
 
 # ---------------------------------------------------------------------------

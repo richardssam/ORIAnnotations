@@ -28,7 +28,7 @@ def _make_otio_logger():
         sh = _logging.StreamHandler()
         sh.setFormatter(_logging.Formatter("[OTIOSync] %(message)s"))
         logger.addHandler(sh)
-    log_file = os.environ.get("RV_OTIO_SYNC_LOG_FILE")
+    log_file = os.environ.get("ORI_SYNC_LOG_FILE")
     if log_file:
         fh = _logging.FileHandler(log_file, mode='w')
         fh.setFormatter(ts_fmt)
