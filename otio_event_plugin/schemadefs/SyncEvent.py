@@ -516,6 +516,7 @@ class PaintVertices(otio.core.SerializableObject):
        x [float]: Array of x positions for the stroke.
        y [float]: Array of y positions for the stroke.
        size [float]: Array of sizes for the stroke.
+       alpha [float]: Array of alpha values for the stroke.
     """
 
     _serializable_label = "PaintVertices.1"
@@ -525,12 +526,14 @@ class PaintVertices(otio.core.SerializableObject):
             self,
             x=None,
             y=None,
-            size=None
+            size=None,
+            alpha=None
         ):
         otio.core.SerializableObject.__init__(self)
         self.x = x if x is not None else []
         self.y = y if y is not None else []
         self.size = size if size is not None else []
+        self.alpha = alpha if alpha is not None else []
 
         if not isinstance(self.x, otio._otio.AnyVector) or not all(isinstance(i, float)  or isinstance(i, int) for i in self.x):
             raise TypeError(f"x must be a list of floats {self.x}")
@@ -538,6 +541,8 @@ class PaintVertices(otio.core.SerializableObject):
             raise TypeError(f"y must be a list of floats {self.y}")
         if not isinstance(self.size, otio._otio.AnyVector) or not all(isinstance(i, float) or isinstance(i, int) for i in self.size):
             raise TypeError(f"size must be a list of floats {self.size}")
+        if not isinstance(self.alpha, otio._otio.AnyVector) or not all(isinstance(i, float) or isinstance(i, int) for i in self.alpha):
+            raise TypeError(f"alpha must be a list of floats {self.alpha}")
     x = otio.core.serializable_field(
         "x",
         required_type=list,
@@ -553,13 +558,19 @@ class PaintVertices(otio.core.SerializableObject):
         required_type=list,
         doc="The sizes of the paint stroke"
     )
+    alpha = otio.core.serializable_field(
+        "alpha",
+        required_type=list,
+        default_value=[],
+        doc="The alpha values of the paint stroke, this is optional, and if not defined is assumed to be 1.0 for all points"
+    )
     def __str__(self):
         return "PaintVertices({})".format(
-            repr(self.x) + ", " + repr(self.y) + ", " + repr(self.size)
+            repr(self.x) + ", " + repr(self.y) + ", " + repr(self.size) + ", " + repr(self.alpha)
         )
     def __repr__(self):
-        return "otio.schemadef.SyncEvent.PaintVertices(x={}, y={}, size={})".format(
-            repr(self.x), repr(self.y), repr(self.size)
+        return "otio.schemadef.SyncEvent.PaintVertices(x={}, y={}, size={}, alpha={})".format(
+            repr(self.x), repr(self.y), repr(self.size), repr(self.alpha)
         )
 
 @otio.core.register_type
@@ -845,4 +856,279 @@ class TextAnnotation(SyncEvent):
     def __repr__(self):
         return "otio.schemadef.SyncEvent.TextAnnotation(position={}, text={})".format(
             repr(self.position), repr(self.text)
+        )
+
+
+@otio.core.register_type
+class EllipseAnnotation(SyncEvent):
+    """A schema for an ellipse shape.
+
+    Attributes:
+       min (list): Bounding box top-left corner coordinate [x, y]
+       max (list): Bounding box bottom-right corner coordinate [x, y]
+       rgba (list): Outline color [r, g, b, a]
+       size (float): Outline thickness (brush size)
+       inner_rgba (list): Inner fill color [r, g, b, a]
+       uuid (str): Unique identifier
+       timestamp (str): Timestamp of the change
+    """
+
+    _serializable_label = "EllipseAnnotation.1"
+    _name = "EllipseAnnotation"
+
+    def __init__(
+        self,
+        min=None,
+        max=None,
+        rgba=None,
+        size=1.0,
+        inner_rgba=None,
+        visible=True,
+        uuid=None,
+        timestamp=None
+    ):
+        SyncEvent.__init__(self, timestamp)
+        self.uuid = uuid
+
+        if min is not None and not isinstance(min, list):
+            raise TypeError("min must be a list of floats")
+        if max is not None and not isinstance(max, list):
+            raise TypeError("max must be a list of floats")
+        if rgba is not None and not isinstance(rgba, list):
+            raise TypeError("rgba must be a list of floats")
+        if not isinstance(size, (int, float)):
+            raise TypeError("size must be a float")
+        if inner_rgba is not None and not isinstance(inner_rgba, list):
+            raise TypeError("inner_rgba must be a list of floats")
+
+        self.min = min if min is not None else [0.0, 0.0]
+        self.max = max if max is not None else [0.0, 0.0]
+        self.rgba = rgba if rgba is not None else [1.0, 1.0, 1.0, 1.0]
+        self.size = size
+        self.inner_rgba = inner_rgba if inner_rgba is not None else [0.0, 0.0, 0.0, 0.0]
+        self.visible = visible
+
+    min = otio.core.serializable_field(
+        "min",
+        required_type=list,
+        doc="The bounding box top-left corner coordinate in format [x, y]"
+    )
+    max = otio.core.serializable_field(
+        "max",
+        required_type=list,
+        doc="The bounding box bottom-right corner coordinate in format [x, y]"
+    )
+    rgba = otio.core.serializable_field(
+        "rgba",
+        required_type=list,
+        doc="The outline color of the ellipse in RGBA format"
+    )
+    size = otio.core.serializable_field(
+        "size",
+        required_type=float,
+        doc="The line width of the ellipse outline"
+    )
+    inner_rgba = otio.core.serializable_field(
+        "inner_rgba",
+        required_type=list,
+        doc="The inner fill color of the ellipse in RGBA format"
+    )
+    uuid = otio.core.serializable_field(
+        "uuid",
+        doc="The unique identifier for the ellipse annotation"
+    )
+    visible = otio.core.serializable_field(
+        "visible",
+        required_type=bool,
+        doc="The visibility of the ellipse annotation"
+    )
+
+    def __str__(self):
+        return "EllipseAnnotation(min={}, max={})".format(
+            repr(self.min), repr(self.max)
+        )
+
+    def __repr__(self):
+        return "otio.schemadef.SyncEvent.EllipseAnnotation(min={}, max={})".format(
+            repr(self.min), repr(self.max)
+        )
+
+
+@otio.core.register_type
+class RectangleAnnotation(SyncEvent):
+    """A schema for a rectangle shape.
+
+    Attributes:
+       min (list): Bounding box top-left corner coordinate [x, y]
+       max (list): Bounding box bottom-right corner coordinate [x, y]
+       rgba (list): Outline color [r, g, b, a]
+       size (float): Outline thickness (brush size)
+       inner_rgba (list): Inner fill color [r, g, b, a]
+       uuid (str): Unique identifier
+       timestamp (str): Timestamp of the change
+    """
+
+    _serializable_label = "RectangleAnnotation.1"
+    _name = "RectangleAnnotation"
+
+    def __init__(
+        self,
+        min=None,
+        max=None,
+        rgba=None,
+        size=1.0,
+        inner_rgba=None,
+        visible=True,
+        uuid=None,
+        timestamp=None
+    ):
+        SyncEvent.__init__(self, timestamp)
+        self.uuid = uuid
+
+        if min is not None and not isinstance(min, list):
+            raise TypeError("min must be a list of floats")
+        if max is not None and not isinstance(max, list):
+            raise TypeError("max must be a list of floats")
+        if rgba is not None and not isinstance(rgba, list):
+            raise TypeError("rgba must be a list of floats")
+        if not isinstance(size, (int, float)):
+            raise TypeError("size must be a float")
+        if inner_rgba is not None and not isinstance(inner_rgba, list):
+            raise TypeError("inner_rgba must be a list of floats")
+
+        self.min = min if min is not None else [0.0, 0.0]
+        self.max = max if max is not None else [0.0, 0.0]
+        self.rgba = rgba if rgba is not None else [1.0, 1.0, 1.0, 1.0]
+        self.size = size
+        self.inner_rgba = inner_rgba if inner_rgba is not None else [0.0, 0.0, 0.0, 0.0]
+        self.visible = visible
+
+    min = otio.core.serializable_field(
+        "min",
+        required_type=list,
+        doc="The bounding box top-left corner coordinate in format [x, y]"
+    )
+    max = otio.core.serializable_field(
+        "max",
+        required_type=list,
+        doc="The bounding box bottom-right corner coordinate in format [x, y]"
+    )
+    rgba = otio.core.serializable_field(
+        "rgba",
+        required_type=list,
+        doc="The outline color of the rectangle in RGBA format"
+    )
+    size = otio.core.serializable_field(
+        "size",
+        required_type=float,
+        doc="The line width of the rectangle outline"
+    )
+    inner_rgba = otio.core.serializable_field(
+        "inner_rgba",
+        required_type=list,
+        doc="The inner fill color of the rectangle in RGBA format"
+    )
+    uuid = otio.core.serializable_field(
+        "uuid",
+        doc="The unique identifier for the rectangle annotation"
+    )
+    visible = otio.core.serializable_field(
+        "visible",
+        required_type=bool,
+        doc="The visibility of the rectangle annotation"
+    )
+
+    def __str__(self):
+        return "RectangleAnnotation(min={}, max={})".format(
+            repr(self.min), repr(self.max)
+        )
+
+    def __repr__(self):
+        return "otio.schemadef.SyncEvent.RectangleAnnotation(min={}, max={})".format(
+            repr(self.min), repr(self.max)
+        )
+
+
+@otio.core.register_type
+class ArrowAnnotation(SyncEvent):
+    """A schema for a straight arrow shape.
+
+    Attributes:
+       start (list): Start coordinate [x, y]
+       end (list): End coordinate [x, y]
+       rgba (list): Arrow color [r, g, b, a]
+       size (float): Arrow line thickness
+       uuid (str): Unique identifier
+       timestamp (str): Timestamp of the change
+    """
+
+    _serializable_label = "ArrowAnnotation.1"
+    _name = "ArrowAnnotation"
+
+    def __init__(
+        self,
+        start=None,
+        end=None,
+        rgba=None,
+        size=1.0,
+        visible=True,
+        uuid=None,
+        timestamp=None
+    ):
+        SyncEvent.__init__(self, timestamp)
+        self.uuid = uuid
+
+        if start is not None and not isinstance(start, list):
+            raise TypeError("start must be a list of floats")
+        if end is not None and not isinstance(end, list):
+            raise TypeError("end must be a list of floats")
+        if rgba is not None and not isinstance(rgba, list):
+            raise TypeError("rgba must be a list of floats")
+        if not isinstance(size, (int, float)):
+            raise TypeError("size must be a float")
+
+        self.start = start if start is not None else [0.0, 0.0]
+        self.end = end if end is not None else [0.0, 0.0]
+        self.rgba = rgba if rgba is not None else [1.0, 1.0, 1.0, 1.0]
+        self.size = size
+        self.visible = visible
+
+    start = otio.core.serializable_field(
+        "start",
+        required_type=list,
+        doc="The start tail coordinate in format [x, y]"
+    )
+    end = otio.core.serializable_field(
+        "end",
+        required_type=list,
+        doc="The end head coordinate in format [x, y]"
+    )
+    rgba = otio.core.serializable_field(
+        "rgba",
+        required_type=list,
+        doc="The color of the arrow in RGBA format"
+    )
+    size = otio.core.serializable_field(
+        "size",
+        required_type=float,
+        doc="The line thickness of the arrow"
+    )
+    uuid = otio.core.serializable_field(
+        "uuid",
+        doc="The unique identifier for the arrow annotation"
+    )
+    visible = otio.core.serializable_field(
+        "visible",
+        required_type=bool,
+        doc="The visibility of the arrow annotation"
+    )
+
+    def __str__(self):
+        return "ArrowAnnotation(start={}, end={})".format(
+            repr(self.start), repr(self.end)
+        )
+
+    def __repr__(self):
+        return "otio.schemadef.SyncEvent.ArrowAnnotation(start={}, end={})".format(
+            repr(self.start), repr(self.end)
         )

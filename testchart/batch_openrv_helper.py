@@ -40,8 +40,24 @@ def run_batch():
 
 def _run_batch_impl():
     try:
+        import sys
+        import os
+        import importlib.util
+        
+        # Force load the workspace version of SyncEvent.py
+        workspace_sync_event_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "otio_event_plugin", "schemadefs", "SyncEvent.py"))
+        spec = importlib.util.spec_from_file_location("opentimelineio.schemadef.SyncEvent", workspace_sync_event_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["opentimelineio.schemadef.SyncEvent"] = module
+
         from rv import commands, extra_commands
         import opentimelineio as otio
+        otio.schemadef.SyncEvent = module
+        spec.loader.exec_module(module)
+        
+        print("SyncEvent location:", otio.schemadef.SyncEvent.__file__)
+        print("SyncEvent attributes:", dir(otio.schemadef.SyncEvent))
+            
         import otio_reader
         import ORIAnnotations
         
@@ -188,6 +204,41 @@ def _run_batch_impl():
                                 'rotation': event.rotation
                             }
                             strokes.append(stroke)
+                        elif isinstance(event, otio.schemadef.SyncEvent.EllipseAnnotation):
+                            stroke = {
+                                'type': 'ellipse',
+                                'min': list(event.min),
+                                'max': list(event.max),
+                                'rgba': list(event.rgba),
+                                'size': event.size,
+                                'inner_rgba': list(event.inner_rgba),
+                                'uuid': event.uuid or str(uuid.uuid4()),
+                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
+                            }
+                            strokes.append(stroke)
+                        elif isinstance(event, otio.schemadef.SyncEvent.RectangleAnnotation):
+                            stroke = {
+                                'type': 'rect',
+                                'min': list(event.min),
+                                'max': list(event.max),
+                                'rgba': list(event.rgba),
+                                'size': event.size,
+                                'inner_rgba': list(event.inner_rgba),
+                                'uuid': event.uuid or str(uuid.uuid4()),
+                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
+                            }
+                            strokes.append(stroke)
+                        elif isinstance(event, otio.schemadef.SyncEvent.ArrowAnnotation):
+                            stroke = {
+                                'type': 'arrow',
+                                'start': list(event.start),
+                                'end': list(event.end),
+                                'rgba': list(event.rgba),
+                                'size': event.size,
+                                'uuid': event.uuid or str(uuid.uuid4()),
+                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
+                            }
+                            strokes.append(stroke)
 
                     # Create properties if they don't exist
                     if not commands.propertyExists(f"{rv_node}.tag.annotate"):
@@ -198,35 +249,71 @@ def _run_batch_impl():
                     commands.setIntProperty(f"{rv_node}.internal.creationContext", [1], True)
 
                     order = []
+                    frame_node = f"{rv_node}.frame:{int(frame.frame)}"
                     for stroke in strokes:
+                        rv_frame = int(frame.frame)
+                        def set_prop(node_path, name, ptype, val, dim=1):
+                            if not commands.propertyExists(f"{node_path}.{name}"):
+                                commands.newProperty(f"{node_path}.{name}", ptype, dim)
+                            if ptype == commands.FloatType:
+                                commands.setFloatProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
+                            elif ptype == commands.StringType:
+                                commands.setStringProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
+                            else:
+                                commands.setIntProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
+
                         if stroke['type'] == 'text':
                             text_node = f"{rv_node}.text:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                            rv_frame = int(frame.frame)
-                            def set_prop(name, ptype, val, dim=1):
-                                if not commands.propertyExists(f"{text_node}.{name}"):
-                                    commands.newProperty(f"{text_node}.{name}", ptype, dim)
-                                if ptype == commands.FloatType:
-                                    commands.setFloatProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
-                                elif ptype == commands.StringType:
-                                    commands.setStringProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
-                                else:
-                                    commands.setIntProperty(f"{text_node}.{name}", val if isinstance(val, list) else [val], True)
-                            set_prop("position",    commands.FloatType,  list(stroke['position']), dim=2)
-                            set_prop("color",       commands.FloatType,  [float(x) for x in stroke['color']], dim=4)
-                            set_prop("spacing",     commands.FloatType,  stroke['spacing'] or 0.8)
-                            set_prop("size",        commands.FloatType,  stroke['font_size'] / 5000.0)
-                            set_prop("font",        commands.StringType, "")
-                            set_prop("text",        commands.StringType, stroke['text'])
-                            set_prop("scale",       commands.FloatType,  stroke['scale'] or 1.0)
-                            set_prop("rotation",    commands.FloatType,  stroke['rotation'] or 0.0)
-                            set_prop("origin",      commands.StringType, "")
-                            set_prop("debug",       commands.IntType,    0)
-                            set_prop("startFrame",  commands.IntType,    rv_frame)
-                            set_prop("duration",    commands.IntType,    1)
-                            set_prop("mode",        commands.IntType,    0)
-                            set_prop("uuid",        commands.StringType, stroke.get('uuid', str(uuid.uuid4())))
-                            set_prop("softDeleted", commands.IntType,    0)
+                            set_prop(text_node, "position",    commands.FloatType,  list(stroke['position']), dim=2)
+                            set_prop(text_node, "color",       commands.FloatType,  [float(x) for x in stroke['color']], dim=4)
+                            set_prop(text_node, "spacing",     commands.FloatType,  stroke['spacing'] or 0.8)
+                            set_prop(text_node, "size",        commands.FloatType,  stroke['font_size'] / 5000.0)
+                            set_prop(text_node, "font",        commands.StringType, "")
+                            set_prop(text_node, "text",        commands.StringType, stroke['text'])
+                            set_prop(text_node, "scale",       commands.FloatType,  stroke['scale'] or 1.0)
+                            set_prop(text_node, "rotation",    commands.FloatType,  stroke['rotation'] or 0.0)
+                            set_prop(text_node, "origin",      commands.StringType, "")
+                            set_prop(text_node, "debug",       commands.IntType,    0)
+                            set_prop(text_node, "startFrame",  commands.IntType,    rv_frame)
+                            set_prop(text_node, "duration",    commands.IntType,    1)
+                            set_prop(text_node, "mode",        commands.IntType,    0)
+                            set_prop(text_node, "uuid",        commands.StringType, stroke.get('uuid', str(uuid.uuid4())))
+                            set_prop(text_node, "softDeleted", commands.IntType,    0)
                             order.append(f"text:{strokeid}:{rv_frame}:{stroke['user']}")
+                            strokeid += 1
+                            continue
+
+                        if stroke['type'] in ['ellipse', 'rect']:
+                            shape_type = stroke['type']
+                            shape_node = f"{rv_node}.{shape_type}:{strokeid}:{int(frame.frame)}:{stroke['user']}"
+                            set_prop(shape_node, "min",         commands.FloatType,  stroke['min'], dim=2)
+                            set_prop(shape_node, "max",         commands.FloatType,  stroke['max'], dim=2)
+                            set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
+                            set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['inner_rgba'], dim=4)
+                            set_prop(shape_node, "borderWidth", commands.FloatType,  stroke['size'] / 2.0)
+                            set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
+                            set_prop(shape_node, "duration",    commands.IntType,    1)
+                            set_prop(shape_node, "eye",         commands.IntType,    2)
+                            set_prop(shape_node, "uuid",        commands.StringType, stroke['uuid'])
+                            set_prop(shape_node, "softDeleted", commands.IntType,    0)
+                            order.append(f"{shape_type}:{strokeid}:{rv_frame}:{stroke['user']}")
+                            strokeid += 1
+                            continue
+
+                        if stroke['type'] == 'arrow':
+                            shape_node = f"{rv_node}.arrow:{strokeid}:{int(frame.frame)}:{stroke['user']}"
+                            set_prop(shape_node, "startPos",    commands.FloatType,  stroke['start'], dim=2)
+                            set_prop(shape_node, "endPos",      commands.FloatType,  stroke['end'], dim=2)
+                            set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
+                            set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['rgba'], dim=4)
+                            set_prop(shape_node, "borderWidth", commands.FloatType,  0.0)
+                            set_prop(shape_node, "thickness",   commands.FloatType,  stroke['size'] / 2.0)
+                            set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
+                            set_prop(shape_node, "duration",    commands.IntType,    1)
+                            set_prop(shape_node, "eye",         commands.IntType,    2)
+                            set_prop(shape_node, "uuid",        commands.StringType, stroke['uuid'])
+                            set_prop(shape_node, "softDeleted", commands.IntType,    0)
+                            order.append(f"arrow:{strokeid}:{rv_frame}:{stroke['user']}")
                             strokeid += 1
                             continue
 
@@ -293,8 +380,7 @@ def _run_batch_impl():
         
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-            
-        # Get annotated frames across all sources
+                 # Get annotated frames across all sources
         annotated_frames = extra_commands.findAnnotatedFrames()
         if annotated_frames:
             # Locate rvio
@@ -302,21 +388,52 @@ def _run_batch_impl():
             if not os.path.exists(rvio_bin):
                 rvio_bin = "/Applications/OpenRV.app/Contents/MacOS/rvio"
                 
-            # Export frames to temp png files
-            frames_str = ",".join(str(f) for f in annotated_frames)
-            export_pattern = os.path.join(output_dir, "export.%d.png")
-            rvio_cmd = [
-                rvio_bin,
-                temp_session_name,
-                "-t", frames_str,
-                "-outsrgb",
-                "-o", export_pattern
-            ]
-            print(f"Running rvio: {rvio_cmd}")
-            subprocess.run(rvio_cmd, check=True)
-            
-            # Rename outputs to match media naming
             for globalframe in annotated_frames:
+                export_file = os.path.join(output_dir, f"export.{globalframe}.png")
+                rvio_cmd = [
+                    rvio_bin,
+                    temp_session_name,
+                    "-t", str(globalframe),
+                    "-outsrgb",
+                    "-o", export_file
+                ]
+                print(f"Running rvio for frame {globalframe}: {rvio_cmd}")
+                try:
+                    subprocess.run(rvio_cmd, check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: rvio failed to render frame {globalframe}: {e}")
+                    print(f"Attempting GUI fallback grab for frame {globalframe}...")
+                    
+                    # Locate RV binary
+                    rv_bin = os.path.join(os.path.dirname(sys.argv[0]), "RV")
+                    if not os.path.exists(rv_bin):
+                        rv_bin = "/Users/sam/git/openrv_annotations/_build/stage/app/RV.app/Contents/MacOS/RV"
+                        
+                    grab_script = os.path.join(os.path.dirname(__file__), "grab_frame.py")
+                    
+                    env_grab = os.environ.copy()
+                    env_grab["GRAB_FRAME"] = str(globalframe)
+                    env_grab["GRAB_OUTPUT_PATH"] = export_file
+                    
+                    cmd_grab = [
+                        rv_bin,
+                        temp_session_name,
+                        "-pyeval",
+                        f"exec(open('{grab_script}').read())"
+                    ]
+                    try:
+                        subprocess.run(cmd_grab, env=env_grab, check=True)
+                        print(f"Successfully generated frame {globalframe} via GUI fallback grab.")
+                    except Exception as e_grab:
+                        print(f"Warning: GUI fallback grab failed: {e_grab}")
+                        if os.path.exists(export_file):
+                            try:
+                                os.remove(export_file)
+                            except Exception:
+                                pass
+                        continue
+                
+                # Rename the output to match media naming
                 for source in commands.sourcesAtFrame(globalframe):
                     source_group = commands.nodeGroup(source)
                     source_frame = extra_commands.sourceFrame(globalframe)
@@ -328,14 +445,18 @@ def _run_batch_impl():
                         outputuiname = outputuiname.replace("__", "_")
                     outputuiname = outputuiname.strip("_")
 
-                    
-                    src_file = os.path.join(output_dir, f"export.{globalframe}.png")
                     dest_file = os.path.join(output_dir, f"{outputuiname}.{source_frame:05d}.png")
-                    if os.path.exists(src_file):
+                    if os.path.exists(export_file):
                         if os.path.exists(dest_file):
-                            os.remove(dest_file)
-                        os.rename(src_file, dest_file)
-                        print(f"Generated: {dest_file}")
+                            try:
+                                os.remove(dest_file)
+                            except Exception:
+                                pass
+                        try:
+                            os.rename(export_file, dest_file)
+                            print(f"Generated: {dest_file}")
+                        except Exception as rename_err:
+                            print(f"Error renaming {export_file} to {dest_file}: {rename_err}")
                         
         # Save exported OTIO with relative paths
         otio_export_path = os.path.join(output_dir, os.path.basename(otio_path))

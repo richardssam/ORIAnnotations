@@ -229,7 +229,7 @@
 </head>
 <body>
     <div class="container">
-        <nav class="sidebar"><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#remove-timeline">RemoveTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul><h2>Uncategorized</h2><ul><li><a href="#replace-timeline">ReplaceTimeline</a></li></ul></nav>
+        <nav class="sidebar"><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li><li><a href="#ellipse-annotation">EllipseAnnotation</a></li><li><a href="#rectangle-annotation">RectangleAnnotation</a></li><li><a href="#arrow-annotation">ArrowAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#remove-timeline">RemoveTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul><h2>Uncategorized</h2><ul><li><a href="#replace-timeline">ReplaceTimeline</a></li></ul></nav>
         <main class="content"><div class="section"><div class="intro-content"><h1>OTIO Sync Protocol</h1>
 <p>This project synchronises live review sessions (playback, selection, and
 annotations) between hosts such as OpenRV and xStudio. It is built on two
@@ -1391,6 +1391,398 @@ event = otio.schema.schemadef.TextAnnotation(
 </pre>
                     </div>
                 </div></div>
+        <div id="ellipse-annotation" class="section">
+            <h2>EllipseAnnotation</h2>
+            <span class="schema-label">EllipseAnnotation.1</span>
+            <div class="description">A schema for an ellipse shape.</div>
+            <h3>Parameters</h3>
+            <table class="params-table">
+                <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td><code>min</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The bounding box top-left corner coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>max</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The bounding box bottom-right corner coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>rgba</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The outline color of the ellipse in RGBA format</td>
+                    </tr>
+                    <tr>
+                        <td><code>size</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">float</span></td>
+                        <td>The line width of the ellipse outline</td>
+                    </tr>
+                    <tr>
+                        <td><code>inner_rgba</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The inner fill color of the ellipse in RGBA format</td>
+                    </tr>
+                    <tr>
+                        <td><code>visible</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">bool</span></td>
+                        <td>The visibility of the ellipse annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>The unique identifier for the ellipse annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td></td>
+                    </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-ellipse-annotation"><button class="example-tab active" onclick="switchExampleTab(event, 'ellipse-annotation', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'ellipse-annotation', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'ellipse-annotation', 'filled_blue')">Filled Blue</button><button class="example-tab " onclick="switchExampleTab(event, 'ellipse-annotation', 'filled_blue_python')">Filled Blue (Python)</button></div>
+                <div id="ellipse-annotation-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"EllipseAnnotation.1"</span>,
+  <span class="json-key">"inner_rgba"</span>: [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  <span class="json-key">"max"</span>: [
+    0.25,
+    -0.25
+  ],
+  <span class="json-key">"min"</span>: [
+    -0.25,
+    0.25
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"size"</span>: <span class="json-number">2.0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"ellipse_annotation_uuid_001"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="ellipse-annotation-default_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># OTIO SyncEvent (serialized as OpenTimelineIO object)</span>
+<span class="py-keyword">import</span> opentimelineio <span class="py-keyword">as</span> otio
+
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.EllipseAnnotation(
+    uuid=<span class="py-string">"ellipse_annotation_uuid_001"</span>,
+    min=[<span class="py-number">-0.25</span>, <span class="py-number">0.25</span>],
+    max=[<span class="py-number">0.25</span>, <span class="py-number">-0.25</span>],
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    size=<span class="py-number">2.0</span>,
+    inner_rgba=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>],
+    timestamp=<span class="py-string">"2025-01-31T16:14:00Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="ellipse-annotation-filled_blue" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"EllipseAnnotation.1"</span>,
+  <span class="json-key">"inner_rgba"</span>: [
+    0.0,
+    0.0,
+    1.0,
+    0.5
+  ],
+  <span class="json-key">"max"</span>: [
+    -0.15,
+    0.15
+  ],
+  <span class="json-key">"min"</span>: [
+    -0.45,
+    0.45
+  ],
+  <span class="json-key">"rgba"</span>: [
+    0.0,
+    0.0,
+    1.0,
+    1.0
+  ],
+  <span class="json-key">"size"</span>: <span class="json-number">1.5</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">15</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"ellipse_annotation_uuid_002"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="ellipse-annotation-filled_blue_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># OTIO SyncEvent (serialized as OpenTimelineIO object)</span>
+<span class="py-keyword">import</span> opentimelineio <span class="py-keyword">as</span> otio
+
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.EllipseAnnotation(
+    uuid=<span class="py-string">"ellipse_annotation_uuid_002"</span>,
+    min=[<span class="py-number">-0.45</span>, <span class="py-number">0.45</span>],
+    max=[<span class="py-number">-0.15</span>, <span class="py-number">0.15</span>],
+    rgba=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>],
+    size=<span class="py-number">1.5</span>,
+    inner_rgba=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.5</span>],
+    timestamp=<span class="py-string">"2025-01-31T16:15:00Z"</span>,
+)
+</pre>
+                    </div>
+                </div></div>
+        <div id="rectangle-annotation" class="section">
+            <h2>RectangleAnnotation</h2>
+            <span class="schema-label">RectangleAnnotation.1</span>
+            <div class="description">A schema for a rectangle shape.</div>
+            <h3>Parameters</h3>
+            <table class="params-table">
+                <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td><code>min</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The bounding box top-left corner coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>max</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The bounding box bottom-right corner coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>rgba</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The outline color of the rectangle in RGBA format</td>
+                    </tr>
+                    <tr>
+                        <td><code>size</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">float</span></td>
+                        <td>The line width of the rectangle outline</td>
+                    </tr>
+                    <tr>
+                        <td><code>inner_rgba</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The inner fill color of the rectangle in RGBA format</td>
+                    </tr>
+                    <tr>
+                        <td><code>visible</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">bool</span></td>
+                        <td>The visibility of the rectangle annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>The unique identifier for the rectangle annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td></td>
+                    </tr></tbody></table><h3>Examples</h3><div class="example-tabs" id="tabs-rectangle-annotation"><button class="example-tab active" onclick="switchExampleTab(event, 'rectangle-annotation', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'rectangle-annotation', 'default_python')">Default (Python)</button><button class="example-tab " onclick="switchExampleTab(event, 'rectangle-annotation', 'filled_rect')">Filled Rect</button><button class="example-tab " onclick="switchExampleTab(event, 'rectangle-annotation', 'filled_rect_python')">Filled Rect (Python)</button></div>
+                <div id="rectangle-annotation-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RectangleAnnotation.1"</span>,
+  <span class="json-key">"inner_rgba"</span>: [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  <span class="json-key">"max"</span>: [
+    0.2,
+    -0.1
+  ],
+  <span class="json-key">"min"</span>: [
+    -0.2,
+    0.2
+  ],
+  <span class="json-key">"rgba"</span>: [
+    0.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"size"</span>: <span class="json-number">2.0</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"rectangle_annotation_uuid_001"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="rectangle-annotation-default_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># OTIO SyncEvent (serialized as OpenTimelineIO object)</span>
+<span class="py-keyword">import</span> opentimelineio <span class="py-keyword">as</span> otio
+
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.RectangleAnnotation(
+    uuid=<span class="py-string">"rectangle_annotation_uuid_001"</span>,
+    min=[<span class="py-number">-0.2</span>, <span class="py-number">0.2</span>],
+    max=[<span class="py-number">0.2</span>, <span class="py-number">-0.1</span>],
+    rgba=[<span class="py-number">0.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    size=<span class="py-number">2.0</span>,
+    inner_rgba=[<span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>],
+    timestamp=<span class="py-string">"2025-01-31T16:14:00Z"</span>,
+)
+</pre>
+                    </div>
+                </div>
+                <div id="rectangle-annotation-filled_rect" class="example-content ">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"RectangleAnnotation.1"</span>,
+  <span class="json-key">"inner_rgba"</span>: [
+    1.0,
+    0.0,
+    0.0,
+    0.7
+  ],
+  <span class="json-key">"max"</span>: [
+    0.4,
+    -0.1
+  ],
+  <span class="json-key">"min"</span>: [
+    0.1,
+    0.1
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  <span class="json-key">"size"</span>: <span class="json-number">2.5</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">16</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"rectangle_annotation_uuid_002"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="rectangle-annotation-filled_rect_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># OTIO SyncEvent (serialized as OpenTimelineIO object)</span>
+<span class="py-keyword">import</span> opentimelineio <span class="py-keyword">as</span> otio
+
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.RectangleAnnotation(
+    uuid=<span class="py-string">"rectangle_annotation_uuid_002"</span>,
+    min=[<span class="py-number">0.1</span>, <span class="py-number">0.1</span>],
+    max=[<span class="py-number">0.4</span>, <span class="py-number">-0.1</span>],
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">1.0</span>],
+    size=<span class="py-number">2.5</span>,
+    inner_rgba=[<span class="py-number">1.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.0</span>, <span class="py-number">0.7</span>],
+    timestamp=<span class="py-string">"2025-01-31T16:16:00Z"</span>,
+)
+</pre>
+                    </div>
+                </div></div>
+        <div id="arrow-annotation" class="section">
+            <h2>ArrowAnnotation</h2>
+            <span class="schema-label">ArrowAnnotation.1</span>
+            <div class="description">A schema for a straight arrow shape.</div>
+            <h3>Parameters</h3>
+            <table class="params-table">
+                <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td><code>start</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The start tail coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>end</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The end head coordinate in format [x, y]</td>
+                    </tr>
+                    <tr>
+                        <td><code>rgba</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">list</span></td>
+                        <td>The color of the arrow in RGBA format</td>
+                    </tr>
+                    <tr>
+                        <td><code>size</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">float</span></td>
+                        <td>The line thickness of the arrow</td>
+                    </tr>
+                    <tr>
+                        <td><code>visible</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">bool</span></td>
+                        <td>The visibility of the arrow annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>uuid</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>The unique identifier for the arrow annotation</td>
+                    </tr>
+                    <tr>
+                        <td><code>timestamp</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td></td>
+                    </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-arrow-annotation"><button class="example-tab active" onclick="switchExampleTab(event, 'arrow-annotation', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'arrow-annotation', 'default_python')">Default (Python)</button></div>
+                <div id="arrow-annotation-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"ArrowAnnotation.1"</span>,
+  <span class="json-key">"end"</span>: [
+    0.4,
+    0.4
+  ],
+  <span class="json-key">"rgba"</span>: [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  <span class="json-key">"size"</span>: <span class="json-number">3.0</span>,
+  <span class="json-key">"start"</span>: [
+    -0.4,
+    -0.4
+  ],
+  <span class="json-key">"timestamp"</span>: <span class="json-string">"2025-01-31T16: <span class="json-number">14</span>: <span class="json-number">00</span>Z"</span>,
+  <span class="json-key">"uuid"</span>: <span class="json-string">"arrow_annotation_uuid_001"</span>,
+  <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+}</pre>
+                    </div>
+                </div>
+                <div id="arrow-annotation-default_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># OTIO SyncEvent (serialized as OpenTimelineIO object)</span>
+<span class="py-keyword">import</span> opentimelineio <span class="py-keyword">as</span> otio
+
+SyncEvent = otio.schema.schemadef.module_from_name(<span class="py-string">"SyncEvent"</span>)
+
+event = otio.schema.schemadef.ArrowAnnotation(
+    uuid=<span class="py-string">"arrow_annotation_uuid_001"</span>,
+    start=[<span class="py-number">-0.4</span>, <span class="py-number">-0.4</span>],
+    end=[<span class="py-number">0.4</span>, <span class="py-number">0.4</span>],
+    rgba=[<span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>, <span class="py-number">1.0</span>],
+    size=<span class="py-number">3.0</span>,
+    timestamp=<span class="py-string">"2025-01-31T16:14:00Z"</span>,
+)
+</pre>
+                    </div>
+                </div></div>
         <div id="partial-annotation" class="section">
             <h2>PartialAnnotation</h2>
             <span class="schema-label">Annotation.1</span><span class="event-label">event: PARTIAL</span>
@@ -1436,13 +1828,83 @@ performed.</div>
     <span class="json-key">"command"</span>: {
       <span class="json-key">"event"</span>: <span class="json-string">"PARTIAL"</span>,
       <span class="json-key">"payload"</span>: {
-        <span class="json-key">"clip_guid"</span>: <span class="json-string">"clip-guid-001"</span>,
-        <span class="json-key">"frame"</span>: <span class="json-number">12.0</span>,
+        <span class="json-key">"clip_guid"</span>: <span class="json-string">"abf2a376-917a-496d-9249-61ad5c2e8397"</span>,
+        <span class="json-key">"frame"</span>: <span class="json-number">89898.0</span>,
         <span class="json-key">"fps"</span>: <span class="json-number">24.0</span>,
         <span class="json-key">"events"</span>: [
           {
             <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintStart.1"</span>,
-            <span class="json-key">"uuid"</span>: <span class="json-string">"stroke-001"</span>
+            <span class="json-key">"brush"</span>: <span class="json-string">"circle"</span>,
+            <span class="json-key">"friendly_name"</span>: <span class="json-string">"sam_81003"</span>,
+            <span class="json-key">"ghost"</span>: <span class="json-boolean">false</span>,
+            <span class="json-key">"ghost_after"</span>: <span class="json-number">0</span>,
+            <span class="json-key">"ghost_before"</span>: <span class="json-number">0</span>,
+            <span class="json-key">"hold"</span>: <span class="json-boolean">false</span>,
+            <span class="json-key">"layer_range"</span>: <span class="json-null">null</span>,
+            <span class="json-key">"participant_hash"</span>: <span class="json-null">null</span>,
+            <span class="json-key">"rgba"</span>: [
+              0.12207217514514923,
+              0.12207217514514923,
+              0.7411764860153198,
+              1.0
+            ],
+            <span class="json-key">"source_index"</span>: <span class="json-number">0</span>,
+            <span class="json-key">"timestamp"</span>: <span class="json-string">"2026-06-02T20: <span class="json-number">46</span>: <span class="json-number">19.501940</span>"</span>,
+            <span class="json-key">"type"</span>: <span class="json-string">"color"</span>,
+            <span class="json-key">"uuid"</span>: <span class="json-string">"aa726033-ff02-4d4c-bcca-f57f8ae77ea8"</span>,
+            <span class="json-key">"visible"</span>: <span class="json-boolean">true</span>
+          },
+          {
+            <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintPoint.1"</span>,
+            <span class="json-key">"layer_range"</span>: <span class="json-null">null</span>,
+            <span class="json-key">"points"</span>: {
+              <span class="json-key">"OTIO_SCHEMA"</span>: <span class="json-string">"PaintVertices.1"</span>,
+              <span class="json-key">"size"</span>: [
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565,
+                0.006075292360037565
+              ],
+              <span class="json-key">"x"</span>: [
+                -0.324410080909729,
+                -0.3169737756252289,
+                -0.3021010756492615,
+                -0.2835102677345276,
+                -0.26120126247406006,
+                -0.17196524143218994,
+                0.013943103142082691,
+                0.05112481489777565,
+                0.09202462434768677,
+                0.10503822565078735,
+                0.11991093307733536,
+                0.1292063295841217,
+                0.1292063295841217
+              ],
+              <span class="json-key">"y"</span>: [
+                0.28072163462638855,
+                0.27328526973724365,
+                0.2621307969093323,
+                0.25283536314964294,
+                0.2509762942790985,
+                0.24725812673568726,
+                0.25841259956359863,
+                0.2639898657798767,
+                0.2751443386077881,
+                0.28629887104034424,
+                0.30117154121398926,
+                0.3123260736465454,
+                0.3160442113876343
+              ]
+            }
           }
         ]
       }
@@ -1458,10 +1920,80 @@ performed.</div>
 <span class="py-keyword">from</span> otio_sync_core.protocol_messages <span class="py-keyword">import</span> PartialAnnotation
 
 msg = PartialAnnotation(
-    clip_guid=<span class="py-string">"clip-guid-001"</span>,
-    frame=<span class="py-number">12.0</span>,
+    clip_guid=<span class="py-string">"abf2a376-917a-496d-9249-61ad5c2e8397"</span>,
+    frame=<span class="py-number">89898.0</span>,
     fps=<span class="py-number">24.0</span>,
-    events=[{<span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"PaintStart.1"</span>, <span class="py-string">"uuid"</span>: <span class="py-string">"stroke-001"</span>}],
+    events=[
+        {
+            <span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"PaintStart.1"</span>,
+            <span class="py-string">"brush"</span>: <span class="py-string">"circle"</span>,
+            <span class="py-string">"friendly_name"</span>: <span class="py-string">"sam_81003"</span>,
+            <span class="py-string">"ghost"</span>: <span class="py-keyword">False</span>,
+            <span class="py-string">"ghost_after"</span>: <span class="py-number">0</span>,
+            <span class="py-string">"ghost_before"</span>: <span class="py-number">0</span>,
+            <span class="py-string">"hold"</span>: <span class="py-keyword">False</span>,
+            <span class="py-string">"layer_range"</span>: <span class="py-keyword">None</span>,
+            <span class="py-string">"participant_hash"</span>: <span class="py-keyword">None</span>,
+            <span class="py-string">"rgba"</span>: [<span class="py-number">0.12207217514514923</span>, <span class="py-number">0.12207217514514923</span>, <span class="py-number">0.7411764860153198</span>, <span class="py-number">1.0</span>],
+            <span class="py-string">"source_index"</span>: <span class="py-number">0</span>,
+            <span class="py-string">"timestamp"</span>: <span class="py-string">"2026-06-02T20:46:19.501940"</span>,
+            <span class="py-string">"type"</span>: <span class="py-string">"color"</span>,
+            <span class="py-string">"uuid"</span>: <span class="py-string">"aa726033-ff02-4d4c-bcca-f57f8ae77ea8"</span>,
+            <span class="py-string">"visible"</span>: <span class="py-keyword">True</span>,
+        },
+        {
+            <span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"PaintPoint.1"</span>,
+            <span class="py-string">"layer_range"</span>: <span class="py-keyword">None</span>,
+            <span class="py-string">"points"</span>: {
+                <span class="py-string">"OTIO_SCHEMA"</span>: <span class="py-string">"PaintVertices.1"</span>,
+                <span class="py-string">"size"</span>: [
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                    <span class="py-number">0.006075292360037565</span>,
+                ],
+                <span class="py-string">"x"</span>: [
+                    <span class="py-number">-0.324410080909729</span>,
+                    <span class="py-number">-0.3169737756252289</span>,
+                    <span class="py-number">-0.3021010756492615</span>,
+                    <span class="py-number">-0.2835102677345276</span>,
+                    <span class="py-number">-0.26120126247406006</span>,
+                    <span class="py-number">-0.17196524143218994</span>,
+                    <span class="py-number">0.013943103142082691</span>,
+                    <span class="py-number">0.05112481489777565</span>,
+                    <span class="py-number">0.09202462434768677</span>,
+                    <span class="py-number">0.10503822565078735</span>,
+                    <span class="py-number">0.11991093307733536</span>,
+                    <span class="py-number">0.1292063295841217</span>,
+                    <span class="py-number">0.1292063295841217</span>,
+                ],
+                <span class="py-string">"y"</span>: [
+                    <span class="py-number">0.28072163462638855</span>,
+                    <span class="py-number">0.27328526973724365</span>,
+                    <span class="py-number">0.2621307969093323</span>,
+                    <span class="py-number">0.25283536314964294</span>,
+                    <span class="py-number">0.2509762942790985</span>,
+                    <span class="py-number">0.24725812673568726</span>,
+                    <span class="py-number">0.25841259956359863</span>,
+                    <span class="py-number">0.2639898657798767</span>,
+                    <span class="py-number">0.2751443386077881</span>,
+                    <span class="py-number">0.28629887104034424</span>,
+                    <span class="py-number">0.30117154121398926</span>,
+                    <span class="py-number">0.3123260736465454</span>,
+                    <span class="py-number">0.3160442113876343</span>,
+                ],
+            },
+        },
+    ],
 )
 </pre>
                     </div>

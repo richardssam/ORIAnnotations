@@ -649,6 +649,10 @@ class AnnotationSyncController:
                 # so subsequent scans detect only real user edits.
                 self._last_sent_captions[cap_key] = current_sig
                 saved_sig = current_sig  # fall through with no mismatch
+                _log(
+                    f"[DRAG] caption baseline confirmed for bm={str(bm_uuid)[:8]}"
+                    f" ({len(all_captions)} captions)"
+                )
             if saved_sig != current_sig:
                 with self._our_bookmark_uuids_lock:
                     is_remote_bookmark = str(bm_uuid) in self._our_bookmark_uuids
@@ -703,6 +707,8 @@ class AnnotationSyncController:
                             ann_clip_guid, all_events
                         )
                     self._last_sent_captions[cap_key] = current_sig
+                    # Keep cache consistent so future ADD scans don't re-detect captions.
+                    self._bookmark_captions_cache[bm_key] = all_captions
                     return True
 
         events = (
@@ -960,6 +966,12 @@ class AnnotationSyncController:
                 self._last_sent_captions[str(bm.uuid)] = (
                     self._CAPTION_SIG_UNCONFIRMED
                 )
+                # Trigger a fast confirmation scan (~DEBOUNCE_SECONDS = 250 ms)
+                # instead of waiting for the full 1-second periodic scan.  This
+                # shrinks the window where a concurrent user drag gets silently
+                # captured as the post-refresh baseline.
+                if self.plugin._annotation_pending_time is None:
+                    self.plugin._annotation_pending_time = time.monotonic()
         except Exception:
             _log_exc("refresh_annotation_bookmark: failed")
 

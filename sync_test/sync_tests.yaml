@@ -75,7 +75,7 @@ tests:
       - "xstudio"
       - "openrv"
   - name: "reorder_media"
-    recording: "recordings/reorder_media_notc_v2.jsonl"
+    recording: "recordings/reorder_media_v2.jsonl"
     script_driven: false
     checkpoint_validation_delay: 4.5
     apps:

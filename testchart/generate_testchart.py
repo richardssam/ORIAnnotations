@@ -462,6 +462,150 @@ def vector_shapes_annotations():
             rgba=[0.86, 0.47, 0.16, 1.0], brush_size=4 / H
         )
 
+    # Trace all concentric shapes
+    return ev
+
+
+def create_vector_primitives_image(path, is_uhd=False):
+    from PIL import Image, ImageDraw
+
+    scale = 2 if is_uhd else 1
+    W, H = LAND_W * scale, LAND_H * scale
+    img  = Image.new("RGB", (W, H), (245, 245, 240))
+    d    = ImageDraw.Draw(img)
+    title_f = _load_font(24 * scale)
+    section_f = _load_font(18 * scale)
+
+    title_text = "VECTOR PRIMITIVES TEST CHART  3840×2160" if is_uhd else "VECTOR PRIMITIVES TEST CHART  1920×1080"
+    d.text((50*scale, 40*scale), title_text, fill=(40, 40, 50), font=title_f)
+
+    ref_color = (80, 80, 90)
+    fill_color = (200, 200, 210)
+
+    # Helper to draw arrows in PIL
+    def _draw_pil_arrow(draw_ctx, start_pt, end_pt, color, width):
+        draw_ctx.line([start_pt, end_pt], fill=color, width=width)
+        dx = end_pt[0] - start_pt[0]
+        dy = end_pt[1] - start_pt[1]
+        length = math.sqrt(dx*dx + dy*dy)
+        if length > 0:
+            ux, uy = dx/length, dy/length
+            angle = math.atan2(uy, ux)
+            barb_len = 25 * scale
+            a1 = angle - math.pi / 6
+            a2 = angle + math.pi / 6
+            bx1 = end_pt[0] - barb_len * math.cos(a1)
+            by1 = end_pt[1] - barb_len * math.sin(a1)
+            bx2 = end_pt[0] - barb_len * math.cos(a2)
+            by2 = end_pt[1] - barb_len * math.sin(a2)
+            draw_ctx.line([end_pt, (bx1, by1)], fill=color, width=width)
+            draw_ctx.line([end_pt, (bx2, by2)], fill=color, width=width)
+
+    # 1. Rectangles
+    d.text((150*scale, 120*scale), "Rectangles Test", fill=(60, 60, 70), font=section_f)
+    # Hollow rectangle
+    d.rectangle([
+        (150*scale, 300*scale),
+        (550*scale, 500*scale)
+    ], outline=ref_color, width=4*scale)
+    # Filled rectangle
+    d.rectangle([
+        (150*scale, 550*scale),
+        (550*scale, 750*scale)
+    ], fill=fill_color, outline=ref_color, width=4*scale)
+
+    # 2. Ellipses
+    d.text((760*scale, 120*scale), "Ellipses Test", fill=(60, 60, 70), font=section_f)
+    # Hollow ellipse
+    d.ellipse([
+        (760*scale, 300*scale),
+        (1160*scale, 500*scale)
+    ], outline=ref_color, width=4*scale)
+    # Filled ellipse
+    d.ellipse([
+        (760*scale, 550*scale),
+        (1160*scale, 750*scale)
+    ], fill=fill_color, outline=ref_color, width=4*scale)
+
+    # 3. Arrows
+    d.text((1370*scale, 120*scale), "Arrows Test", fill=(60, 60, 70), font=section_f)
+    # Arrow 1
+    _draw_pil_arrow(d, (1370*scale, 350*scale), (1770*scale, 450*scale), ref_color, 4*scale)
+    # Arrow 2
+    _draw_pil_arrow(d, (1770*scale, 550*scale), (1370*scale, 750*scale), ref_color, 4*scale)
+
+    _crosshair(d, W // 2, H // 2, size=40*scale, lw=2*scale)
+    c_lw = CORNER_LINE_WIDTH * scale
+    d.line([c_lw, c_lw, W - 1 - c_lw, c_lw, W - 1 - c_lw, H - 1 - c_lw, c_lw, H - 1 - c_lw, c_lw, c_lw], fill=(120, 120, 130), width=2*scale)
+
+    img.save(path)
+    print(f"  Saved primitives image: {path}")
+
+
+def vector_primitives_annotations():
+    W, H = LAND_W, LAND_H
+    se = otio.schema.schemadef.module_from_name('SyncEvent')
+    ev = []
+
+    # Helper to convert pixel min/max to normalized
+    def make_rect_ann(min_px, max_px, rgba, size, inner_rgba):
+        nx_min, ny_min = px_to_norm(min_px[0], min_px[1], W, H)
+        nx_max, ny_max = px_to_norm(max_px[0], max_px[1], W, H)
+        min_x = min(nx_min, nx_max)
+        max_x = max(nx_min, nx_max)
+        min_y = min(ny_min, ny_max)
+        max_y = max(ny_min, ny_max)
+        return se.RectangleAnnotation(
+            min=[min_x, min_y],
+            max=[max_x, max_y],
+            rgba=rgba,
+            size=size,
+            inner_rgba=inner_rgba,
+            uuid=str(uuid.uuid4()),
+            timestamp=ts()
+        )
+
+    def make_ellipse_ann(min_px, max_px, rgba, size, inner_rgba):
+        nx_min, ny_min = px_to_norm(min_px[0], min_px[1], W, H)
+        nx_max, ny_max = px_to_norm(max_px[0], max_px[1], W, H)
+        min_x = min(nx_min, nx_max)
+        max_x = max(nx_min, nx_max)
+        min_y = min(ny_min, ny_max)
+        max_y = max(ny_min, ny_max)
+        return se.EllipseAnnotation(
+            min=[min_x, min_y],
+            max=[max_x, max_y],
+            rgba=rgba,
+            size=size,
+            inner_rgba=inner_rgba,
+            uuid=str(uuid.uuid4()),
+            timestamp=ts()
+        )
+
+    def make_arrow_ann(start_px, end_px, rgba, size):
+        nx_start, ny_start = px_to_norm(start_px[0], start_px[1], W, H)
+        nx_end, ny_end = px_to_norm(end_px[0], end_px[1], W, H)
+        return se.ArrowAnnotation(
+            start=[nx_start, ny_start],
+            end=[nx_end, ny_end],
+            rgba=rgba,
+            size=size,
+            uuid=str(uuid.uuid4()),
+            timestamp=ts()
+        )
+
+    # 1. Rectangles (Blue borders [0.1, 0.4, 0.9, 1.0], Green fills [0.2, 0.8, 0.3])
+    ev.append(make_rect_ann([150, 300], [550, 500], [0.1, 0.4, 0.9, 1.0], 4.0 / H, [0.2, 0.8, 0.3, 0.0]))
+    ev.append(make_rect_ann([150, 550], [550, 750], [0.1, 0.4, 0.9, 1.0], 4.0 / H, [0.2, 0.8, 0.3, 0.5]))
+
+    # 2. Ellipses (Blue borders [0.1, 0.4, 0.9, 1.0], Green fills [0.2, 0.8, 0.3])
+    ev.append(make_ellipse_ann([760, 300], [1160, 500], [0.1, 0.4, 0.9, 1.0], 4.0 / H, [0.2, 0.8, 0.3, 0.0]))
+    ev.append(make_ellipse_ann([760, 550], [1160, 750], [0.1, 0.4, 0.9, 1.0], 4.0 / H, [0.2, 0.8, 0.3, 0.5]))
+
+    # 3. Arrows
+    ev.append(make_arrow_ann([1370, 350], [1770, 450], [0.86, 0.47, 0.16, 1.0], 4.0 / H))
+    ev.append(make_arrow_ann([1770, 550], [1370, 750], [0.86, 0.47, 0.16, 1.0], 4.0 / H))
+
     # Corner tracing lines
     line1pixel = 2 / H
     ev += make_stroke(line_pts(0, 0, CORNER_LINE_WIDTH, CORNER_LINE_WIDTH, 4), W, H, rgba=[0, 1, 0, 1.0], brush_size=line1pixel)
@@ -983,6 +1127,8 @@ def main():
     v_colors_uhd_path = os.path.join(SCRIPT_DIR, "vector_colors_uhd.png")
     v_fonts_path = os.path.join(SCRIPT_DIR, "vector_fonts.png")
     v_fonts_uhd_path = os.path.join(SCRIPT_DIR, "vector_fonts_uhd.png")
+    v_primitives_path = os.path.join(SCRIPT_DIR, "vector_primitives.png")
+    v_primitives_uhd_path = os.path.join(SCRIPT_DIR, "vector_primitives_uhd.png")
 
     otio_path = os.path.join(SCRIPT_DIR, "testchart_annotations.otio")
 
@@ -997,6 +1143,8 @@ def main():
     create_vector_colors_image(v_colors_uhd_path, is_uhd=True)
     create_vector_fonts_image(v_fonts_path, is_uhd=False)
     create_vector_fonts_image(v_fonts_uhd_path, is_uhd=True)
+    create_vector_primitives_image(v_primitives_path, is_uhd=False)
+    create_vector_primitives_image(v_primitives_uhd_path, is_uhd=True)
 
     print("Building OTIO annotation file …")
 
@@ -1010,6 +1158,8 @@ def main():
     m_colors_uhd = ORIAnnotations.Media(name="vector_colors_uhd.png", media_path=v_colors_uhd_path, frame_rate=24.0, duration=24, start_frame=0)
     m_fonts = ORIAnnotations.Media(name="vector_fonts.png", media_path=v_fonts_path, frame_rate=24.0, duration=24, start_frame=0)
     m_fonts_uhd = ORIAnnotations.Media(name="vector_fonts_uhd.png", media_path=v_fonts_uhd_path, frame_rate=24.0, duration=24, start_frame=0)
+    m_primitives = ORIAnnotations.Media(name="vector_primitives.png", media_path=v_primitives_path, frame_rate=24.0, duration=24, start_frame=0)
+    m_primitives_uhd = ORIAnnotations.Media(name="vector_primitives_uhd.png", media_path=v_primitives_uhd_path, frame_rate=24.0, duration=24, start_frame=0)
 
     ri_shapes = ORIAnnotations.ReviewItem(media=m_shapes)
     frame_shapes = ORIAnnotations.ReviewItemFrame(review_item=ri_shapes, frame=1, note="**Vector Shapes test**", annotation_image=v_shapes_path)
@@ -1061,10 +1211,20 @@ def main():
     frame_fonts_uhd.annotation_commands = vector_fonts_annotations()
     ri_fonts_uhd.review_frames = [frame_fonts_uhd]
 
+    ri_primitives = ORIAnnotations.ReviewItem(media=m_primitives)
+    frame_primitives = ORIAnnotations.ReviewItemFrame(review_item=ri_primitives, frame=1, note="**Vector Primitives test**", annotation_image=v_primitives_path)
+    frame_primitives.annotation_commands = vector_primitives_annotations()
+    ri_primitives.review_frames = [frame_primitives]
+
+    ri_primitives_uhd = ORIAnnotations.ReviewItem(media=m_primitives_uhd)
+    frame_primitives_uhd = ORIAnnotations.ReviewItemFrame(review_item=ri_primitives_uhd, frame=1, note="**Vector Primitives UHD test**", annotation_image=v_primitives_uhd_path)
+    frame_primitives_uhd.annotation_commands = vector_primitives_annotations()
+    ri_primitives_uhd.review_frames = [frame_primitives_uhd]
+
     # ── Review & group ─────────────────────────────────────────────────────────
     review_items_list = [
-        ri_shapes, ri_thickness, ri_calligraphy, ri_colors, ri_fonts,
-        ri_shapes_uhd, ri_thickness_uhd, ri_calligraphy_uhd, ri_colors_uhd, ri_fonts_uhd
+        ri_shapes, ri_thickness, ri_calligraphy, ri_colors, ri_fonts, ri_primitives,
+        ri_shapes_uhd, ri_thickness_uhd, ri_calligraphy_uhd, ri_colors_uhd, ri_fonts_uhd, ri_primitives_uhd
     ]
     review = ORIAnnotations.Review(
         title="Test Chart Alignment Review",

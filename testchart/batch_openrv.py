@@ -43,6 +43,7 @@ def main():
     env["BATCH_OTIO_PATH"] = otio_path
     env["BATCH_OUTPUT_DIR"] = output_dir
     env["PYTHONUNBUFFERED"] = "1"
+    env["OTIO_PLUGIN_MANIFEST_PATH"] = os.path.join(repo_root, "otio_event_plugin", "plugin_manifest.json")
     
     # Ensure the repository's python directory is in PYTHONPATH so OpenRV can import ORIAnnotations
     python_dir = os.path.join(repo_root, "python")
@@ -54,6 +55,7 @@ def main():
 
     # Launch OpenRV with -pyeval to execute the batch processing helper
     rv_bin = "/Applications/OpenRV.app/Contents/MacOS/RV"
+    #rv_bin = "/Users/sam/git/openrv_annotations/_build/stage/app/RV.app/Contents/MacOS/RV"
     testchart_dir = os.path.dirname(os.path.abspath(__file__))
     
     cmd = [

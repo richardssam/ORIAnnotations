@@ -404,3 +404,51 @@ otio_events:
       rotation: 15.0
       font: "Impact"
       timestamp: "2025-01-31T16:18:00Z"
+
+  EllipseAnnotation:
+    _category: Annotation
+    default:
+      uuid: "ellipse_annotation_uuid_001"
+      min: [-0.25, 0.25]
+      max: [0.25, -0.25]
+      rgba: [1.0, 0.0, 0.0, 1.0]
+      size: 2.0
+      inner_rgba: [0.0, 0.0, 0.0, 0.0]
+      timestamp: "2025-01-31T16:14:00Z"
+    filled_blue:
+      uuid: "ellipse_annotation_uuid_002"
+      min: [-0.45, 0.45]
+      max: [-0.15, 0.15]
+      rgba: [0.0, 0.0, 1.0, 1.0]
+      size: 1.5
+      inner_rgba: [0.0, 0.0, 1.0, 0.5]
+      timestamp: "2025-01-31T16:15:00Z"
+
+  RectangleAnnotation:
+    _category: Annotation
+    default:
+      uuid: "rectangle_annotation_uuid_001"
+      min: [-0.2, 0.2]
+      max: [0.2, -0.1]
+      rgba: [0.0, 1.0, 0.0, 1.0]
+      size: 2.0
+      inner_rgba: [0.0, 0.0, 0.0, 0.0]
+      timestamp: "2025-01-31T16:14:00Z"
+    filled_rect:
+      uuid: "rectangle_annotation_uuid_002"
+      min: [0.1, 0.1]
+      max: [0.4, -0.1]
+      rgba: [1.0, 1.0, 0.0, 1.0]
+      size: 2.5
+      inner_rgba: [1.0, 0.0, 0.0, 0.7]
+      timestamp: "2025-01-31T16:16:00Z"
+
+  ArrowAnnotation:
+    _category: Annotation
+    default:
+      uuid: "arrow_annotation_uuid_001"
+      start: [-0.4, -0.4]
+      end: [0.4, 0.4]
+      rgba: [1.0, 1.0, 1.0, 1.0]
+      size: 3.0
+      timestamp: "2025-01-31T16:14:00Z"

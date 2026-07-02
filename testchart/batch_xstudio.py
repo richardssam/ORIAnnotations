@@ -130,7 +130,7 @@ def batch_process(otio_path, output_dir):
         # Save xStudio session for inspection
         session_path = os.path.join(output_dir, "session.xst")
         try:
-            conn.api.session.save(session_path)
+            conn.api.session.save_as(session_path)
             print(f"Saved xStudio session to: {session_path}")
         except Exception as se:
             print(f"Could not save xStudio session: {se}")
@@ -143,6 +143,42 @@ def batch_process(otio_path, output_dir):
             include_media=False,
             include_images=True
         )
+        # Composite annotation overlays on top of test chart background images
+        print("Compositing annotation drawings over background media frames...")
+        try:
+            # We execute the compositing script using the system/default python interpreter
+            # since the xStudio embedded python environment lacks the Pillow (PIL) package.
+            composite_code = (
+                "import os, sys\n"
+                "from PIL import Image\n"
+                "output_dir = sys.argv[1]\n"
+                "repo_root = sys.argv[2]\n"
+                "for f in os.listdir(output_dir):\n"
+                "    if f.endswith('.00000.png'):\n"
+                "        stem = f[:-10]\n"
+                "        bg_name = f'{stem}.png'\n"
+                "        bg_path = os.path.join(repo_root, 'testchart', bg_name)\n"
+                "        \n"
+                "        media_path = os.path.abspath(bg_path)\n"
+                "        stem_replaced = media_path.replace('/', '_').replace('\\\\', '_')\n"
+                "        fg_name = f'{stem_replaced}.00001.png'\n"
+                "        fg_path = os.path.join(output_dir, fg_name)\n"
+                "        \n"
+                "        if os.path.exists(bg_path) and os.path.exists(fg_path):\n"
+                "            try:\n"
+                "                bg = Image.open(bg_path).convert('RGBA')\n"
+                "                fg = Image.open(fg_path).convert('RGBA')\n"
+                "                comp = Image.alpha_composite(bg, fg)\n"
+                "                comp.convert('RGB').save(os.path.join(output_dir, f))\n"
+                "                print(f'Composited: {f}')\n"
+                "            except Exception as e_comp:\n"
+                "                print(f'Error compositing {f}: {e_comp}')\n"
+            )
+            # Run using the PATH-resolved "python" which has PIL
+            subprocess.run(["python", "-c", composite_code, output_dir, repo_root], check=True)
+        except Exception as e_run:
+            print(f"Subprocess compositing failed: {e_run}")
+
         print(f"Export status: {'SUCCESS' if success else 'FAILED'}")
         print(f"Export message: {message}")
 
