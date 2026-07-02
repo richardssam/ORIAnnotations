@@ -212,7 +212,7 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
 
     import json
     for cmd in commands:
-        if not isinstance(cmd, dict) and not hasattr(cmd, "rgba") and not hasattr(cmd, "points"):
+        if not isinstance(cmd, dict) and not hasattr(cmd, "rgba") and not hasattr(cmd, "points") and not hasattr(cmd, "min") and not hasattr(cmd, "start"):
             try:
                 cmd = json.loads(otio.adapters.write_to_string(cmd, "otio_json"))
             except Exception:
@@ -220,7 +220,99 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
 
         schema = sync_event_schema(cmd)
 
-        if schema.startswith("PaintStart"):
+        is_ellipse = schema.startswith("EllipseAnnotation")
+        is_rect = schema.startswith("RectangleAnnotation")
+        is_arrow = schema.startswith("ArrowAnnotation")
+
+        if is_ellipse or is_rect or is_arrow:
+            rgba = cmd.get("rgba") if isinstance(cmd, dict) else getattr(cmd, "rgba", None)
+            if rgba is None:
+                rgba = [1.0, 1.0, 1.0, 1.0]
+            rgba = list(rgba)
+            r_val = rgba[0] if len(rgba) > 0 else 1.0
+            g_val = rgba[1] if len(rgba) > 1 else 1.0
+            b_val = rgba[2] if len(rgba) > 2 else 1.0
+            opacity = rgba[3] if len(rgba) > 3 else 1.0
+            
+            size = cmd.get("size") if isinstance(cmd, dict) else getattr(cmd, "size", 2.0)
+            thickness = size / (2.0 * aspect_half)
+            
+            pts_list = []
+            if is_rect:
+                min_val = cmd.get("min") if isinstance(cmd, dict) else getattr(cmd, "min", [0.0, 0.0])
+                max_val = cmd.get("max") if isinstance(cmd, dict) else getattr(cmd, "max", [0.0, 0.0])
+                min_val, max_val = list(min_val), list(max_val)
+                pts_list = [
+                    [min_val[0], min_val[1]],
+                    [max_val[0], min_val[1]],
+                    [max_val[0], max_val[1]],
+                    [min_val[0], max_val[1]],
+                    [min_val[0], min_val[1]]
+                ]
+            elif is_ellipse:
+                import math
+                min_val = cmd.get("min") if isinstance(cmd, dict) else getattr(cmd, "min", [0.0, 0.0])
+                max_val = cmd.get("max") if isinstance(cmd, dict) else getattr(cmd, "max", [0.0, 0.0])
+                min_val, max_val = list(min_val), list(max_val)
+                cx = (min_val[0] + max_val[0]) / 2.0
+                cy = (min_val[1] + max_val[1]) / 2.0
+                rx = (max_val[0] - min_val[0]) / 2.0
+                ry = (max_val[1] - min_val[1]) / 2.0
+                steps = 36
+                for step in range(steps + 1):
+                    theta = 2.0 * math.pi * step / steps
+                    pts_list.append([cx + rx * math.cos(theta), cy + ry * math.sin(theta)])
+            elif is_arrow:
+                import math
+                start_val = cmd.get("start") if isinstance(cmd, dict) else getattr(cmd, "start", [0.0, 0.0])
+                end_val = cmd.get("end") if isinstance(cmd, dict) else getattr(cmd, "end", [0.0, 0.0])
+                start_val, end_val = list(start_val), list(end_val)
+                pts_list = [start_val, end_val]
+                dx = end_val[0] - start_val[0]
+                dy = end_val[1] - start_val[1]
+                length = math.sqrt(dx*dx + dy*dy)
+                if length > 0.0001:
+                    ux = dx / length
+                    uy = dy / length
+                    nx = -uy
+                    ny = ux
+                    hl = min(0.3, length * 0.25)
+                    lx = end_val[0] - hl * ux + 0.5 * hl * nx
+                    ly = end_val[1] - hl * uy + 0.5 * hl * ny
+                    rx_val = end_val[0] - hl * ux - 0.5 * hl * nx
+                    ry_val = end_val[1] - hl * uy - 0.5 * hl * ny
+                    pts_list.extend([[lx, ly], end_val, [rx_val, ry_val]])
+                    
+            raw_pts = []
+            for x, y in pts_list:
+                raw_pts.extend([
+                    x / aspect_half,
+                    -y / aspect_half,
+                    1.0,  # pressure
+                    1.0,  # opacity
+                ])
+                
+            stroke_uuid = cmd.get("uuid") if isinstance(cmd, dict) else getattr(cmd, "uuid", None)
+            if not stroke_uuid:
+                import uuid
+                stroke_uuid = str(uuid.uuid4())
+                
+            pen_strokes.append({
+                "colour": [r_val, g_val, b_val],
+                "r": r_val,
+                "g": g_val,
+                "b": b_val,
+                "opacity": opacity,
+                "thickness": thickness,
+                "softness": 0.0,
+                "size_sensitivity": 1.0,
+                "opacity_sensitivity": 1.0,
+                "type": "Brush",
+                "is_erase_stroke": False,
+                "points": raw_pts,
+                "uuid": stroke_uuid
+            })
+        elif schema.startswith("PaintStart"):
             # Tolerate both live OTIO schemadef objects and raw deserialised dicts.
             rgba = getattr(cmd, "rgba", None)
             if rgba is None and isinstance(cmd, dict):

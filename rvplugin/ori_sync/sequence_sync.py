@@ -1587,6 +1587,44 @@ class SequenceSyncController:
                                         "uuid": uuid_val,
                                     }
                                     self.plugin.annotation._apply_text_annotation(text_data)
+                                elif isinstance(event, otio.schemadef.SyncEvent.EllipseAnnotation):
+                                    self.plugin.annotation._apply_shape_annotation({
+                                        "frame": frame,
+                                        "node_name": node_name,
+                                        "media_path": media_path,
+                                        "type": "ellipse",
+                                        "min": list(event.min),
+                                        "max": list(event.max),
+                                        "rgba": list(event.rgba),
+                                        "size": event.size,
+                                        "inner_rgba": list(event.inner_rgba),
+                                        "uuid": event.uuid,
+                                    })
+                                elif isinstance(event, otio.schemadef.SyncEvent.RectangleAnnotation):
+                                    self.plugin.annotation._apply_shape_annotation({
+                                        "frame": frame,
+                                        "node_name": node_name,
+                                        "media_path": media_path,
+                                        "type": "rect",
+                                        "min": list(event.min),
+                                        "max": list(event.max),
+                                        "rgba": list(event.rgba),
+                                        "size": event.size,
+                                        "inner_rgba": list(event.inner_rgba),
+                                        "uuid": event.uuid,
+                                    })
+                                elif isinstance(event, otio.schemadef.SyncEvent.ArrowAnnotation):
+                                    self.plugin.annotation._apply_shape_annotation({
+                                        "frame": frame,
+                                        "node_name": node_name,
+                                        "media_path": media_path,
+                                        "type": "arrow",
+                                        "start": list(event.start),
+                                        "end": list(event.end),
+                                        "rgba": list(event.rgba),
+                                        "size": event.size,
+                                        "uuid": event.uuid,
+                                    })
                                 elif hasattr(event, "uuid"):
                                     if event.uuid not in event_groups:
                                         event_groups[event.uuid] = {"start": None, "points": None}

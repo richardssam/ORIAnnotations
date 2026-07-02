@@ -259,6 +259,22 @@ class PlaybackSyncController:
         clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
         if clip_tl_guid:
             self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
+        # In flat-playlist mode the current sequence view shows exactly this source
+        # group as its only input.  Switching to the source group would show
+        # identical content but move annotations to a different paint node
+        # (sourceGroup_paint vs seq_p_sourceGroup), hiding locally-drawn strokes.
+        current_view = rv.commands.viewNode()
+        if current_view != source_group:
+            try:
+                seq_inputs = self.plugin.sequence._get_sequence_inputs(current_view)
+                if seq_inputs == [source_group]:
+                    _log(
+                        f"apply view-state: flat-playlist source mode — {current_view} "
+                        f"already shows {source_group}, skipping view switch"
+                    )
+                    return
+            except Exception:
+                pass
         self.plugin._rv_updating = True
         try:
             rv.commands.setViewNode(source_group)

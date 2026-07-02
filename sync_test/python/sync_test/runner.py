@@ -315,6 +315,14 @@ class TestRunner:
         # leak in (the cause of suite-only flakiness).
         session_id = f"otio-sync-{test_name}-{uuid.uuid4().hex[:8]}"
         with AppSpawner(test_name, executables, session_id=session_id) as spawner:
+            # Mirror all runner logging to a file in the test's log directory so
+            # CI failures are diagnosable without live stdout capture.
+            runner_log_path = os.path.join(spawner.logs_dir, "runner.log")
+            _runner_fh = logging.FileHandler(runner_log_path, mode="w")
+            _runner_fh.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+            ))
+            logging.getLogger().addHandler(_runner_fh)
             player = None
             player_thread = None
             playing_state = {"playing": True}
@@ -695,10 +703,15 @@ class TestRunner:
 
             if failed:
                 logging.error(f"Test '{test_name}' FAILED.")
-                return False
             else:
                 logging.info(f"✅ Test '{test_name}' PASSED.")
-                return True
+
+            logging.getLogger().removeHandler(_runner_fh)
+            _runner_fh.close()
+
+            if failed:
+                return False
+            return True
 
     def _scan_log_for_errors(self, log_path):
         """Return a Counter of {error_summary: count} found in a log file.
@@ -885,6 +898,13 @@ _STRUCTURAL_SCHEMAS = {"OTIO_SESSION_1.0", "TIMELINE_1.0", "SELECTION_1.0"}
 # lands, and the live apps have already followed the recording onward.
 _FRAME_HOLD_SAFETY_MARGIN = 1.5
 
+# Minimum structural silence required *beyond* validation_delay before a
+# STATE_SNAPSHOT is used as a structural checkpoint.  The inspector round-trip
+# takes ~0.5 s per app, so a snapshot whose next structural event fires only
+# marginally after validation_delay will have already been superseded by the
+# time the first poll result arrives — causing a false failure.
+_SCP_SILENCE_MARGIN = 1.5
+
 # Post-playback drain (see run_test). Minimum lingering time after the last
 # replayed event so the final events always get settle time, and the extra
 # margin added beyond (last_checkpoint - last_event + validation_delay) so the
@@ -947,7 +967,14 @@ def derive_state_checkpoints(jsonl_path, validation_delay=0.0):
         # an event sharing the snapshot's offset disqualifies it).
         idx = bisect.bisect_left(structural_times, t)
         next_struct = structural_times[idx] if idx < len(structural_times) else float("inf")
-        if validation_delay > 0 and (next_struct - t) < validation_delay:
+        # Require validation_delay + _SCP_SILENCE_MARGIN of structural quiet so
+        # the runner's polling window (which can start late by up to ~0.5 s and
+        # polls for up to several seconds) does not overlap with the next
+        # structural mutation and catch the apps in a later state.  A gap that
+        # is only marginally larger than validation_delay (e.g. 4.64 s when
+        # delay=4.5) means the first MOVE_CHILD after the snapshot fires before
+        # the inspector even returns the first response, causing a false failure.
+        if validation_delay > 0 and (next_struct - t) < (validation_delay + _SCP_SILENCE_MARGIN):
             continue
         # Frame-held: no playback change for validation_delay + safety margin
         # after the snapshot (same margin as the frame checkpoints, so a brief

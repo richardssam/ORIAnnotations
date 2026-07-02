@@ -20,7 +20,18 @@ def get_openrv_state():
     }
 
     try:
-        state["frame"] = rv.commands.frame()
+        # Report the 1-indexed LOCAL frame (frame - frameStart + 1) rather than
+        # the raw global frame so timecode-bearing media works correctly.
+        # validate_checkpoint expects adjusted = protocol_value + 1, where
+        # protocol_value is 0-indexed (xStudio's position). For non-timecode
+        # media frameStart()=1 so this equals frame(); for timecode media
+        # (e.g. laser_ACES_sRGB.mov with embedded TC ≈91699) it strips the
+        # timecode base and gives the same 1-indexed local frame the protocol
+        # value implies.
+        try:
+            state["frame"] = rv.commands.frame() - rv.commands.frameStart() + 1
+        except Exception:
+            state["frame"] = rv.commands.frame()
         state["playing"] = rv.commands.isPlaying()
         
         # Report the first non-empty sequence's human-readable name regardless
@@ -270,23 +281,24 @@ def start_openrv_inspector(http_port):
 
     class MainThreadExecutor(QtCore.QObject):
         execute_signal = QtCore.Signal(object)
-        
+
         def __init__(self):
             super().__init__()
             self.execute_signal.connect(self.execute)
-            self.q = queue.Queue()
-            
-        def execute(self, func):
+
+        def execute(self, item):
+            func, q = item
             try:
                 res = func()
-                self.q.put(("ok", res))
+                q.put(("ok", res))
             except Exception as e:
-                self.q.put(("error", e))
-                
+                q.put(("error", e))
+
         def run_sync(self, func, timeout=5.0):
-            self.execute_signal.emit(func)
+            q = queue.Queue()
+            self.execute_signal.emit((func, q))
             try:
-                status, res = self.q.get(timeout=timeout)
+                status, res = q.get(timeout=timeout)
                 if status == "error":
                     raise res
                 return res

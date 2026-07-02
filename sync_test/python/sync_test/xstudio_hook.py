@@ -68,9 +68,14 @@ def get_xstudio_state(port=14441):
                 state["clip"] = c.name
                 logging.info(f"Container name: {c.name}")
             
-            # Check if media exists via active playhead
+            # Check if media exists via active playhead.
+            # Default True: "unknown" is not the same as "missing". We only set
+            # False when we have the path and can confirm the file is absent.
+            # In xs_flat_playlist mode the container is a Playlist and
+            # on_screen_media may not expose a single source, which previously
+            # left media_exists=False and caused compare_states to fail for 10s.
             state["media_path"] = None
-            state["media_exists"] = False
+            state["media_exists"] = True
             try:
                 from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
                 from xstudio.api.session.playhead import Playhead
@@ -90,18 +95,18 @@ def get_xstudio_state(port=14441):
                         ms_src = ms.media_source()
                         if ms_src and ms_src.media_reference:
                             uri_str = str(ms_src.media_reference.uri())
-                        state["media_path"] = uri_str
-                        if uri_str.startswith("file:/"):
-                            local_path = uri_str
-                            if local_path.startswith("file://localhost"):
-                                local_path = local_path[16:]
-                            elif local_path.startswith("file://"):
-                                local_path = local_path[7:]
-                            elif local_path.startswith("file:/"):
-                                local_path = local_path[5:]
-                            state["media_exists"] = os.path.exists(local_path)
-                        else:
-                            state["media_exists"] = os.path.exists(uri_str)
+                            state["media_path"] = uri_str
+                            if uri_str.startswith("file:/"):
+                                local_path = uri_str
+                                if local_path.startswith("file://localhost"):
+                                    local_path = local_path[16:]
+                                elif local_path.startswith("file://"):
+                                    local_path = local_path[7:]
+                                elif local_path.startswith("file:/"):
+                                    local_path = local_path[5:]
+                                state["media_exists"] = os.path.exists(local_path)
+                            else:
+                                state["media_exists"] = os.path.exists(uri_str)
             except Exception as e:
                 logging.debug(f"Could not check playhead media: {e}")
             
