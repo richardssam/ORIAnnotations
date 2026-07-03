@@ -54,8 +54,8 @@ def main():
         env["PYTHONPATH"] = python_dir
 
     # Launch OpenRV with -pyeval to execute the batch processing helper
-    rv_bin = "/Applications/OpenRV.app/Contents/MacOS/RV"
-    #rv_bin = "/Users/sam/git/openrv_annotations/_build/stage/app/RV.app/Contents/MacOS/RV"
+    #rv_bin = "/Applications/OpenRV.app/Contents/MacOS/RV"
+    rv_bin = "/Users/sam/git/openrv_annotations/_build/stage/app/RV.app/Contents/MacOS/RV"
     testchart_dir = os.path.dirname(os.path.abspath(__file__))
     
     cmd = [
