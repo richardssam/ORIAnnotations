@@ -40,24 +40,8 @@ def run_batch():
 
 def _run_batch_impl():
     try:
-        import sys
-        import os
-        import importlib.util
-        
-        # Force load the workspace version of SyncEvent.py
-        workspace_sync_event_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "otio_event_plugin", "schemadefs", "SyncEvent.py"))
-        spec = importlib.util.spec_from_file_location("opentimelineio.schemadef.SyncEvent", workspace_sync_event_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["opentimelineio.schemadef.SyncEvent"] = module
-
         from rv import commands, extra_commands
         import opentimelineio as otio
-        otio.schemadef.SyncEvent = module
-        spec.loader.exec_module(module)
-        
-        print("SyncEvent location:", otio.schemadef.SyncEvent.__file__)
-        print("SyncEvent attributes:", dir(otio.schemadef.SyncEvent))
-            
         import otio_reader
         import ORIAnnotations
         
@@ -105,8 +89,10 @@ def _run_batch_impl():
             media_track = newtimeline.tracks[0]
             
         # Create track and load media
-        new_seq = otio_reader._create_track(media_track, context)
+        otio_reader._create_track(media_track, context)
         commands.addSourceEnd()
+        new_seq = "defaultSequence"
+        commands.setViewNode(new_seq)
 
         # Allow a brief moment for RV to populate sources and groups
         time.sleep(1.0)
@@ -119,9 +105,10 @@ def _run_batch_impl():
         all_paint_nodes = commands.nodesOfType("RVPaint")
         seq_paint_map = {}  # sourceGroupName → sequence-level paint node
         for pn in all_paint_nodes:
-            if not pn.startswith("defaultSequence_p_"):
+            prefix = f"{new_seq}_p_"
+            if not pn.startswith(prefix):
                 continue
-            sg = pn[len("defaultSequence_p_"):].replace("_switchGroup", "")
+            sg = pn[len(prefix):].replace("_switchGroup", "")
             seq_paint_map[sg] = pn
 
         sg_to_media = {}
@@ -157,6 +144,32 @@ def _run_batch_impl():
                     print(f"Warning: Media not found in RV session for {media_key}")
                     continue
                     
+                media_height = 1080.0
+                try:
+                    seq_node = f"{new_seq}_sequence"
+                    if seq_node and commands.propertyExists(f"{seq_node}.output.size"):
+                        media_height = float(commands.getIntProperty(f"{seq_node}.output.size")[1])
+                    else:
+                        from PySide6.QtGui import QImage
+                        img = QImage(clipinfo['media_path'])
+                        if img.height() > 0:
+                            media_height = float(img.height())
+                except Exception:
+                    pass
+                print(f"DEBUG HEIGHT: media_key={media_key} resolved_height={media_height}")
+                    
+                global_start = 0.0
+                if media_track:
+                    for c in media_track:
+                        if isinstance(c, otio.schema.Clip):
+                            if c.media_reference:
+                                target = c.media_reference.target_url
+                                if target == media_key or os.path.basename(target) == os.path.basename(media_key):
+                                    if c.range_in_parent():
+                                        global_start = c.range_in_parent().start_time.value
+                                        print(f"DEBUG SEARCH: media_key={media_key} matched c.name={c.name} target={target} global_start={global_start}")
+                                    break
+                                    
                 rv_node = clipinfo['paint_node']
                 if not rv_node:
                     print(f"Warning: No paint node found for {media_key}")
@@ -169,7 +182,9 @@ def _run_batch_impl():
                     strokes = []
                     strokemap = {}
                     for event in frame.annotation_commands:
-                        if isinstance(event, otio.schemadef.SyncEvent.PaintStart):
+                        schema = event.schema_name() if hasattr(event, "schema_name") else ""
+                        print(f"DEBUG EVENT: schema={schema} uuid={getattr(event, 'uuid', None)}")
+                        if schema == "PaintStart":
                             stroke = {
                                 'type': event.type,
                                 'color': event.rgba,
@@ -180,17 +195,17 @@ def _run_batch_impl():
                             }
                             strokemap[event.uuid] = stroke
                             strokes.append(stroke)
-                        elif isinstance(event, otio.schemadef.SyncEvent.PaintPoints):
+                        elif schema in ["PaintPoint", "PaintPoints"]:
                             stroke = strokemap.get(event.uuid)
                             if stroke and event.points:
                                 stroke['width'] = [v for v in event.points.size]
                                 stroke['points'] = [val for pair in zip(event.points.x, event.points.y) for val in pair]
-                        elif isinstance(event, otio.schemadef.SyncEvent.PaintEnd):
+                        elif schema == "PaintEnd":
                             stroke = strokemap.get(event.uuid)
-                            if stroke and event.points:
+                            if stroke and hasattr(event, "points") and event.points:
                                 stroke['width'].extend(event.points.size)
                                 stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
-                        elif isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
+                        elif schema == "TextAnnotation":
                             stroke = {
                                 'type': 'text',
                                 'color': event.rgba,
@@ -204,7 +219,7 @@ def _run_batch_impl():
                                 'rotation': event.rotation
                             }
                             strokes.append(stroke)
-                        elif isinstance(event, otio.schemadef.SyncEvent.EllipseAnnotation):
+                        elif schema == "EllipseAnnotation":
                             stroke = {
                                 'type': 'ellipse',
                                 'min': list(event.min),
@@ -216,7 +231,7 @@ def _run_batch_impl():
                                 'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
                             }
                             strokes.append(stroke)
-                        elif isinstance(event, otio.schemadef.SyncEvent.RectangleAnnotation):
+                        elif schema == "RectangleAnnotation":
                             stroke = {
                                 'type': 'rect',
                                 'min': list(event.min),
@@ -228,7 +243,7 @@ def _run_batch_impl():
                                 'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
                             }
                             strokes.append(stroke)
-                        elif isinstance(event, otio.schemadef.SyncEvent.ArrowAnnotation):
+                        elif schema == "ArrowAnnotation":
                             stroke = {
                                 'type': 'arrow',
                                 'start': list(event.start),
@@ -249,9 +264,9 @@ def _run_batch_impl():
                     commands.setIntProperty(f"{rv_node}.internal.creationContext", [1], True)
 
                     order = []
-                    frame_node = f"{rv_node}.frame:{int(frame.frame)}"
+                    rv_frame = int(frame.frame)
+                    frame_node = f"{rv_node}.frame:{rv_frame}"
                     for stroke in strokes:
-                        rv_frame = int(frame.frame)
                         def set_prop(node_path, name, ptype, val, dim=1):
                             if not commands.propertyExists(f"{node_path}.{name}"):
                                 commands.newProperty(f"{node_path}.{name}", ptype, dim)
@@ -263,7 +278,7 @@ def _run_batch_impl():
                                 commands.setIntProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
 
                         if stroke['type'] == 'text':
-                            text_node = f"{rv_node}.text:{strokeid}:{int(frame.frame)}:{stroke['user']}"
+                            text_node = f"{rv_node}.text:{strokeid}:{rv_frame}:{stroke['user']}"
                             set_prop(text_node, "position",    commands.FloatType,  list(stroke['position']), dim=2)
                             set_prop(text_node, "color",       commands.FloatType,  [float(x) for x in stroke['color']], dim=4)
                             set_prop(text_node, "spacing",     commands.FloatType,  stroke['spacing'] or 0.8)
@@ -285,12 +300,12 @@ def _run_batch_impl():
 
                         if stroke['type'] in ['ellipse', 'rect']:
                             shape_type = stroke['type']
-                            shape_node = f"{rv_node}.{shape_type}:{strokeid}:{int(frame.frame)}:{stroke['user']}"
+                            shape_node = f"{rv_node}.{shape_type}:{strokeid}:{rv_frame}:{stroke['user']}"
                             set_prop(shape_node, "min",         commands.FloatType,  stroke['min'], dim=2)
                             set_prop(shape_node, "max",         commands.FloatType,  stroke['max'], dim=2)
                             set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
                             set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['inner_rgba'], dim=4)
-                            set_prop(shape_node, "borderWidth", commands.FloatType,  stroke['size'] / 2.0)
+                            set_prop(shape_node, "borderWidth", commands.FloatType,  (stroke['size'] * media_height) / 2.0)
                             set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
                             set_prop(shape_node, "duration",    commands.IntType,    1)
                             set_prop(shape_node, "eye",         commands.IntType,    2)
@@ -301,13 +316,13 @@ def _run_batch_impl():
                             continue
 
                         if stroke['type'] == 'arrow':
-                            shape_node = f"{rv_node}.arrow:{strokeid}:{int(frame.frame)}:{stroke['user']}"
+                            shape_node = f"{rv_node}.arrow:{strokeid}:{rv_frame}:{stroke['user']}"
                             set_prop(shape_node, "startPos",    commands.FloatType,  stroke['start'], dim=2)
                             set_prop(shape_node, "endPos",      commands.FloatType,  stroke['end'], dim=2)
                             set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
                             set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['rgba'], dim=4)
                             set_prop(shape_node, "borderWidth", commands.FloatType,  0.0)
-                            set_prop(shape_node, "thickness",   commands.FloatType,  stroke['size'] / 2.0)
+                            set_prop(shape_node, "thickness",   commands.FloatType,  (stroke['size'] * media_height) / 2.0)
                             set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
                             set_prop(shape_node, "duration",    commands.IntType,    1)
                             set_prop(shape_node, "eye",         commands.IntType,    2)
@@ -317,8 +332,7 @@ def _run_batch_impl():
                             strokeid += 1
                             continue
 
-                        pen_node = f"{rv_node}.pen:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                        frame_node = f"{rv_node}.frame:{int(frame.frame)}"
+                        pen_node = f"{rv_node}.pen:{strokeid}:{rv_frame}:{stroke['user']}"
 
                         brush_name = "gauss" if stroke['brush'] in ["gauss", "gaussian"] else "circle"
                         if not commands.propertyExists(f"{pen_node}.brush"):
@@ -352,17 +366,18 @@ def _run_batch_impl():
 
                         if not commands.propertyExists(f"{pen_node}.width"):
                             commands.newProperty(f"{pen_node}.width", commands.FloatType, 1)
-                        commands.setFloatProperty(f"{pen_node}.width", stroke['width'], True)
+                        commands.setFloatProperty(f"{pen_node}.width", [w * 0.6 for w in stroke['width']], True)
 
                         if not commands.propertyExists(f"{pen_node}.points"):
                             commands.newProperty(f"{pen_node}.points", commands.FloatType, 2)
                         commands.setFloatProperty(f"{pen_node}.points", stroke['points'], True)
 
-                        order.append(f"pen:{strokeid}:{int(frame.frame)}:{stroke['user']}")
+                        order.append(f"pen:{strokeid}:{rv_frame}:{stroke['user']}")
                         strokeid += 1
 
-                    if not commands.propertyExists(f"{frame_node}.order"):
-                        commands.newProperty(f"{frame_node}.order", commands.StringType, 1)
+                    if commands.propertyExists(f"{frame_node}.order"):
+                        commands.deleteProperty(f"{frame_node}.order")
+                    commands.newProperty(f"{frame_node}.order", commands.StringType, 1)
                     commands.setStringProperty(f"{frame_node}.order", order, True)
 
                 # Update next ID
@@ -380,7 +395,7 @@ def _run_batch_impl():
         
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-                 # Get annotated frames across all sources
+        # Get annotated frames across all sources
         annotated_frames = extra_commands.findAnnotatedFrames()
         if annotated_frames:
             # Locate rvio

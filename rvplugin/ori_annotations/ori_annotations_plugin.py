@@ -547,7 +547,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                         if not commands.propertyExists(f"{pen_node}.width"):
                             commands.newProperty(f"{pen_node}.width", commands.FloatType, 1)
                         commands.setFloatProperty(
-                            f"{pen_node}.width", stroke['width'], True
+                            f"{pen_node}.width", [w * 0.6 for w in stroke['width']], True
                         )
 
                         if not commands.propertyExists(f"{pen_node}.points"):

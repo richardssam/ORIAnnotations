@@ -295,7 +295,7 @@ class AnnotationSyncController:
                     rv.commands.setFloatProperty(
                         f"{node}.{existing_pen}.points", points_flat, True
                     )
-                    widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
+                    widths = [w * 0.6 for w in (pts_ev.points.size if pts_ev.points.size else [2.0])]
                     if len(widths) == 1:
                         widths = widths * (len(points_flat) // 2)
                     rv.commands.setFloatProperty(
@@ -501,7 +501,7 @@ class AnnotationSyncController:
                 if node and rv.commands.propertyExists(f"{node}.{pen_node}.points"):
                     points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
                     rv.commands.setFloatProperty(f"{node}.{pen_node}.points", points_flat, True)
-                    widths = list(points_event.points.size)
+                    widths = [w * 0.6 for w in points_event.points.size]
                     if len(widths) == 1:
                         widths = widths * (len(points_flat) // 2)
                     rv.commands.setFloatProperty(f"{node}.{pen_node}.width", widths, True)
@@ -883,7 +883,7 @@ class AnnotationSyncController:
             rv.commands.setIntProperty(f"{full_pen}.startFrame", [frame], True)
             rv.commands.setIntProperty(f"{full_pen}.duration", [1], True)
             rv.commands.setFloatProperty(f"{full_pen}.color", list(color), True)
-            rv.commands.insertFloatProperty(f"{full_pen}.width", list(width))
+            rv.commands.insertFloatProperty(f"{full_pen}.width", [w * 0.6 for w in width])
             rv.commands.setStringProperty(f"{full_pen}.brush", [brush], True)
             rv.commands.setIntProperty(f"{full_pen}.splat", [1 if brush == "gauss" else 0], True)
             rv.commands.insertFloatProperty(f"{full_pen}.points", list(points))
