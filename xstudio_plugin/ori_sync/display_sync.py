@@ -16,6 +16,16 @@ from .utils import _log, bounded_timeout
 # 100 s default so a stale viewport actor fails fast instead of freezing.
 _DISPLAY_TIMEOUT_MS = 2000
 
+def _parse_vec(val) -> list[float]:
+    """Parse an Imath vector from JSON, skipping JSONStore type headers if present."""
+    if not val:
+        return []
+    if isinstance(val[0], str):
+        # Skip type name (e.g. 'vec2') and version number (usually 1)
+        return [float(x) for x in val[2:]]
+    return [float(x) for x in val]
+
+
 class DisplaySyncController:
     """Owns display-state sync (exposure, channel, zoom) with the active viewport.
 
@@ -125,14 +135,29 @@ class DisplaySyncController:
                 )[0]
                 vp_state = json.loads(js.dump())["base"]
                 raw_scale = float(vp_state["scale"])
-                if self._xs_base_scale is None and raw_scale > 0.0:
+                translate = _parse_vec(vp_state.get("translate"))
+                size = _parse_vec(vp_state.get("size"))
+
+                w = float(size[0]) if len(size) > 0 else 0.0
+                h = float(size[1]) if len(size) > 1 else 0.0
+                aspect = w / h if h > 0.0 else 1.0
+
+                fit_mode = vp.get_attribute("Fit (F)").value()
+                if fit_mode != "Off":
                     self._xs_base_scale = raw_scale
-                    _log(f"xStudio base scale set to {raw_scale:.4f}")
-                state["zoom"] = (raw_scale / self._xs_base_scale) if self._xs_base_scale else 1.0
+                    state["zoom"] = 1.0
+                    state["pan"] = [0.0, 0.0]
+                else:
+                    if self._xs_base_scale is None and raw_scale > 0.0:
+                        self._xs_base_scale = raw_scale
+                    state["zoom"] = (raw_scale / self._xs_base_scale) if self._xs_base_scale else 1.0
+                    translate_x = float(translate[0]) if len(translate) > 0 else 0.0
+                    translate_y = float(translate[1]) if len(translate) > 1 else 0.0
+                    state["pan"] = [translate_x * aspect, -translate_y * aspect]
         except Exception as e:
             _log(f"read_xs_display_state: read failed ({e}) — dropping stale viewport")
             self._viewport = None
-            return {"pan": None, "zoom": None, "exposure": 0.0, "channel": "RGBA"}
+            return {"pan": [0.0, 0.0], "zoom": 1.0, "exposure": 0.0, "channel": "RGBA"}
         return state
 
     # ── apply ─────────────────────────────────────────────────────────────────
@@ -159,6 +184,34 @@ class DisplaySyncController:
         except Exception as e:
             _log(f"RECV display: channel set failed: {e}")
 
+        if pan is not None or zoom is not None:
+            try:
+                js = self.plugin.connection.request_receive_timeout(
+                    100, vp.remote, serialise_atom()
+                )[0]
+                vp_state = json.loads(js.dump())["base"]
+                size = _parse_vec(vp_state.get("size"))
+                w = float(size[0]) if len(size) > 0 else 0.0
+                h = float(size[1]) if len(size) > 1 else 0.0
+                aspect = w / h if h > 0.0 else 1.0
+
+                fit_mode = vp.get_attribute("Fit (F)").value()
+                if fit_mode != "Off":
+                    if self._xs_base_scale is None:
+                        self._xs_base_scale = float(vp_state["scale"])
+                    vp.set_attribute("Fit (F)", "Off")
+                    _log("Set viewport fit mode to Off for pan/zoom sync")
+
+                if zoom is not None:
+                    if self._xs_base_scale is None:
+                        self._xs_base_scale = float(vp_state["scale"])
+                    vp.scale = float(zoom) * self._xs_base_scale
+
+                if pan is not None:
+                    vp.pan = (float(pan[0]) / aspect, -float(pan[1]) / aspect)
+            except Exception as e:
+                _log(f"RECV display: pan/zoom set failed: {e}")
+
         readback = self.read_xs_display_state()
         self._last_display_state = {
             "pan": readback["pan"],
@@ -167,12 +220,12 @@ class DisplaySyncController:
             "channel": channel,
         }
         _log(f"RECV display exposure={exposure:.3f} channel={channel} "
-             f"(zoom={zoom} pan={pan} received but not applied — write not safe)")
+             f"zoom={zoom} pan={pan}")
 
     # ── poll ──────────────────────────────────────────────────────────────────
 
     def poll_and_broadcast_display(self) -> None:
-        """Broadcast display state when exposure or channel changes."""
+        """Broadcast display state when display settings (exposure, channel, zoom, pan) change."""
         manager = self.plugin.manager
         if not manager or manager.status != STATE_SYNCED:
             return
@@ -181,5 +234,5 @@ class DisplaySyncController:
             return
         self._last_display_state = state
         _log(f"Poll display: broadcasting exposure={state['exposure']:.3f} "
-             f"channel={state['channel']}")
+             f"channel={state['channel']} zoom={state['zoom']} pan={state['pan']}")
         manager.broadcast_display_state(state)
