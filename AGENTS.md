@@ -37,10 +37,10 @@ For a detailed breakdown of the protocol and architecture, see [docs/architectur
 
 Before modifying specific components, **you MUST read the corresponding constraints document**. The codebase has numerous non-obvious gotchas regarding threading, event loops, and coordinate systems.
 
-- **OpenRV Plugin**: [docs/openrv_constraints.md](file:///Users/sam/git/ORIAnnotations/docs/openrv_constraints.md)
-- **xStudio Plugin**: [docs/xstudio_constraints.md](file:///Users/sam/git/ORIAnnotations/docs/xstudio_constraints.md)
-- **Sync Viewer**: [docs/sync_viewer_constraints.md](file:///Users/sam/git/ORIAnnotations/docs/sync_viewer_constraints.md)
-- **Debugging & Diagnostics**: [debug/README.md](file:///Users/sam/git/ORIAnnotations/debug/README.md)
+- **OpenRV Plugin**: [docs/openrv_constraints.md](docs/openrv_constraints.md)
+- **xStudio Plugin**: [docs/xstudio_constraints.md](docs/xstudio_constraints.md)
+- **Sync Viewer**: [docs/sync_viewer_constraints.md](docs/sync_viewer_constraints.md)
+- **Debugging & Diagnostics**: [debug/README.md](debug/README.md)
 
 ---
 
