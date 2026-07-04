@@ -861,7 +861,9 @@ class HTMLDocGenerator:
 
     def _generate_sidebar(self) -> str:
         title = self.meta.get("title", "OTIO Sync Protocol")
-        html = f'<nav class="sidebar"><h1>{title}</h1>'
+        html = f'<nav class="sidebar">'
+        html += '<div class="back-link" style="margin-bottom: 15px;"><a href="../" style="color: #3498db; text-decoration: none; font-size: 0.95em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">← Back to Main Docs</a></div>'
+        html += f'<h1>{title}</h1>'
 
         html += '<div class="sidebar-section">OTIO SyncEvents</div>'
         for cat, schemas in self.otio_categories.items():

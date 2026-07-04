@@ -2,7 +2,7 @@
 layout: default
 title: Sync Testing Framework.
 parent: ORI Sync Tools
-nav_order: 2.3
+nav_order: 3.5
 ---
 
 # UI Sync Test Framework
@@ -12,6 +12,7 @@ The `sync_test` directory contains an automated integration testing framework fo
 ## How It Works
 
 Instead of testing only the `SyncManager` library in isolation, this framework provides true end-to-end testing:
+
 1. **App Spawner:** Launches the actual application binaries (xStudio, OpenRV) in isolated subprocesses.
 2. **Inspection Server (RPC):** Injects a lightweight HTTP server (`inspector.py`) into the running applications. This exposes a `/state` endpoint to query the *true logical state* of the app directly from its native Python API (`xstudio_hook.py`, `openrv_hook.py`).
 3. **Playback Automation:** Uses the existing `sync_recorder.player.SyncPlayer` to stream a `.jsonl` recording of OTIO sync events into the RabbitMQ exchange, simulating a remote master peer driving the session.
@@ -19,9 +20,10 @@ Instead of testing only the `SyncManager` library in isolation, this framework p
 
 ## Test Configuration
 
-Tests are defined in a YAML configuration file (`sync_tests.yaml` at the project root). 
+Tests are defined in a YAML configuration file (`sync_tests.yaml` at the project root).
 
 Example `sync_tests.yaml`:
+
 ```yaml
 tests:
   - name: "xstudio_vs_openrv_demo"

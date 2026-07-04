@@ -2,7 +2,7 @@
 layout: default
 title: How to install rabbitmq on Oracle Cloud Infrastructure
 parent: ORI Sync Tools
-nav_order: 2.6
+nav_order: 3.91
 ---
 
 # RabbitMQ on OCI Always Free (US West / San Jose) \- Build Runbook
@@ -87,22 +87,17 @@ Guardrails: do not add a load balancer above the free shape, do not exceed 200 G
 Do this in the Console.
 
 1. **Create the VCN with the wizard.**  
-     
+
    - Console: Networking \> Virtual Cloud Networks \> **Start VCN Wizard** \> "VCN with Internet Connectivity".  
    - Name: `rabbit-vcn`. Accept the default CIDRs (VCN `10.0.0.0/16`, public subnet `10.0.0.0/24`). This creates an Internet Gateway and route table for you.
 
-   
-
 2. **Reserve a public IP.**  
-     
+
    - Networking \> IP Management \> Reserved Public IPs \> Reserve. Name it `rabbit-ip`. You will attach it to the VM's VNIC after launch.
 
-   
-
 3. **Lock down the security list.** Edit the public subnet's security list. Replace the broad default SSH rule with source-restricted rules. Use your actual client CIDR(s) instead of `YOUR.IP.ADDR/32`.  
-     
+
    Ingress rules to add:  
-   
 
 | Source CIDR | Protocol | Dest port | Purpose |
 | :---- | :---- | :---- | :---- |
@@ -111,11 +106,7 @@ Do this in the Console.
 | `APP.CIDR/xx` | TCP | 5671 | AMQPS (TLS AMQP) for your apps |
 | `YOUR.IP.ADDR/32` | TCP | 80 | Temporary, for first TLS cert issue only |
 
-   
-
    Do **not** open 5672 (plaintext AMQP) or 15672 (plaintext UI) to the internet. Keep them internal only. Remove the wide-open `0.0.0.0/0` SSH rule the wizard created.
-
-   
 
    Tip: For tighter control you can use a Network Security Group (NSG) instead of editing the subnet security list, and attach the NSG to the VM's VNIC. Either works; the rules above are identical.
 
@@ -432,7 +423,7 @@ Console: Billing & Cost Management \> Budgets \> create a budget with a low thre
 openssl s_client -connect rabbit.yourdomain.com:5671 -servername rabbit.yourdomain.com </dev/null
 ```
 
-3. Publish and consume a test message through the management UI ("Queues" tab \> add a queue \> publish \> get).
+1. Publish and consume a test message through the management UI ("Queues" tab \> add a queue \> publish \> get).
 
 ---
 
@@ -453,4 +444,3 @@ openssl s_client -connect rabbit.yourdomain.com:5671 -servername rabbit.yourdoma
 - RabbitMQ official Docker image (arm64v8, env vars, mgmt UI): [https://hub.docker.com/\_/rabbitmq/](https://hub.docker.com/_/rabbitmq/)  
 - RabbitMQ configuration and memory alarms: [https://www.rabbitmq.com/configure](https://www.rabbitmq.com/configure)  
 - RabbitMQ TLS Support: [https://www.rabbitmq.com/docs/ssl](https://www.rabbitmq.com/docs/ssl)
-

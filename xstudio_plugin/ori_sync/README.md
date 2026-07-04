@@ -29,25 +29,50 @@ pip install opentimelineio pika
 
 ---
 
-## TODO: document xStudio build + required patches
+## xStudio build + required patches
 
-This plugin depends on xStudio C++ changes that are not yet upstream. Need to
-write up:
+This plugin depends on xStudio C++/Python changes that are not yet upstream.
+They are curated on the local **`xstudio_sync_fixes`** branch in
+`/Users/sam/git/xstudio`, sitting **directly on top of upstream `develop`**
+(fork point `eb3d235e`, "Merge pull request #294"). `xstudio_sync_fixes` is
+exactly `develop` + the five commits below — nothing else.
 
-- Full build steps for `/Users/sam/git/xstudio` (vcpkg bootstrap, cmake configure/build,
-  which target(s) to build, how to point a running `xstudio` at the built plugin).
-- The patch set that must be present (currently curated on the local
-  `xstudio_sync_fixes` branch, built on top of `develop`):
-  - `feat(annotations): broadcast stroke events to plugin_events_group` — the
-    5-tuple live-stroke geometry broadcast this plugin's partial-annotation
-    sync depends on (`xstudio-partial-annotations` change).
-  - `feat(python): expose viewport scale and pan atoms` — needed for pan/zoom sync.
-  - `Fix python event routing sender mismatch for playhead events` — without
-    this, playhead events are silently dropped in the Python API.
-  - `fix(python): purge stale actor callbacks on broadcast_down to prevent segfault`.
-  - (`build: upgrade FFmpeg vcpkg override` is local-only and not required upstream.)
-- Whether/when these land on the real `pr/annotation-stroke-events` PR branch
-  vs. staying as local patches.
+### Required patches (rebuild recipe)
+
+To rebuild `xstudio_sync_fixes`, apply these on top of `develop`. Four are
+functionally required by the plugin; one is a local build convenience.
+
+| Commit | Summary | Why it's needed | Cleaned-up branch / upstream status |
+|---|---|---|---|
+| `cc071f56` | `feat(python): expose viewport scale and pan atoms` | Pan/zoom sync — `display_sync.py` reads and writes `Viewport.scale` / `Viewport.pan`. | Being reworked to tedwaine's `V2f` naming under OpenSpec change `expose-viewport-scale-pan`. Branch `pr/expose-viewport-scale-pan` holds the older `Vec2f` version — **do not push that one**. |
+| `a6893b38` | `Fix python event routing sender mismatch` | Event-group owner-actor routing. Without it `subscribe_to_event_group` silently drops timeline `change_atom` and current-selection events, so structure/selection sync breaks. **Verified required**: reverting the 3-arg call fails the `delete_media_xstudio` sync test. | Cleaner combined rebuild is `779c1857` on `pr/python-event-routing`. That branch was PR #270 (**closed** — rejected on its "playhead" framing); needs re-submitting reframed around generic event-group routing. |
+| `8c978aa5` | `fix(python): purge stale actor callbacks on broadcast_down` | Prevents a SIGSEGV on timeline switch when a subscribed owner actor is torn down mid-dispatch. Pairs with the routing fix above. | Folded into `779c1857` (same `pr/python-event-routing` branch). |
+| `7e9b44d1` | `feat(annotations): broadcast live-stroke geometry to plugin_events_group` | The 5-tuple live-stroke geometry broadcast the partial-annotation sync consumes (`xstudio-partial-annotations` change). | Intended for a `pr/annotation-stroke-events` branch (not yet raised). |
+| `a099681e` | `build: upgrade FFmpeg vcpkg override to 8.0.1#2` | **Local build convenience only — NOT functionally required.** Omit for a clean upstream-tracking build. | Not for upstream. |
+
+Note: the original event-routing work also patched `plugin_base.py` for playhead
+events; that part was **dropped**. The plugin instead uses the maintainer-recommended
+`subscribe_to_playhead_events()` + `playhead_attribute_changed` path. Only the
+generic event-group owner-actor routing (`module.py` + `py_context.cpp`) survives
+and is required.
+
+### Build (macOS, as used here)
+
+```bash
+cd /Users/sam/git/xstudio
+git checkout xstudio_sync_fixes
+cmake -B build --preset MacOSNinjaReleaseLocal
+cmake --build build --target install
+```
+
+This produces `build/xSTUDIO.app`. The Python API (`module.py`, `viewport.py`, …)
+and the compiled `python_module` are packaged inside the bundle at
+`build/xSTUDIO.app/Contents/Frameworks/lib/python3.11/site-packages/xstudio/`.
+Point a running xstudio (or the `sync_test` harness) at `build/xSTUDIO.app`.
+
+> Pure-Python binding tweaks (e.g. `module.py`) can be tested by editing the
+> installed copy inside the app bundle — no rebuild needed. C++ changes
+> (`py_context.cpp`, `py_atoms.cpp`, `py_register.cpp`, …) require a rebuild.
 
 ---
 

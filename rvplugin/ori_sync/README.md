@@ -2,6 +2,7 @@
 layout: default
 title: OpenRV Sync Plugin
 parent: ORI Sync Tools
+nav_order: 3.7
 ---
 
 # OTIO Sync Plugin for OpenRV

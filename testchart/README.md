@@ -2,6 +2,7 @@
 layout: default
 title: Annotation Test Charts.
 parent: ORI Annotations
+nav_order: 2.5
 ---
 
 # Test Chart Annotations Batch Processing
@@ -15,6 +16,19 @@ This folder contains test charts and batch scripts to automate loading annotatio
 - `batch_openrv.py`: Command-line runner to automate importing annotations into **OpenRV** and rendering the annotated frames using `rvio`.
 - `batch_openrv_helper.py`: Helper script evaluated inside OpenRV to handle the import and export.
 - `run_batch.csh`: C-shell script that runs both the xStudio and OpenRV batch processing in sequence.
+
+## Vector Test Charts
+
+Below is a list of the vector test chart image assets used in the test suite:
+
+| Chart Type | Standard Resolution |
+| :--- | :--- |
+| **Calligraphy** | ![Calligraphy]({% link testchart/vector_calligraphy.png %}) |
+| **Colors** | ![Colors]({% link testchart/vector_colors.png %}) |
+| **Fonts** | ![Fonts]({% link testchart/vector_fonts.png %}) |
+| **Primitives** | ![Primitives]({% link testchart/vector_primitives.png %}) |
+| **Shapes** | ![Shapes]({% link testchart/vector_shapes.png %}) |
+| **Thickness** | ![Thickness]({% link testchart/vector_thickness.png %}) |
 
 ## How to Run
 

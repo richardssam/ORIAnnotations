@@ -2,6 +2,7 @@
 layout: default
 title: ORI Sync Recorder
 parent: ORI Sync Tools
+nav_order: 3.3
 ---
 # Sync Session Recorder & Player
 
