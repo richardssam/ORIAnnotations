@@ -62,3 +62,7 @@ tests/test_inspect.py
 
 
 _site
+sync_test/logs
+testchart/rv_output.old
+testchart/rv_output
+testchart/xstudio_output.old
