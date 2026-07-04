@@ -14,10 +14,14 @@ modes:
     event: ''
     load: immediate
 
-folders: 
+folders:
   - folder: otio_event_plugin
     location: Python
     description: 'OTIO Event Plugin'
+
+  - folder: otio_sync_core
+    location: Python
+    description: 'Shared annotation codec (coords, shapes, RV paint codec/applier)'
 
   - file: ORIAnnotations.py
     location: Python

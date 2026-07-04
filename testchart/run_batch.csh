@@ -46,5 +46,17 @@ echo "========================================="
 python compare_testchart.py rv_output/vector_colors.png_DEFAULT_MEDIA.00001.png
 
 echo ""
+echo "========================================="
+echo "Running Text Anchor Comparison (xStudio)"
+echo "========================================="
+python compare_testchart.py xstudio_output/vector_fonts.00000.png --mode text
+
+echo ""
+echo "========================================="
+echo "Running Text Anchor Comparison (OpenRV)"
+echo "========================================="
+python compare_testchart.py rv_output/vector_fonts.png_DEFAULT_MEDIA.00001.png --mode text
+
+echo ""
 echo "Batch processing finished. Check testchart/xstudio_output/ and testchart/rv_output/."
 

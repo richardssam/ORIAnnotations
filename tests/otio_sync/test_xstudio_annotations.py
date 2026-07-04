@@ -16,10 +16,12 @@ if os.path.exists(manifest_file):
             existing + os.pathsep + manifest_file if existing else manifest_file
         )
 
+from otio_sync_core import xs_annotation_codec
 from otio_sync_core.xs_annotation_codec import (
     xs_captions_to_sync_events,
     sync_events_to_xs_captions,
 )
+from otio_sync_core import coords
 import opentimelineio as otio
 
 # Ensure SyncEvent schema is registered
@@ -75,6 +77,43 @@ class TestXStudioAnnotations(unittest.TestCase):
         self.assertEqual(recon["wrap_width"], 1.5)
         self.assertEqual(recon["justification"], 0)
         print("✓ xStudio caption translation round-trip test passed!")
+
+    def test_caption_spacing_uses_coords_default(self):
+        # xStudio has no spacing concept; emitted spacing must be the shared
+        # coords.DEFAULT_SPACING (0.8, RV-neutral), not the old hardcoded 0.0
+        # (which collapsed letter spacing when rendered in RV).
+        captions = [{
+            "colour": ["colour", 1, 1.0, 1.0, 1.0], "opacity": 1.0,
+            "position": ["vec2", 1, 0.0, 0.0], "font_name": "Arial",
+            "font_size": 50.0, "text": "hi",
+        }]
+        events = xs_captions_to_sync_events(captions, 0.8889)
+        self.assertEqual(events[0].spacing, coords.DEFAULT_SPACING)
+        self.assertEqual(coords.DEFAULT_SPACING, 0.8)
+
+    def test_contract_entry_points_roundtrip(self):
+        # D9 common contract: HOST_ID/SUPPORTED_KINDS declared, and
+        # to_sync_events/from_sync_events round-trip through the native
+        # {"strokes", "captions"} shape matching Bookmark.set_annotation.
+        self.assertEqual(xs_annotation_codec.HOST_ID, "xstudio")
+        self.assertEqual(xs_annotation_codec.SUPPORTED_KINDS, frozenset({"pen", "erase", "text"}))
+
+        native = {
+            "strokes": [{"colour": [1.0, 0.0, 0.0], "points": [0.1, 0.1, 1.0, 1.0], "type": "Brush"}],
+            "captions": [{"colour": ["colour", 1, 1.0, 1.0, 1.0], "opacity": 1.0,
+                          "position": ["vec2", 1, 0.0, 0.0], "font_name": "Arial",
+                          "font_size": 50.0, "text": "hi"}],
+        }
+        events = xs_annotation_codec.to_sync_events(native, {"aspect_half": 0.8889})
+        schema_names = [e.schema_name() for e in events]
+        self.assertIn("PaintStart", schema_names)
+        self.assertIn("PaintPoint", schema_names)
+        self.assertIn("TextAnnotation", schema_names)
+
+        back = xs_annotation_codec.from_sync_events(events, {"aspect_half": 0.8889})
+        self.assertEqual(len(back["strokes"]), 1)
+        self.assertEqual(len(back["captions"]), 1)
+        self.assertEqual(back["captions"][0]["text"], "hi")
 
 if __name__ == "__main__":
     unittest.main()

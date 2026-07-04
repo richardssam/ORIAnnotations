@@ -5,7 +5,6 @@ import sys
 import datetime
 import tempfile
 import subprocess
-import uuid
 from pathlib import Path
 import shutil
 try:
@@ -142,6 +141,16 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         if not otio_export_name.endswith(".otio"):
             otio_export_name += ".otio"
         basepath = dialog.selectedFiles()[0]
+
+        self._export_annotations_to_directory(
+            basepath, export_media, export_annotation_media,
+            as_nested_stacks, otio_export_name)
+
+    def _export_annotations_to_directory(self, basepath, export_media,
+                                          export_annotation_media,
+                                          as_nested_stacks, otio_export_name):
+        """Headless export entry point (no Qt dialog) — callable from batch/test code."""
+        from otio_sync_core import rv_annotation_codec, rv_paint_applier
         print("Setting OTIO event log directory to:", basepath)
 
         import ORIAnnotations
@@ -192,98 +201,18 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                     os.rename(inputframe, outputframe)
                 else:
                     outputframe = None
-                annotations[uiname]['annotations'][source_frame] = {'paint_node': paint_node, 'strokes': [], 'annotationframe': outputframe, 'note': ""}
+                annotations[uiname]['annotations'][source_frame] = {'paint_node': paint_node, 'annotationframe': outputframe, 'note': ""}
 
         # Now we try to extract the brush strokes.
         for uiname, annotationmediainfo in annotations.items():
                 print("Processing:", annotationmediainfo)
                 paint_node = annotationmediainfo['paint_node']
                 annotationframes = annotationmediainfo['annotations']
-                for prop in commands.properties(paint_node):
-                    if ".frame:" in prop:
-                        try:
-                            print("FRAME PROP:", prop)
-                            frame = int(prop.split(".frame:")[1].split(".order")[0])
-                        except ValueError:
-                            continue
-                        order = commands.getStringProperty(prop)
-                        annotationframes[frame]['order'] = order
                 for frame in annotationframes:
-                    strokes = []
-                    otioevents = []
-                    for order in annotationframes[frame]['order']:
-                        baseprop = f'{paint_node}.{order}'
-                        stroke = {'paint_node': paint_node}
-                        if order.startswith("pen:"):
-                            stroke['stroketype'] = 'pen'
-                            stroke['width'] = commands.getFloatProperty(f"{baseprop}.width")
-                            stroke['color'] = commands.getFloatProperty(f"{baseprop}.color")
-                            stroke['points'] = commands.getFloatProperty(f"{baseprop}.points")
-                            stroke['join'] = commands.getIntProperty(f"{baseprop}.join")[0]
-                            stroke['cap'] = commands.getIntProperty(f"{baseprop}.cap")[0]
-                            stroke['splat'] = commands.getIntProperty(f"{baseprop}.splat")[0]
-                            stroke['brush'] = commands.getStringProperty(f"{baseprop}.brush")[0]
-                            penuuid = str(uuid.uuid4())
-                            event = otio.schemadef.SyncEvent.PaintStart(brush=stroke['brush'],
-                                                                        rgba=stroke['color'],
-                                                                        friendly_name=baseprop.split(':')[-1],
-                                                                        uuid=penuuid
-                                                                        )
-                            if  commands.propertyExists(f"{baseprop}.mode") and commands.getIntProperty(f"{baseprop}.mode")[0] == 1:
-                                event.type = 'erase'
-                                stroke['stroketype'] = 'erase'
-                            otioevents.append(event)
-                            points = stroke['points']
-                            outpointlist = []
-                            if len(stroke['width']) == 1:
-                                # If we have a single width, we assume it's the same for all points.
-                                w = [stroke['width'][0]] * (len(points) // 2)
-                            else:
-                                w = [ i for i in stroke['width']]
-                            x = [ i for i in points[::2]] # convert to list
-                            y = [ i for i in points[1::2]]# convert to list
-    
-                            p = otio.schemadef.SyncEvent.PaintVertices(x, y, w)
-                            
-                            event = otio.schemadef.SyncEvent.PaintPoints(
-                                uuid=penuuid,
-                                points=p
-                            )
-                            otioevents.append(event)
-
-                        if order.startswith("text:"):
-                            stroke['stroketype'] = 'text'
-                            stroke['user'] = order.split(":")[-1]
-                            stroke['position'] = commands.getFloatProperty(f"{baseprop}.position")
-                            stroke['color'] = commands.getFloatProperty(f"{baseprop}.color")
-                            stroke['spacing'] = commands.getFloatProperty(f"{baseprop}.spacing")[0]
-                            stroke['font_size'] = commands.getFloatProperty(f"{baseprop}.size")[0] * 5000.0
-                            stroke['font'] = commands.getStringProperty(f"{baseprop}.font")[0]
-                            stroke['text'] = commands.getStringProperty(f"{baseprop}.text")[0]
-                            stroke['scale'] = commands.getFloatProperty(f"{baseprop}.scale")[0]
-                            stroke['rotation'] = commands.getFloatProperty(f"{baseprop}.rotation")[0]
-
-                            if not stroke['text']:
-                                strokes.append(stroke)
-                                continue
-
-                            textuuid = str(uuid.uuid4())
-                            event = otio.schemadef.SyncEvent.TextAnnotation(
-                                                                        rgba=stroke['color'],
-                                                                        position=stroke['position'],
-                                                                        spacing=stroke['spacing'],
-                                                                        friendly_name=stroke['user'],
-                                                                        font_size=stroke['font_size'],
-                                                                        font=stroke['font'],
-                                                                        text=stroke['text'],
-                                                                        rotation=stroke['rotation'],
-                                                                        scale=stroke['scale'],
-                                                                        uuid=textuuid
-                                                                        )
-                            otioevents.append(event)
-                        strokes.append(stroke)
-                    annotationframes[frame]['strokes'] = strokes
-                    annotationframes[frame]['events'] = otioevents
+                    # Read RV paint-node properties → stroke dicts → SyncEvents,
+                    # via the shared codec (same path the load plugin/batch use).
+                    strokes = rv_paint_applier.read_frame_strokes(commands, paint_node, frame)
+                    annotationframes[frame]['events'] = rv_annotation_codec.rv_strokes_to_sync_events(strokes)
 
         # print("Frames:", annotations)
         medialist = []
@@ -330,7 +259,6 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         print("Exported to:", f"{basepath}/{otio_export_name}")
 
     def import_annotations(self, event):
-        import opentimelineio as otio
         otiofile = "/Users/sam/git/Annotations/test_export/test_export.otio"
         dialog = QFileDialog()
         dialog.setNameFilter("OpenTimelineIO (*.otio)")
@@ -340,9 +268,14 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
             otiofile = dialog.selectedFiles()[0]
         else:
             return
-        
+
+        self._import_annotations_from_file(otiofile)
+
+    def _import_annotations_from_file(self, otiofile):
+        """Headless import entry point (no Qt dialog) — callable from batch/test code."""
         import otio_reader
         import ORIAnnotations
+        from otio_sync_core import rv_annotation_codec, rv_paint_applier
         otio.schema.schemadef.module_from_name('SyncEvent')
 
         commands.addSourceBegin()
@@ -385,189 +318,29 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
         for review in rg.reviews:
             for ri in review.review_items:
+                if ri.media.media_path not in clipmap:
+                    print("WARNING: Media not found in clipmap for review item:", ri.media.media_path)
+                    continue
+                rv_node = clipmap[ri.media.media_path]['paint_node']
+                if not rv_node:
+                    print(f"Warning: No paint node found for {ri.media.media_path}")
+                    continue
+
                 strokeid = 1
                 for frame in ri.review_frames:
                     if frame.annotation_commands is None:
                         continue
-                    if ri.media.media_path not in clipmap:
-                        print("WARNING: Media not found in clipmap for review item:", ri.media.media_path)
-                        continue
                     print("Processing review item:", ri.media.media_path, "Frame:", frame.frame)
-                    clipinfo = clipmap[ri.media.media_path]
 
-                    strokes = []
-                    stroke = {}
-                    strokemap = {}
-
-                    for event in frame.annotation_commands:
-                        if isinstance(event, otio.schemadef.SyncEvent.PaintStart):
-                            stroke = {'type': event.type,
-                                      'color': event.rgba,
-                                      'brush': event.brush,
-                                      'user': event.friendly_name.split(":")[-1],
-                                      'width': [],
-                                      'points': [],}
-                            strokemap[event.uuid] = stroke
-                            strokes.append(stroke)
-                        if isinstance(event, otio.schemadef.SyncEvent.PaintPoints):
-                            stroke = strokemap[event.uuid]
-                            stroke['width'] = [v for v in event.points.size]
-                            stroke['points'] = [val for pair in zip(event.points.x, event.points.y) for val in pair]
-
-                        if isinstance(event, otio.schemadef.SyncEvent.PaintEnd):
-                            stroke = strokemap.get(event.uuid)
-                            if stroke and event.points:
-                                stroke['width'].extend(event.points.size)
-                                stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
-
-                        if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
-                            strokemap[event.uuid] = {'type': 'text'}
-                            stroke = strokemap[event.uuid]
-                            strokes.append(stroke)
-                            stroke['type'] = 'text'
-                            stroke['color'] = event.rgba
-                            stroke['user'] = event.friendly_name
-                            stroke['position'] = event.position
-                            stroke['spacing'] = event.spacing
-                            stroke['font_size'] = event.font_size
-                            stroke['font'] = event.font
-                            stroke['text'] = event.text
-                            stroke['scale'] = event.scale
-                            stroke['rotation'] = event.rotation
-
-                    rv_node = clipinfo['paint_node']
-                    if not rv_node:
-                        print(f"Warning: No paint node found for {ri.media.media_path}")
-                        continue
-
-                    if not commands.propertyExists(f"{rv_node}.tag.annotate"):
-                        commands.newProperty(f"{rv_node}.tag.annotate", commands.StringType, 1)
-                    commands.setStringProperty(
-                                f"{rv_node}.tag.annotate", [''], True
-                    )            
-                    if not commands.propertyExists(f"{rv_node}.internal.creationContext"):
-                        commands.newProperty(f"{rv_node}.internal.creationContext", commands.IntType, 1)
-                    commands.setIntProperty(
-                                f"{rv_node}.internal.creationContext", [1], True
-                    )
-
-
-                    order = []
-                    for stroke in strokes:
-                        if stroke['type'] == 'text':
-                            text_node = f"{rv_node}.text:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                            if not commands.propertyExists(f"{text_node}.position"):
-                                commands.newProperty(f"{text_node}.position", commands.FloatType, 2)
-                            commands.setFloatProperty(
-                                f"{text_node}.position", [x for x in stroke['position']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.color"):
-                                commands.newProperty(f"{text_node}.color", commands.FloatType, 4)
-                            commands.setFloatProperty(
-                                f"{text_node}.color", [float(x) for x in stroke['color']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.spacing"):
-                                commands.newProperty(f"{text_node}.spacing", commands.FloatType, 1)
-                            commands.setFloatProperty(
-                                f"{text_node}.spacing", [stroke['spacing']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.size"):
-                                commands.newProperty(f"{text_node}.size", commands.FloatType, 1)
-                            commands.setFloatProperty(
-                                f"{text_node}.size", [stroke['font_size'] / 5000.0], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.font"):
-                                commands.newProperty(f"{text_node}.font", commands.StringType, 1)
-                            commands.setStringProperty(
-                                f"{text_node}.font", [stroke['font']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.text"):
-                                commands.newProperty(f"{text_node}.text", commands.StringType, 1)
-                            commands.setStringProperty(
-                                f"{text_node}.text", [stroke['text']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.scale"):
-                                commands.newProperty(f"{text_node}.scale", commands.FloatType, 1)
-                            commands.setFloatProperty(
-                                f"{text_node}.scale", [stroke['scale']], True
-                            )
-                            if not commands.propertyExists(f"{text_node}.rotation"):
-                                commands.newProperty(f"{text_node}.rotation", commands.FloatType, 1)
-                            commands.setFloatProperty(
-                                f"{text_node}.rotation", [stroke['rotation']], True
-                            )
-                            order.append(f"text:{strokeid}:{int(frame.frame)}:{stroke['user']}")
-                            strokeid += 1
-                            continue
-                        paint_node = f"{rv_node}.paint"
-                        pen_node = f"{rv_node}.pen:{strokeid}:{int(frame.frame)}:{stroke['user']}"
-                        frame_node = f"{rv_node}.frame:{int(frame.frame)}"
-
-                        if not commands.propertyExists(f"{pen_node}.brush"):
-                            commands.newProperty(f"{pen_node}.brush", commands.StringType, 1)
-
-                        commands.setStringProperty(f"{pen_node}.brush", [stroke['brush']], True)
-
-                        if not commands.propertyExists(f"{pen_node}.color"):
-                            commands.newProperty(f"{pen_node}.color", commands.FloatType, 4)
-
-                        commands.setFloatProperty(
-                            f"{pen_node}.color", [float(x) for x in stroke['color']], True
-                        )
-
-                        if not commands.propertyExists(f"{pen_node}.debug"):
-                            commands.newProperty(f"{pen_node}.debug", commands.IntType, 1)
-
-                            commands.setIntProperty(f"{pen_node}.debug", [False], True)
-
-                        if not commands.propertyExists(f"{pen_node}.join"):
-                            commands.newProperty(f"{pen_node}.join", commands.IntType, 1)
-
-                        commands.setIntProperty(f"{pen_node}.join", [3], True)
-
-                        if not commands.propertyExists(f"{pen_node}.cap"):
-                            commands.newProperty(f"{pen_node}.cap", commands.IntType, 1)
-
-                        commands.setIntProperty(f"{pen_node}.cap", [1], True)
-
-                        if not commands.propertyExists(f"{pen_node}.splat"):
-                            commands.newProperty(f"{pen_node}.splat", commands.IntType, 1)
-
-                        commands.setIntProperty(f"{pen_node}.splat", [0], True)
-
-                        if stroke['type'] == 'erase':
-                            if not commands.propertyExists(f"{pen_node}.mode"):
-                                commands.newProperty(f"{pen_node}.mode", commands.IntType, 1)
-
-                            commands.setIntProperty(
-                                f"{pen_node}.mode", [1], True
-                            )
-
-
-                        if not commands.propertyExists(f"{pen_node}.width"):
-                            commands.newProperty(f"{pen_node}.width", commands.FloatType, 1)
-                        commands.setFloatProperty(
-                            f"{pen_node}.width", [w * 0.6 for w in stroke['width']], True
-                        )
-
-                        if not commands.propertyExists(f"{pen_node}.points"):
-                            commands.newProperty(f"{pen_node}.points", commands.FloatType, 2)
-
-                        commands.setFloatProperty(
-                            f"{pen_node}.points", stroke['points'], True
-                        )
-
-                        order.append(f"pen:{strokeid}:{int(frame.frame)}:{stroke['user']}")
-                        strokeid += 1
-                    
-                    if not commands.propertyExists(f"{frame_node}.order"):
-                        commands.newProperty(f"{frame_node}.order", commands.StringType, 1)
-
-                    commands.setStringProperty(f"{frame_node}.order", order, True)
-                    
-                commands.setIntProperty(
-                            f"{paint_node}.nextId", [strokeid], False
-                        )
+                    # Convert SyncEvents → RV paint-node specs (pure codec) and
+                    # write them via the shared applier — the same code path
+                    # the testchart batch and live-sync plugin use.
+                    rv_frame = int(frame.frame)
+                    specs = rv_annotation_codec.sync_events_to_rv_specs(
+                        frame.annotation_commands, {"frame": rv_frame})
+                    strokeid = rv_paint_applier.apply_specs(
+                        specs, commands, rv_node=rv_node, frame=rv_frame,
+                        mode="append", start_id=strokeid)
         commands.addSourceEnd()
 
 

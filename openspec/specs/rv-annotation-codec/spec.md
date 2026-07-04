@@ -1,0 +1,89 @@
+# rv-annotation-codec
+
+## Purpose
+
+The pure SyncEvent ⇄ RV-paint-node structure codec (`otio_sync_core.rv_annotation_codec` + `otio_sync_core.rv_paint_applier`): the `PaintNodeSpec` intermediate representation plus a thin `apply_specs` edge. Owns which properties, node-name conventions, per-frame `order` lists, shape geometry, gauss/splat, and width for pen · erase · text · ellipse · rect · arrow. Shared by the testchart batch renderer, both OTIO load-plugin directions, and the live-sync renderer — the sole authoritative implementation of this mapping, replacing four previously-duplicated inline copies.
+
+## Requirements
+
+### Requirement: Single RV Annotation Codec
+
+The system SHALL provide a single module `otio_sync_core.rv_annotation_codec` that is the sole authoritative implementation of the OTIO `SyncEvent` ⇄ RV paint-node mapping. All RV code that renders SyncEvents to paint nodes, or reads paint nodes back to SyncEvents, SHALL route through this module and SHALL NOT set or read RV paint-node properties for annotations directly.
+
+#### Scenario: All RV call sites use the codec
+
+- **WHEN** the testchart batch helper, the OTIO load plugin (import and export), or the live-sync renderer renders or parses annotations
+- **THEN** each SHALL call the codec's conversion functions
+- **AND** no annotation paint-node property SHALL be constructed inline at those call sites
+
+#### Scenario: RV units owned by the codec
+
+- **WHEN** a value is an RV-specific unit conversion (`RV_FONT_SCALE = 5000.0`, `RV_WIDTH_SCALE = 0.6`, `font_size_to_rv`, `rv_to_font_size`)
+- **THEN** it SHALL be defined in `rv_annotation_codec`, mirroring how the xStudio codec owns xStudio's font factor
+
+### Requirement: PaintNodeSpec Intermediate Representation
+
+The codec function `sync_events_to_rv_specs(events, ctx)` SHALL be a pure function that returns an ordered list of `PaintNodeSpec` dictionaries and SHALL NOT import or call `rv.commands`. Each `PaintNodeSpec` SHALL carry a `kind`, a stable `uuid`, and an ordered list of `props` (each `(name, rv_type, value, dim)`), fully describing one RV paint child node independent of the target paint node, strokeid, or frame.
+
+#### Scenario: Pure conversion is testable outside RV
+
+- **WHEN** `sync_events_to_rv_specs` is called with a list of SyncEvents in an environment where `rv.commands` is unavailable
+- **THEN** it SHALL return the `PaintNodeSpec` list without error
+- **AND** the result SHALL be assertable in a unit test without launching RV
+
+#### Scenario: Property superset per kind
+
+- **WHEN** a spec is produced for a given kind
+- **THEN** its `props` SHALL include every property the richest existing renderer sets for that kind: pen/erase (`brush, color, debug, join, cap, splat, mode` when erase, `width, points`), text (`position, color, spacing, size, font, text, scale, rotation, origin, debug, startFrame, duration, mode, uuid, softDeleted`), ellipse/rect (`min, max, borderColor, innerColor, borderWidth, startFrame, duration, eye, uuid, softDeleted`), arrow (`startPos, endPos, borderColor, innerColor, borderWidth, thickness, startFrame, duration, eye, uuid, softDeleted`)
+
+### Requirement: Schema-Name Event Dispatch
+
+The codec SHALL dispatch on `event.schema_name()` when classifying SyncEvents, and SHALL NOT use `isinstance(event, otio.schemadef.SyncEvent.X)`, because `isinstance` silently returns `False` when the SyncEvent schemadef is registered more than once.
+
+#### Scenario: Double-loaded schemadef still classifies
+
+- **WHEN** the SyncEvent schemadef has been loaded twice and a `PaintStart` event is passed to the codec
+- **THEN** the codec SHALL classify it as a paint-start via `schema_name() == "PaintStart"`
+- **AND** the annotation SHALL NOT be silently dropped
+
+### Requirement: Thin RV Applier With Append and Reconcile Modes
+
+The codec SHALL provide the only RV-touching function, `apply_specs(specs, commands, *, rv_node, frame, mode, start_id=None)`, which writes `PaintNodeSpec` entries (each carrying its own `user` field) to RV paint nodes and maintains the per-frame `order` list. It SHALL support `mode="append"` (create fresh nodes and append to order) and `mode="reconcile"` (match existing nodes by `uuid`, update in place when found, add when not, and prune managed nodes whose uuid is absent from the incoming set).
+
+#### Scenario: Append mode adds nodes
+
+- **WHEN** `apply_specs` is called with `mode="append"` for a frame that has no existing managed nodes
+- **THEN** it SHALL create the paint child nodes and set the frame `order` to reference them
+
+#### Scenario: Reconcile updates in place by uuid
+
+- **WHEN** `apply_specs` is called with `mode="reconcile"` and a spec whose `uuid` matches an existing node in the frame order
+- **THEN** it SHALL update that node's properties in place rather than appending a duplicate
+
+#### Scenario: Reconcile prunes deleted annotations
+
+- **WHEN** `apply_specs` is called with `mode="reconcile"` and an existing managed node's `uuid` is not present among the incoming specs
+- **THEN** that node SHALL be removed from the frame `order`
+
+### Requirement: RV Round-Trip Preserves Scale
+
+The codec SHALL preserve the text annotation `scale` field on the RV round-trip: `rv_strokes_to_sync_events` SHALL read the RV text node's `scale` property (as read via `rv_paint_applier.read_stroke`/`read_frame_strokes`) into `TextAnnotation.scale`, and `sync_events_to_rv_specs` SHALL write `TextAnnotation.scale` back to the node.
+
+#### Scenario: Scale survives read-back
+
+- **WHEN** a `TextAnnotation` with `scale = 1.5` is rendered to an RV text node and then read back via `rv_paint_applier.read_stroke` + `rv_strokes_to_sync_events`
+- **THEN** the resulting `TextAnnotation.scale` SHALL equal `1.5`
+
+### Requirement: Common Codec Contract for Multi-Host Extensibility
+
+The codec SHALL expose a uniform, host-agnostic surface so that host-agnostic tooling works without special-casing and future host codecs (e.g. Nuke Studio) can be added as a new spoke without editing existing codecs. Each host codec SHALL declare `HOST_ID` and `SUPPORTED_KINDS`, and SHALL provide `to_sync_events(native, ctx)` and `from_sync_events(events, ctx)`; imperative-write hosts SHALL additionally provide `apply(...)`, while single-handoff hosts MAY omit it.
+
+#### Scenario: Codec declares its identity and capabilities
+
+- **WHEN** `rv_annotation_codec` is inspected
+- **THEN** it SHALL expose `HOST_ID == "rv"` and a `SUPPORTED_KINDS` set enumerating the SyncEvent kinds it renders natively
+
+#### Scenario: Unsupported kinds degrade via shared tessellation
+
+- **WHEN** a codec's `from_sync_events` receives a SyncEvent kind not in its `SUPPORTED_KINDS`
+- **THEN** it SHALL route that event through the shared shape tessellation fallback rather than failing

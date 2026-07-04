@@ -18,8 +18,9 @@ except ImportError:
     except ImportError:
         QtCore = None
 
-from utils import _log, _log_exc, _media_path
+from utils import _log, _log_exc, _media_path, _clip_effective_range
 from otio_sync_core.manager import STATE_SYNCED
+from otio_sync_core import rv_annotation_codec, rv_paint_applier
 
 
 def _ensure_workspace_sync_event():
@@ -295,7 +296,8 @@ class AnnotationSyncController:
                     rv.commands.setFloatProperty(
                         f"{node}.{existing_pen}.points", points_flat, True
                     )
-                    widths = [w * 0.6 for w in (pts_ev.points.size if pts_ev.points.size else [2.0])]
+                    widths = [w * rv_annotation_codec.RV_WIDTH_SCALE
+                              for w in (pts_ev.points.size if pts_ev.points.size else [2.0])]
                     if len(widths) == 1:
                         widths = widths * (len(points_flat) // 2)
                     rv.commands.setFloatProperty(
@@ -319,13 +321,7 @@ class AnnotationSyncController:
                     "color": color,
                     "brush": brush,
                     "width": widths,
-                    "join": 3,
-                    "cap": 1,
                     "mode": mode,
-                    "hold": int(bool(getattr(ev_dict, "hold", False))),
-                    "ghost": int(bool(getattr(ev_dict, "ghost", False))),
-                    "ghost_before": getattr(ev_dict, "ghost_before", 0) or 0,
-                    "ghost_after": getattr(ev_dict, "ghost_after", 0) or 0,
                     "_stroke_uuid": stroke_uuid,
                 })
 
@@ -381,55 +377,26 @@ class AnnotationSyncController:
                     text_val = ev.text or ""
                     if not text_val.strip():
                         continue
-                    # Snapshot replay sends the full clip as insert_child; if the
-                    # node was already painted by _rebuild_rv_session, skip it.
-                    if _paint_node_cache and self._text_uuid_exists_in_rv(_paint_node_cache, rv_frame, uuid_val):
-                        position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
-                        color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
-                        rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
-                        order_prop = f"{_paint_node_cache}.frame:{rv_frame}.order"
-                        updated = False
-                        if rv.commands.propertyExists(order_prop):
-                            for item in rv.commands.getStringProperty(order_prop):
-                                if not item.startswith("text:"):
-                                    continue
-                                uuid_prop = f"{_paint_node_cache}.{item}.uuid"
-                                if not rv.commands.propertyExists(uuid_prop):
-                                    continue
-                                  
-                                existing_uuid = rv.commands.getStringProperty(uuid_prop)
-                                if existing_uuid and existing_uuid[0] == uuid_val:
-                                    rv.commands.setStringProperty(f"{_paint_node_cache}.{item}.text", [text_val], True)
-                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.position", position, True)
-                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.color", color, True)
-                                    rv.commands.setFloatProperty(f"{_paint_node_cache}.{item}.size", [rv_size], True)
-                                    _log(f"RECV annotation: updated dup text uuid={uuid_val[:8]!r} in place (text={text_val!r})")
-                                    updated = True
-                                    break
-                        if updated:
-                            if QtCore:
-                                QtCore.QTimer.singleShot(0, rv.commands.redraw)
-                            rendered += 1
-                        else:
-                            _log(f"RECV annotation: skip dup text uuid={uuid_val[:8]!r} (already in RV, but could not update)")
+                    # Reconcile mode subsumes the old manual dup-uuid scan:
+                    # snapshot replay sending the full clip as insert_child
+                    # (already painted by _rebuild_rv_session) updates the
+                    # existing node in place instead of duplicating it; a
+                    # genuinely new uuid gets added.
+                    node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+                    if not node:
+                        _log(f"RECV annotation: no paint node for text uuid={uuid_val[:8]!r}")
                         continue
-                    rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
-                    _log(f"RECV TextAnnotation font_size={getattr(ev, 'font_size', None)!r} → rv_size={rv_size!r}")
-                    self._apply_text_annotation({
-                        "media_path": media_path,
-                        "frame": rv_frame,
-                        "clip_guid": clip_guid,
-                        "node_name": None,
-                        "position": list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0],
-                        "color": list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0],
-                        "spacing": float(ev.spacing) if getattr(ev, "spacing", None) is not None else 0.8,
-                        "size": rv_size,
-                        "scale": float(ev.scale) if getattr(ev, "scale", None) is not None else 1.0,
-                        "rotation": float(ev.rotation) if getattr(ev, "rotation", None) is not None else 0.0,
-                        "font": ev.font or "",
-                        "text": ev.text or "",
-                        "uuid": uuid_val,
-                    })
+                    specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": rv_frame})
+                    for spec in specs:
+                        spec["user"] = "remote"
+                        spec["props"] = [
+                            (name, ptype, [ev.font or ""] if name == "font" else val, dim)
+                            for (name, ptype, val, dim) in spec["props"]
+                        ]
+                    rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile")
+                    _log(f"RECV annotation: reconciled text uuid={uuid_val[:8]!r} (text={text_val!r})")
+                    if QtCore:
+                        QtCore.QTimer.singleShot(0, rv.commands.redraw)
                     rendered += 1
                 elif isinstance(ev, otio.schemadef.SyncEvent.EllipseAnnotation):
                     self._apply_shape_annotation({
@@ -501,7 +468,7 @@ class AnnotationSyncController:
                 if node and rv.commands.propertyExists(f"{node}.{pen_node}.points"):
                     points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
                     rv.commands.setFloatProperty(f"{node}.{pen_node}.points", points_flat, True)
-                    widths = [w * 0.6 for w in points_event.points.size]
+                    widths = [w * rv_annotation_codec.RV_WIDTH_SCALE for w in points_event.points.size]
                     if len(widths) == 1:
                         widths = widths * (len(points_flat) // 2)
                     rv.commands.setFloatProperty(f"{node}.{pen_node}.width", widths, True)
@@ -519,13 +486,7 @@ class AnnotationSyncController:
                 "color": list(start_event.rgba),
                 "brush": start_event.brush,
                 "width": list(points_event.points.size),
-                "join": 3,
-                "cap": 1,
                 "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
-                "hold": int(bool(getattr(start_event, "hold", False))),
-                "ghost": int(bool(getattr(start_event, "ghost", False))),
-                "ghost_before": getattr(start_event, "ghost_before", 0) or 0,
-                "ghost_after": getattr(start_event, "ghost_after", 0) or 0,
             })
             rendered += 1
 
@@ -536,21 +497,24 @@ class AnnotationSyncController:
         """Apply a full annotation_commands replacement to RV paint.
 
         Called when a peer sends ``annotation_commands_replaced`` (e.g. a text
-        edit or drag-move in xStudio).  For each ``TextAnnotation`` command in
-        the replacement, the method finds the existing RV text node by UUID and
-        updates its ``text``, ``position``, ``color``, and ``size`` properties in
-        place.  This avoids the duplicate-text artefact that would result from
-        calling ``_apply_text_annotation`` (which always creates a new node).
+        edit or drag-move in xStudio). Uses the shared codec's reconcile mode:
+        text/shape commands are matched by uuid and updated in place, added if
+        new, and any existing managed node whose uuid is absent from this
+        replacement is pruned (the "replace" semantics — this payload becomes
+        the complete set of text/shape annotations for the frame).
 
-        Stroke commands (``PaintStart`` / ``PaintPoints``) are skipped because
-        they are already painted in RV and have not changed.
+        Stroke commands (``PaintStart``/``PaintPoints``/``PaintEnd``) are
+        excluded — they are already painted in RV and are not part of a
+        "replace" (text-edit / drag-move) broadcast.
 
-        Falls back to ``_apply_text_annotation`` when no node with the matching
-        UUID is found (e.g. if the first broadcast was dropped).
+        Note: reconcile-mode updates overwrite every property the codec
+        writes (including ``softDeleted``, always 0), whereas the original
+        surgical per-field update never touched ``softDeleted``. Nothing in
+        this codebase ever sets it to 1, so this is a low-probability,
+        accepted divergence rather than one worth extra machinery to avoid.
         """
         clip_guid = ann_clip.metadata.get("clip_guid")
         events_data = ann_clip.metadata.get("annotation_commands", [])
-        incoming_uuids = set()
 
         media_clip = self.plugin.sync_manager._object_map.get(clip_guid) if clip_guid else None
         if not isinstance(media_clip, otio.schema.Clip):
@@ -573,8 +537,10 @@ class AnnotationSyncController:
             _log(f"RECV annotation replace: no paint node for media_path={media_path} frame={rv_frame}")
             return
 
-        order_prop = f"{node}.frame:{rv_frame}.order"
+        _STROKE_TYPES = (otio.schemadef.SyncEvent.PaintStart, otio.schemadef.SyncEvent.PaintPoints,
+                          otio.schemadef.SyncEvent.PaintEnd)
 
+        specs = []
         for ev in events_data:
             try:
                 if isinstance(ev, (dict, collections.abc.Mapping)):
@@ -582,181 +548,22 @@ class AnnotationSyncController:
             except Exception as e:
                 _log(f"RECV annotation replace: failed to deserialise event: {e}")
                 continue
+            if isinstance(ev, _STROKE_TYPES):
+                continue
 
-            if isinstance(ev, otio.schemadef.SyncEvent.TextAnnotation):
-                uuid_val = ev.uuid or ""
-                text_val = ev.text or ""
-                position = list(ev.position) if getattr(ev, "position", None) else [0.0, 0.0]
-                color = list(ev.rgba) if getattr(ev, "rgba", None) else [1.0, 1.0, 1.0, 1.0]
-                rv_size = float(ev.font_size) / 5000.0 if getattr(ev, "font_size", None) else 0.01
-                
-                incoming_uuids.add(uuid_val)
+            ev_specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": rv_frame})
+            for spec in ev_specs:
+                spec["user"] = "remote"
+                if spec["kind"] == "text":
+                    font_val = getattr(ev, "font", "") or ""
+                    spec["props"] = [
+                        (name, ptype, [font_val] if name == "font" else val, dim)
+                        for (name, ptype, val, dim) in spec["props"]
+                    ]
+                _log(f"RECV annotation replace: reconciling {spec['kind']} uuid={spec['uuid'][:8]!r}")
+            specs.extend(ev_specs)
 
-                # Scan the frame's draw-order list for a text node with this UUID.
-                found = False
-                if rv.commands.propertyExists(order_prop):
-                    for item in rv.commands.getStringProperty(order_prop):
-                        if not item.startswith("text:"):
-                            continue
-                        uuid_prop = f"{node}.{item}.uuid"
-                        if not rv.commands.propertyExists(uuid_prop):
-                            continue
-                        existing_uuid = rv.commands.getStringProperty(uuid_prop)
-                        if not existing_uuid or existing_uuid[0] != uuid_val:
-                            continue
-                        current_text = rv.commands.getStringProperty(f"{node}.{item}.text")
-                        if not current_text or current_text[0] != text_val:
-                            rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
-                        
-                        # For simplicity, we just overwrite floats since they don't crash the text editor
-                        rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
-                        _log(f"RECV annotation replace: updated {item} text={text_val!r} uuid={uuid_val[:8]!r}")
-                        found = True
-                        break
-
-                if not found:
-                    # UUID not found — initial broadcast may have stored a null/empty uuid.
-                    # If exactly one text node exists on this frame, update it in place and
-                    # repair its uuid so subsequent replaces can find it by uuid.
-                    updated_orphan = False
-                    if rv.commands.propertyExists(order_prop):
-                        text_items = [
-                            i for i in rv.commands.getStringProperty(order_prop)
-                            if i.startswith("text:")
-                        ]
-                        if len(text_items) == 1:
-                            item = text_items[0]
-                            current_text = rv.commands.getStringProperty(f"{node}.{item}.text")
-                            if not current_text or current_text[0] != text_val:
-                                rv.commands.setStringProperty(f"{node}.{item}.text", [text_val], True)
-                            rv.commands.setFloatProperty(f"{node}.{item}.position", position, True)
-                            rv.commands.setFloatProperty(f"{node}.{item}.color", color, True)
-                            rv.commands.setFloatProperty(f"{node}.{item}.size", [rv_size], True)
-                            if rv.commands.propertyExists(f"{node}.{item}.uuid"):
-                                rv.commands.setStringProperty(f"{node}.{item}.uuid", [uuid_val], True)
-                            _log(f"RECV annotation replace: repaired orphan {item} → uuid={uuid_val[:8]!r} text={text_val!r}")
-                            updated_orphan = True
-                    if not updated_orphan:
-                        _log(f"RECV annotation replace: UUID {uuid_val[:8]!r} not found, adding new node")
-                        self._apply_text_annotation({
-                            "media_path": media_path,
-                            "frame": rv_frame,
-                            "node_name": None,
-                            "position": position,
-                            "color": color,
-                            "spacing": float(ev.spacing) if getattr(ev, "spacing", None) is not None else 0.8,
-                            "size": rv_size,
-                            "scale": float(ev.scale) if getattr(ev, "scale", None) is not None else 1.0,
-                            "rotation": float(ev.rotation) if getattr(ev, "rotation", None) is not None else 0.0,
-                            "font": ev.font or "",
-                            "text": text_val,
-                            "uuid": uuid_val,
-                        })
-
-            elif isinstance(ev, (otio.schemadef.SyncEvent.EllipseAnnotation, otio.schemadef.SyncEvent.RectangleAnnotation)):
-                shape_type = "ellipse" if isinstance(ev, otio.schemadef.SyncEvent.EllipseAnnotation) else "rect"
-                uuid_val = ev.uuid or ""
-                incoming_uuids.add(uuid_val)
-
-                found = False
-                if rv.commands.propertyExists(order_prop):
-                    for item in rv.commands.getStringProperty(order_prop):
-                        if not item.startswith(f"{shape_type}:"):
-                            continue
-                        uuid_prop = f"{node}.{item}.uuid"
-                        if not rv.commands.propertyExists(uuid_prop):
-                            continue
-                        existing_uuid = rv.commands.getStringProperty(uuid_prop)
-                        if not existing_uuid or existing_uuid[0] != uuid_val:
-                            continue
-                        
-                        rv.commands.setFloatProperty(f"{node}.{item}.min", list(ev.min), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.max", list(ev.max), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.borderColor", list(ev.rgba), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.innerColor", list(ev.inner_rgba), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.borderWidth", [ev.size / 2.0], True)
-                        _log(f"RECV annotation replace: updated shape {item} uuid={uuid_val[:8]!r}")
-                        found = True
-                        break
-
-                if not found:
-                    self._apply_shape_annotation({
-                        "media_path": media_path,
-                        "frame": rv_frame,
-                        "clip_guid": clip_guid,
-                        "node_name": None,
-                        "type": shape_type,
-                        "min": list(ev.min),
-                        "max": list(ev.max),
-                        "rgba": list(ev.rgba),
-                        "size": ev.size,
-                        "inner_rgba": list(ev.inner_rgba),
-                        "uuid": uuid_val,
-                    })
-
-            elif isinstance(ev, otio.schemadef.SyncEvent.ArrowAnnotation):
-                uuid_val = ev.uuid or ""
-                incoming_uuids.add(uuid_val)
-
-                found = False
-                if rv.commands.propertyExists(order_prop):
-                    for item in rv.commands.getStringProperty(order_prop):
-                        if not item.startswith("arrow:"):
-                            continue
-                        uuid_prop = f"{node}.{item}.uuid"
-                        if not rv.commands.propertyExists(uuid_prop):
-                            continue
-                        existing_uuid = rv.commands.getStringProperty(uuid_prop)
-                        if not existing_uuid or existing_uuid[0] != uuid_val:
-                            continue
-                        
-                        rv.commands.setFloatProperty(f"{node}.{item}.startPos", list(ev.start), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.endPos", list(ev.end), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.borderColor", list(ev.rgba), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.innerColor", list(ev.rgba), True)
-                        rv.commands.setFloatProperty(f"{node}.{item}.thickness", [ev.size / 2.0], True)
-                        _log(f"RECV annotation replace: updated arrow {item} uuid={uuid_val[:8]!r}")
-                        found = True
-                        break
-
-                if not found:
-                    self._apply_shape_annotation({
-                        "media_path": media_path,
-                        "frame": rv_frame,
-                        "clip_guid": clip_guid,
-                        "node_name": None,
-                        "type": "arrow",
-                        "start": list(ev.start),
-                        "end": list(ev.end),
-                        "rgba": list(ev.rgba),
-                        "size": ev.size,
-                        "uuid": uuid_val,
-                    })
-
-        if rv.commands.propertyExists(order_prop):
-            old_order = rv.commands.getStringProperty(order_prop) or []
-            new_order = []
-            for item in old_order:
-                is_managed = (
-                    item.startswith("text:") or 
-                    item.startswith("ellipse:") or 
-                    item.startswith("rect:") or 
-                    item.startswith("arrow:")
-                )
-                if is_managed:
-                    uuid_prop = f"{node}.{item}.uuid"
-                    existing_uuid = ""
-                    if rv.commands.propertyExists(uuid_prop):
-                        eu = rv.commands.getStringProperty(uuid_prop)
-                        existing_uuid = eu[0] if eu else ""
-                    if existing_uuid and existing_uuid not in incoming_uuids:
-                        _log(f"RECV annotation replace: removing deleted node {item} uuid={existing_uuid[:8]!r}")
-                        continue
-                new_order.append(item)
-            if new_order != old_order:
-                rv.commands.setStringProperty(order_prop, new_order, True)
+        rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile")
 
         if QtCore:
             QtCore.QTimer.singleShot(0, rv.commands.redraw)
@@ -788,18 +595,38 @@ class AnnotationSyncController:
                 # where clip_local = frame - source_range.start (timecode) or frame-1 (native).
                 try:
                     clip = self.plugin.sync_manager._object_map.get(clip_guid)
-                    if clip and clip.parent():
+                    if clip is None:
+                        _log(f"  _find_paint_node: clip_guid={clip_guid} not in _object_map — "
+                             f"seq_frame falls back to raw frame={frame}")
+                    elif not clip.parent():
+                        _log(f"  _find_paint_node: clip_guid={clip_guid} found but clip.parent() is falsy — "
+                             f"seq_frame falls back to raw frame={frame}")
+                    else:
                         rip = clip.trimmed_range_in_parent()
-                        if rip is not None:
-                            sr = clip.source_range
+                        if rip is None:
+                            _log(f"  _find_paint_node: clip_guid={clip_guid} trimmed_range_in_parent() "
+                                 f"returned None — seq_frame falls back to raw frame={frame}")
+                        else:
+                            # clip.source_range is often None (a legitimate OTIO
+                            # state meaning "use the whole available_range") —
+                            # xStudio stores the real embedded-timecode start on
+                            # media_reference.available_range in that case, so
+                            # checking source_range alone would misdetect a
+                            # genuine timecode clip as native/no-timecode.
+                            effective = _clip_effective_range(clip)
                             frame_base = self.plugin.playback._frame_base()
-                            if sr is not None and int(sr.start_time.value) > 1:
-                                clip_local = frame - int(sr.start_time.value)
+                            if effective is not None and effective[0] > 1:
+                                clip_local = frame - effective[0]
                             else:
                                 clip_local = frame - 1
                             seq_frame = int(rip.start_time.value) + clip_local + frame_base
-                except Exception:
-                    pass  # flat-playlist clips lack available_range; seq_frame = frame fallback is used
+                            _log(f"  _find_paint_node: seq_frame computed OK — "
+                                 f"rip.start={rip.start_time.value} clip_local={clip_local} "
+                                 f"frame_base={frame_base} effective_start={effective[0] if effective else None} "
+                                 f"-> seq_frame={seq_frame}")
+                except Exception as e:
+                    _log(f"  _find_paint_node: exception computing seq_frame for clip_guid={clip_guid}: {e} — "
+                         f"seq_frame falls back to raw frame={frame}")
             else:
                 lookup_guid = self.plugin.playback._clip_guid_for_media_path(media_path)
                 if lookup_guid:
@@ -830,14 +657,19 @@ class AnnotationSyncController:
         return None
 
     def _apply_annotation(self, data):
+        """Write a received pen/erase stroke to RV paint via the shared codec.
+
+        ``hold``/``ghost``/``ghostBefore``/``ghostAfter`` are local RV display
+        properties, not part of the sync schema — they are always written as
+        fixed defaults (0) here, never derived from network data (matching
+        ``_construct_annotation_events``'s send-side note).
+        """
         try:
             frame = data.get("frame")
             points = data.get("points")
             color = data.get("color")
             brush = data.get("brush")
             width = data.get("width", [2.0])
-            join = data.get("join", 3)
-            cap = data.get("cap", 1)
             node_name = data.get("node_name")
             media_path = data.get("media_path")
             ann_clip_guid = data.get("clip_guid")
@@ -851,47 +683,36 @@ class AnnotationSyncController:
                 else:
                     _log(f"RECV annotation dropped: no paint node for media_path={media_path} frame={frame}")
                     return
-            paint_prop = f"{node}.paint"
-            next_id = rv.commands.getIntProperty(f"{paint_prop}.nextId")[0]
-            pen_node = f"pen:{next_id}:{frame}:remote"
-            full_pen = f"{node}.{pen_node}"
-            order_prop = f"{node}.frame:{frame}.order"
 
-            rv.commands.newProperty(f"{full_pen}.color", rv.commands.FloatType, 4)
-            rv.commands.newProperty(f"{full_pen}.width", rv.commands.FloatType, 1)
-            rv.commands.newProperty(f"{full_pen}.brush", rv.commands.StringType, 1)
-            rv.commands.newProperty(f"{full_pen}.points", rv.commands.FloatType, 2)
-            rv.commands.newProperty(f"{full_pen}.debug", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.join", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.cap", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.splat", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.startFrame", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.duration", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.mode", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.hold", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.ghost", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.ghostBefore", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_pen}.ghostAfter", rv.commands.IntType, 1)
-            rv.commands.setIntProperty(f"{full_pen}.mode", [data.get("mode", 0)], True)
-            rv.commands.setIntProperty(f"{full_pen}.hold", [data.get("hold", 0)], True)
-            rv.commands.setIntProperty(f"{full_pen}.ghost", [data.get("ghost", 0)], True)
-            rv.commands.setIntProperty(f"{full_pen}.ghostBefore", [data.get("ghost_before", 0)], True)
-            rv.commands.setIntProperty(f"{full_pen}.ghostAfter", [data.get("ghost_after", 0)], True)
-            rv.commands.setIntProperty(f"{full_pen}.debug", [0], True)
-            rv.commands.setIntProperty(f"{full_pen}.join", [join], True)
-            rv.commands.setIntProperty(f"{full_pen}.cap", [cap], True)
-            rv.commands.setIntProperty(f"{full_pen}.startFrame", [frame], True)
-            rv.commands.setIntProperty(f"{full_pen}.duration", [1], True)
-            rv.commands.setFloatProperty(f"{full_pen}.color", list(color), True)
-            rv.commands.insertFloatProperty(f"{full_pen}.width", [w * 0.6 for w in width])
-            rv.commands.setStringProperty(f"{full_pen}.brush", [brush], True)
-            rv.commands.setIntProperty(f"{full_pen}.splat", [1 if brush == "gauss" else 0], True)
-            rv.commands.insertFloatProperty(f"{full_pen}.points", list(points))
-            if not rv.commands.propertyExists(order_prop):
-                rv.commands.newProperty(order_prop, rv.commands.StringType, 1)
-            rv.commands.insertStringProperty(order_prop, [pen_node])
+            # Build a synthetic PaintStart/PaintPoints pair (in-memory only —
+            # never persisted) so the shared codec's tested pen-spec logic
+            # (width scale, splat/gauss, erase mode) is reused verbatim.
+            se = otio.schemadef.SyncEvent
+            pairing_uuid = data.get("_stroke_uuid") or str(uuid.uuid4())
+            start_event = se.PaintStart(brush=brush, rgba=list(color), friendly_name="remote", uuid=pairing_uuid)
+            if data.get("mode", 0) == 1:
+                start_event.type = "erase"
+            x = [p for p in points[0::2]]
+            y = [p for p in points[1::2]]
+            points_event = se.PaintPoints(uuid=pairing_uuid, points=se.PaintVertices(x, y, list(width)))
+
+            specs = rv_annotation_codec.sync_events_to_rv_specs([start_event, points_event], {"frame": frame})
+            for spec in specs:
+                spec["user"] = "remote"
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="append")
+
+            order_prop = f"{node}.frame:{frame}.order"
+            pen_items = [i for i in rv.commands.getStringProperty(order_prop) if i.startswith(("pen:",))]
+            if not pen_items:
+                return
+            pen_node = pen_items[-1]
+            full_pen = f"{node}.{pen_node}"
+            for prop_name in ("hold", "ghost", "ghostBefore", "ghostAfter"):
+                if not rv.commands.propertyExists(f"{full_pen}.{prop_name}"):
+                    rv.commands.newProperty(f"{full_pen}.{prop_name}", rv.commands.IntType, 1)
+                rv.commands.setIntProperty(f"{full_pen}.{prop_name}", [0], True)
             _log(f"  _apply_annotation: wrote {pen_node} to {order_prop}")
-            rv.commands.setIntProperty(f"{paint_prop}.nextId", [next_id + 1], True)
+
             # Record UUID→pen_node so partial updates can find this node,
             # and so the final INSERT_CHILD render can skip re-creating it.
             stroke_uuid = data.get("_stroke_uuid")
@@ -902,44 +723,22 @@ class AnnotationSyncController:
         except Exception as e:
             _log_exc(f"Failed to apply remote annotation: {e}")
 
-    def _text_uuid_exists_in_rv(self, node, frame, uuid_val):
-        """Return True if a text node with *uuid_val* already exists in *node*'s draw-order for *frame*."""
-        if not uuid_val or not node:
-            return False
-        order_prop = f"{node}.frame:{frame}.order"
-        if not rv.commands.propertyExists(order_prop):
-            return False
-        for item in rv.commands.getStringProperty(order_prop):
-            if not item.startswith("text:"):
-                continue
-            uuid_prop = f"{node}.{item}.uuid"
-            if not rv.commands.propertyExists(uuid_prop):
-                continue
-            existing = rv.commands.getStringProperty(uuid_prop)
-            if existing and existing[0] == uuid_val:
-                return True
-        return False
-
     def _apply_text_annotation(self, data):
+        """Write a received TextAnnotation to RV paint via the shared codec.
+
+        ``font`` is passed through from the received value here — unlike the
+        batch/load-plugin paths, which intentionally leave RV's text ``font``
+        property blank (see ``rv_annotation_codec._text_spec``), live-sync has
+        always relayed the real font name, so the codec's default is overridden
+        for this call site to preserve that pre-existing behaviour.
+        """
         try:
             frame = data.get("frame")
-            position = data.get("position", [0.0, 0.0])
-            color = data.get("color", [1.0, 1.0, 1.0, 1.0])
-            spacing = data.get("spacing", 0.8)
-            size = data.get("size", 0.01)
-            scale = data.get("scale", 1.0)
-            rotation = data.get("rotation", 0.0)
-            font = data.get("font", "")
-            text = data.get("text", "")
-            origin = data.get("origin", "")
-            debug = data.get("debug", 0)
-            duration = data.get("duration", 1)
-            mode = data.get("mode", 0)
-            uuid_val = data.get("uuid", "")
-            soft_deleted = data.get("softDeleted", 0)
             node_name = data.get("node_name")
             media_path = data.get("media_path")
             ann_clip_guid = data.get("clip_guid")
+            text = data.get("text", "")
+            uuid_val = data.get("uuid", "")
 
             _log(f"RECV text annotation frame={frame} text={text} uuid={uuid_val}")
             node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
@@ -951,49 +750,28 @@ class AnnotationSyncController:
                     _log(f"RECV text annotation dropped: no paint node for media_path={media_path} frame={frame}")
                     return
 
-            paint_prop = f"{node}.paint"
-            next_id = rv.commands.getIntProperty(f"{paint_prop}.nextId")[0]
-            text_node = f"text:{next_id}:{frame}:remote"
-            full_text = f"{node}.{text_node}"
-            order_prop = f"{node}.frame:{frame}.order"
-
-            rv.commands.newProperty(f"{full_text}.position", rv.commands.FloatType, 2)
-            rv.commands.newProperty(f"{full_text}.color", rv.commands.FloatType, 4)
-            rv.commands.newProperty(f"{full_text}.spacing", rv.commands.FloatType, 1)
-            rv.commands.newProperty(f"{full_text}.size", rv.commands.FloatType, 1)
-            rv.commands.newProperty(f"{full_text}.scale", rv.commands.FloatType, 1)
-            rv.commands.newProperty(f"{full_text}.rotation", rv.commands.FloatType, 1)
-            rv.commands.newProperty(f"{full_text}.font", rv.commands.StringType, 1)
-            rv.commands.newProperty(f"{full_text}.text", rv.commands.StringType, 1)
-            rv.commands.newProperty(f"{full_text}.origin", rv.commands.StringType, 1)
-            rv.commands.newProperty(f"{full_text}.debug", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_text}.startFrame", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_text}.duration", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_text}.mode", rv.commands.IntType, 1)
-            rv.commands.newProperty(f"{full_text}.uuid", rv.commands.StringType, 1)
-            rv.commands.newProperty(f"{full_text}.softDeleted", rv.commands.IntType, 1)
-
-            rv.commands.setFloatProperty(f"{full_text}.position", list(position), True)
-            rv.commands.setFloatProperty(f"{full_text}.color", list(color), True)
-            rv.commands.setFloatProperty(f"{full_text}.spacing", [spacing], True)
-            rv.commands.setFloatProperty(f"{full_text}.size", [size], True)
-            rv.commands.setFloatProperty(f"{full_text}.scale", [scale], True)
-            rv.commands.setFloatProperty(f"{full_text}.rotation", [rotation], True)
-            rv.commands.setStringProperty(f"{full_text}.font", [font], True)
-            rv.commands.setStringProperty(f"{full_text}.text", [text], True)
-            rv.commands.setStringProperty(f"{full_text}.origin", [origin], True)
-            rv.commands.setIntProperty(f"{full_text}.debug", [debug], True)
-            rv.commands.setIntProperty(f"{full_text}.startFrame", [frame], True)
-            rv.commands.setIntProperty(f"{full_text}.duration", [duration], True)
-            rv.commands.setIntProperty(f"{full_text}.mode", [mode], True)
-            rv.commands.setStringProperty(f"{full_text}.uuid", [uuid_val], True)
-            rv.commands.setIntProperty(f"{full_text}.softDeleted", [soft_deleted], True)
-
-            if not rv.commands.propertyExists(order_prop):
-                rv.commands.newProperty(order_prop, rv.commands.StringType, 1)
-            rv.commands.insertStringProperty(order_prop, [text_node])
-            _log(f"  _apply_text_annotation: wrote {text_node} to {order_prop}")
-            rv.commands.setIntProperty(f"{paint_prop}.nextId", [next_id + 1], True)
+            se = otio.schemadef.SyncEvent
+            text_event = se.TextAnnotation(
+                rgba=list(data.get("color", [1.0, 1.0, 1.0, 1.0])),
+                position=list(data.get("position", [0.0, 0.0])),
+                spacing=float(data.get("spacing", 0.8)),
+                friendly_name="remote",
+                font_size=rv_annotation_codec.rv_to_font_size(data.get("size", 0.01)),
+                font=data.get("font", ""),
+                text=text,
+                rotation=float(data.get("rotation", 0.0)),
+                scale=float(data.get("scale", 1.0)),
+                uuid=uuid_val,
+            )
+            specs = rv_annotation_codec.sync_events_to_rv_specs([text_event], {"frame": frame})
+            for spec in specs:
+                spec["user"] = "remote"
+                spec["props"] = [
+                    (name, ptype, [data.get("font", "")] if name == "font" else val, dim)
+                    for (name, ptype, val, dim) in spec["props"]
+                ]
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="append")
+            _log(f"  _apply_text_annotation: wrote text node to {node}.frame:{frame}.order")
             if QtCore:
                 QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:
@@ -1033,6 +811,11 @@ class AnnotationSyncController:
         self._broadcast_annotation(node_name, component, partial=False, stroke_uuid=stroke_uuid)
 
     def _apply_shape_annotation(self, data):
+        """Write a received shape annotation (ellipse/rect/arrow) to RV paint
+        via the shared codec, using reconcile mode: a duplicate broadcast
+        (same uuid) updates the existing node in place instead of the manual
+        skip-if-duplicate check this used to do (a safe superset — idempotent
+        either way, and correctly applies an edit if the data did change)."""
         try:
             frame = data.get("frame")
             shape_type = data.get("type")
@@ -1051,95 +834,60 @@ class AnnotationSyncController:
                     _log(f"RECV shape annotation dropped: no paint node for media_path={media_path} frame={frame}")
                     return
 
-            order_prop = f"{node}.frame:{frame}.order"
-            if rv.commands.propertyExists(order_prop):
-                for item in rv.commands.getStringProperty(order_prop):
-                    if not (item.startswith("ellipse:") or item.startswith("rect:") or item.startswith("arrow:")):
-                        continue
-                    uuid_prop = f"{node}.{item}.uuid"
-                    if rv.commands.propertyExists(uuid_prop):
-                        existing_uuid = rv.commands.getStringProperty(uuid_prop)
-                        if existing_uuid and existing_uuid[0] == uuid_val:
-                            _log(f"RECV shape annotation: skip duplicate shape uuid={uuid_val[:8]}")
-                            return
+            se = otio.schemadef.SyncEvent
+            if shape_type == "arrow":
+                shape_event = se.ArrowAnnotation(
+                    start=list(data.get("start")), end=list(data.get("end")),
+                    rgba=list(data.get("rgba")), size=float(data.get("size", 1.0)), uuid=uuid_val)
+            else:
+                cls = se.EllipseAnnotation if shape_type == "ellipse" else se.RectangleAnnotation
+                shape_event = cls(
+                    min=list(data.get("min")), max=list(data.get("max")),
+                    rgba=list(data.get("rgba")), size=float(data.get("size", 1.0)),
+                    inner_rgba=list(data.get("inner_rgba")), uuid=uuid_val)
 
-            paint_prop = f"{node}.paint"
-            next_id = rv.commands.getIntProperty(f"{paint_prop}.nextId")[0]
-            shape_node = f"{shape_type}:{next_id}:{frame}:remote"
-            full_shape = f"{node}.{shape_node}"
-
-            def set_prop(name, ptype, val, dim=1):
-                if not rv.commands.propertyExists(f"{full_shape}.{name}"):
-                    rv.commands.newProperty(f"{full_shape}.{name}", ptype, dim)
-                if ptype == rv.commands.FloatType:
-                    rv.commands.setFloatProperty(f"{full_shape}.{name}", val if isinstance(val, list) else [val], True)
-                elif ptype == rv.commands.StringType:
-                    rv.commands.setStringProperty(f"{full_shape}.{name}", val if isinstance(val, list) else [val], True)
-                else:
-                    rv.commands.setIntProperty(f"{full_shape}.{name}", val if isinstance(val, list) else [val], True)
-
-            set_prop("startFrame",  rv.commands.IntType,    frame)
-            set_prop("duration",    rv.commands.IntType,    1)
-            set_prop("eye",         rv.commands.IntType,    2)
-            set_prop("uuid",        rv.commands.StringType, uuid_val)
-            set_prop("softDeleted", rv.commands.IntType,    0)
-
-            if shape_type in ["ellipse", "rect"]:
-                set_prop("min",         rv.commands.FloatType,  data.get("min"), dim=2)
-                set_prop("max",         rv.commands.FloatType,  data.get("max"), dim=2)
-                set_prop("borderColor", rv.commands.FloatType,  data.get("rgba"), dim=4)
-                set_prop("innerColor",  rv.commands.FloatType,  data.get("inner_rgba"), dim=4)
-                set_prop("borderWidth", rv.commands.FloatType,  data.get("size") / 2.0)
-            elif shape_type == "arrow":
-                set_prop("startPos",    rv.commands.FloatType,  data.get("start"), dim=2)
-                set_prop("endPos",      rv.commands.FloatType,  data.get("end"), dim=2)
-                set_prop("borderColor", rv.commands.FloatType,  data.get("rgba"), dim=4)
-                set_prop("innerColor",  rv.commands.FloatType,  data.get("rgba"), dim=4)
-                set_prop("borderWidth", rv.commands.FloatType,  0.0)
-                set_prop("thickness",   rv.commands.FloatType,  data.get("size") / 2.0)
-
-            if not rv.commands.propertyExists(order_prop):
-                rv.commands.newProperty(order_prop, rv.commands.StringType, 1)
-            rv.commands.insertStringProperty(order_prop, [shape_node])
-            _log(f"  _apply_shape_annotation: wrote {shape_node} to {order_prop}")
-            rv.commands.setIntProperty(f"{paint_prop}.nextId", [next_id + 1], True)
-
+            specs = rv_annotation_codec.sync_events_to_rv_specs([shape_event], {"frame": frame})
+            for spec in specs:
+                spec["user"] = "remote"
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="reconcile")
+            _log(f"  _apply_shape_annotation: wrote {shape_type} node to {node}.frame:{frame}.order")
             if QtCore:
                 QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:
             _log_exc(f"Failed to apply remote shape annotation: {e}")
 
+    #: For each order-item prefix, the RV property whose *existence* signals
+    #: the node is fully written (guards against reading mid-creation).
+    _DISCRIMINATOR_PROP = {
+        "pen:": "points", "text:": "text",
+        "rect:": "min", "ellipse:": "min", "arrow:": "startPos",
+    }
+
     def _construct_annotation_events(self, node_name, component, stroke_uuid=None):
+        """Read one RV paint child node and return its JSON-serialised SyncEvents.
+
+        The live-sync counterpart to :func:`export_annotations`'s per-frame read
+        (see ``rv_paint_applier.read_stroke`` / ``rv_annotation_codec``), but for
+        a single named component and returning wire-ready dicts. Note fields
+        ``hold``/``ghost``/``ghost_before``/``ghost_after`` are intentionally
+        NOT read into the outbound event — these are local RV display concerns,
+        not part of the sync schema (see ``_apply_annotation``'s matching note).
+        """
         full_prop = f"{node_name}.{component}"
-        is_text = component.startswith("text:")
-        is_rect = component.startswith("rect:")
-        is_ellipse = component.startswith("ellipse:")
-        is_arrow = component.startswith("arrow:")
-        events = []
-        
-        if is_text:
-            text_prop = f"{full_prop}.text"
-            if not rv.commands.propertyExists(text_prop):
-                return []
-            text = rv.commands.getStringProperty(text_prop)
-            text_val = text[0] if text else ""
-            text_val = text_val.replace("\x01", "")
-            
-            # Skip soft-deleted text nodes
-            soft_deleted_prop = f"{full_prop}.softDeleted"
-            if rv.commands.propertyExists(soft_deleted_prop):
-                if rv.commands.getIntProperty(soft_deleted_prop)[0]:
-                    return []
+        prefix = next((p for p in self._DISCRIMINATOR_PROP if component.startswith(p)), None)
+        if prefix is None:
+            return []
+        if not rv.commands.propertyExists(f"{full_prop}.{self._DISCRIMINATOR_PROP[prefix]}"):
+            return []
 
-            color = rv.commands.getFloatProperty(f"{full_prop}.color")
-            position = rv.commands.getFloatProperty(f"{full_prop}.position")
-            size = rv.commands.getFloatProperty(f"{full_prop}.size")
-            spacing = rv.commands.getFloatProperty(f"{full_prop}.spacing")
-            scale = rv.commands.getFloatProperty(f"{full_prop}.scale")
-            rotation = rv.commands.getFloatProperty(f"{full_prop}.rotation")
-            font = rv.commands.getStringProperty(f"{full_prop}.font")
+        is_text = prefix == "text:"
+        is_shape = prefix in ("rect:", "ellipse:", "arrow:")
 
-            # Check for uuid or generate one
+        # Text/shape UUIDs must be stable across repeated broadcasts (e.g. a
+        # text edit re-sends the same node), so persist one if missing. Pens
+        # track their UUID in-memory instead (_pending_stroke/_partial_pen_nodes)
+        # and never persist a `.uuid` property, matching pre-existing behaviour.
+        if is_text or is_shape:
             uuid_prop = f"{full_prop}.uuid"
             if rv.commands.propertyExists(uuid_prop):
                 ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
@@ -1147,163 +895,32 @@ class AnnotationSyncController:
                 ann_uuid = str(uuid.uuid4())
                 rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
                 rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
-
-            if not text_val.strip():
-                return []
-
-            # Map size: font_size in xstudio is around 50.0, RV size is around 0.01.
-            # So: font_size = size[0] * 5000.0 if size else 50.0.
-            r_size = size[0] if size else 0.01
-            font_size = r_size * 5000.0
-
-            try:
-                text_event = otio.schemadef.SyncEvent.TextAnnotation(
-                    rgba=list(color) if color else [1.0, 1.0, 1.0, 1.0],
-                    position=list(position) if position else [0.0, 0.0],
-                    spacing=spacing[0] if spacing else 0.0,
-                    friendly_name=component.split(':')[-1],
-                    font_size=float(font_size),
-                    font=font[0] if font else "",
-                    text=text_val,
-                    rotation=rotation[0] if rotation else 0.0,
-                    scale=scale[0] if scale else 1.0,
-                    uuid=ann_uuid
-                )
-                event_data = json.loads(otio.adapters.write_to_string(text_event, "otio_json", indent=-1))
-                events = [event_data]
-            except Exception as e:
-                _log(f"SEND annotation skipped: SyncEvent TextAnnotation serialisation failed: {e}")
-                return []
-        elif is_rect or is_ellipse:
-            min_prop = f"{full_prop}.min"
-            if not rv.commands.propertyExists(min_prop):
-                return []
-            min_val = list(rv.commands.getFloatProperty(min_prop))
-            max_val = list(rv.commands.getFloatProperty(f"{full_prop}.max"))
-            rgba = list(rv.commands.getFloatProperty(f"{full_prop}.borderColor"))
-            inner_rgba = list(rv.commands.getFloatProperty(f"{full_prop}.innerColor"))
-            border_width = rv.commands.getFloatProperty(f"{full_prop}.borderWidth")[0]
-            size = border_width * 2.0
-
-            uuid_prop = f"{full_prop}.uuid"
-            if rv.commands.propertyExists(uuid_prop):
-                ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
-            else:
-                ann_uuid = str(uuid.uuid4())
-                rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
-                rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
-
-            try:
-                if is_rect:
-                    shape_event = otio.schemadef.SyncEvent.RectangleAnnotation(
-                        min=min_val,
-                        max=max_val,
-                        rgba=rgba,
-                        size=size,
-                        inner_rgba=inner_rgba,
-                        uuid=ann_uuid,
-                        timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                    )
-                else:
-                    shape_event = otio.schemadef.SyncEvent.EllipseAnnotation(
-                        min=min_val,
-                        max=max_val,
-                        rgba=rgba,
-                        size=size,
-                        inner_rgba=inner_rgba,
-                        uuid=ann_uuid,
-                        timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                    )
-                event_data = json.loads(otio.adapters.write_to_string(shape_event, "otio_json", indent=-1))
-                events = [event_data]
-            except Exception as e:
-                _log(f"SEND shape annotation skipped: SyncEvent serialization failed: {e}")
-                return []
-        elif is_arrow:
-            start_prop = f"{full_prop}.startPos"
-            if not rv.commands.propertyExists(start_prop):
-                return []
-            start_val = list(rv.commands.getFloatProperty(start_prop))
-            end_val = list(rv.commands.getFloatProperty(f"{full_prop}.endPos"))
-            rgba = list(rv.commands.getFloatProperty(f"{full_prop}.borderColor"))
-            thickness = rv.commands.getFloatProperty(f"{full_prop}.thickness")[0]
-            size = thickness * 2.0
-
-            uuid_prop = f"{full_prop}.uuid"
-            if rv.commands.propertyExists(uuid_prop):
-                ann_uuid = rv.commands.getStringProperty(uuid_prop)[0]
-            else:
-                ann_uuid = str(uuid.uuid4())
-                rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
-                rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
-
-            try:
-                shape_event = otio.schemadef.SyncEvent.ArrowAnnotation(
-                    start=start_val,
-                    end=end_val,
-                    rgba=rgba,
-                    size=size,
-                    uuid=ann_uuid,
-                    timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                )
-                event_data = json.loads(otio.adapters.write_to_string(shape_event, "otio_json", indent=-1))
-                events = [event_data]
-            except Exception as e:
-                _log(f"SEND shape annotation skipped: SyncEvent serialization failed: {e}")
-                return []
         else:
-            points = rv.commands.getFloatProperty(f"{full_prop}.points")
-            if not points:
+            ann_uuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
+
+        if is_text:
+            soft_deleted_prop = f"{full_prop}.softDeleted"
+            if rv.commands.propertyExists(soft_deleted_prop) and rv.commands.getIntProperty(soft_deleted_prop)[0]:
                 return []
-            color = rv.commands.getFloatProperty(f"{full_prop}.color")
-            brush = rv.commands.getStringProperty(f"{full_prop}.brush")[0]
-            width = rv.commands.getFloatProperty(f"{full_prop}.width")
-            
-            try:
-                penuuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
 
-                def _int_prop(prop, default=0):
-                    try:
-                        return rv.commands.getIntProperty(prop)[0]
-                    except Exception:
-                        return default
+        stroke = rv_paint_applier.read_stroke(rv.commands, node_name, component)
+        if stroke is None:
+            return []
+        stroke["uuid"] = ann_uuid
 
-                hold         = bool(_int_prop(f"{full_prop}.hold"))
-                ghost        = bool(_int_prop(f"{full_prop}.ghost"))
-                ghost_before = _int_prop(f"{full_prop}.ghostBefore")
-                ghost_after  = _int_prop(f"{full_prop}.ghostAfter")
-
-                start_event = otio.schemadef.SyncEvent.PaintStart(
-                    brush=brush,
-                    rgba=list(color),
-                    friendly_name=component.split(':')[-1],
-                    uuid=penuuid,
-                    hold=hold,
-                    ghost=ghost,
-                    ghost_before=ghost_before,
-                    ghost_after=ghost_after,
-                )
-                mode_prop = f"{full_prop}.mode"
-                if rv.commands.propertyExists(mode_prop) and rv.commands.getIntProperty(mode_prop)[0] == 1:
-                    start_event.type = 'erase'
-
-                x = [i for i in points[::2]]
-                y = [i for i in points[1::2]]
-                if len(width) == 1:
-                    w = [width[0]] * (len(points) // 2)
-                else:
-                    w = [i for i in width]
-                p = otio.schemadef.SyncEvent.PaintVertices(x, y, w)
-                points_event = otio.schemadef.SyncEvent.PaintPoints(uuid=penuuid, points=p)
-
-                start_event_data = json.loads(otio.adapters.write_to_string(start_event, "otio_json", indent=-1))
-                points_event_data = json.loads(otio.adapters.write_to_string(points_event, "otio_json", indent=-1))
-                events = [start_event_data, points_event_data]
-            except Exception as e:
-                _log(f"SEND annotation skipped: SyncEvent serialisation failed: {e}")
+        if is_text:
+            stroke["text"] = (stroke.get("text") or "").replace("\x01", "")
+            if not stroke["text"].strip():
                 return []
-        
-        return events
+
+        try:
+            events = rv_annotation_codec.rv_strokes_to_sync_events([stroke])
+            if not events:
+                return []
+            return [json.loads(otio.adapters.write_to_string(ev, "otio_json", indent=-1)) for ev in events]
+        except Exception as e:
+            _log(f"SEND annotation skipped: SyncEvent serialisation failed: {e}")
+            return []
 
     def _broadcast_frame_annotations_replace(self, node_name, frame):
         try:

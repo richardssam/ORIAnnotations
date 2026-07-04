@@ -32,7 +32,13 @@ from typing import List, Optional
 
 import opentimelineio as otio
 
+from otio_sync_core import coords, shapes
 from otio_sync_core.manager import sync_event_schema
+
+# --- xStudio unit conversions (owned here, NOT in coords) ------------------
+
+#: OTIO ``TextAnnotation.font_size`` → xStudio caption ``font_size`` multiplier.
+XS_FONT_SCALE: float = 2.5
 
 # Lazily resolved — requires OTIO_PLUGIN_MANIFEST_PATH to be populated first.
 _SyncEvent = None
@@ -171,9 +177,9 @@ def xs_captions_to_sync_events(
             se.TextAnnotation(
                 rgba=[r, g, b, opacity],
                 position=position,
-                spacing=0.0,
+                spacing=coords.DEFAULT_SPACING,
                 friendly_name=font_name,
-                font_size=float(caption.get("font_size", 50.0)) / 2.5,
+                font_size=float(caption.get("font_size", coords.DEFAULT_FONT_SIZE)) / XS_FONT_SCALE,
                 font=font_name,
                 text=caption.get("text", ""),
                 rotation=0.0,
@@ -237,52 +243,22 @@ def sync_events_to_xs_strokes(commands: list, aspect_half: float) -> list:
             size = cmd.get("size") if isinstance(cmd, dict) else getattr(cmd, "size", 2.0)
             thickness = size / (2.0 * aspect_half)
             
+            # Shape geometry → OTIO-norm polyline via the shared host-neutral
+            # tessellation helper (see otio_sync_core.shapes).
             pts_list = []
             if is_rect:
                 min_val = cmd.get("min") if isinstance(cmd, dict) else getattr(cmd, "min", [0.0, 0.0])
                 max_val = cmd.get("max") if isinstance(cmd, dict) else getattr(cmd, "max", [0.0, 0.0])
-                min_val, max_val = list(min_val), list(max_val)
-                pts_list = [
-                    [min_val[0], min_val[1]],
-                    [max_val[0], min_val[1]],
-                    [max_val[0], max_val[1]],
-                    [min_val[0], max_val[1]],
-                    [min_val[0], min_val[1]]
-                ]
+                pts_list = shapes.rect_polyline(min_val, max_val)
             elif is_ellipse:
-                import math
                 min_val = cmd.get("min") if isinstance(cmd, dict) else getattr(cmd, "min", [0.0, 0.0])
                 max_val = cmd.get("max") if isinstance(cmd, dict) else getattr(cmd, "max", [0.0, 0.0])
-                min_val, max_val = list(min_val), list(max_val)
-                cx = (min_val[0] + max_val[0]) / 2.0
-                cy = (min_val[1] + max_val[1]) / 2.0
-                rx = (max_val[0] - min_val[0]) / 2.0
-                ry = (max_val[1] - min_val[1]) / 2.0
-                steps = 36
-                for step in range(steps + 1):
-                    theta = 2.0 * math.pi * step / steps
-                    pts_list.append([cx + rx * math.cos(theta), cy + ry * math.sin(theta)])
+                pts_list = shapes.ellipse_polyline(min_val, max_val)
             elif is_arrow:
-                import math
                 start_val = cmd.get("start") if isinstance(cmd, dict) else getattr(cmd, "start", [0.0, 0.0])
                 end_val = cmd.get("end") if isinstance(cmd, dict) else getattr(cmd, "end", [0.0, 0.0])
-                start_val, end_val = list(start_val), list(end_val)
-                pts_list = [start_val, end_val]
-                dx = end_val[0] - start_val[0]
-                dy = end_val[1] - start_val[1]
-                length = math.sqrt(dx*dx + dy*dy)
-                if length > 0.0001:
-                    ux = dx / length
-                    uy = dy / length
-                    nx = -uy
-                    ny = ux
-                    hl = min(0.3, length * 0.25)
-                    lx = end_val[0] - hl * ux + 0.5 * hl * nx
-                    ly = end_val[1] - hl * uy + 0.5 * hl * ny
-                    rx_val = end_val[0] - hl * ux - 0.5 * hl * nx
-                    ry_val = end_val[1] - hl * uy - 0.5 * hl * ny
-                    pts_list.extend([[lx, ly], end_val, [rx_val, ry_val]])
-                    
+                pts_list = shapes.arrow_polyline(start_val, end_val)
+
             raw_pts = []
             for x, y in pts_list:
                 raw_pts.extend([
@@ -449,7 +425,7 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
         position = _get("position", [0.0, 0.0]) or [0.0, 0.0]
         text = _get("text", "") or ""
         font = _get("font", "") or ""
-        font_size = float(_get("font_size", 50.0) or 50.0)
+        font_size = float(_get("font_size", coords.DEFAULT_FONT_SIZE) or coords.DEFAULT_FONT_SIZE)
         uuid_val = _get("uuid", "") or ""
 
         # xStudio requires a valid font name to render text; default to one of its built-ins
@@ -464,7 +440,7 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
             "opacity": rgba[3] if len(rgba) > 3 else 1.0,
             "position": ["vec2", 1, x_xs, y_xs],
             "font_name": font,
-            "font_size": font_size * 2.5,
+            "font_size": font_size * XS_FONT_SCALE,
             "text": text,
             "wrap_width": 1.5,
             "justification": 0,
@@ -475,3 +451,53 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
             cap_dict["uuid"] = uuid_val
         captions.append(cap_dict)
     return captions
+
+
+# ---------------------------------------------------------------------------
+# D9 common contract entry points (host-agnostic tooling; see design.md)
+# ---------------------------------------------------------------------------
+
+HOST_ID = "xstudio"
+
+#: SyncEvent kinds xStudio renders natively. Shapes (ellipse/rect/arrow) are
+#: NOT in this set — xStudio has no shape primitives, so
+#: :func:`sync_events_to_xs_strokes` already tessellates them into stroke
+#: polylines via :mod:`otio_sync_core.shapes` before this point is reached.
+SUPPORTED_KINDS = frozenset({"pen", "erase", "text"})
+
+
+def from_sync_events(events: list, ctx: Optional[dict] = None) -> dict:
+    """Hub → host: SyncEvents → xStudio's native ``{"strokes", "captions"}`` dict.
+
+    The dict shape matches ``Bookmark.set_annotation(strokes=..., captions=...)``
+    — xStudio's single-handoff API — so callers can pass the result straight
+    through without unpacking.
+
+    :param events: SyncEvent objects (or serialised dicts) for one frame.
+    :param ctx: Optional context; ``ctx["aspect_half"]`` overrides the default.
+    :returns: ``{"strokes": [...], "captions": [...]}``.
+    """
+    aspect_half = (ctx or {}).get("aspect_half", coords.DEFAULT_ASPECT_HALF)
+    return {
+        "strokes": sync_events_to_xs_strokes(events, aspect_half),
+        "captions": sync_events_to_xs_captions(events, aspect_half),
+    }
+
+
+def to_sync_events(native: dict, ctx: Optional[dict] = None) -> list:
+    """Host → hub: xStudio's native ``{"strokes", "captions"}`` dict → SyncEvents.
+
+    :param native: ``{"strokes": [...], "captions": [...]}`` as read from
+        ``Bookmark.annotation_data["Data"]``.
+    :param ctx: Optional context; ``ctx["aspect_half"]`` overrides the default,
+        ``ctx["uuid_list"]``/``ctx["existing_uuids"]`` thread through to the
+        underlying stroke/caption converters for stable-uuid partial rebroadcasts.
+    :returns: Flat list of SyncEvent objects (strokes then captions).
+    """
+    aspect_half = (ctx or {}).get("aspect_half", coords.DEFAULT_ASPECT_HALF)
+    uuid_list = (ctx or {}).get("uuid_list") if ctx else None
+    existing_uuids = (ctx or {}).get("existing_uuids") if ctx else None
+    return (
+        xs_strokes_to_sync_events(native.get("strokes", []), aspect_half, uuid_list=uuid_list)
+        + xs_captions_to_sync_events(native.get("captions", []), aspect_half, existing_uuids=existing_uuids)
+    )

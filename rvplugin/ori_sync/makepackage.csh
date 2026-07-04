@@ -21,6 +21,10 @@ cd python
 zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/__init__.py \
     otio_sync_core/color.py \
+    otio_sync_core/coords.py \
+    otio_sync_core/shapes.py \
+    otio_sync_core/rv_annotation_codec.py \
+    otio_sync_core/rv_paint_applier.py \
     otio_sync_core/network.py \
     otio_sync_core/rabbitmq_network.py \
     otio_sync_core/manager.py \

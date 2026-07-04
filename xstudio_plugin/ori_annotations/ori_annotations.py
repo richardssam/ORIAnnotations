@@ -48,6 +48,7 @@ from otio_sync_core.xs_annotation_codec import (  # noqa: E402
     sync_events_to_xs_strokes,
     sync_events_to_xs_captions,
 )
+from otio_sync_core import coords  # noqa: E402
 
 SyncEvent = otio.schema.schemadef.module_from_name("SyncEvent")
 
@@ -620,7 +621,7 @@ class ORIAnnotationsPlugin(PluginBase):
 
         return media_list, review_items, annotated_count
 
-    def _bookmark_to_sync_events(self, bookmark, aspect_half=0.8889):
+    def _bookmark_to_sync_events(self, bookmark, aspect_half=coords.DEFAULT_ASPECT_HALF):
         """Read annotation data from *bookmark* and convert to SyncEvent objects.
 
         Deserialises the bookmark's raw annotation JSON via ``serialise_atom``,
@@ -702,19 +703,19 @@ class ORIAnnotationsPlugin(PluginBase):
 
         :param media: xStudio ``Media`` object.
         :returns: ``aspect_half`` value (e.g. ``0.8889`` for 16:9 1920×1080).
-            Falls back to ``0.8889`` on any error.
+            Falls back to :data:`coords.DEFAULT_ASPECT_HALF` on any error.
         :rtype: float
         """
         try:
             ms = media.media_source()
             if ms is None:
-                return 0.8889
+                return coords.DEFAULT_ASPECT_HALF
             streams = ms.image_streams
             res = streams[0].media_stream_detail.resolution() if streams else None
-            img_w, img_h = (res[0], res[1]) if res and res[1] else (1920, 1080)
+            img_w, img_h = (res[0], res[1]) if res else (1920, 1080)
         except Exception:
-            img_w, img_h = 1920, 1080
-        return img_w / (2.0 * img_h)
+            return coords.DEFAULT_ASPECT_HALF
+        return coords.aspect_half(img_w, img_h)
 
 
 def create_plugin_instance(connection):

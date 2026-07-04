@@ -10,7 +10,7 @@ try:
 except ImportError:
     STATE_SYNCED = "synced"
 
-from utils import _log, _log_exc, _media_path
+from utils import _log, _log_exc, _media_path, _clip_effective_range
 
 
 class PlaybackSyncController:
@@ -304,10 +304,12 @@ class PlaybackSyncController:
         """Return the OTIO clip guid for the occurrence of media_path covering media_frame.
 
         For OTIO cut sequences the same file can appear at multiple positions with
-        different source_range values.  We pick the clip whose source_range contains
-        media_frame (the absolute media/timecode frame stored in RV paint node names).
-        Falls back to the first path-match for native single-occurrence timelines or
-        when no source_range covers the frame.
+        different source_range values.  We pick the clip whose effective range
+        (source_range, or media_reference.available_range when source_range is
+        the legitimate-but-unhelpful None — see _clip_effective_range) contains
+        media_frame (the absolute media/timecode frame stored in RV paint node
+        names). Falls back to the first path-match for native single-occurrence
+        timelines or when no range covers the frame.
         """
         import os
         norm = os.path.abspath(_media_path(media_path))
@@ -323,10 +325,9 @@ class PlaybackSyncController:
                 continue
             if fallback is None:
                 fallback = guid
-            sr = obj.source_range
-            if sr is not None:
-                start = int(sr.start_time.value)
-                end = start + int(sr.duration.value) - 1
+            effective = _clip_effective_range(obj)
+            if effective is not None:
+                start, end = effective
                 if start <= int(media_frame) <= end:
                     _log(f"LOOKUP CLIP (frame={media_frame}): matched occurrence {guid} [{start}..{end}]")
                     return guid

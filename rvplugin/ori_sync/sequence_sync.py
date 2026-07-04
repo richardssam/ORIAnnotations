@@ -731,6 +731,17 @@ class SequenceSyncController:
                     num_frames = int(src_end) - int(src_start) + 1
             except Exception:
                 pass
+            # RV reports startFrame=1 as its own internal convention for media
+            # with NO real embedded timecode (see playback_sync.py::_frame_base:
+            # "a normal no-timecode source/sequence starts at frame 1"). Genuine
+            # embedded timecode essentially never lands on exactly frame 1 (it's
+            # values like 86400 for 01:00:00:00@24fps). Embedding RV's synthetic
+            # "1" literally into available_range made xStudio treat frame 1 as
+            # the start and skip the true first frame — confirmed live as an
+            # off-by-one on non-timecode media. Normalise to the OTIO-conventional
+            # 0 for untimed media; leave any other (real timecode) value as-is.
+            if start_frame == 1:
+                start_frame = 0
             if num_frames is None:
                 num_frames = int(fps)  # 1-second fallback
             duration = otio.opentime.RationalTime(num_frames, fps)

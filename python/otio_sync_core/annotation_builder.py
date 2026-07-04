@@ -10,6 +10,8 @@ from typing import Any
 
 import opentimelineio as otio
 
+from otio_sync_core import coords
+
 # Lazily resolved — requires OTIO_PLUGIN_MANIFEST_PATH to be populated first.
 _SyncEvent = None
 
@@ -24,16 +26,12 @@ def _se() -> Any:
 
 def px_to_norm(px: float, py: float, width: float, height: float) -> tuple[float, float]:
     """Convert pixel coordinates to H-normalised coordinates (RV paint / OTIO SyncEvent)."""
-    nx = (px - width / 2.0) / height
-    ny = -((py - height / 2.0) / height)
-    return float(nx), float(ny)
+    return coords.px_to_otio(px, py, width, height)
 
 
 def norm_to_px(nx: float, ny: float, width: float, height: float) -> tuple[float, float]:
     """Convert H-normalised coordinates (RV paint / OTIO SyncEvent) to pixels."""
-    px = nx * height + width / 2.0
-    py = -ny * height + height / 2.0
-    return float(px), float(py)
+    return coords.otio_to_px(nx, ny, width, height)
 
 
 def line_pts(x0: float, y0: float, x1: float, y1: float, n: int = 24) -> list[tuple[float, float]]:

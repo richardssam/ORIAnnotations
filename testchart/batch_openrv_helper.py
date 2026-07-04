@@ -44,7 +44,8 @@ def _run_batch_impl():
         import opentimelineio as otio
         import otio_reader
         import ORIAnnotations
-        
+        from otio_sync_core import rv_annotation_codec, rv_paint_applier
+
         # Read parameters from environment variables
         otio_path = os.environ.get("BATCH_OTIO_PATH")
         output_dir = os.environ.get("BATCH_OUTPUT_DIR")
@@ -179,211 +180,15 @@ def _run_batch_impl():
                     if not frame.annotation_commands:
                         continue
                         
-                    strokes = []
-                    strokemap = {}
-                    for event in frame.annotation_commands:
-                        schema = event.schema_name() if hasattr(event, "schema_name") else ""
-                        print(f"DEBUG EVENT: schema={schema} uuid={getattr(event, 'uuid', None)}")
-                        if schema == "PaintStart":
-                            stroke = {
-                                'type': event.type,
-                                'color': event.rgba,
-                                'brush': event.brush,
-                                'user': event.friendly_name.split(":")[-1] if event.friendly_name else "user",
-                                'width': [],
-                                'points': []
-                            }
-                            strokemap[event.uuid] = stroke
-                            strokes.append(stroke)
-                        elif schema in ["PaintPoint", "PaintPoints"]:
-                            stroke = strokemap.get(event.uuid)
-                            if stroke and event.points:
-                                stroke['width'] = [v for v in event.points.size]
-                                stroke['points'] = [val for pair in zip(event.points.x, event.points.y) for val in pair]
-                        elif schema == "PaintEnd":
-                            stroke = strokemap.get(event.uuid)
-                            if stroke and hasattr(event, "points") and event.points:
-                                stroke['width'].extend(event.points.size)
-                                stroke['points'].extend([val for pair in zip(event.points.x, event.points.y) for val in pair])
-                        elif schema == "TextAnnotation":
-                            stroke = {
-                                'type': 'text',
-                                'color': event.rgba,
-                                'user': event.friendly_name or "user",
-                                'position': event.position,
-                                'spacing': event.spacing,
-                                'font_size': event.font_size,
-                                'font': event.font,
-                                'text': event.text,
-                                'scale': event.scale,
-                                'rotation': event.rotation
-                            }
-                            strokes.append(stroke)
-                        elif schema == "EllipseAnnotation":
-                            stroke = {
-                                'type': 'ellipse',
-                                'min': list(event.min),
-                                'max': list(event.max),
-                                'rgba': list(event.rgba),
-                                'size': event.size,
-                                'inner_rgba': list(event.inner_rgba),
-                                'uuid': event.uuid or str(uuid.uuid4()),
-                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
-                            }
-                            strokes.append(stroke)
-                        elif schema == "RectangleAnnotation":
-                            stroke = {
-                                'type': 'rect',
-                                'min': list(event.min),
-                                'max': list(event.max),
-                                'rgba': list(event.rgba),
-                                'size': event.size,
-                                'inner_rgba': list(event.inner_rgba),
-                                'uuid': event.uuid or str(uuid.uuid4()),
-                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
-                            }
-                            strokes.append(stroke)
-                        elif schema == "ArrowAnnotation":
-                            stroke = {
-                                'type': 'arrow',
-                                'start': list(event.start),
-                                'end': list(event.end),
-                                'rgba': list(event.rgba),
-                                'size': event.size,
-                                'uuid': event.uuid or str(uuid.uuid4()),
-                                'user': event.friendly_name.split(":")[-1] if getattr(event, "friendly_name", None) else "user"
-                            }
-                            strokes.append(stroke)
-
-                    # Create properties if they don't exist
-                    if not commands.propertyExists(f"{rv_node}.tag.annotate"):
-                        commands.newProperty(f"{rv_node}.tag.annotate", commands.StringType, 1)
-                    commands.setStringProperty(f"{rv_node}.tag.annotate", [''], True)
-                    if not commands.propertyExists(f"{rv_node}.internal.creationContext"):
-                        commands.newProperty(f"{rv_node}.internal.creationContext", commands.IntType, 1)
-                    commands.setIntProperty(f"{rv_node}.internal.creationContext", [1], True)
-
-                    order = []
                     rv_frame = int(frame.frame)
-                    frame_node = f"{rv_node}.frame:{rv_frame}"
-                    for stroke in strokes:
-                        def set_prop(node_path, name, ptype, val, dim=1):
-                            if not commands.propertyExists(f"{node_path}.{name}"):
-                                commands.newProperty(f"{node_path}.{name}", ptype, dim)
-                            if ptype == commands.FloatType:
-                                commands.setFloatProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
-                            elif ptype == commands.StringType:
-                                commands.setStringProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
-                            else:
-                                commands.setIntProperty(f"{node_path}.{name}", val if isinstance(val, list) else [val], True)
-
-                        if stroke['type'] == 'text':
-                            text_node = f"{rv_node}.text:{strokeid}:{rv_frame}:{stroke['user']}"
-                            set_prop(text_node, "position",    commands.FloatType,  list(stroke['position']), dim=2)
-                            set_prop(text_node, "color",       commands.FloatType,  [float(x) for x in stroke['color']], dim=4)
-                            set_prop(text_node, "spacing",     commands.FloatType,  stroke['spacing'] or 0.8)
-                            set_prop(text_node, "size",        commands.FloatType,  stroke['font_size'] / 5000.0)
-                            set_prop(text_node, "font",        commands.StringType, "")
-                            set_prop(text_node, "text",        commands.StringType, stroke['text'])
-                            set_prop(text_node, "scale",       commands.FloatType,  stroke['scale'] or 1.0)
-                            set_prop(text_node, "rotation",    commands.FloatType,  stroke['rotation'] or 0.0)
-                            set_prop(text_node, "origin",      commands.StringType, "")
-                            set_prop(text_node, "debug",       commands.IntType,    0)
-                            set_prop(text_node, "startFrame",  commands.IntType,    rv_frame)
-                            set_prop(text_node, "duration",    commands.IntType,    1)
-                            set_prop(text_node, "mode",        commands.IntType,    0)
-                            set_prop(text_node, "uuid",        commands.StringType, stroke.get('uuid', str(uuid.uuid4())))
-                            set_prop(text_node, "softDeleted", commands.IntType,    0)
-                            order.append(f"text:{strokeid}:{rv_frame}:{stroke['user']}")
-                            strokeid += 1
-                            continue
-
-                        if stroke['type'] in ['ellipse', 'rect']:
-                            shape_type = stroke['type']
-                            shape_node = f"{rv_node}.{shape_type}:{strokeid}:{rv_frame}:{stroke['user']}"
-                            set_prop(shape_node, "min",         commands.FloatType,  stroke['min'], dim=2)
-                            set_prop(shape_node, "max",         commands.FloatType,  stroke['max'], dim=2)
-                            set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
-                            set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['inner_rgba'], dim=4)
-                            set_prop(shape_node, "borderWidth", commands.FloatType,  stroke['size'] / 2.0)
-                            set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
-                            set_prop(shape_node, "duration",    commands.IntType,    1)
-                            set_prop(shape_node, "eye",         commands.IntType,    2)
-                            set_prop(shape_node, "uuid",        commands.StringType, stroke['uuid'])
-                            set_prop(shape_node, "softDeleted", commands.IntType,    0)
-                            order.append(f"{shape_type}:{strokeid}:{rv_frame}:{stroke['user']}")
-                            strokeid += 1
-                            continue
-
-                        if stroke['type'] == 'arrow':
-                            shape_node = f"{rv_node}.arrow:{strokeid}:{rv_frame}:{stroke['user']}"
-                            set_prop(shape_node, "startPos",    commands.FloatType,  stroke['start'], dim=2)
-                            set_prop(shape_node, "endPos",      commands.FloatType,  stroke['end'], dim=2)
-                            set_prop(shape_node, "borderColor", commands.FloatType,  stroke['rgba'], dim=4)
-                            set_prop(shape_node, "innerColor",  commands.FloatType,  stroke['rgba'], dim=4)
-                            set_prop(shape_node, "borderWidth", commands.FloatType,  0.0)
-                            set_prop(shape_node, "thickness",   commands.FloatType,  stroke['size'] / 2.0)
-                            set_prop(shape_node, "startFrame",  commands.IntType,    rv_frame)
-                            set_prop(shape_node, "duration",    commands.IntType,    1)
-                            set_prop(shape_node, "eye",         commands.IntType,    2)
-                            set_prop(shape_node, "uuid",        commands.StringType, stroke['uuid'])
-                            set_prop(shape_node, "softDeleted", commands.IntType,    0)
-                            order.append(f"arrow:{strokeid}:{rv_frame}:{stroke['user']}")
-                            strokeid += 1
-                            continue
-
-                        pen_node = f"{rv_node}.pen:{strokeid}:{rv_frame}:{stroke['user']}"
-
-                        brush_name = "gauss" if stroke['brush'] in ["gauss", "gaussian"] else "circle"
-                        if not commands.propertyExists(f"{pen_node}.brush"):
-                            commands.newProperty(f"{pen_node}.brush", commands.StringType, 1)
-                        commands.setStringProperty(f"{pen_node}.brush", [brush_name], True)
-
-                        if not commands.propertyExists(f"{pen_node}.color"):
-                            commands.newProperty(f"{pen_node}.color", commands.FloatType, 4)
-                        commands.setFloatProperty(f"{pen_node}.color", [float(x) for x in stroke['color']], True)
-
-                        if not commands.propertyExists(f"{pen_node}.debug"):
-                            commands.newProperty(f"{pen_node}.debug", commands.IntType, 1)
-                        commands.setIntProperty(f"{pen_node}.debug", [False], True)
-
-                        if not commands.propertyExists(f"{pen_node}.join"):
-                            commands.newProperty(f"{pen_node}.join", commands.IntType, 1)
-                        commands.setIntProperty(f"{pen_node}.join", [3], True)
-
-                        if not commands.propertyExists(f"{pen_node}.cap"):
-                            commands.newProperty(f"{pen_node}.cap", commands.IntType, 1)
-                        commands.setIntProperty(f"{pen_node}.cap", [1], True)
-
-                        if not commands.propertyExists(f"{pen_node}.splat"):
-                            commands.newProperty(f"{pen_node}.splat", commands.IntType, 1)
-                        commands.setIntProperty(f"{pen_node}.splat", [1 if brush_name == "gauss" else 0], True)
-
-                        if stroke['type'] == 'erase':
-                            if not commands.propertyExists(f"{pen_node}.mode"):
-                                commands.newProperty(f"{pen_node}.mode", commands.IntType, 1)
-                            commands.setIntProperty(f"{pen_node}.mode", [1], True)
-
-                        if not commands.propertyExists(f"{pen_node}.width"):
-                            commands.newProperty(f"{pen_node}.width", commands.FloatType, 1)
-                        commands.setFloatProperty(f"{pen_node}.width", [w * 0.6 for w in stroke['width']], True)
-
-                        if not commands.propertyExists(f"{pen_node}.points"):
-                            commands.newProperty(f"{pen_node}.points", commands.FloatType, 2)
-                        commands.setFloatProperty(f"{pen_node}.points", stroke['points'], True)
-
-                        order.append(f"pen:{strokeid}:{rv_frame}:{stroke['user']}")
-                        strokeid += 1
-
-                    if commands.propertyExists(f"{frame_node}.order"):
-                        commands.deleteProperty(f"{frame_node}.order")
-                    commands.newProperty(f"{frame_node}.order", commands.StringType, 1)
-                    commands.setStringProperty(f"{frame_node}.order", order, True)
-
-                # Update next ID
-                paint_node = f"{rv_node}.paint"
-                if commands.propertyExists(f"{paint_node}.nextId"):
-                    commands.setIntProperty(f"{paint_node}.nextId", [strokeid], False)
+                    # Convert SyncEvents → RV paint-node specs (pure codec) and
+                    # write them via the shared applier. This is the same code
+                    # path the RV plugins use — no inline rendering here.
+                    specs = rv_annotation_codec.sync_events_to_rv_specs(
+                        frame.annotation_commands, {"frame": rv_frame})
+                    strokeid = rv_paint_applier.apply_specs(
+                        specs, commands, rv_node=rv_node, frame=rv_frame,
+                        mode="append", start_id=strokeid)
 
         # Save session for inspection and for rvio rendering
         if not os.path.exists(output_dir):

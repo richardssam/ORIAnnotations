@@ -151,6 +151,34 @@ def _media_path(url: str) -> str:
     return os.path.abspath(path)
 
 
+def _clip_effective_range(clip):
+    """Return the timecode-based ``(start, end_inclusive)`` frame range for *clip*.
+
+    Checks ``clip.source_range`` first. When that's ``None`` — a legitimate
+    OTIO state meaning "use the whole available_range" — falls back to
+    ``clip.media_reference.available_range``, which is where hosts like
+    xStudio store the real embedded-timecode range for a clip that doesn't
+    override it with its own trimmed ``source_range``. Callers that checked
+    only ``clip.source_range`` would silently treat a real-timecode clip as
+    native/no-timecode whenever the clip relies on this fallback.
+
+    :param clip: An :class:`opentimelineio.schema.Clip` (or any object
+        exposing ``source_range``/``media_reference``).
+    :returns: ``(start, end_inclusive)`` ints, or ``None`` if neither
+        ``source_range`` nor ``media_reference.available_range`` is set.
+    :rtype: tuple[int, int] or None
+    """
+    rng = getattr(clip, "source_range", None)
+    if rng is None:
+        ref = getattr(clip, "media_reference", None)
+        rng = getattr(ref, "available_range", None) if ref is not None else None
+    if rng is None:
+        return None
+    start = int(rng.start_time.value)
+    end = start + int(rng.duration.value) - 1
+    return start, end
+
+
 def _is_media_track(track) -> bool:
     """Return True if *track* carries source clips (not annotations).
 
