@@ -378,18 +378,6 @@ class PlaybackSyncController:
             _log(f"[SEL] show_atom (annotation/bookmark): {_shape} — queuing annotation flush")
             if self.plugin.manager and self.plugin.manager.status == STATE_SYNCED:
                 self.plugin._annotation_pending_time = time.monotonic()
-                # [2C] Hot scan is now activated by _on_core_annotation_event
-                # (PaintStart/PaintPoint events from AnnotationsCore).  Keep this
-                # as a fallback for builds that don't have the [2C] broadcast.
-                if not self.plugin._hot_scan_active:
-                    try:
-                        if self.plugin.active_playhead:
-                            self.plugin._hot_scan_frame = self.plugin.active_playhead.position
-                            self.plugin._hot_scan_active = True
-                            self.plugin._hot_scan_last_change = time.monotonic()
-                            _log(f"[fallback] Hot scan activated at frame {self.plugin._hot_scan_frame} via show_atom")
-                    except Exception:
-                        pass
             return
 
         if not isinstance(event[1], viewport_playhead_atom):

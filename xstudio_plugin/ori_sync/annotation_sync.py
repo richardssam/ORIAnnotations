@@ -34,8 +34,10 @@ class AnnotationSyncController:
 
     #: How long to wait after the last annotation_atom before scanning bookmarks.
     DEBOUNCE_SECONDS = 0.25
-    #: Stop hot-scanning a frame after this many seconds of no new strokes.
-    HOT_SCAN_TIMEOUT = 0.6
+    #: Minimum interval between outbound partial-stroke broadcasts per
+    #: (clip, frame), to coalesce PaintPoint bursts instead of sending one
+    #: broadcast per point.
+    PARTIAL_BROADCAST_INTERVAL = 0.5
     #: Sentinel stored in ``_last_sent_captions`` immediately after a remote
     #: annotation is applied, before xStudio has committed the annotation_data.
     _CAPTION_SIG_UNCONFIRMED = "\x00unconfirmed\x00"
@@ -56,8 +58,6 @@ class AnnotationSyncController:
         self._core_events_received: int = 0
         self._stroke_uuid_cache: dict[str, list] = {}
         self._live_stroke_current_key: str | None = None
-        self._hot_scan_stroke_counts: dict[str, int] = {}
-        self._hot_scan_point_counts: dict[str, int] = {}
         self._last_annotation_scan: float = 0.0
         # Throttle partial set_annotation calls: tracks the last time we actually
         # called bm.set_annotation() for each (clip_guid, frame) key during a
@@ -152,181 +152,15 @@ class AnnotationSyncController:
         if stroke_completed:
             _log("[2C] AnnotationsCore: pen-up — scheduling flush")
             self.plugin._annotation_pending_time = time.monotonic()
-            self.plugin._hot_scan_active = False
             # Signal poll thread to clear the live-stroke key so the next
             # paint gesture gets a fresh UUID slot in _stroke_uuid_cache.
             self.plugin._cmd_queue.put_nowait(("clear_live_stroke", None))
         elif has_json:
-            # New path: broadcast the live stroke directly from the event JSON.
+            # Sole mid-stroke path: broadcast the live stroke directly from the
+            # event JSON. No bookmark hot-scan — nothing exists to scan mid-stroke.
             self.plugin._cmd_queue.put_nowait(("live_stroke", raw_json))
-        else:
-            # Legacy path (old build without JSON): fall back to hot-scan.
-            if not self.plugin._hot_scan_active:
-                if self.plugin.active_playhead:
-                    try:
-                        self.plugin._hot_scan_frame = self.plugin.active_playhead.position
-                        self.plugin._hot_scan_active = True
-                        self.plugin._hot_scan_last_change = time.monotonic()
-                        _log(
-                            f"[2C] mid-stroke (legacy) — hot scan at frame"
-                            f" {self.plugin._hot_scan_frame}"
-                        )
-                    except Exception:
-                        pass
-            else:
-                self.plugin._hot_scan_last_change = time.monotonic()
-            self.plugin._cmd_queue.put_nowait(("hot_scan", None))
-
-    # ── hot scan ───────────────────────────────────────────────────────
-
-    @bounded(_ANNOTATION_TIMEOUT_MS)
-    def hot_scan_active_annotation(self) -> None:
-        """Poll the active drawing frame every tick to stream partial strokes.
-
-        Activated when ``show_atom`` fires (user starts drawing on a new frame).
-        Runs on every poll tick (33 ms) so that partial strokes are broadcast to
-        peers before pen-up, giving an interactive feel.
-
-        Uses ``_stroke_uuid_cache`` to assign stable UUIDs to strokes at each
-        index, so that a receiver that already rendered the partial via
-        ``apply_partial_annotation_xs`` can update in-place rather than create
-        a duplicate when the final ``INSERT_CHILD`` arrives.
-        """
-        if not self.plugin._hot_scan_active:
-            return
-        if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
-            self.plugin._hot_scan_active = False
-            return
-        now = time.monotonic()
-        if now - self.plugin._hot_scan_last_change > self.HOT_SCAN_TIMEOUT:
-            _log("Hot scan timed out — deactivating")
-            self.plugin._hot_scan_active = False
-            return
-
-        frame = self.plugin._hot_scan_frame
-        if frame is None:
-            return
-
-        tl = self.plugin.manager.root_timeline
-        if tl is None:
-            return
-
-        try:
-            clip_guid, clip_local_time = self.plugin.playback.resolve_clip_at_frame(tl, frame)
-        except Exception:
-            return
-        if clip_guid is None:
-            # Flat-playlist fallback: clips have no source_range so
-            # resolve_clip_at_frame always returns None.  Use the last
-            # broadcast/received selection clip GUID; for flat playlists the
-            # user views one clip at a time so this is always the right clip.
-            fb = self.plugin.playback._last_viewed_clip_guid
-            if fb and fb in self.plugin.media._flat_clip_to_media:
-                clip_guid = fb
-                ph_fps = 25.0
-                if self.plugin.active_playhead:
-                    try:
-                        ph_fps = self.plugin.active_playhead.frame_rate.fps() or ph_fps
-                    except Exception:
-                        pass
-                clip_local_time = otio.opentime.RationalTime(frame, ph_fps)
-            else:
-                return
-
-        local_frame = int(clip_local_time.value)
-        fps = float(clip_local_time.rate) if clip_local_time.rate else 25.0
-
-        # Find a local (non-remote) bookmark at this frame.
-        try:
-            all_bms = self.plugin.connection.api.session.bookmarks.bookmarks
-        except Exception:
-            return
-
-        target_bm = None
-        for bm in all_bms:
-            bm_uuid_str = str(bm.uuid)
-            if bm_uuid_str in self._our_bookmark_clip_frame:
-                continue  # remote bookmark, skip
-            with self._our_bookmark_uuids_lock:
-                is_remote = bm_uuid_str in self._our_bookmark_uuids
-            if is_remote:
-                continue
-            try:
-                detail = bm.detail
-                if detail is None or detail.start is None:
-                    continue
-                bm_frame = int(round(detail.start.total_seconds() * fps))
-                if bm_frame == frame:
-                    target_bm = bm
-                    break
-            except Exception:
-                continue
-
-        if target_bm is None:
-            return
-
-        try:
-            ann_data = target_bm.annotation_data
-            if not ann_data:
-                return
-        except Exception:
-            return
-
-        canvas = ann_data.get("Data", ann_data)
-        all_strokes = canvas.get("pen_strokes", [])
-        if not all_strokes:
-            return
-
-        key = f"{clip_guid}:{local_frame}"
-        last_sent_strokes = self._hot_scan_stroke_counts.get(key, 0)
-        last_sent_points = self._hot_scan_point_counts.get(key, 0)
-
-        current_stroke_points = (
-            len(all_strokes[-1].get("points", [])) if all_strokes else 0
-        )
-
-        if len(all_strokes) == last_sent_strokes and current_stroke_points <= last_sent_points:
-            return  # no new strokes or points since last hot broadcast
-
-        self.plugin._hot_scan_last_change = now
-        self._hot_scan_stroke_counts[key] = len(all_strokes)
-        self._hot_scan_point_counts[key] = current_stroke_points
-
-        # Ensure UUID cache covers all strokes (including pre-existing ones).
-        if key not in self._stroke_uuid_cache:
-            self._stroke_uuid_cache[key] = []
-        cache = self._stroke_uuid_cache[key]
-        while len(cache) < len(all_strokes):
-            cache.append(str(uuid.uuid4()))
-
-        _, aspect_half = self.plugin.media.media_for_sync_guid(clip_guid)
-
-        # Send ALL current strokes so peers can update from any starting point.
-        events_obj = xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=cache)
-        if not events_obj:
-            return
-
-        events_dicts = []
-        for e in events_obj:
-            try:
-                events_dicts.append(
-                    json.loads(otio.adapters.write_to_string(e, "otio_json", indent=-1))
-                )
-            except Exception:
-                pass
-        if not events_dicts:
-            return
-
-        _log(
-            f"Hot scan: broadcasting {len(all_strokes)} stroke(s) as partial"
-            f" at frame={frame} clip={clip_guid[:8]}"
-        )
-        self.plugin.manager.broadcast_partial_annotation(
-            clip_guid=clip_guid,
-            frame=float(local_frame),
-            fps=fps,
-            events=events_dicts,
-        )
+        # else: legacy build without geometry (4-tuple) or empty JSON. No partial
+        # is broadcast; the committed stroke still syncs via the pen-up flush above.
 
     # ── live stroke broadcast ──────────────────────────────────────────
 
@@ -385,7 +219,24 @@ class AnnotationSyncController:
         local_frame = int(clip_local_time.value)
         fps = float(clip_local_time.rate) if clip_local_time.rate else 25.0
 
-        # Extract the pen_strokes list from the serialised JSON.
+        # Throttle outbound partials: at most one broadcast per
+        # PARTIAL_BROADCAST_INTERVAL per (clip, frame), reusing the same
+        # scaffolding apply_partial_annotation_xs uses on the receive side.
+        # The committed stroke is flushed separately on pen-up and is never
+        # subject to this throttle.
+        throttle_key = (clip_guid, local_frame)
+        now = time.monotonic()
+        last_broadcast = self._last_partial_render_time.get(throttle_key, 0.0)
+        if now - last_broadcast < self.PARTIAL_BROADCAST_INTERVAL:
+            return
+        self._last_partial_render_time[throttle_key] = now
+
+        # Extract the pen_strokes list from the serialised JSON. anno_json is
+        # a JsonStore, not a plain dict — JsonStore.get() is a JSON-Pointer
+        # lookup, not a dict-style get(key, default), so convert to a native
+        # dict via dump()/loads() first (same pattern as Bookmark.annotation_data).
+        if isinstance(anno_json, JsonStore):
+            anno_json = json.loads(anno_json.dump())
         canvas = anno_json.get("Data", anno_json) if isinstance(anno_json, dict) else {}
         live_strokes = canvas.get("pen_strokes", [])
         if not live_strokes:

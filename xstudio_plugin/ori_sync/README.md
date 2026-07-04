@@ -2,6 +2,7 @@
 layout: default
 title: XStudio ORI Sync Plugin
 parent: ORI Sync Tools
+nav_order: 3.6
 ---
 # ORI Sync Review — xStudio Plugin
 
@@ -18,13 +19,35 @@ The plugin uses `SyncManager` and `RabbitMQNetwork` from `python/otio_sync_core/
 
 ## Requirements
 
-- xStudio with Python plugin support
+- xStudio with Python plugin support, **built from a patched checkout** — see TODO below
 - A running RabbitMQ broker accessible on the network (default: `localhost:5672`)
 - `opentimelineio` and `pika` importable in the Python environment xStudio uses
 
 ```bash
 pip install opentimelineio pika
 ```
+
+---
+
+## TODO: document xStudio build + required patches
+
+This plugin depends on xStudio C++ changes that are not yet upstream. Need to
+write up:
+
+- Full build steps for `/Users/sam/git/xstudio` (vcpkg bootstrap, cmake configure/build,
+  which target(s) to build, how to point a running `xstudio` at the built plugin).
+- The patch set that must be present (currently curated on the local
+  `xstudio_sync_fixes` branch, built on top of `develop`):
+  - `feat(annotations): broadcast stroke events to plugin_events_group` — the
+    5-tuple live-stroke geometry broadcast this plugin's partial-annotation
+    sync depends on (`xstudio-partial-annotations` change).
+  - `feat(python): expose viewport scale and pan atoms` — needed for pan/zoom sync.
+  - `Fix python event routing sender mismatch for playhead events` — without
+    this, playhead events are silently dropped in the Python API.
+  - `fix(python): purge stale actor callbacks on broadcast_down to prevent segfault`.
+  - (`build: upgrade FFmpeg vcpkg override` is local-only and not required upstream.)
+- Whether/when these land on the real `pr/annotation-stroke-events` PR branch
+  vs. staying as local patches.
 
 ---
 

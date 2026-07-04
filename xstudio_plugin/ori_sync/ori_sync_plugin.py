@@ -70,8 +70,6 @@ class ORISyncPlugin(PluginBase):
     :param connection: xStudio connection object passed by the plugin loader.
     """
 
-    #: How often the poll thread calls manager.tick() (seconds).
-    POLL_INTERVAL = 0.033
     #: How long to wait for a master before self-electing (seconds).
     DISCOVERY_TIMEOUT = 2.0
     #: Fallback scan interval (seconds).  AnnotationsCore plugin_events_ events
@@ -161,14 +159,6 @@ class ORISyncPlugin(PluginBase):
         # Cross-thread annotation trigger: set on xStudio thread by _on_annotation_event /
         # _on_core_annotation_event; read and cleared on poll thread by flush_pending_annotations.
         self._annotation_pending_time: float | None = None
-
-        # Hot-scan state: after show_atom fires the poll loop scans the active frame
-        # on every tick to detect mid-stroke data as soon as xStudio exposes it.
-        self._hot_scan_active: bool = False
-        self._hot_scan_frame: int | None = None
-        self._hot_scan_stroke_counts: dict[str, int] = {}  # f"{clip}:{frame}" → last sent count
-        self._hot_scan_point_counts: dict[str, int] = {}  # f"{clip}:{frame}" → last sent point count
-        self._hot_scan_last_change: float = 0.0
 
         # Polling-based scrub detection: last frame seen by the poll loop and
         # last frame applied from a remote PLAYBACK_SETTINGS message.
@@ -621,8 +611,8 @@ class ORISyncPlugin(PluginBase):
 
         while not self._poll_stop.is_set():
             try:
-                # 1. Determine timeout based on active hot scanning (partial strokes)
-                timeout = self.POLL_INTERVAL if self._hot_scan_active else 0.1
+                # 1. Poll timeout for command queue wait
+                timeout = 0.1
 
                 # 2. Block on the queue to wait for events or ticks
                 try:
@@ -642,9 +632,7 @@ class ORISyncPlugin(PluginBase):
                         with _timed(f"handle:{action}"):
                             self._handle_manager_event(action, data)
 
-                # 4. Partial annotation / stroke hot scanning
-                with _timed("annotation.hot_scan"):
-                    self.annotation.hot_scan_active_annotation()
+                # 4. Pen-up annotation flush
                 with _timed("annotation.flush"):
                     self.annotation.flush_pending_annotations()
 
@@ -703,8 +691,6 @@ class ORISyncPlugin(PluginBase):
         try:
             if cmd == "load_timelines":
                 self.builder.do_load_timelines()
-            elif cmd == "hot_scan":
-                self.annotation.hot_scan_active_annotation()
             elif cmd == "live_stroke":
                 self.annotation.broadcast_live_stroke_from_json(payload)
             elif cmd == "clear_live_stroke":
