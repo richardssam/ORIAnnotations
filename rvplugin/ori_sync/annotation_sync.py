@@ -43,6 +43,11 @@ def _ensure_workspace_sync_event():
 
 
 class AnnotationSyncController:
+    #: Coalescing interval (ms) for mid-drag shape broadcasts, mirroring the
+    #: pen stroke timer.  Without this, a shape drag (rect/ellipse/arrow) fires
+    #: an immediate, unthrottled network broadcast on every mouse-move.
+    SHAPE_BROADCAST_INTERVAL_MS = 50
+
     def __init__(self, plugin):
         self.plugin = plugin
         _ensure_workspace_sync_event()
@@ -53,6 +58,8 @@ class AnnotationSyncController:
         self._partial_pen_nodes = {}           # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
         self._last_sent_replace_sig = {}       # ann_clip_guid → JSON sig of last broadcast
         self._ignore_annotations_until = 0.0
+        self._pending_shape = None             # (node_name, frame) awaiting a coalesced broadcast
+        self._shape_timer = None               # repeating partial-broadcast timer during shape drag
 
     def _resolve_media_path_for_paint_node(self, node_name):
         """Return the media file path for an RVPaint node, or None.
@@ -797,6 +804,17 @@ class AnnotationSyncController:
         self._last_partial_point_count = len(pts)
         self._broadcast_annotation(node_name, component, partial=True, stroke_uuid=stroke_uuid)
 
+    def _send_partial_shape(self):
+        """Repeating timer callback: coalesce rapid shape-drag graph-state-change
+        events into a single throttled broadcast, mirroring the pen stroke timer."""
+        if not self._pending_shape:
+            if self._shape_timer:
+                self._shape_timer.stop()
+            return
+        node_name, frame = self._pending_shape
+        self._pending_shape = None
+        self._broadcast_frame_annotations_replace(node_name, frame)
+
     def _on_pen_up(self):
         """Pen-up: stop partial timer and send final stroke."""
         if self._stroke_timer:
@@ -1098,7 +1116,7 @@ class AnnotationSyncController:
         is_text = ".text:" in contents and not contents.endswith(".order")
         is_shape = (".rect:" in contents or ".ellipse:" in contents or ".arrow:" in contents) and not contents.endswith(".order")
         
-        if is_text or is_shape:
+        if is_text:
             parts = contents.split(".")
             if len(parts) >= 2:
                 node_name, component = parts[0], parts[1]
@@ -1106,7 +1124,26 @@ class AnnotationSyncController:
                     frame = int(component.split(":")[2])
                     self._broadcast_frame_annotations_replace(node_name, frame)
                 except Exception:
-                    _log_exc(f"Failed to parse frame from text/shape update: {contents}")
+                    _log_exc(f"Failed to parse frame from text update: {contents}")
+            event.reject()
+            return
+
+        if is_shape:
+            parts = contents.split(".")
+            if len(parts) >= 2:
+                node_name, component = parts[0], parts[1]
+                try:
+                    frame = int(component.split(":")[2])
+                    # Coalesce rapid shape-drag updates instead of broadcasting
+                    # on every mouse-move (mirrors the pen stroke timer).
+                    self._pending_shape = (node_name, frame)
+                    if self._shape_timer is None:
+                        self._shape_timer = QtCore.QTimer()
+                        self._shape_timer.timeout.connect(self._send_partial_shape)
+                    if not self._shape_timer.isActive():
+                        self._shape_timer.start(self.SHAPE_BROADCAST_INTERVAL_MS)
+                except Exception:
+                    _log_exc(f"Failed to parse frame from shape update: {contents}")
             event.reject()
             return
             
