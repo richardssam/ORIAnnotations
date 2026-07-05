@@ -13,12 +13,13 @@ import the same ``otio_sync_core`` within one process, so they share it.  It is
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .manager import SyncManager
 
 _REGISTERED_MANAGER: "SyncManager | None" = None
+_REGISTERED_ANNOTATION_CONTROLLER: Any = None
 
 
 def register_manager(manager: "SyncManager") -> None:
@@ -33,3 +34,18 @@ def register_manager(manager: "SyncManager") -> None:
 def get_registered_manager() -> "SyncManager | None":
     """Return the registered manager, or ``None`` if none has registered yet."""
     return _REGISTERED_MANAGER
+
+
+def register_annotation_controller(controller: Any) -> None:
+    """Register the live ``AnnotationSyncController`` so an in-process caller
+    (the ``sync_test`` OpenRV hook) can trigger the real annotation send path.
+
+    :param controller: The active ``AnnotationSyncController`` for this peer.
+    """
+    global _REGISTERED_ANNOTATION_CONTROLLER
+    _REGISTERED_ANNOTATION_CONTROLLER = controller
+
+
+def get_registered_annotation_controller() -> Any:
+    """Return the registered annotation controller, or ``None`` if unregistered."""
+    return _REGISTERED_ANNOTATION_CONTROLLER

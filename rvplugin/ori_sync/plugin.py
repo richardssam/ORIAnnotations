@@ -251,6 +251,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         try:
             import otio_sync_core
             otio_sync_core.register_manager(self.sync_manager)
+            otio_sync_core.register_annotation_controller(self.annotation)
         except Exception as e:
             _log(f"Could not register manager for inspection: {e}")
         network = RabbitMQNetwork(

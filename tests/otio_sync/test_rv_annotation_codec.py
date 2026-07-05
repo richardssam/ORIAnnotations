@@ -78,7 +78,9 @@ class TestRvCodecForward(unittest.TestCase):
         specs = codec.sync_events_to_rv_specs([el, ar], {"frame": 1})
         kinds = [s["kind"] for s in specs]
         self.assertEqual(kinds, ["ellipse", "arrow"])
-        self.assertEqual(_props(specs[0])["borderWidth"], [1.0])      # size/2
+        self.assertEqual(_props(specs[0])["min"], [-1.1, -0.9])
+        self.assertEqual(_props(specs[0])["max"], [1.1, 0.9])
+        self.assertEqual(_props(specs[0])["borderWidth"], [2.0])      # borderWidth is size
         self.assertEqual(_props(specs[1])["thickness"], [1.5])        # size/2
         self.assertIn("startPos", _props(specs[1]))
 
@@ -126,6 +128,20 @@ class TestRvCodecReverse(unittest.TestCase):
         self.assertEqual(list(pts.x), [0.1, 0.2])
         self.assertEqual(list(pts.y), [0.0, 0.1])
 
+    def test_pen_width_forward_reverse_roundtrip(self):
+        # Forward (SyncEvent size → RV width) then reverse (RV width read-back
+        # → SyncEvent size) should reproduce the original size through the
+        # `* RV_WIDTH_SCALE` / `/ RV_WIDTH_SCALE` transforms, mirroring
+        # test_shape_forward_reverse_roundtrip for pen strokes.
+        ps = se.PaintStart(brush="circle", rgba=[1.0, 0.0, 0.0, 1.0], uuid="w1")
+        pts = se.PaintPoints(uuid="w1", points=se.PaintVertices([0.1], [0.0], [0.02]))
+        specs = codec.sync_events_to_rv_specs([ps, pts], {})
+        rv_width = _props(specs[0])["width"][0]
+        readback = {"kind": "pen", "brush": "circle", "color": [1.0, 0.0, 0.0, 1.0],
+                    "points": [0.1, 0.0], "width": [rv_width], "uuid": "w1", "user": "user"}
+        events = codec.rv_strokes_to_sync_events([readback])
+        self.assertAlmostEqual(list(events[1].points.size)[0], 0.02)
+
     def test_ellipse_readback(self):
         strokes = [{"kind": "ellipse", "min": [-0.1, 0.1], "max": [0.1, -0.1],
                     "rgba": [0.0, 0.0, 1.0, 1.0], "inner_rgba": [0.0, 0.0, 0.0, 0.0],
@@ -156,16 +172,26 @@ class TestRvCodecReverse(unittest.TestCase):
     def test_shape_forward_reverse_roundtrip(self):
         # Forward (SyncEvent → specs) then reverse (read-back dict → SyncEvent)
         # should reproduce the same geometry through the borderWidth/thickness
-        # *2.0 / /2.0 transforms in the applier read/write helpers.
+        # and min/max offset transforms.
         el = se.EllipseAnnotation(min=[-0.15, 0.05], max=[0.35, -0.25], rgba=[0.0, 0.0, 1.0, 1.0],
                                   size=1.5, inner_rgba=[1.0, 1.0, 0.0, 0.8], uuid="rt1")
         specs = codec.sync_events_to_rv_specs([el], {"frame": 0})
         border_width = dict((n, v) for (n, _t, v, _d) in specs[0]["props"])["borderWidth"][0]
-        # Simulate the applier's read side: size = borderWidth * 2.0
-        readback = {"kind": "ellipse", "min": el.min, "max": el.max, "rgba": el.rgba,
-                    "inner_rgba": el.inner_rgba, "size": border_width * 2.0, "uuid": "rt1", "user": "user"}
+        r_min = dict((n, v) for (n, _t, v, _d) in specs[0]["props"])["min"]
+        r_max = dict((n, v) for (n, _t, v, _d) in specs[0]["props"])["max"]
+        
+        # Simulate the applier's read side: size = borderWidth directly, contract min/max
+        half = border_width / 2.0
+        c_min = [r_min[0] + half, r_min[1] + half]
+        c_max = [r_max[0] - half, r_max[1] - half]
+        readback = {"kind": "ellipse", "min": c_min, "max": c_max, "rgba": el.rgba,
+                    "inner_rgba": el.inner_rgba, "size": border_width, "uuid": "rt1", "user": "user"}
         events = codec.rv_strokes_to_sync_events([readback])
         self.assertAlmostEqual(events[0].size, el.size)
+        self.assertAlmostEqual(events[0].min[0], el.min[0])
+        self.assertAlmostEqual(events[0].min[1], el.min[1])
+        self.assertAlmostEqual(events[0].max[0], el.max[0])
+        self.assertAlmostEqual(events[0].max[1], el.max[1])
 
 
 if __name__ == "__main__":

@@ -253,12 +253,15 @@ def _text_spec(stroke: dict, frame: int) -> PaintNodeSpec:
 
 
 def _box_shape_spec(stroke: dict, frame: int) -> PaintNodeSpec:
+    half = stroke["size"] / 2.0
+    expanded_min = [stroke["min"][0] - half, stroke["min"][1] - half]
+    expanded_max = [stroke["max"][0] + half, stroke["max"][1] + half]
     props = [
-        ("min", TYPE_FLOAT, list(stroke["min"]), 2),
-        ("max", TYPE_FLOAT, list(stroke["max"]), 2),
+        ("min", TYPE_FLOAT, expanded_min, 2),
+        ("max", TYPE_FLOAT, expanded_max, 2),
         ("borderColor", TYPE_FLOAT, list(stroke["rgba"]), 4),
         ("innerColor", TYPE_FLOAT, list(stroke["inner_rgba"]), 4),
-        ("borderWidth", TYPE_FLOAT, [stroke["size"] / 2.0], 1),
+        ("borderWidth", TYPE_FLOAT, [stroke["size"]], 1),
         ("startFrame", TYPE_INT, [frame], 1),
         ("duration", TYPE_INT, [1], 1),
         ("eye", TYPE_INT, [2], 1),
@@ -369,7 +372,9 @@ def rv_strokes_to_sync_events(strokes: List[dict]) -> List[Any]:
                 start.type = "erase"
             events.append(start)
             points = list(stroke.get("points", []))
-            width = list(stroke.get("width", []))
+            # Invert the forward _pen_spec's `w * RV_WIDTH_SCALE` so a stroke's
+            # width round-trips to the same OTIO/xStudio size it started as.
+            width = [w / RV_WIDTH_SCALE for w in stroke.get("width", [])]
             xs = [p for p in points[0::2]]
             ys = [p for p in points[1::2]]
             if len(width) == 1:

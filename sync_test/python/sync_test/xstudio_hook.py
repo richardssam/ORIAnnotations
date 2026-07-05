@@ -12,7 +12,7 @@ if os.path.exists(xstudio_site_packages) and xstudio_site_packages not in sys.pa
 try:
     from xstudio.connection import Connection
     from xstudio.api.session.playlist.timeline import Timeline
-    from xstudio.core import viewport_active_media_container_atom, viewport_playhead_atom, bookmark_detail_atom
+    from xstudio.core import viewport_active_media_container_atom, viewport_playhead_atom, bookmark_detail_atom, BookmarkDetail
     from xstudio.api.session.container import Container
     from xstudio.api.intrinsic.viewport import Viewport
     from xstudio.api.session.playhead import Playhead
@@ -40,11 +40,24 @@ def get_xstudio_state(port=14441):
         "clip": None,
         "frame": None,
         "playing": False,
-        "annotations": []
+        "annotations": [],
+        "is_master": None,
     }
 
     try:
         conn = _get_connection(port)
+
+        # Best-effort: read is_master from the in-process plugin's full-state
+        # file bridge (ORI_FULLSTATE_FILE). This out-of-process hook cannot
+        # reach the plugin's SyncManager directly, but export_state() already
+        # writes is_master into that file (see manager.py) for exactly this
+        # kind of harness visibility.
+        try:
+            full = get_xstudio_full_state(port)
+            if isinstance(full, dict) and "is_master" in full:
+                state["is_master"] = full["is_master"]
+        except Exception:
+            pass
         
         # 1. Playhead Status
         state["frame"] = None
@@ -141,8 +154,16 @@ def get_xstudio_state(port=14441):
                     ann = bm.annotation_data
                     if ann:
                         data = ann.get("Data", {})
-                        ann_state["strokes"] = len(data.get("pen_strokes", []))
+                        pen_strokes = data.get("pen_strokes", [])
+                        ann_state["strokes"] = len(pen_strokes)
                         ann_state["captions"] = len(data.get("captions", []))
+                        # Surface native geometry per stroke, additive to the
+                        # counts above — lets callers assert on drawn/received
+                        # geometry (e.g. round-tripped pen width), not just
+                        # presence.
+                        ann_state["stroke_thickness"] = [
+                            s.get("thickness") for s in pen_strokes
+                        ]
                 except Exception:
                     pass
                 state["annotations"].append(ann_state)
@@ -258,10 +279,165 @@ def execute_xstudio_command(payload, port):
                 f.write(otio_str)
             return {"action": action, "status": "success", "filepath": path}
 
+        elif action == "draw_annotation":
+            kind = payload.get("kind")
+            if kind != "pen":
+                raise ValueError(
+                    f"draw_annotation: kind {kind!r} not supported for xStudio — "
+                    "xStudio has no wired-up native shape broadcast path yet"
+                )
+            return _draw_xstudio_annotation(conn, payload)
+
+        elif action == "capture_frame":
+            return _capture_xstudio_frame(conn, payload)
+
         raise ValueError(f"Unknown action: {action}")
     except Exception as e:
         logging.error(f"Error in execute_xstudio_command: {e}")
         return {"action": payload.get("action"), "status": "error", "error": str(e)}
+
+
+def _draw_xstudio_annotation(conn, payload):
+    """Simulate a completed native pen draw by writing a real bookmark.
+
+    Writes directly via the same remote annotation API (``Bookmark.set_annotation``)
+    the running plugin itself uses on the receive side — no new xStudio-plugin
+    code is involved. Because this harness connection and the plugin's own
+    connection share the same live session, the plugin's own poll loop
+    (``flush_pending_annotations``) will discover this bookmark and broadcast it
+    exactly as it would a real user-drawn stroke. The caller is responsible for
+    waiting for that convergence (bounded by the plugin's debounce/scan-interval
+    constants) — this function only performs the write.
+    """
+    import datetime
+    from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+
+    thickness = float(payload.get("thickness", 0.01))
+    color = payload.get("color", [1.0, 1.0, 1.0, 1.0])
+    colour = [float(c) for c in color[:3]]
+    opacity = float(color[3]) if len(color) > 3 else 1.0
+
+    gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+    ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+    if not ph_actor:
+        raise RuntimeError("draw_annotation: no active playhead")
+    ph = Playhead(conn, ph_actor)
+    media = ph.on_screen_media
+    if media is None:
+        raise RuntimeError("draw_annotation: no on-screen media at current playhead")
+    frame = ph.position or 0
+    fps = 25.0
+    try:
+        fps = ph.frame_rate.fps() or fps
+    except Exception:
+        pass
+
+    stroke = {
+        "colour": colour,
+        # Legacy r/g/b keys alongside "colour", matching the production
+        # xs_annotation_codec.sync_events_to_xs_strokes stroke shape — some
+        # xStudio versions read these instead of "colour". Omitting them (as
+        # this harness originally did) rendered the stroke as plain white
+        # regardless of the requested colour, a real bug the frame-capture
+        # visual check caught (the numeric round-trip check only asserts
+        # thickness, never colour).
+        "r": colour[0],
+        "g": colour[1],
+        "b": colour[2],
+        "opacity": opacity,
+        # Raw native thickness — the value under test, deliberately not
+        # derived from any OTIO size.
+        "thickness": thickness,
+        "softness": 0.0,
+        "size_sensitivity": 1.0,
+        "opacity_sensitivity": 1.0,
+        # "Brush" is not a recognised stroke type in the production codec
+        # (which uses "color"/"erase"); it silently fell back to a default
+        # render, part of the same bug as the missing r/g/b keys above.
+        "type": "color",
+        "is_erase_stroke": False,
+        # Two points, flat [x, y, pressure, opacity] quads in xStudio-native
+        # (W-normalised, Y-down) space.
+        "points": [-0.05, 0.0, 1.0, 1.0, 0.05, 0.0, 1.0, 1.0],
+    }
+
+    bm = conn.api.session.bookmarks.add_bookmark(target=media)
+    detail = BookmarkDetail()
+    detail.start = datetime.timedelta(seconds=frame / fps)
+    detail.duration = datetime.timedelta(seconds=0)
+    conn.request_receive(bm.remote, bookmark_detail_atom(), detail)
+    bm.set_annotation(strokes=[stroke], captions=[])
+
+    return {
+        "action": "draw_annotation",
+        "status": "success",
+        "bookmark_uuid": str(bm.uuid),
+    }
+
+
+def _capture_xstudio_frame(conn, payload):
+    """Render the current on-screen frame (video + annotation) to an image.
+
+    Resolves the bookmark at the current playhead's media/frame using the same
+    global bookmark enumeration ``get_xstudio_state`` uses, then renders via
+    ``OffscreenViewport.render_bookmark_with_transparency`` with an explicit
+    width/height (design D1) so the output resolution is a known, comparable
+    quantity — the comparison step still reads the file's actual dimensions
+    back rather than trusting this request was honored exactly.
+    """
+    from xstudio.api.intrinsic.viewport import OffscreenViewport
+    from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+
+    output_path = payload.get("output_path")
+    if not output_path:
+        raise ValueError("capture_frame: output_path is required")
+    width = int(payload.get("width", 1920))
+    height = int(payload.get("height", 1080))
+
+    gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+    ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+    if not ph_actor:
+        raise RuntimeError("capture_frame: no active playhead")
+    ph = Playhead(conn, ph_actor)
+    media = ph.on_screen_media
+    if media is None:
+        raise RuntimeError("capture_frame: no on-screen media at current playhead")
+    frame = ph.position or 0
+
+    target_bookmark = None
+    for bm in conn.api.session.bookmarks.bookmarks:
+        detail = bm.detail
+        if not detail.owner or not detail.owner.actor:
+            continue
+        if str(detail.owner.uuid) != str(media.uuid):
+            continue
+        try:
+            seconds_per_frame = media.media_source().rate.seconds()
+            bm_frame = round(detail.start.total_seconds() / seconds_per_frame)
+            bm_duration_frames = round(detail.duration.total_seconds() / seconds_per_frame)
+        except Exception:
+            bm_frame, bm_duration_frames = 0, 0
+        if bm_frame <= frame <= bm_frame + max(bm_duration_frames, 0):
+            target_bookmark = bm
+            break
+
+    if target_bookmark is None:
+        raise RuntimeError(
+            f"capture_frame: no bookmark found at frame {frame} for the on-screen media"
+        )
+    logging.info(
+        f"capture_frame: matched bookmark {target_bookmark.uuid} at frame {frame} "
+        f"(has_annotation={target_bookmark.has_annotation})"
+    )
+
+    viewport = OffscreenViewport(conn)
+    viewport.render_bookmark_with_transparency(
+        output_path, target_bookmark.uuid,
+        include_image=True, include_drawings=True,
+        width=width, height=height,
+    )
+    return {"action": "capture_frame", "status": "success", "output_path": output_path}
+
 
 def start_xstudio_inspector(http_port, xstudio_port):
     def get_state_callback():

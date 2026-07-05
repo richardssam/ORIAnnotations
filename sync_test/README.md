@@ -118,6 +118,60 @@ Save the current session to a file. Used automatically by the runner at the end 
   filepath: "/tmp/debug_session.xst"
 ```
 
+#### `draw_annotation`
+
+Make the driver app produce a native pen or rectangle annotation and broadcast it via that app's real, unmodified send path — no mouse/UI automation involved. Writes go directly to native properties/dicts (RV paint-node properties; xStudio bookmark stroke dicts), as if a real draw had just completed, then trigger (RV) or wait on (xStudio) the same broadcast machinery a live user stroke uses. This exists to exercise the *reverse* codec direction (native draw → `SyncEvent`) that `testchart/` never covers — `testchart/` only exercises the forward (OTIO import → app) direction.
+
+| Field          | Type   | Description                                                  |
+| -------------- | ------ | ------------------------------------------------------------ |
+| `action`       | string | `"draw_annotation"`                                          |
+| `kind`         | string | `"pen"` (both apps) or `"rect"`, `"ellipse"`, `"arrow"` (OpenRV only, see below). |
+| `width`        | float  | Pen only, OpenRV: nominal native RV pen width.               |
+| `thickness`    | float  | Pen only, xStudio: nominal native xStudio pen thickness; OR Arrow only, OpenRV: nominal native RV arrow shaft thickness. |
+| `border_width` | float  | Rect/Ellipse only, OpenRV: nominal native RV border width.   |
+| `points`       | list   | Pen only, OpenRV, optional: flat [x0, y0, x1, y1] override.  |
+
+```yaml
+- action: "draw_annotation"
+  kind: "pen"
+  width: 3.0
+```
+
+**Note:** `kind: "rect"`, `"ellipse"`, and `"arrow"` are only supported with OpenRV as the driver app. xStudio has no wired-up native shape-drawing broadcast path yet, so a shape command sent to xStudio raises an error rather than silently no-op'ing.
+
+Use `sync_test.annotation_assertions` to verify round-trip fidelity after a `draw_annotation` converges to a peer — it computes the expected peer-side width/thickness from the same production codec constants the apps themselves use (not a hardcoded number), so the check fails precisely when an app's forward and reverse conversions disagree.
+
+#### `capture_frame`
+
+Render the target app's current live frame (video plus any applied annotations) to an image file, in-process — no external render subprocess and no save/reload round-trip. xStudio resolves the bookmark at the current playhead's media/frame and renders via `OffscreenViewport.render_bookmark_with_transparency`; OpenRV grabs its live viewport widget (`rv.commands.sessionGLView()` wrapped as a Qt widget, `.grab().save(...)`), the same technique `testchart/grab_frame.py` uses.
+
+| Field         | Type   | Description                                        |
+| ------------- | ------ | -------------------------------------------------- |
+| `action`      | string | `"capture_frame"`                                  |
+| `output_path` | string | Absolute path to write the PNG.                    |
+| `width`       | int    | Optional requested output width (default 1920).    |
+| `height`      | int    | Optional requested output height (default 1080).   |
+
+```yaml
+- action: "capture_frame"
+  output_path: "/tmp/capture.png"
+```
+
+`width`/`height` are a *request*, not a guarantee (xStudio honors them exactly; OpenRV's in-process grab may not, depending on window/HiDPI state) — any comparison against a capture should read the saved image's own actual pixel dimensions rather than assume the request was honored precisely. See `sync_test.visual_geometry` and the `visual_check` flag below for a ready-made comparison built on this.
+
+##### `visual_check` (in the `annotation_geometry` yaml block)
+
+Setting `visual_check: true` inside a test's `annotation_geometry` block additionally captures *both* the driver's and the peer's rendered frame after the numeric round-trip check and verifies the annotation is actually rendered where/how thick expected on each — projecting the same known OTIO-normalized geometry (`sync_test.annotation_assertions.DEFAULT_SHAPE_GEOMETRY`, driver-adjusted for xStudio-native pen strokes via `shape_geometry_for_driver`) into each captured image's own actual resolution and sampling a perpendicular cross-section, the same technique `testchart/compare_testchart.py` uses for its reference chart. Capturing both apps (not just the peer) means both PNGs land in `logs_dir` for inspection and both hosts' `capture_frame` implementations stay under test. This is the check that would have caught the 2x rect-border bug automatically instead of requiring manual visual inspection — it also caught a real colour bug in this harness's own `xstudio_hook.py::_draw_xstudio_annotation` (an unrecognised `"type": "Brush"` and missing legacy `r`/`g`/`b` keys silently rendered every xStudio-driven pen stroke as plain white, regardless of the requested colour — the numeric check alone only ever asserted thickness). Supports every `draw_annotation` kind (`pen`/`rect`/`ellipse`/`arrow`); soft-skips (does not fail the test) if PIL/numpy are unavailable in the interpreter `runner.py` is running under. The pass/fail tolerance scales with the expected thickness (floored at `tolerance_px`, default 4px) to account for the proportionally larger antialiasing bias on thick/soft-edged strokes — the same effect `compare_thickness.py` already reports as normal (e.g. ~1.19x scale factors on solid lines).
+
+```yaml
+annotation_geometry:
+  driver: "openrv"
+  peer: "xstudio"
+  kind: "rect"
+  nominal: 0.005
+  visual_check: true
+```
+
 ## Isolated Logging
 
 When apps are launched, their `stdout` and `stderr` are redirected to isolated log files to make debugging easy. Logs are grouped by test name in the top-level `logs/` directory:

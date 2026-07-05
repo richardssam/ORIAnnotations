@@ -26,6 +26,11 @@ except ImportError:  # pragma: no cover - exercised on annotations-only installs
 # killing the whole plugin's import — and therefore all live sync.
 try:
     from .state_projection import project_state, diff_states, normalize_clip_name
-    from .inspection import register_manager, get_registered_manager
+    from .inspection import (
+        register_manager,
+        get_registered_manager,
+        register_annotation_controller,
+        get_registered_annotation_controller,
+    )
 except ImportError:  # pragma: no cover - exercised only on incomplete installs
     pass

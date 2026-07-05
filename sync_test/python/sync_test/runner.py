@@ -47,6 +47,7 @@ except ImportError:
     SyncPlayer = None
 
 from otio_sync_core import project_state, diff_states, normalize_clip_name
+from . import annotation_assertions
 
 
 def _normalize_clip_name(name):
@@ -128,7 +129,7 @@ class TestRunner:
             # components vs xStudio bookmarks) and are checked separately by the
             # annotation-presence check, so exclude them from structural equality.
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
-                           "annotations", "annotation_count"}
+                           "annotations", "annotation_count", "is_master"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 
@@ -269,6 +270,213 @@ class TestRunner:
                 return True
             time.sleep(1.0)
         return False
+
+    def _wait_for_master(self, port, timeout=15.0):
+        """Poll a single app's /state until it reports ``is_master: true``.
+
+        Structural edits (add_media, selection, ...) are only ever broadcast
+        by whichever peer holds master (see ``sequence_sync.py``'s
+        ``check_otio_snapshots`` gate) — a non-master peer's own local edits
+        are silently dropped, never queued for later broadcast. Script-driven
+        tests that drive an app's structural commands must not assume launch
+        order settles this: apps self-promote to master on different
+        timescales (xStudio tends to claim it immediately; OpenRV waits ~2s
+        for a WHO_IS_MASTER reply before self-promoting, and can take longer
+        than that to even finish booting and connecting). Returns False (not
+        an exception) on timeout so callers can log a clear diagnostic instead
+        of a generic downstream state-mismatch failure.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st = self.fetch_state(port)
+            if "error" not in st and st.get("is_master") is True:
+                return True
+            time.sleep(0.5)
+        return False
+
+    _ANNOTATION_GEOMETRY_FORMULAS = {
+        ("pen", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_pen_width,
+        ("pen", "xstudio_to_openrv"): annotation_assertions.expected_rv_width_from_xstudio_pen_thickness,
+        ("rect", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_border_width,
+        ("ellipse", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_ellipse_border_width,
+        ("arrow", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_arrow_thickness,
+    }
+
+    def _verify_annotation_geometry(self, app_ports, cfg):
+        """Verify a `draw_annotation` round-tripped to the peer within tolerance.
+
+        `cfg` (from the test's `annotation_geometry` yaml block) names the
+        `driver`/`peer` apps by their `apps:` list name, the annotation `kind`
+        (`pen`/`rect`), the `nominal` value the driver was asked to draw, and a
+        `tolerance`. The expected peer-side value is computed from the same
+        production codec constants the apps themselves use (see
+        `annotation_assertions`), not a hardcoded number — see the
+        `sync-test-draw-annotation` change design doc, decision D3/D4.
+        """
+        driver_name = cfg["driver"]
+        peer_name = cfg["peer"]
+        kind = cfg.get("kind", "pen")
+        nominal = float(cfg["nominal"])
+        tolerance = float(cfg.get("tolerance", 1e-4))
+        direction = f"{driver_name}_to_{peer_name}"
+
+        formula = self._ANNOTATION_GEOMETRY_FORMULAS.get((kind, direction))
+        if formula is None:
+            return False, f"No round-trip formula for kind={kind!r} direction={direction!r}"
+        expected = formula(nominal)
+
+        peer_port = next((port for name, port in app_ports if name == peer_name), None)
+        if peer_port is None:
+            return False, f"No app named {peer_name!r} in this test's apps list"
+
+        def fetch_peer_state():
+            return self.fetch_state(peer_port)
+
+        def has_geometry(state):
+            return bool(state.get("annotations"))
+
+        state = annotation_assertions.wait_for_predicate(
+            fetch_peer_state, has_geometry,
+            timeout=annotation_assertions.XSTUDIO_ANNOTATION_CONVERGENCE_TIMEOUT,
+        )
+        if not state or not state.get("annotations"):
+            return False, f"{peer_name} reported no annotations before timeout"
+
+        last = state["annotations"][-1]
+        if peer_name == "xstudio":
+            thicknesses = last.get("stroke_thickness") or []
+            actual = thicknesses[-1] if thicknesses else None
+        else:
+            actual = last.get("width") if kind == "pen" else last.get("size")
+            if isinstance(actual, list):
+                actual = actual[-1] if actual else None
+
+        try:
+            annotation_assertions.assert_almost_equal(
+                actual, expected, tolerance=tolerance,
+                msg=f"{peer_name} {kind} geometry round-trip from {driver_name}",
+            )
+        except AssertionError as e:
+            return False, str(e)
+        return True, ""
+
+    def _capture_and_measure(self, app_ports, app_name, cfg, kind, geometry, color, otio_thickness, logs_dir):
+        """Capture `app_name`'s live frame and measure its rendered border against
+        `otio_thickness`/`geometry`. Returns `(ok, msg)`, mirroring `_verify_visual_check`.
+        """
+        from . import visual_geometry
+
+        port = next((p for name, p in app_ports if name == app_name), None)
+        if port is None:
+            return False, f"No app named {app_name!r} in this test's apps list"
+
+        # Naming convention per design D3 (`capture_<app_name>_<port>_<frame>.png`),
+        # consistent with the existing per-test session-dump artifacts
+        # (`openrv_<port>.rv`, `xstudio_<port>.xst`) saved into `logs_dir`.
+        state = self.fetch_state(port)
+        frame = state.get("frame") if isinstance(state, dict) else None
+        frame_label = frame if frame is not None else "current"
+        capture_path = os.path.join(logs_dir, f"capture_{app_name}_{port}_{frame_label}.png")
+        res = self.send_command(port, {
+            "action": "capture_frame",
+            "output_path": capture_path,
+            "width": int(cfg.get("capture_width", 1920)),
+            "height": int(cfg.get("capture_height", 1080)),
+        })
+        if "error" in res:
+            return False, f"{app_name} capture_frame failed: {res['error']}"
+
+        result = visual_geometry.measure_shape_border(
+            capture_path, kind, geometry, color, otio_thickness
+        )
+        if not result["found"]:
+            return False, (
+                f"{app_name}: no annotation-colored ink found near expected "
+                f"geometry in {capture_path}"
+            )
+
+        # Antialiased/soft-edged strokes (pen, and to a lesser extent shape
+        # borders) have a Gaussian-equivalent measured width that runs
+        # proportionally larger than their nominal declared thickness — the
+        # same effect `testchart/compare_thickness.py` already reports as
+        # normal for xStudio's own rendering (e.g. a ~1.19x scale factor on
+        # solid lines), not something specific to this comparison. A fixed
+        # pixel tolerance that comfortably covers thin shape borders (~5-10px)
+        # is too tight for thick strokes (observed up to ~21% high on a pen
+        # stroke); scale the tolerance with the expected thickness itself,
+        # floored at the configured/default absolute tolerance so thin
+        # borders keep a tight absolute check.
+        tolerance_px = max(
+            float(cfg.get("tolerance_px", 4.0)),
+            0.3 * result["expected_thickness_px"],
+        )
+        msg = (
+            f"{app_name}: expected {result['expected_thickness_px']:.2f}px, "
+            f"measured {result['measured_thickness_px']:.2f}px "
+            f"(offset {result['offset_px']:+.2f}px, "
+            f"centroid offset {result['centroid_offset_px']:.2f}px) — {capture_path}"
+        )
+        if abs(result["offset_px"]) > tolerance_px:
+            return False, f"{app_name} rendered border thickness mismatch: {msg}"
+        return True, msg
+
+    def _verify_visual_check(self, app_ports, cfg, draw_cmd, logs_dir):
+        """Capture *both* the driver's and the peer's live frame and check the
+        annotation is actually rendered where/how thick the driver's own
+        `draw_annotation` geometry says it should be — the stronger, additive
+        check the numeric `annotation_geometry` round-trip cannot make (see
+        the `sync-test-frame-capture` change design doc, decision D4).
+        Capturing the driver too (not just the peer) means both apps' PNGs
+        land in `logs_dir` for inspection, and exercises both hosts'
+        `capture_frame` implementations, not just the peer's — the two are
+        genuinely different code paths (xStudio's direct render API vs
+        OpenRV's in-process Qt grab). Supports `pen`/`rect`/`ellipse`/`arrow`
+        — every `draw_annotation` kind has a straight-line cross-section to
+        sample (a pen stroke's own thickness, in a pen's case).
+
+        Soft-imports `visual_geometry` (needs PIL/numpy) and returns a passing
+        result with an explanatory message if unavailable in this interpreter,
+        rather than failing the whole test over an optional dependency (see
+        design Risk: PIL/numpy availability).
+        """
+        try:
+            from . import visual_geometry  # noqa: F401 (availability check only)
+        except ImportError as e:
+            return True, f"visual check skipped (PIL/numpy unavailable: {e})"
+
+        driver_name = cfg["driver"]
+        peer_name = cfg["peer"]
+        kind = cfg.get("kind", "pen")
+        nominal = float(cfg["nominal"])
+
+        # Geometry is driver-dependent for `pen`: xStudio's native stroke
+        # coordinates need an aspect_half conversion RV's raw paint
+        # coordinates don't (see `shape_geometry_for_driver`).
+        geometry = annotation_assertions.shape_geometry_for_driver(kind, driver_name)
+        if geometry is None:
+            return False, f"visual check: no supported geometry for kind={kind!r} driver={driver_name!r}"
+
+        # Both apps are expected to render the *same* OTIO-normalized geometry
+        # (that's the whole point of the shared coordinate space), so the same
+        # otio_thickness/geometry ground truth applies to the driver's own
+        # frame and the peer's — there's no separate "driver formula".
+        otio_thickness = annotation_assertions.otio_size_from_driver_nominal(
+            kind, driver_name, nominal
+        )
+        if otio_thickness is None:
+            return False, f"visual check: no OTIO-size formula for kind={kind!r} driver={driver_name!r}"
+
+        color = (draw_cmd or {}).get("border_rgba") or (draw_cmd or {}).get("color") or [1.0, 1.0, 1.0, 1.0]
+
+        messages = []
+        for app_name in (driver_name, peer_name):
+            ok, msg = self._capture_and_measure(
+                app_ports, app_name, cfg, kind, geometry, color, otio_thickness, logs_dir
+            )
+            messages.append(msg)
+            if not ok:
+                return False, "; ".join(messages)
+        return True, "; ".join(messages)
 
     def run_test(self, test_name, script_driven=False,
                  checkpoint_validation_delay=1.5,
@@ -449,6 +657,26 @@ class TestRunner:
 
             if script_driven:
                 driver_app = app_ports[0]
+
+                # Structural commands (add_media, set_selection, ...) are only
+                # ever broadcast by whichever peer holds master — a non-master
+                # driver's own edits are silently dropped, not queued for later
+                # broadcast (see check_otio_snapshots's is_master gate in
+                # sequence_sync.py). Apps self-promote to master on different
+                # timescales (xStudio tends to claim it near-instantly; OpenRV
+                # waits ~2s for a WHO_IS_MASTER reply, and can take longer than
+                # that just to finish booting), so launch order alone does not
+                # reliably decide who wins. Wait here rather than assume, so a
+                # lost race produces a clear log line instead of a generic
+                # downstream state-mismatch failure.
+                if commands and not self._wait_for_master(driver_app[1]):
+                    logging.warning(
+                        f"{driver_app[0]} did not become master within the "
+                        "wait timeout — its structural commands (add_media, "
+                        "set_selection, ...) may be silently dropped rather "
+                        "than broadcast to peers."
+                    )
+
                 logging.info(f"Driving {driver_app[0]} via commands...")
                 for cmd in commands:
                     logging.info(f"  -> Sending command: {cmd}")
@@ -577,6 +805,43 @@ class TestRunner:
                 match, diff = self.compare_states(states, [a[0] for a in app_ports])
                 if not match:
                     logging.error(f"❌ FAIL: Final state mismatch in test '{test_name}'!\n{diff}")
+                    failed = True
+
+            # Annotation geometry round-trip check (script-driven `draw_annotation`
+            # tests only): verify the peer's native readback matches the value
+            # predicted by feeding the driver's nominal input through both apps'
+            # real codec constants (see `annotation_assertions`).
+            annotation_geometry = test_data.get("annotation_geometry")
+            if not failed and annotation_geometry:
+                ok, msg = self._verify_annotation_geometry(app_ports, annotation_geometry)
+                if ok:
+                    logging.info(f"✅ Annotation geometry round-trip verified: {annotation_geometry}")
+                else:
+                    logging.error(f"❌ FAIL: annotation geometry mismatch in test '{test_name}': {msg}")
+                    failed = True
+
+            # Visual check (sync-test-frame-capture change): additive to the
+            # numeric round-trip above — captures the peer's live rendered
+            # frame and checks the annotation actually appears where/how thick
+            # expected, the class of bug (e.g. the 2x rect-border bug) that a
+            # self-consistent-but-wrong numeric round-trip cannot catch.
+            # Opt-in via `visual_check: true` in the `annotation_geometry` block.
+            if not failed and annotation_geometry and annotation_geometry.get("visual_check"):
+                draw_cmd = None
+                if script_driven and "commands" in test_data:
+                    kind = annotation_geometry.get("kind", "pen")
+                    draw_cmd = next(
+                        (c for c in commands
+                         if c.get("action") == "draw_annotation" and c.get("kind") == kind),
+                        None,
+                    )
+                ok, msg = self._verify_visual_check(
+                    app_ports, annotation_geometry, draw_cmd, spawner.logs_dir
+                )
+                if ok:
+                    logging.info(f"✅ Visual check: {msg}")
+                else:
+                    logging.error(f"❌ FAIL: visual check in test '{test_name}': {msg}")
                     failed = True
 
             # Annotation-presence check: if the recording contained annotations,

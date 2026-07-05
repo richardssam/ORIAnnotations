@@ -820,9 +820,17 @@ class SyncManager:
         :func:`otio_sync_core.project_state`.  Works on any peer, not only the
         master.
 
-        :returns: A ``StateSnapshot``-shaped payload dict (timelines in wire form).
+        Also carries ``is_master`` as an extra top-level key, purely for test
+        harness visibility (e.g. waiting for a script-driven test's driver app
+        to hold master before sending structural commands it would otherwise
+        silently be unable to broadcast). ``project_state``/``diff_states``
+        only read the named ``StateSnapshot`` fields, so this extra key is
+        inert for structural comparison.
+
+        :returns: A ``StateSnapshot``-shaped payload dict (timelines in wire
+            form), plus ``is_master``.
         """
-        return StateSnapshot(
+        payload = StateSnapshot(
             target_guid="",
             timelines=dict(self._timelines),
             active_timeline_guid=self.active_timeline_guid,
@@ -830,6 +838,8 @@ class SyncManager:
             playback_state=self.playback_state or None,
             display_state=self.display_state or None,
         ).to_payload()
+        payload["is_master"] = self.is_master
+        return payload
 
     def _send_message(self, msg: ProtocolMessage) -> None:
         """Wrap a typed :class:`ProtocolMessage` in the envelope and send it.

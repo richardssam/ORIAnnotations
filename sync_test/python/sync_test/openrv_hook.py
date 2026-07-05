@@ -16,10 +16,18 @@ def get_openrv_state():
         "clip": None,
         "frame": None,
         "playing": False,
-        "annotations": []
+        "annotations": [],
+        "is_master": None,
     }
 
     try:
+        try:
+            import otio_sync_core
+            _mgr_for_master = otio_sync_core.get_registered_manager()
+            if _mgr_for_master is not None:
+                state["is_master"] = bool(_mgr_for_master.is_master)
+        except Exception:
+            pass
         # Report the 1-indexed LOCAL frame (frame - frameStart + 1) rather than
         # the raw global frame so timecode-bearing media works correctly.
         # validate_checkpoint expects adjusted = protocol_value + 1, where
@@ -125,14 +133,41 @@ def get_openrv_state():
         # component path.  This lets the test assert annotations were *created*
         # (placement/frame correctness is validated separately).
         total_strokes = 0
+        _GEOMETRY_PREFIXES = ("pen:", "text:", "rect:", "ellipse:", "arrow:")
         for pnode in rv.commands.nodesOfType("RVPaint"):
             try:
                 comps = set()
+                geom_comps = set()
                 for prop in rv.commands.properties(pnode):
                     short = prop[len(pnode) + 1:] if prop.startswith(pnode + ".") else prop
                     if short.startswith("pen:") or short.startswith("text:"):
                         comps.add(short.rsplit(".", 1)[0])
+                    if short.startswith(_GEOMETRY_PREFIXES):
+                        geom_comps.add(short.rsplit(".", 1)[0])
                 total_strokes += len(comps)
+
+                # Surface native geometry (width for pen/erase, size for
+                # shapes) per stroke, additive to the existing counts above —
+                # lets callers assert on drawn/received geometry, not just
+                # presence. Reuses the already-tested read_stroke rather than
+                # re-parsing properties here.
+                try:
+                    from otio_sync_core import rv_paint_applier
+                    for comp in geom_comps:
+                        try:
+                            stroke = rv_paint_applier.read_stroke(rv.commands, pnode, comp)
+                        except Exception:
+                            stroke = None
+                        if not stroke:
+                            continue
+                        ann_entry = {"node": pnode, "component": comp, "kind": stroke.get("kind")}
+                        if "width" in stroke:
+                            ann_entry["width"] = stroke["width"]
+                        if "size" in stroke:
+                            ann_entry["size"] = stroke["size"]
+                        state["annotations"].append(ann_entry)
+                except ImportError:
+                    pass
             except Exception:
                 continue
         state["annotation_count"] = total_strokes
@@ -254,7 +289,166 @@ def execute_openrv_command(payload):
                         pass
         raise ValueError(f"Could not find sequence or clip matching name to delete: {name}")
 
+    elif action == "draw_annotation":
+        return _draw_openrv_annotation(payload)
+
+    elif action == "capture_frame":
+        return _capture_openrv_frame(payload)
+
     raise ValueError(f"Unknown action: {action}")
+
+
+def _draw_openrv_annotation(payload):
+    """Simulate a completed native draw and broadcast it via the real send path.
+
+    Writes raw paint-node properties directly (NOT via ``rv_paint_applier``'s
+    caller, ``sync_events_to_rv_specs`` — that would re-apply the forward
+    OTIO->RV width scale we're trying to test the *reverse* of) at the current
+    frame's paint node, then calls the real ``AnnotationSyncController._broadcast_annotation``
+    — the same function OpenRV's own pen-up handler calls — so the annotation
+    is broadcast exactly as a live user stroke would be.
+    """
+    import uuid as uuid_mod
+    import otio_sync_core
+    from otio_sync_core import rv_paint_applier
+    from otio_sync_core.rv_annotation_codec import TYPE_STRING, TYPE_FLOAT, TYPE_INT
+
+    kind = payload.get("kind")
+    frame = rv.commands.frame()
+    eval_infos = rv.commands.metaEvaluateClosestByType(frame, "RVPaint")
+    if not eval_infos:
+        raise ValueError(f"draw_annotation: no RVPaint node found at frame {frame}")
+    node = eval_infos[0]["node"]
+
+    if kind == "pen":
+        width = float(payload.get("width", 2.0))
+        points = payload.get("points", [-0.05, 0.0, 0.05, 0.0])
+        color = payload.get("color", [1.0, 1.0, 1.0, 1.0])
+        spec = {
+            "kind": "pen",
+            "uuid": str(uuid_mod.uuid4()),
+            "user": "sync_test",
+            "props": [
+                ("brush", TYPE_STRING, ["circle"], 1),
+                ("color", TYPE_FLOAT, list(color), 4),
+                ("debug", TYPE_INT, [0], 1),
+                ("join", TYPE_INT, [3], 1),
+                ("cap", TYPE_INT, [1], 1),
+                ("splat", TYPE_INT, [0], 1),
+                # Raw native width — the value under test, deliberately NOT
+                # derived from any OTIO size via RV_WIDTH_SCALE.
+                ("width", TYPE_FLOAT, [width, width], 1),
+                ("points", TYPE_FLOAT, list(points), 2),
+            ],
+        }
+    elif kind in ("rect", "ellipse"):
+        border_width = float(payload.get("border_width", 1.0))
+        border_rgba = payload.get("border_rgba", [1.0, 1.0, 1.0, 1.0])
+        inner_rgba = payload.get("inner_rgba", [0.0, 0.0, 0.0, 0.0])
+        spec = {
+            "kind": kind,
+            "uuid": str(uuid_mod.uuid4()),
+            "user": "sync_test",
+            "props": [
+                ("min", TYPE_FLOAT, [-0.1, -0.1], 2),
+                ("max", TYPE_FLOAT, [0.1, 0.1], 2),
+                ("borderColor", TYPE_FLOAT, list(border_rgba), 4),
+                ("innerColor", TYPE_FLOAT, list(inner_rgba), 4),
+                # Raw native border width — the value under test.
+                ("borderWidth", TYPE_FLOAT, [border_width], 1),
+                ("startFrame", TYPE_INT, [frame], 1),
+                ("duration", TYPE_INT, [1], 1),
+                ("eye", TYPE_INT, [2], 1),
+                ("uuid", TYPE_STRING, [str(uuid_mod.uuid4())], 1),
+                ("softDeleted", TYPE_INT, [0], 1),
+            ],
+        }
+    elif kind == "arrow":
+        thickness = float(payload.get("thickness", 1.0))
+        color = payload.get("color", [1.0, 1.0, 1.0, 1.0])
+        start = payload.get("start", [-0.1, -0.1])
+        end = payload.get("end", [0.1, 0.1])
+        spec = {
+            "kind": "arrow",
+            "uuid": str(uuid_mod.uuid4()),
+            "user": "sync_test",
+            "props": [
+                ("startPos", TYPE_FLOAT, list(start), 2),
+                ("endPos", TYPE_FLOAT, list(end), 2),
+                ("borderColor", TYPE_FLOAT, list(color), 4),
+                ("innerColor", TYPE_FLOAT, list(color), 4),
+                ("borderWidth", TYPE_FLOAT, [0.0], 1),
+                ("thickness", TYPE_FLOAT, [thickness], 1),
+                ("startFrame", TYPE_INT, [frame], 1),
+                ("duration", TYPE_INT, [1], 1),
+                ("eye", TYPE_INT, [2], 1),
+                ("uuid", TYPE_STRING, [str(uuid_mod.uuid4())], 1),
+                ("softDeleted", TYPE_INT, [0], 1),
+            ],
+        }
+    else:
+        raise ValueError(f"draw_annotation: unknown kind {kind!r}")
+
+    next_strokeid = rv_paint_applier.apply_specs(
+        [spec], rv.commands, rv_node=node, frame=frame, mode="append"
+    )
+    written_strokeid = next_strokeid - 1
+    component = f"{spec['kind']}:{written_strokeid}:{frame}:{spec['user']}"
+
+    controller = otio_sync_core.get_registered_annotation_controller()
+    if controller is None:
+        raise RuntimeError(
+            "draw_annotation: annotation controller not registered yet "
+            "(plugin has not connected to a session)"
+        )
+    controller._broadcast_annotation(node, component)
+
+    return {"action": "draw_annotation", "status": "success", "node": node, "component": component}
+
+
+def _capture_openrv_frame(payload):
+    """Grab the live viewport widget in-process and save it to disk.
+
+    Uses `testchart/grab_frame.py`'s proven technique (`rv.commands.sessionGLView()`
+    wrapped as a Qt widget, `.grab().save(path)`) rather than an external `rvio`
+    subprocess: `rvio` has known crash issues in this build (see the font-crash
+    fallback that technique was originally written for), and the sync_test
+    instance is already live, so no save/reload round-trip is needed either way.
+    """
+    output_path = payload.get("output_path")
+    if not output_path:
+        raise ValueError("capture_frame: output_path is required")
+
+    width = payload.get("width")
+    height = payload.get("height")
+    if width and height:
+        # Request a known capture size (design D2, option 1 — rv.commands.setViewSize
+        # is a small, low-risk existing command) so the output resolution is
+        # comparable to xStudio's explicit render size. Not guaranteed exact
+        # (HiDPI/window-manager rounding) — the comparison step reads the saved
+        # image's actual dimensions rather than trusting this request was
+        # honored precisely (design D2, option 2, kept as the robust fallback).
+        rv.commands.setViewSize(int(width), int(height))
+
+    # Settle/redraw before capture (design Risk: capture timing) — force a
+    # redraw and flush pending Qt paint events so the grab reflects the
+    # annotation that was just applied, not a stale buffer.
+    rv.commands.redraw()
+    try:
+        from PySide6 import QtWidgets
+        import shiboken6
+    except ImportError:
+        from PySide2 import QtWidgets
+        import shiboken2 as shiboken6
+    QtWidgets.QApplication.processEvents()
+
+    ptr = rv.commands.sessionGLView()
+    if not ptr:
+        raise RuntimeError("capture_frame: sessionGLView() returned no widget pointer")
+    view = shiboken6.wrapInstance(ptr, QtWidgets.QWidget)
+    view.grab().save(output_path)
+
+    return {"action": "capture_frame", "status": "success", "output_path": output_path}
 
 
 def _execute_openrv_command_inner(payload):

@@ -273,13 +273,18 @@ def read_stroke(commands, rv_node: str, item: str) -> Optional[dict]:
         }
     if item.startswith("ellipse:") or item.startswith("rect:"):
         border_width = (_read_float(commands, f"{base}.borderWidth", [0.0]) or [0.0])[0]
+        r_min = _read_float(commands, f"{base}.min", [0.0, 0.0])
+        r_max = _read_float(commands, f"{base}.max", [0.0, 0.0])
+        half = border_width / 2.0
+        c_min = [r_min[0] + half, r_min[1] + half] if r_min else [0.0, 0.0]
+        c_max = [r_max[0] - half, r_max[1] - half] if r_max else [0.0, 0.0]
         return {
             "kind": "ellipse" if item.startswith("ellipse:") else "rect",
-            "min": _read_float(commands, f"{base}.min", [0.0, 0.0]),
-            "max": _read_float(commands, f"{base}.max", [0.0, 0.0]),
+            "min": c_min,
+            "max": c_max,
             "rgba": _read_float(commands, f"{base}.borderColor", [1.0, 1.0, 1.0, 1.0]),
             "inner_rgba": _read_float(commands, f"{base}.innerColor", [0.0, 0.0, 0.0, 0.0]),
-            "size": border_width * 2.0,
+            "size": border_width,
             "uuid": (_read_string(commands, f"{base}.uuid", [""]) or [""])[0],
             "user": user,
         }

@@ -13,45 +13,52 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 
 # Todo Critical
 
-[ ] Need to figure out how to handle regular playlists reordering for xstudio playlists in rv.
-[x] XStudio plugin for annotations inport/export - currently imports are failing.
-[ ] Test a media handler, so missing media can be substituted.
-[ ] Test Squares, arrows, and circles from new OpenRV.
-[ ] Handle x, y flip
-[ ] Handle play backwards.
-[ ] Need loop controls, do we loop, or rock-and-roll?
-[ ] Changes to frame rate.
+- [ ] Annotations are still different sizes between RV and xSTUDIO need to investigate.
+- [ ] Need to figure out how to handle regular playlists reordering for xstudio playlists in rv.
+- [x] XStudio plugin for annotations inport/export - currently imports are failing.
+- [ ] Test a media handler, so missing media can be substituted.
+- [x] Test Squares, arrows, and circles from new OpenRV.
+- [ ] Handle x, y flip
+- [ ] Handle play backwards. (xstudio doesnt have a button for this)
+- [ ] Need loop controls, do we loop, or rock-and-roll? - started, but not complete.
+- [ ] Changes to frame rate.
 
 * Creating prototype C++ changes to OTIO, currently its failing running the tests.
 
 
-# Sync Security and Session Users
-[ ] Sync manager should keep track of who is connected.
-[ ] Need security controls for who can drive, or modify, or annotate.
-[ ] Laser pointer.
-[ ] We should be able to request the state of a particular host, and be able to compare it to what it thinks is there.
-[x] Update protocol to new format (only slightly different to before).
-[x] Add in menu options for registering with environment variable for stream-name.
-[ ] Handle encryption and possibly compression.
+# TODO Cleanup
+- [ ] Move loader and saver for RV to export/import menu.
+- [ ] Figure out if we can move the pika install into the plugin for xstudio
+- [ ] README says it needs a OTIO_PLUGIN_MANIFEST_PATH for xstudio. Can we make it part of the plugin.
 
-[x] Fix text size issues.
-[x] Figure out issue with xstudio and timecode in quicktime files.
+# Sync Security and Session Users
+- [ ] Sync manager should keep track of who is connected.
+- [ ] Need security controls for who can drive, or modify, or annotate.
+- [ ] Laser pointer.
+- [ ] We should be able to request the state of a particular host, and be able to compare it to what it thinks is there.
+- [x] Update protocol to new format (only slightly different to before).
+- [x] Add in menu options for registering with environment variable for stream-name.
+- [ ] Handle encryption and possibly compression.
+
+- [x] Fix text size issues.
+- [x] Figure out issue with xstudio and timecode in quicktime files.
 
 
 
 # openrv_sync_plugin
 
-[ ] importing full OTIO sessions (Assuming single track).
-[x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
-[ ] Figure out redraw issue where text gets visually duplicated for a moment. - created test for this - text_annotations_xstudio_to_rv duplicate text not in rv file.
-[ ] Handle clear annotations.
+- [x] importing full OTIO sessions (Assuming single track).
+- [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
+- [ ] Figure out redraw issue where text gets visually duplicated for a moment. - created test for this - text_annotations_xstudio_to_rv duplicate text not in rv file.
+- [ ] Handle clear annotations.
 
 # XStudio Plugin
 
-[ ] Add tests for full OTIO sessions - need to understand what options there are (e.g. edits, different frame rates, etc).
-[x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
-[ ] Handle clear annotations, not clear if we need to handle the undo/redo delete.
-[ ] Handle partial annotations.
+- [ ] Add tests for full OTIO sessions - need to understand what options there are (e.g. edits, different frame rates, etc).
+- [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
+- [ ] Handle clear annotations, not clear if we need to handle the undo/redo delete.
+- [x] Handle partial annotations.
+- [ ] Handle Shapes as OTIO objects: draw a Square/Circle/Arrow/Line; confirm **no** mid-drag partial is broadcast and the shape appears only on pen-up.
 
 ## Known Limitations
 
@@ -82,12 +89,7 @@ The `stroke_completed=True` flag on `PaintEnd` is the pen-up signal.
 * Erase all annotations on a frame → peer should see the frame annotation cleared
 * Test that remote-sourced bookmarks (`_our_bookmark_uuids`) are still correctly filtered and not echoed back
 
-### [2A] Zoom and pan sync via viewport atoms
-
-Replace the fragile `serialise_atom` zoom read with `viewport_scale_atom` and
-enable pan sync using `viewport_pan_atom` (both now exposed in `py_atoms.cpp`).
-Use `fit_mode_atom` to capture a reliable fit-to-window baseline instead of
-the first-seen heuristic.  Remove `_xs_base_scale` first-seen logic.
+I
 
 **Testing:**
 

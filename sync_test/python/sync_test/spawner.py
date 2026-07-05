@@ -50,11 +50,17 @@ class AppSpawner:
             
             repo_root = os.path.abspath(os.path.join(self.base_dir, ".."))
             env["XSTUDIO_PYTHON_PLUGIN_PATH"] = os.path.join(repo_root, "xstudio_plugin")
-            
+
             python_path = os.environ.get("PYTHONPATH", "")
             env["PYTHONPATH"] = f"{os.path.join(repo_root, 'python')}:{python_path}"
             env["OTIO_PLUGIN_MANIFEST_PATH"] = os.path.join(repo_root, "otio_event_plugin", "plugin_manifest.json")
             env["ORI_SESSION"] = self.session_id
+            # Without $OCIO, RV/xStudio each fall back to their own built-in
+            # default config, which can silently diverge and confound
+            # cross-app color comparisons (e.g. testing whether a "washed
+            # out" annotation render is a colorspace/exposure issue rather
+            # than a geometry one). Pin both apps to the same known config.
+            env["OCIO"] = os.path.join(repo_root, "test_media", "config.ocio")
 
             # File bridge: the plugin dumps manager.export_state() here and the
             # out-of-process inspector reads it for guid-accurate full state.
@@ -132,7 +138,13 @@ class AppSpawner:
             env["RV_OTIO_SYNC_LOG_FILE"] = plugin_log_path
             env["ORI_SESSION"] = self.session_id
             env["RV_NO_CONSOLE_REDIRECT"] = "1"
-            
+            # Without $OCIO, RV falls back to its own built-in default config
+            # (logged as "$OCIO environment variable unset!"), which can
+            # silently diverge from xStudio's and confound cross-app color
+            # comparisons. Pin both apps to the same known config.
+            repo_root = os.path.abspath(os.path.join(self.base_dir, ".."))
+            env["OCIO"] = os.path.join(repo_root, "test_media", "config.ocio")
+
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             self.processes.append((app_name, p))
             
