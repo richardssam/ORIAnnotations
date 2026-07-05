@@ -38,11 +38,11 @@ The system SHALL redirect stdout and stderr of each spawned application into iso
 - **THEN** the runner outputs the failure diff and the location of the isolated application log file for the LLM or developer to review
 
 ### Requirement: Script-Driven Annotation Drawing
-The system SHALL support a `draw_annotation` script-driven command that makes a driver app produce a native pen or rectangle annotation and broadcast it via that app's real, unmodified production send path — without driving real mouse/UI input.
+The system SHALL support a `draw_annotation` script-driven command that makes a driver app produce a native pen, rectangle, ellipse, or arrow annotation and broadcast it via that app's real, unmodified production send path — without driving real mouse/UI input.
 
 For OpenRV, the command SHALL write native paint-node properties directly (not via the OTIO-import codec path) and then invoke the same function OpenRV's real pen-up handler invokes to broadcast a completed stroke. For xStudio, the command SHALL write a native annotation via the existing remote annotation-write API into the live session the running plugin is watching, and rely on that plugin's own existing poll loop to detect and broadcast it, exactly as it would a real user-drawn stroke.
 
-The `rect` kind SHALL be supported as a driver action for OpenRV only. xStudio SHALL NOT be required to support `rect` as a driver action until xStudio's native shape-drawing broadcast path exists.
+The `rect`, `ellipse`, and `arrow` kinds SHALL be supported as driver actions for OpenRV only. xStudio SHALL NOT be required to support any shape kind as a driver action until xStudio's native shape-drawing broadcast path exists.
 
 #### Scenario: Drawing a pen stroke in OpenRV
 - **WHEN** the runner sends `{"action": "draw_annotation", "kind": "pen", ...}` to an OpenRV instance
@@ -57,14 +57,22 @@ The `rect` kind SHALL be supported as a driver action for OpenRV only. xStudio S
 - **WHEN** the runner sends `{"action": "draw_annotation", "kind": "rect", ...}` to an OpenRV instance
 - **THEN** OpenRV writes a native rectangle paint-node with the requested nominal border width and broadcasts it to peers via its real send path
 
-#### Scenario: Rectangle drawing is not required from xStudio
+#### Scenario: Drawing an ellipse in OpenRV
+- **WHEN** the runner sends `{"action": "draw_annotation", "kind": "ellipse", ...}` to an OpenRV instance
+- **THEN** OpenRV writes a native ellipse paint-node with the requested nominal border width and broadcasts it to peers via its real send path
+
+#### Scenario: Drawing an arrow in OpenRV
+- **WHEN** the runner sends `{"action": "draw_annotation", "kind": "arrow", ...}` to an OpenRV instance
+- **THEN** OpenRV writes a native arrow paint-node with the requested nominal shaft thickness and broadcasts it to peers via its real send path
+
+#### Scenario: Shape drawing is not required from xStudio
 - **WHEN** a test suite targets xStudio as the driver app
-- **THEN** it SHALL NOT be required to support `kind: "rect"`, since xStudio has no wired-up native shape broadcast path
+- **THEN** it SHALL NOT be required to support `kind: "rect"`, `"ellipse"`, or `"arrow"`, since xStudio has no wired-up native shape broadcast path
 
 ### Requirement: Round-Trip Annotation Geometry Verification
 The system SHALL be able to verify, after a `draw_annotation` command converges to a peer, that the peer's native readback of the annotation's width/size matches — within `assertAlmostEqual`-style tolerance — an expected value computed by feeding the driver's nominal input through the same production codec functions and constants the apps themselves use for that conversion (not a hardcoded or independently-derived expected value).
 
-Pen coverage SHALL run bidirectionally (OpenRV driving/xStudio verifying, and xStudio driving/OpenRV verifying). Rectangle coverage SHALL run with OpenRV as the driver and xStudio as the verifier.
+Pen coverage SHALL run bidirectionally (OpenRV driving/xStudio verifying, and xStudio driving/OpenRV verifying). Rectangle, ellipse, and arrow coverage SHALL run with OpenRV as the driver and xStudio as the verifier.
 
 #### Scenario: OpenRV-drawn pen width round-trips to xStudio
 - **WHEN** OpenRV draws a pen stroke with a chosen nominal native width and it converges to an xStudio peer
@@ -77,6 +85,14 @@ Pen coverage SHALL run bidirectionally (OpenRV driving/xStudio verifying, and xS
 #### Scenario: OpenRV-drawn rectangle border width round-trips to xStudio
 - **WHEN** OpenRV draws a rectangle with a chosen nominal native border width and it converges to an xStudio peer
 - **THEN** the xStudio peer's native tessellated-stroke thickness, read via its `/state` annotation geometry, SHALL be within tolerance of the value predicted by running that nominal border width through OpenRV's reverse shape codec and then xStudio's forward shape-tessellation codec
+
+#### Scenario: OpenRV-drawn ellipse border width round-trips to xStudio
+- **WHEN** OpenRV draws an ellipse with a chosen nominal native border width and it converges to an xStudio peer
+- **THEN** the xStudio peer's native tessellated-stroke thickness, read via its `/state` annotation geometry, SHALL be within tolerance of the value predicted by running that nominal border width through OpenRV's reverse shape codec and then xStudio's forward shape-tessellation codec
+
+#### Scenario: OpenRV-drawn arrow shaft thickness round-trips to xStudio
+- **WHEN** OpenRV draws an arrow with a chosen nominal native shaft thickness and it converges to an xStudio peer
+- **THEN** the xStudio peer's native tessellated-stroke thickness, read via its `/state` annotation geometry, SHALL be within tolerance of the value predicted by running that nominal shaft thickness through OpenRV's reverse arrow codec and then xStudio's forward shape-tessellation codec
 
 ### Requirement: Script-Driven Frame Capture
 The system SHALL support a `capture_frame` script-driven command, available for both OpenRV and xStudio driver/peer apps, that renders the target app's current live frame (video plus applied annotations) to an image file at a caller-specified output path.
