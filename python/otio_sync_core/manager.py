@@ -915,13 +915,13 @@ class SyncManager:
         """Broadcast the current view/playback state to all peers.
 
         This is the single authoritative view-state message (SELECTION_1.0 is
-        retired): besides ``playing``/``current_time``/``looping`` it carries the
-        view-state fields ``view_mode`` ("sequence"|"source") and ``clip_guid``
+        retired): besides ``playing``/``current_time``/``playback_mode`` it carries
+        the view-state fields ``view_mode`` ("sequence"|"source") and ``clip_guid``
         when the caller includes them in *state_dict* (they round-trip through
         ``PlaybackSettingsSet.from_payload``).
 
         :param state_dict: View/playback fields — ``playing``, ``current_time``,
-            ``looping``, and optionally ``view_mode`` and ``clip_guid``.
+            ``playback_mode``, and optionally ``view_mode`` and ``clip_guid``.
         :param timeline_guid: GUID of the timeline being viewed; falls back to
             :attr:`active_timeline_guid`.
         """
@@ -1625,6 +1625,16 @@ class SyncManager:
                 replay = self.apply_snapshot(data)
                 if "playback_state" in data:
                     self.playback_state = data["playback_state"]
+                    # Mirror _h_playback_set: some callers (e.g. the xStudio
+                    # plugin) only ever apply playback state via the
+                    # on_playback_changed callback list, not the returned
+                    # action tuple — so this must fire both paths.
+                    for cb in self._playback_callbacks:
+                        try:
+                            cb(self.playback_state)
+                        except Exception as e:
+                            _log(f"on_playback_changed callback error: {e}")
+                    app_events.append(("playback_settings", self.playback_state))
                 if "display_state" in data:
                     self.display_state = data["display_state"]
                     app_events.append(("display_settings", self.display_state))

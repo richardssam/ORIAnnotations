@@ -25,6 +25,10 @@ from .utils import _log, _log_exc, bounded, bounded_timeout
 # so a stale/destroyed actor fails fast and the poll thread keeps running.
 _PLAYHEAD_TIMEOUT_MS = 2000
 
+# Native "Loop Mode" playhead attribute string <-> wire playback_mode string.
+_LOOP_MODE_TO_WIRE = {"Loop": "loop", "Play Once": "play-once", "Ping Pong": "ping-pong"}
+_WIRE_TO_LOOP_MODE = {v: k for k, v in _LOOP_MODE_TO_WIRE.items()}
+
 # Minimum interval (s) between position-only scrub broadcasts.  xStudio fires a
 # "Logical Frame" attribute change per rendered frame while dragging the
 # playhead (~60 Hz); peers don't need updates that often, and the flood backs
@@ -32,14 +36,17 @@ _PLAYHEAD_TIMEOUT_MS = 2000
 _SCRUB_BROADCAST_INTERVAL = 0.05
 
 # Programmatically highlighting the selected clip inside a sequence track (via a
-# raw item_selection_atom send) crashes xStudio: the send into a recently-rebuilt
+# raw item_selection_atom send) can crash xStudio: the send into a recently-rebuilt
 # timeline races with that timeline's clip actors being torn down, and the
 # resulting broadcast_down_atom is delivered to a Python event callback that
-# segfaults (signal 11 in execute_event_callback).  The highlight is cosmetic —
-# the peer already switches to the sequence and seeks to the clip — so it is
-# disabled by default.  Re-enable only once the underlying actor-down crash is
-# resolved in xStudio.
-_ENABLE_TIMELINE_ITEM_HIGHLIGHT = False
+# segfaults (signal 11 in execute_event_callback) — a C++-level crash no Python
+# try/except can catch.  The highlight is now gated behind a timeline-stability
+# guard (_timeline_recently_rebuilt) that skips the send for a settle window
+# after any structural rebuild, which closes most of the race (see design D2 of
+# the fix-xstudio-selection-and-playhead-sync change).  This flag remains as an
+# instant kill-switch: flip it to False to disable all item_selection_atom sends
+# outright if crashes recur during live testing.
+_ENABLE_TIMELINE_ITEM_HIGHLIGHT = True
 
 
 class PlaybackSyncController:
@@ -54,13 +61,14 @@ class PlaybackSyncController:
         # ── owned state ───────────────────────────────────────────────
         self._pending_seek_frame: int | None = None
         self._pending_seek_deadline: float = 0.0
+        self._last_known_playback_mode: str | None = None
+        self._loop_mode_apply_suppress_until: float = 0.0
         self._current_selection_sub_id: int | None = None
         self._current_selection_container_uuid: str | None = None
         self._last_logged_container_uuid: str | None = None
         self._last_logged_clip_name: str | None = None
         self._last_viewed_clip_guid: str | None = None
         self._last_pinned_source_mode: bool | None = None
-        self._last_remote_stop_at: float = 0.0
         self._last_sel_names = None
         self._last_src_names = None
         self._last_playhead_check: float = 0.0
@@ -111,8 +119,9 @@ class PlaybackSyncController:
         self._last_viewed_clip_guid = None
         self._pending_seek_frame = None
         self._pending_seek_deadline = 0.0
+        self._last_known_playback_mode = None
+        self._loop_mode_apply_suppress_until = 0.0
         self._last_pinned_source_mode = None
-        self._last_remote_stop_at = 0.0
         self._last_sel_names = None
         self._last_src_names = None
         self._last_playhead_check = 0.0
@@ -392,7 +401,9 @@ class PlaybackSyncController:
         current_remote = getattr(self.plugin.active_playhead, "remote", None)
         if ph_remote != current_remote:
             try:
-                self.plugin.active_playhead = Playhead(self.plugin.connection, ph_remote)
+                new_ph = Playhead(self.plugin.connection, ph_remote)
+                self._carry_over_playback_mode(new_ph)
+                self.plugin.active_playhead = new_ph
                 _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
             except Exception:
                 _log_exc("on_global_playhead_event: failed to update playhead")
@@ -485,6 +496,7 @@ class PlaybackSyncController:
         if ph:
             current_remote = getattr(self.plugin.active_playhead, "remote", None)
             if ph.remote != current_remote:
+                self._carry_over_playback_mode(ph)
                 self.plugin.active_playhead = ph
                 _log(f"[position_atom] active playhead updated: {ph.remote}")
 
@@ -501,13 +513,18 @@ class PlaybackSyncController:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
                 ph = self.plugin.current_playhead()
                 if ph:
+                    self._carry_over_playback_mode(ph)
                     self.plugin.active_playhead = ph
                     _log(f"[position_atom] re-acquired live playhead: {ph.remote}")
         except Exception:
             _log_exc("_reacquire_active_playhead: failed")
 
     def on_playhead_attribute_changed(self, attr, role) -> None:
-        """Fires when playhead position or play state changes."""
+        """Fires when playhead position, play state, or loop mode changes."""
+        if attr.name == "Loop Mode":
+            self._on_loop_mode_changed()
+            return
+
         if attr.name not in ("Logical Frame", "playing"):
             return
 
@@ -533,22 +550,29 @@ class PlaybackSyncController:
         if time.monotonic() < self.plugin._playback_apply_suppress_until:
             return
 
-        # Initialize play state on first run
-        if self.plugin._last_polled_playing is None:
-            self.plugin._last_polled_playing = playing
-            self.plugin._last_polled_frame = frame
+        # On first run there's no known baseline to diff against. Treat it as
+        # a change unconditionally rather than seeding the baseline from this
+        # same reading — comparing a value against itself just-set from it
+        # always reads as "unchanged", silently swallowing whatever the very
+        # first observed state is (most visibly: hitting play as the first
+        # action after connecting never broadcast, since nothing else fired
+        # an event afterward to "catch" it — only scrubbing did, because it
+        # fires many events in a row and later ones compare against a real
+        # baseline).
+        first_run = self.plugin._last_polled_playing is None
 
         # Check playing state change
-        playing_changed = (playing != self.plugin._last_polled_playing)
+        playing_changed = first_run or (playing != self.plugin._last_polled_playing)
 
-        # Skip frame updates while playing if play state didn't change
-        if playing and not playing_changed:
-            return
-
-        # If paused and frame hasn't changed, skip
-        if not playing and not playing_changed:
-            if frame == self.plugin._last_polled_frame:
+        if not first_run:
+            # Skip frame updates while playing if play state didn't change
+            if playing and not playing_changed:
                 return
+
+            # If paused and frame hasn't changed, skip
+            if not playing and not playing_changed:
+                if frame == self.plugin._last_polled_frame:
+                    return
 
         # Update cache to prevent redundant broadcasts
         self.plugin._last_polled_playing = playing
@@ -564,7 +588,7 @@ class PlaybackSyncController:
                 "value": float(frame),
                 "rate": fps,
             },
-            "looping": self._get_loop_mode(),
+            "playback_mode": self._get_playback_mode(),
             "view_mode": self._cur_view_mode,
             "clip_guid": self._cur_clip_guid,
         }
@@ -807,16 +831,85 @@ class PlaybackSyncController:
 
     # ── playback state ─────────────────────────────────────────────────
 
-    def _get_loop_mode(self) -> bool:
-        """Return True if the playhead loop mode is "Loop", False otherwise."""
+    def _get_playback_mode(self) -> str:
+        """Return the wire playback_mode ("play-once"/"loop"/"ping-pong") for the active playhead.
+
+        Deliberately does NOT update ``_last_known_playback_mode`` — every new
+        clip's playhead defaults to the engine's raw "Play Once" regardless of
+        the user's real preference, so a passive read here would "poison" the
+        cache with that default the moment it's used to build a broadcast.
+        ``_last_known_playback_mode`` is only updated from genuine signals: a
+        local "Loop Mode" attribute-changed event, or a value applied from a
+        peer (see ``on_playhead_attribute_changed`` / ``apply_playback_state``).
+        """
         ph = self.plugin.active_playhead
         if not ph:
-            return False
+            return "play-once"
         try:
-            mode = ph.get_attribute("Loop Mode")
-            return str(mode).strip() == "Loop"
+            mode = str(ph.get_attribute("Loop Mode")).strip()
+            return _LOOP_MODE_TO_WIRE.get(mode, "play-once")
         except Exception:
-            return False
+            return "play-once"
+
+    def _carry_over_playback_mode(self, ph) -> None:
+        """Apply the last-known playback mode onto a newly-acquired playhead.
+
+        Every new clip/media in xStudio gets its own ``Playhead`` object whose
+        native "Loop Mode" resets to the engine default (Play Once) instead of
+        inheriting whatever mode the session was actually using — silently
+        reverting a user's loop/ping-pong choice on every clip switch. Carry
+        the last mode we actually observed forward so switching clips (or
+        reacquiring a stale playhead) doesn't reset it.
+        """
+        if not ph or not self._last_known_playback_mode:
+            return
+        target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
+        if target is None:
+            return
+        try:
+            if str(ph.get_attribute("Loop Mode")).strip() != target:
+                self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                ph.set_attribute("Loop Mode", target)
+                _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
+        except Exception:
+            _log_exc("_carry_over_playback_mode: failed")
+
+    def _on_loop_mode_changed(self) -> None:
+        """Local "Loop Mode" attribute change on the active playhead.
+
+        This is the definitive signal that the user actually chose a mode
+        (as opposed to a passive read of a freshly-defaulted new playhead —
+        see ``_get_playback_mode``'s docstring). Update the carry-over cache
+        and broadcast immediately, mirroring OpenRV's play-mode-changed hook.
+        """
+        if time.monotonic() < self._loop_mode_apply_suppress_until:
+            return
+        ph = self.plugin.active_playhead
+        if not ph:
+            return
+        wire_mode = self._get_playback_mode()
+        self._last_known_playback_mode = wire_mode
+        if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
+            return
+        try:
+            playing = ph.playing
+            frame = ph.position
+            fps = ph.frame_rate.fps() or 25.0
+        except Exception:
+            return
+        state = {
+            "playing": playing,
+            "current_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "value": float(frame),
+                "rate": fps,
+            },
+            "playback_mode": wire_mode,
+            "view_mode": self._cur_view_mode,
+            "clip_guid": self._cur_clip_guid,
+        }
+        _log(f"Event: queuing playback_mode broadcast mode={wire_mode} (source_attr=Loop Mode)")
+        self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def current_playback_state(self) -> dict | None:
@@ -834,7 +927,7 @@ class PlaybackSyncController:
                     "value": float(frame),
                     "rate": fps,
                 },
-                "looping": self._get_loop_mode(),
+                "playback_mode": self._get_playback_mode(),
             }
         except Exception:
             return None
@@ -866,7 +959,7 @@ class PlaybackSyncController:
         state = self.current_playback_state() or {
             "playing": False,
             "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
-            "looping": self._get_loop_mode(),
+            "playback_mode": self._get_playback_mode(),
         }
         state["view_mode"] = view_mode
         state["clip_guid"] = clip_guid or None
@@ -1065,6 +1158,17 @@ class PlaybackSyncController:
                         except Exception:
                             _log_exc("apply_playback_state: sequence view switch failed")
                     self._pending_seek_frame = None
+                elif clip_changed and clip_guid:
+                    # Sequence-mode clip change: the peer selected / switched to a
+                    # different clip.  The SENDER suppresses playhead scan-through
+                    # while playing (see the "suppressed (playing through
+                    # sequence)" guard), so a clip_guid change that reaches us is a
+                    # deliberate user action, not a cut crossed during playback —
+                    # we honour it whether or not the peer is playing (playing must
+                    # never block a selection).  Highlight in place — no source
+                    # switch, no seek — guarded against the actor-teardown crash
+                    # (D2/D3).
+                    self._highlight_timeline_item(clip_guid)
             elif view_mode == "source":
                 if mode_changed or clip_changed:
                     try:
@@ -1110,21 +1214,7 @@ class PlaybackSyncController:
         current_time = state.get("current_time", {})
         # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
         frame = max(0, int(current_time.get("value", 0)))
-
-        if not playing:
-            self._last_remote_stop_at = time.monotonic()
-        else:
-            # Guard against rapid stop→start loop restarts (e.g. RV looping a
-            # single-clip source group sends playing=False then playing=True within
-            # milliseconds).  A genuine user press-play always follows a stop by
-            # more than 300 ms.
-            _loop_gap = time.monotonic() - self._last_remote_stop_at
-            if _loop_gap < 0.3:
-                _log(
-                    f"RECV playback: ignoring rapid play-after-stop"
-                    f" ({_loop_gap*1000:.0f} ms) — loop restart"
-                )
-                return
+        playback_mode = state.get("playback_mode")
 
         ph = self.plugin.active_playhead
 
@@ -1138,6 +1228,18 @@ class PlaybackSyncController:
         # dequeue holds the GIL.)
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                # Sync xStudio's native loop mode so both peers' engines agree,
+                # not just their synced state — mirrors OpenRV's setPlayMode call.
+                target_loop_mode = _WIRE_TO_LOOP_MODE.get(playback_mode)
+                if target_loop_mode is not None:
+                    try:
+                        if str(ph.get_attribute("Loop Mode")).strip() != target_loop_mode:
+                            self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                            ph.set_attribute("Loop Mode", target_loop_mode)
+                            _log(f"RECV playback: set Loop Mode={target_loop_mode} (playback_mode={playback_mode})")
+                        self._last_known_playback_mode = playback_mode
+                    except Exception:
+                        _log_exc("RECV playback: set Loop Mode failed")
                 playing_changed = (playing != ph.playing)
                 if playing_changed:
                     # Update cache only when we actually change xStudio's play
@@ -1202,6 +1304,126 @@ class PlaybackSyncController:
     # ── apply remote selection ────────────────────────────────────────
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
+    def _timeline_recently_rebuilt(self) -> bool:
+        """True if a structural timeline rebuild happened within the settle window.
+
+        Sending ``item_selection_atom`` into a sequence whose ClipActors are
+        being torn down and recreated (which every ``load_otio(clear=True)``
+        rebuild does) races that teardown and segfaults xStudio at the C++
+        event-callback level — a crash no Python ``try/except`` can catch (see
+        design D2).  Every structural-rebuild site already advances the
+        plugin-global ``_structural_mutation_suppress_until`` to ``now + 1.5s``,
+        so "still inside that window" is a ready-made "structure just changed"
+        signal; we reuse it rather than thread a new per-timeline timestamp
+        through every load_otio call site.  It is global (any rebuild suppresses
+        any highlight) and deliberately conservative — a dropped highlight is
+        harmless, a segfault is not.
+        """
+        return time.monotonic() < self.plugin._structural_mutation_suppress_until
+
+    def _highlight_timeline_item(self, clip_guid: str) -> None:
+        """Select/highlight *clip_guid* in its sequence timeline, in place.
+
+        Does NOT switch the on-screen source or seek — it only sets the
+        timeline's item selection, mirroring xStudio's own "select without
+        isolating" behaviour.  Best-effort and defensively guarded:
+
+        * skipped (kill-switch) when ``_ENABLE_TIMELINE_ITEM_HIGHLIGHT`` is off;
+        * skipped (crash-race guard, design D2) when the target timeline was
+          structurally rebuilt within the stability window;
+        * skipped silently when the clip can't be resolved to a live item.
+
+        The ``item_selection_atom`` send stays wrapped in ``try/except`` as
+        defence-in-depth: the guard shrinks the crash window but a rebuild could
+        still begin mid-send.
+        """
+        if not _ENABLE_TIMELINE_ITEM_HIGHLIGHT:
+            return
+        if not clip_guid or not self.plugin.manager:
+            return
+        if self._timeline_recently_rebuilt():
+            _log(
+                f"RECV highlight: skip clip {clip_guid[:8]} — timeline recently"
+                f" rebuilt (stability guard, D2)"
+            )
+            return
+
+        # Resolve the OTIO timeline + live xStudio timeline that contain this
+        # clip guid.  _sync_playlists is keyed by xs parent-playlist guid, which
+        # differs from the OTIO timeline guid for sequences, so cross-reference
+        # via each timeline's xs_parent_playlist_guid metadata (same approach as
+        # apply_selection's pass-2 lookup).
+        otio_tl = None
+        playlist_xs_tl = None
+        _otio_key_to_xsp = {
+            _otg: (_otl.metadata.get("xs_parent_playlist_guid") or _otg)
+            for _otg, _otl in list(self.plugin.manager.timelines.items())
+        }
+        for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
+            cand = self.plugin.manager.timelines.get(tl_guid)
+            if cand is None:
+                for _otg, _xsp in _otio_key_to_xsp.items():
+                    if _xsp == tl_guid:
+                        cand = self.plugin.manager.timelines.get(_otg)
+                        break
+            if cand is None:
+                continue
+            if any(
+                child.metadata.get("sync", {}).get("guid") == clip_guid
+                for track in cand.tracks for child in track
+            ):
+                otio_tl = cand
+                playlist_xs_tl = xs_tl
+                break
+        if otio_tl is None or playlist_xs_tl is None:
+            _log(f"RECV highlight: clip {clip_guid[:8]} not found in any synced timeline")
+            return
+
+        # Locate the clip's (track, child) index in the OTIO timeline.
+        target_track_idx = -1
+        target_child_idx = -1
+        for track_idx, track in enumerate(otio_tl.tracks):
+            for child_idx, child in enumerate(track):
+                if child.metadata.get("sync", {}).get("guid") == clip_guid:
+                    target_track_idx = track_idx
+                    target_child_idx = child_idx
+                    break
+            if target_track_idx != -1:
+                break
+
+        # The OTIO manager timeline may carry an extra Annotations track / a
+        # different child count than the live xStudio timeline, so the indices
+        # are NOT guaranteed positionally aligned — bounds-check before indexing
+        # rather than throwing an IndexError logged as a noisy traceback.
+        xs_tracks = playlist_xs_tl.stack.children
+        xs_track = xs_tracks[target_track_idx] if 0 <= target_track_idx < len(xs_tracks) else None
+        xs_children = xs_track.children if xs_track is not None else []
+        if target_track_idx != -1 and 0 <= target_child_idx < len(xs_children):
+            try:
+                xs_child = xs_children[target_child_idx]
+                from xstudio.core import UuidActor, UuidActorVec
+                ua_vec = UuidActorVec()
+                ua_vec.push_back(UuidActor(xs_child.uuid, xs_child.remote))
+                # Suppress our own outbound re-broadcast of the selection this
+                # send triggers, so applying a peer's highlight doesn't echo
+                # back (mirrors RV's _rv_updating echo guard; task 3.2).
+                self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                self.plugin.connection.send(
+                    playlist_xs_tl.remote, item_selection_atom(), ua_vec
+                )
+                _log(
+                    f"RECV highlight: selected clip {clip_guid[:8]} at"
+                    f" track={target_track_idx} child={target_child_idx}"
+                )
+            except Exception:
+                _log_exc("RECV highlight: failed to set timeline item selection")
+        elif target_track_idx != -1:
+            _log(
+                f"RECV highlight: skip clip {clip_guid[:8]} — OTIO index"
+                f" (track={target_track_idx} child={target_child_idx}) out of"
+                f" range for xStudio timeline"
+            )
+
     def apply_selection(self, data: dict) -> None:
         """Apply a remotely broadcast clip selection.
 
@@ -1244,8 +1466,11 @@ class PlaybackSyncController:
                             if view_mode == "sequence" and tl:
                                 self.plugin.connection.api.session.set_on_screen_source(tl)
                                 _log("RECV selection clear: set_on_screen_source to timeline (Sequence)")
-                                # Same crash risk as the highlight send — gated off.
-                                if _ENABLE_TIMELINE_ITEM_HIGHLIGHT:
+                                # Clear the timeline item selection (empty vec).
+                                # Same actor-teardown crash risk as the highlight
+                                # send, so gate it on the same stability guard
+                                # (not just the kill-switch flag).
+                                if _ENABLE_TIMELINE_ITEM_HIGHLIGHT and not self._timeline_recently_rebuilt():
                                     try:
                                         from xstudio.core import UuidActorVec
                                         self.plugin.connection.send(tl.remote, item_selection_atom(), UuidActorVec())
@@ -1496,52 +1721,10 @@ class PlaybackSyncController:
                     self._pending_seek_frame = start_frame
                     self._pending_seek_deadline = time.monotonic() + 0.300
 
-                    # Programmatically select/highlight the clip in the timeline
-                    # track.  Disabled by default — see _ENABLE_TIMELINE_ITEM_HIGHLIGHT.
-                    otio_tl = self.plugin.manager.timelines.get(matched_tl_guid) if self.plugin.manager else None
-                    if _ENABLE_TIMELINE_ITEM_HIGHLIGHT and otio_tl:
-                        target_track_idx = -1
-                        target_child_idx = -1
-                        for track_idx, track in enumerate(otio_tl.tracks):
-                            for child_idx, child in enumerate(track):
-                                if child.metadata.get("sync", {}).get("guid") == clip_guid:
-                                    target_track_idx = track_idx
-                                    target_child_idx = child_idx
-                                    break
-                            if target_track_idx != -1:
-                                break
-
-                        # The indices come from the OTIO manager timeline (which
-                        # includes an Annotations track and may hold a different
-                        # child count than xStudio's live timeline). They are NOT
-                        # guaranteed positionally aligned with playlist_xs_tl, so
-                        # bounds-check before indexing rather than throwing an
-                        # IndexError that gets logged as a noisy traceback.
-                        xs_tracks = playlist_xs_tl.stack.children
-                        xs_track = xs_tracks[target_track_idx] if 0 <= target_track_idx < len(xs_tracks) else None
-                        xs_children = xs_track.children if xs_track is not None else []
-                        if target_track_idx != -1 and 0 <= target_child_idx < len(xs_children):
-                            try:
-                                xs_child = xs_children[target_child_idx]
-                                from xstudio.core import UuidActor, UuidActorVec, item_selection_atom
-                                ua = UuidActor(xs_child.uuid, xs_child.remote)
-                                ua_vec = UuidActorVec()
-                                ua_vec.push_back(ua)
-                                self.plugin.connection.send(
-                                    playlist_xs_tl.remote, item_selection_atom(), ua_vec
-                                )
-                                _log(
-                                    f"RECV selection: set timeline selection"
-                                    f" to track={target_track_idx} child={target_child_idx}"
-                                )
-                            except Exception:
-                                _log_exc("RECV selection: failed to set timeline item selection")
-                        elif target_track_idx != -1:
-                            _log(
-                                f"RECV selection: skip timeline highlight — OTIO index "
-                                f"(track={target_track_idx} child={target_child_idx}) "
-                                f"out of range for xStudio timeline"
-                            )
+                    # Also select/highlight the clip inside the timeline track,
+                    # in place (guarded against the actor-teardown crash — see
+                    # _highlight_timeline_item / design D2).
+                    self._highlight_timeline_item(clip_guid)
                 else:
                     # Flat playlist: viewed_container + set_on_screen_source + set_selection.
                     # Suppress the show_atom that fires from set_selection so it doesn't

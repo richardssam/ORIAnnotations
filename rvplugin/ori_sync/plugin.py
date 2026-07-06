@@ -30,7 +30,7 @@ except ImportError:
 
 # Import controllers
 from sequence_sync import SequenceSyncController
-from playback_sync import PlaybackSyncController
+from playback_sync import PlaybackSyncController, _PLAY_MODE_TO_WIRE
 from display_sync import DisplaySyncController
 from annotation_sync import AnnotationSyncController
 from color_sync import ColorSyncController
@@ -68,6 +68,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.init(self.MENU_NAME, [
             ("play-start", self.on_rv_play_start, "Broadcast Play"),
             ("play-stop", self.on_rv_play_stop, "Broadcast Stop"),
+            ("play-mode-changed", self.on_rv_play_mode_changed, "Broadcast Play Mode"),
             ("frame-changed", self.on_rv_frame_changed, "Broadcast Frame"),
             ("selection-changed", self.on_rv_selection_changed, "Broadcast Selection"),
             ("graph-state-change", self.on_rv_graph_state_change, "Broadcast Annotation"),
@@ -418,7 +419,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                                 "value": float(frame - 1),
                                 "rate": float(fps),
                             },
-                            "looping": True,
+                            "playback_mode": _PLAY_MODE_TO_WIRE.get(rv.commands.playMode(), "loop"),
                             "timeline_guid": tl_guid,
                         }
                     except Exception:
@@ -536,22 +537,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         event.reject()
 
     def on_rv_play_stop(self, event):
-        # If a peer said to loop and this looks like a natural clip-end (frame
-        # is at frameEnd, not a mid-clip user stop), restart play silently
-        # instead of broadcasting playing=False back.  When _rv_updating is True
-        # the stop came from our own apply code — never restart in that case.
-        if not self._rv_updating and self.playback._cur_looping:
-            try:
-                if rv.commands.frame() >= rv.commands.frameEnd():
-                    self._rv_updating = True
-                    try:
-                        rv.commands.play()
-                    finally:
-                        self._rv_updating = False
-                    event.reject()
-                    return
-            except Exception:
-                pass
+        self.playback._broadcast_playback()
+        event.reject()
+
+    def on_rv_play_mode_changed(self, event):
         self.playback._broadcast_playback()
         event.reject()
 

@@ -586,7 +586,10 @@ class PlaybackSettingsSet(ProtocolMessage):
     current_time: "dict | None" = doc_field(
         default=None, doc="Current position as a serialized RationalTime."
     )
-    looping: "bool | None" = doc_field(default=None, doc="Whether playback loops.")
+    playback_mode: "str | None" = doc_field(
+        default=None,
+        doc='Playback mode: "play-once", "loop", or "ping-pong".',
+    )
     timeline_guid: "str | None" = doc_field(
         default=None, doc="GUID of the timeline being viewed/played."
     )
@@ -610,7 +613,7 @@ class PlaybackSettingsSet(ProtocolMessage):
     _KNOWN: ClassVar[tuple[str, ...]] = (
         "playing",
         "current_time",
-        "looping",
+        "playback_mode",
         "timeline_guid",
         "view_mode",
         "clip_guid",
@@ -623,8 +626,8 @@ class PlaybackSettingsSet(ProtocolMessage):
             payload["playing"] = self.playing
         if self.current_time is not None:
             payload["current_time"] = self.current_time
-        if self.looping is not None:
-            payload["looping"] = self.looping
+        if self.playback_mode is not None:
+            payload["playback_mode"] = self.playback_mode
         if self.timeline_guid is not None:
             payload["timeline_guid"] = self.timeline_guid
         if self.view_mode is not None:
@@ -642,7 +645,7 @@ class PlaybackSettingsSet(ProtocolMessage):
         return cls(
             playing=data.get("playing"),
             current_time=data.get("current_time"),
-            looping=data.get("looping"),
+            playback_mode=data.get("playback_mode"),
             timeline_guid=data.get("timeline_guid"),
             view_mode=data.get("view_mode"),
             clip_guid=data.get("clip_guid"),

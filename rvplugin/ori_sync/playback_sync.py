@@ -12,6 +12,10 @@ except ImportError:
 
 from utils import _log, _log_exc, _media_path, _clip_effective_range
 
+# rv.commands.playMode()/setPlayMode() <-> wire playback_mode string.
+_PLAY_MODE_TO_WIRE = {0: "loop", 1: "play-once", 2: "ping-pong"}
+_WIRE_TO_PLAY_MODE = {v: k for k, v in _PLAY_MODE_TO_WIRE.items()}
+
 
 class PlaybackSyncController:
     def __init__(self, plugin):
@@ -23,9 +27,8 @@ class PlaybackSyncController:
         # message — including pure position updates — carries the view too.
         self._cur_view_mode = "sequence"
         self._cur_clip_guid = None
-        # Last loop state received from a peer — used to restart RV when the
-        # clip ends naturally (play-once boundary) but the peer said to loop.
-        self._cur_looping = True
+        # Last playback mode received from a peer.
+        self._cur_playback_mode = "loop"
         # Last view-state actually applied from a remote message, used to
         # detect real transitions (mode/clip/timeline change) vs. a clip
         # changing under continuous playhead motion in sequence mode, which
@@ -64,9 +67,9 @@ class PlaybackSyncController:
         current_frame = rv.commands.frame()
         playing = rv.commands.isPlaying()
         try:
-            looping = rv.commands.playMode() == 0
+            playback_mode = _PLAY_MODE_TO_WIRE.get(rv.commands.playMode(), "loop")
         except AttributeError:
-            looping = True
+            playback_mode = "loop"
 
         view = rv.commands.viewNode()
         timeline_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view) or self.plugin.sync_manager.active_timeline_guid
@@ -83,7 +86,7 @@ class PlaybackSyncController:
                 "value": float(current_frame - base),
                 "rate": float(fps),
             },
-            "looping": looping,
+            "playback_mode": playback_mode,
             "timeline_guid": timeline_guid,
             # Carry the current view alongside every position update (not just
             # explicit view-state changes) so a peer receiving a pure scrub/play
@@ -115,9 +118,13 @@ class PlaybackSyncController:
 
         Applies, atomically:
         * the **view** — when ``view_mode``/``clip_guid``/``timeline_guid``
-          actually transition, switch the RV view node; a clip-only change
-          while the timeline is unchanged in sequence mode is NOT a transition
-          (position is authoritative there — see D2), so it does not re-switch.
+          actually transition, switch the RV view node.  A clip-only change
+          while the timeline is unchanged in sequence mode surfaces the peer's
+          clip selection by switching to that clip's *source* view: RV has no
+          Python-bound "highlight in place" command (only view switching), so
+          selecting the clip means showing it.  RV loses the parent-sequence
+          context, which is acceptable (see the ``xstudio-clip-selection-sync``
+          spec — the clip identity is what matters, not its sequence).
         * the **position** — ``current_time`` always wins once any view switch
           above has landed, so the frame is never raced against a separate
           selection-apply (one apply path — D4).
@@ -133,6 +140,26 @@ class PlaybackSyncController:
             try:
                 if view_mode == "sequence":
                     if mode_changed or tl_changed:
+                        # Entering or switching sequences — including the INITIAL
+                        # connect.  The clip_guid here is just the peer's playhead
+                        # position, not a user selection (on startup nothing is
+                        # selected), so show the full sequence and adopt the clip
+                        # as baseline WITHOUT isolating it.  This is why startup
+                        # must not change RV to a single clip.
+                        self._switch_to_sequence_view(timeline_guid)
+                    elif clip_changed and clip_guid:
+                        # A clip change *within* an already-established sequence:
+                        # the peer navigated to / selected a different clip.  Honour
+                        # it whether or not the peer is playing — the SENDER already
+                        # suppresses playhead scan-through while playing (see the
+                        # xStudio "suppressed (playing through sequence)" guard), so
+                        # a clip_guid change that reaches us is a deliberate action,
+                        # not a cut crossed during playback.  _switch_to_source_view
+                        # sets _rv_updating around setViewNode so RV's
+                        # on_view_changed doesn't echo this back to the sender.
+                        self._switch_to_source_view(clip_guid)
+                    elif clip_changed and not clip_guid:
+                        # Peer cleared its clip (returned to the full sequence).
                         self._switch_to_sequence_view(timeline_guid)
                 elif view_mode == "source":
                     if mode_changed or clip_changed:
@@ -149,8 +176,8 @@ class PlaybackSyncController:
             self._cur_clip_guid = clip_guid or None
 
         playing = data.get("playing", False)
-        looping = data.get("looping", True)
-        self._cur_looping = looping
+        playback_mode = data.get("playback_mode", "loop")
+        self._cur_playback_mode = playback_mode
         current_time = data.get("current_time", {})
 
         # Resolve the frame base AFTER any view switch so frameStart() reflects
@@ -160,7 +187,7 @@ class PlaybackSyncController:
         base = self._frame_base()
         target_frame = int(current_time.get("value", 0)) + base
         _log(
-            f"RECV playback playing={playing} looping={looping} frame={target_frame} base={base}"
+            f"RECV playback playing={playing} playback_mode={playback_mode} frame={target_frame} base={base}"
             f" value={current_time.get('value')} tl={timeline_guid} mode={view_mode}"
         )
 
@@ -168,13 +195,13 @@ class PlaybackSyncController:
         # so they don't echo back to peers — _broadcast_playback checks _rv_updating.
         self.plugin._rv_updating = True
         try:
-            # Sync RV's loop mode so it doesn't fire spurious playing=False at the
-            # clip boundary and cause the peer to stop — playMode 0 = loop, 1 = once.
-            target_play_mode = 0 if looping else 1
+            # Sync RV's play mode so it doesn't fire spurious playing=False at the
+            # clip boundary and cause the peer to stop.
+            target_play_mode = _WIRE_TO_PLAY_MODE.get(playback_mode, 0)
             try:
                 if rv.commands.playMode() != target_play_mode:
                     rv.commands.setPlayMode(target_play_mode)
-                    _log(f"RECV playback: set playMode={target_play_mode} (looping={looping})")
+                    _log(f"RECV playback: set playMode={target_play_mode} (playback_mode={playback_mode})")
             except Exception:
                 _log_exc("RECV playback: setPlayMode failed")
             if rv.commands.frame() != target_frame:

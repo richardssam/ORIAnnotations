@@ -88,7 +88,7 @@ def test_broadcast_selection_envelope():
 def test_broadcast_playback_envelope_and_json_safe():
     mgr, net = _make_synced_manager()
     mgr.broadcast_playback_state(
-        {"playing": True, "looping": False,
+        {"playing": True, "playback_mode": "play-once",
          "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 5.0, "rate": 24.0}},
         timeline_guid="tl-1",
     )
