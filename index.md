@@ -7,6 +7,8 @@ nav_order: 1
 
 # ORI Annotations Project Home
 
+This is a toolkit for annotations and review sync tools. The focus is on simplifying how annotations and notes within a review can easily get to the artists, ideally in the tool that they typically do their work in.
+
 This project is split into four main parts:
 
 1. [Code for loading and saving annotations]({% link ORIAnnotations.md %})

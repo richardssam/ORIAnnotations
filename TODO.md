@@ -13,14 +13,14 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 
 # Todo Critical
 
-- [ ] Annotations are still different sizes between RV and xSTUDIO need to investigate.
+- [x] Annotations are still different sizes between RV and xSTUDIO need to investigate.
 - [ ] Need to figure out how to handle regular playlists reordering for xstudio playlists in rv.
 - [x] XStudio plugin for annotations inport/export - currently imports are failing.
 - [ ] Test a media handler, so missing media can be substituted.
 - [x] Test Squares, arrows, and circles from new OpenRV.
 - [ ] Handle x, y flip
 - [ ] Handle play backwards. (xstudio doesnt have a button for this)
-- [ ] Need loop controls, do we loop, or rock-and-roll? - started, but not complete.
+- [x] Need loop controls, do we loop, or rock-and-roll? - started, but not complete.
 - [ ] Changes to frame rate.
 
 * Creating prototype C++ changes to OTIO, currently its failing running the tests.
@@ -51,6 +51,7 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 - [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
 - [ ] Figure out redraw issue where text gets visually duplicated for a moment. - created test for this - text_annotations_xstudio_to_rv duplicate text not in rv file.
 - [ ] Handle clear annotations.
+- [ ] Revisit testing rvio for annotation rendering.
 
 # XStudio Plugin
 
