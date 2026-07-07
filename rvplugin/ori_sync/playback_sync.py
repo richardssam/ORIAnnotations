@@ -140,27 +140,19 @@ class PlaybackSyncController:
             try:
                 if view_mode == "sequence":
                     if mode_changed or tl_changed:
-                        # Entering or switching sequences — including the INITIAL
-                        # connect.  The clip_guid here is just the peer's playhead
-                        # position, not a user selection (on startup nothing is
-                        # selected), so show the full sequence and adopt the clip
-                        # as baseline WITHOUT isolating it.  This is why startup
-                        # must not change RV to a single clip.
+                        # Entering or switching sequences (incl. the initial
+                        # connect) → show the full sequence.
                         self._switch_to_sequence_view(timeline_guid)
-                    elif clip_changed and clip_guid:
-                        # A clip change *within* an already-established sequence:
-                        # the peer navigated to / selected a different clip.  Honour
-                        # it whether or not the peer is playing — the SENDER already
-                        # suppresses playhead scan-through while playing (see the
-                        # xStudio "suppressed (playing through sequence)" guard), so
-                        # a clip_guid change that reaches us is a deliberate action,
-                        # not a cut crossed during playback.  _switch_to_source_view
-                        # sets _rv_updating around setViewNode so RV's
-                        # on_view_changed doesn't echo this back to the sender.
-                        self._switch_to_source_view(clip_guid)
-                    elif clip_changed and not clip_guid:
-                        # Peer cleared its clip (returned to the full sequence).
-                        self._switch_to_sequence_view(timeline_guid)
+                    # A sequence-mode clip_guid change is deliberately NOT
+                    # actioned.  In sequence view xStudio's clip_guid tracks the
+                    # clip under the playhead (emitted on show_atom media-change),
+                    # so it changes while merely SCRUBBING — and there is no
+                    # distinct "user selected a clip" signal (the Timeline
+                    # selection actor stays empty; only the playhead moves).
+                    # Isolating on it would wrongly yank RV to a single clip on
+                    # every scrub, so RV stays on the sequence.  Explicit
+                    # isolation comes via SOURCE mode (double-click in xStudio),
+                    # handled by the branch below.
                 elif view_mode == "source":
                     if mode_changed or clip_changed:
                         self._switch_to_source_view(clip_guid)

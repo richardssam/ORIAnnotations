@@ -72,6 +72,11 @@ class PlaybackSyncController:
         self._last_sel_names = None
         self._last_src_names = None
         self._last_playhead_check: float = 0.0
+        # Timestamp of the most recent selection-actor (source_atom) event — a
+        # deliberate user clip selection.  The show_atom handler reads PSM fresh
+        # for a few seconds after this so the FIRST selected clip isn't decided
+        # against a stale cached Pinned Source Mode (see _read_pinned_source_mode_fresh).
+        self._last_source_atom_at: float = 0.0
         self._cached_viewed_tl_guid: str | None = None
         self._cached_viewed_tl_at: float = 0.0
         # Current local view state (unify-view-state-sync): the mode and active
@@ -319,7 +324,21 @@ class PlaybackSyncController:
                 #      (Keying off "_is_seq_media" here mislabelled bin clicks as
                 #      mode=sequence and desynced the peers.)
                 #   4. fallback when container type is unknown.
-                _in_single_clip = (self._last_pinned_source_mode is False)
+                # Normally use the cached Pinned Source Mode, but it is only
+                # refreshed when the selection poll runs, which lags xStudio by a
+                # poll or more.  When a deliberate selection (source_atom) fired
+                # within the last few seconds the user may have just entered
+                # single-clip ("select a clip in the timeline") mode whose PSM
+                # flip we have not polled yet — read PSM fresh so the FIRST
+                # selected clip is not mislabelled as mode=sequence against a
+                # stale PSM=True.  Gated on a recent selection so scrub/playback
+                # show_atoms keep using the cheap cached value.
+                _psm = self._last_pinned_source_mode
+                if time.monotonic() - self._last_source_atom_at < 3.0:
+                    _fresh_psm = self._read_pinned_source_mode_fresh()
+                    if _fresh_psm is not None:
+                        _psm = _fresh_psm
+                _in_single_clip = (_psm is False)
                 if _in_single_clip:
                     view_mode = "source"
                 elif is_timeline:
@@ -468,12 +487,17 @@ class PlaybackSyncController:
         ):
             return
         _log(f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution")
+        now = time.monotonic()
+        # Mark that a deliberate selection just happened — the show_atom handler
+        # reads PSM fresh for a short window after this (see the show_atom
+        # single-clip decision) so the first selected clip isn't mislabelled
+        # against a stale cached Pinned Source Mode.
+        self._last_source_atom_at = now
         # Throttle the blocking current_playhead() query: on_global_playhead_event
         # already maintains active_playhead, so re-querying it on every selection
         # event is redundant.  During a selection storm those per-event blocking
         # reads stack into multi-second stalls (each bounded read costs up to its
         # timeout).  At most once per second is plenty to catch a real change.
-        now = time.monotonic()
         if now - self._last_playhead_check >= 1.0:
             self._last_playhead_check = now
             self.check_and_update_active_playhead()
@@ -482,6 +506,26 @@ class PlaybackSyncController:
     def enqueue_selection_update(self) -> None:
         """Enqueue selection resolution to the poll thread command queue."""
         self.plugin._cmd_queue.put(("resolve_selection", None))
+
+    def _read_pinned_source_mode_fresh(self) -> "bool | None":
+        """Read Pinned Source Mode now, from a live playhead (bounded).
+
+        The cached ``_last_pinned_source_mode`` only updates when the selection
+        poll runs, which lags xStudio; this reads the current value directly.
+        Uses ``current_playhead()`` (the persistent global-playhead actor, not
+        the possibly-stale cached ``active_playhead``) and bounds both reads so a
+        dead actor cannot hang the caller.  Returns ``None`` on any error.
+        """
+        try:
+            with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                _ph = self.plugin.current_playhead()
+            attr = _ph.get_attribute("Pinned Source Mode") if _ph else None
+            if attr is None:
+                return None
+            with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                return attr.value()
+        except Exception:
+            return None
 
     # ── active playhead management ─────────────────────────────────────
 
@@ -826,6 +870,39 @@ class PlaybackSyncController:
                 except Exception:
                     _log_exc("[SEL] Pinned Source Mode poll failed")
 
+            # Reliable single-clip broadcast — driven by the (reliably-fired)
+            # selection event, NOT the show_atom media-change.  When we are in
+            # single-clip mode (PSM False) and have a resolved selected clip that
+            # differs from what we last broadcast, broadcast it as mode=source
+            # here.  This catches the double-clicks the show_atom path misses:
+            # when the shown media does not change (re-clicking a clip already on
+            # screen) no show_atom fires, and some show_atom broadcasts are
+            # suppressed — the logs showed ~5 of 21 double-clicks producing no
+            # broadcast and others lagging 1.3-1.5 s.  `clip_name`/`clip_uuid_str`
+            # come from the selection poll above (timeline.selection or, in
+            # single-clip mode, the playlist's playhead_selection.selected_sources,
+            # which is reliably populated).  Deduped via `_cur_clip_guid` so it
+            # never double-broadcasts with the show_atom / PSM-transition paths,
+            # and gated on PSM False so it cannot fire while scrubbing a sequence.
+            if (
+                self._last_pinned_source_mode is False
+                and clip_name
+                and self.plugin.manager
+                and self.plugin.manager.status == STATE_SYNCED
+            ):
+                _rcg = None
+                if clip_uuid_str:
+                    _rcg = self.plugin.media.sync_guid_for_xs_uuid(clip_uuid_str, container_uuid)
+                if not _rcg:
+                    _rcg = self.plugin.media.clip_guid_for_media_name(clip_name)
+                if _rcg and _rcg != self._cur_clip_guid:
+                    self._last_viewed_clip_guid = _rcg
+                    _rctg = self.plugin.manager.get_or_create_clip_timeline(_rcg)
+                    if _rctg:
+                        self.plugin.manager.active_timeline_guid = _rctg
+                    self.broadcast_view_state(_rcg, "source")
+                    _log(f"[SEL] → broadcast view-state clip {_rcg[:8]} mode=source (from selection, reliable)")
+
         except Exception as e:
             _log_exc(f"[SEL] poll failed: {e}")
 
@@ -842,6 +919,14 @@ class PlaybackSyncController:
         local "Loop Mode" attribute-changed event, or a value applied from a
         peer (see ``on_playhead_attribute_changed`` / ``apply_playback_state``).
         """
+        # In single-clip review mode we force Loop (see broadcast_view_state).
+        # At each clip boundary a freshly-acquired clip playhead momentarily
+        # reads the engine's Play Once default before carry-over sets Loop; a
+        # position broadcast firing in that window would send Play Once and make
+        # RV stop-and-revert at the clip end.  Report Loop directly whenever we
+        # are isolated on a clip so that transient never leaves this peer.
+        if self._last_pinned_source_mode is False:
+            return "loop"
         ph = self.plugin.active_playhead
         if not ph:
             return "play-once"
@@ -914,12 +999,18 @@ class PlaybackSyncController:
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def current_playback_state(self) -> dict | None:
         """Return the local playback state dict for inclusion in a state snapshot."""
-        if not self.plugin.active_playhead:
+        ph = self.plugin.active_playhead
+        if not ph:
             return None
         try:
-            frame = self.plugin.active_playhead.position
-            fps = self.plugin.active_playhead.frame_rate.fps() or 25.0
-            playing = self.plugin.active_playhead.playing
+            # Bound these reads: active_playhead can be stale right after a clip
+            # ends (playhead torn down), and an unbounded read on a dead actor
+            # blocks the poll thread ~100 s.  On timeout we fall back to None and
+            # the caller uses a default state.
+            with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                frame = ph.position
+                fps = ph.frame_rate.fps() or 25.0
+                playing = ph.playing
             return {
                 "playing": playing,
                 "current_time": {
@@ -948,6 +1039,14 @@ class PlaybackSyncController:
         """
         if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
             return
+        # A NEW single-clip isolation (source mode, clip differs from the one we
+        # last broadcast) should start at the clip's FIRST frame — value 0 in the
+        # isolated clip's 0-based frame space — rather than each peer restoring
+        # its own last-viewed position within that clip (which is why RV and
+        # xStudio ended up on different frames of the same clip).
+        _new_source_clip = (
+            view_mode == "source" and clip_guid and clip_guid != self._cur_clip_guid
+        )
         self._cur_view_mode = view_mode
         self._cur_clip_guid = clip_guid or None
         # This is a LOCAL user action — guard against in-flight remote messages
@@ -965,6 +1064,40 @@ class PlaybackSyncController:
         state["clip_guid"] = clip_guid or None
         if playing_override is not None:
             state["playing"] = playing_override
+        if _new_source_clip:
+            # A new single-clip isolation: start at the clip's first frame AND
+            # loop it.  Isolated clips are typically short shots being reviewed —
+            # the engine's per-clip default of Play Once makes them flash past in
+            # under a second (and RV with them); Loop keeps the shot playing so it
+            # is actually reviewable on both peers.  Broadcast frame 0 + loop, and
+            # apply both to our own playhead so xStudio matches.
+            state["current_time"]["value"] = 0.0
+            state["playback_mode"] = "loop"
+            # Make Loop the *remembered* mode.  Every time a clip playhead is
+            # (re-)acquired — including at the loop boundary when the clip
+            # restarts — _carry_over_playback_mode re-applies
+            # _last_known_playback_mode onto the new playhead.  While that stayed
+            # "play-once" it stomped the Loop we set here, so the clip reverted to
+            # Play Once at its end (and play-at-end then did nothing).  Setting it
+            # to "loop" makes carry-over keep Loop instead of fighting it.
+            self._last_known_playback_mode = "loop"
+            # Writes to active_playhead MUST be bounded: at a clip's end the
+            # playhead actor is torn down / re-acquired, so active_playhead can be
+            # stale, and an unbounded set (position / attribute) on a dead actor
+            # blocks the poll thread for ~100 s (the default request_receive
+            # timeout) — which is what froze xStudio after the first clip.
+            try:
+                ph = self.plugin.active_playhead
+                if ph is not None:
+                    with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                        ph.position = 0
+                    # Suppress the resulting attribute-changed event (we already
+                    # updated _last_known_playback_mode directly above).
+                    self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                    with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                        ph.set_attribute("Loop Mode", "Loop")
+            except Exception:
+                _log_exc("[SEL] reset isolated clip to first frame / loop failed")
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
     # ── viewport helpers ───────────────────────────────────────────────
@@ -1158,17 +1291,13 @@ class PlaybackSyncController:
                         except Exception:
                             _log_exc("apply_playback_state: sequence view switch failed")
                     self._pending_seek_frame = None
-                elif clip_changed and clip_guid:
-                    # Sequence-mode clip change: the peer selected / switched to a
-                    # different clip.  The SENDER suppresses playhead scan-through
-                    # while playing (see the "suppressed (playing through
-                    # sequence)" guard), so a clip_guid change that reaches us is a
-                    # deliberate user action, not a cut crossed during playback —
-                    # we honour it whether or not the peer is playing (playing must
-                    # never block a selection).  Highlight in place — no source
-                    # switch, no seek — guarded against the actor-teardown crash
-                    # (D2/D3).
-                    self._highlight_timeline_item(clip_guid)
+                # A sequence-mode clip_guid change is deliberately NOT actioned:
+                # in sequence view clip_guid tracks the clip under the peer's
+                # playhead (show_atom media-change), so it changes while merely
+                # SCRUBBING — there is no distinct "user selected a clip" signal
+                # (the Timeline selection actor stays empty).  Highlighting on it
+                # would fire on every scrub, so we leave the sequence as-is.
+                # Explicit isolation still flows through source mode below.
             elif view_mode == "source":
                 if mode_changed or clip_changed:
                     try:
@@ -1231,6 +1360,16 @@ class PlaybackSyncController:
                 # Sync xStudio's native loop mode so both peers' engines agree,
                 # not just their synced state — mirrors OpenRV's setPlayMode call.
                 target_loop_mode = _WIRE_TO_LOOP_MODE.get(playback_mode)
+                # While reviewing an isolated single clip we force Loop (short
+                # shots must loop to be reviewable — see broadcast_view_state).
+                # RV's isolated source view resets its own play mode to Play Once
+                # and broadcasts that back; applying it here reverted our Loop at
+                # the clip's end AND re-poisoned _last_known_playback_mode,
+                # producing the loop→play-once oscillation.  In single-clip mode
+                # xStudio is authoritative for the clip's loop mode, so ignore a
+                # peer's Play Once.  Sequence mode still respects the peer.
+                if self._last_pinned_source_mode is False and playback_mode == "play-once":
+                    target_loop_mode = None
                 if target_loop_mode is not None:
                     try:
                         if str(ph.get_attribute("Loop Mode")).strip() != target_loop_mode:
