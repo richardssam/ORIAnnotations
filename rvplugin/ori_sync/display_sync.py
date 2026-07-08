@@ -19,22 +19,54 @@ class DisplaySyncController:
         self._last_display_state = {}
         self._display_color_nodes_logged = False
 
-    def _rv_display_color_nodes(self):
-        """Return all active-viewer RVDisplayColor nodes (one per display pane).
-
-        Excludes ``defaultOutputGroup*`` which is the export/output pipeline and
-        is NOT modified by the r/g/b/a channel-isolation keys.  RV creates one
-        ``displayGroup*_colorPipeline_0`` node per layout pane; pressing r/g/b/a
-        only changes the *focused* pane, so we must read and write all of them.
-        """
-        all_nodes = rv.commands.nodesOfType("RVDisplayColor")
-        if not all_nodes:
+    def _members_recursive(self, group):
+        """Return *group*'s members plus the members of any pipeline subgroups."""
+        try:
+            members = list(rv.commands.nodesInGroup(group))
+        except Exception:
             return []
+        for member in list(members):
+            try:
+                if rv.commands.nodeType(member).endswith("PipelineGroup"):
+                    members.extend(rv.commands.nodesInGroup(member))
+            except Exception:
+                pass
+        return members
+
+    def _rv_display_color_nodes(self):
+        """Return the channel-flood node for each active display pane.
+
+        A pane's display pipeline carries ``color.channelFlood`` on an
+        ``RVDisplayColor`` node by default, or on an ``OCIODisplay`` node when
+        the pane's ``RVDisplayPipelineGroup`` is OCIO-managed (see
+        ``RvTopViewToolBar::hasOCIODisplayPipeline`` in RV's source, which
+        switches between ``@RVDisplayColor.color.channelFlood`` and
+        ``@OCIODisplay.color.channelFlood`` the same way) -- so we probe each
+        ``RVDisplayGroup``'s members for the property rather than assuming a
+        node type.  Excludes ``defaultOutputGroup*`` which is the export/output
+        pipeline and is NOT modified by the r/g/b/a channel-isolation keys.
+        RV creates one display group per layout pane; pressing r/g/b/a only
+        changes the *focused* pane, so we must read and write all of them.
+        """
+        try:
+            groups = rv.commands.nodesOfType("RVDisplayGroup")
+        except Exception:
+            groups = []
+        out = []
+        for group in groups:
+            if "defaultoutput" in group.lower():
+                continue
+            for n in self._members_recursive(group):
+                try:
+                    if rv.commands.propertyExists(f"{n}.color.channelFlood"):
+                        out.append(n)
+                        break
+                except Exception:
+                    continue
         if not self._display_color_nodes_logged:
             self._display_color_nodes_logged = True
-            _log(f"RVDisplayColor nodes: {all_nodes}")
-        active = [n for n in all_nodes if "defaultoutput" not in n.lower()]
-        return active if active else all_nodes
+            _log(f"display channelFlood nodes: {out}")
+        return out
 
     def _rv_display_color_node(self):
         """Return the first active-viewer RVDisplayColor node, or None."""
