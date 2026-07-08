@@ -518,11 +518,12 @@ class TestRunner:
         logging.info(f"Starting test '{test_name}' with apps: {apps}")
 
         executables = self.config.settings.get('executables', {})
+        openrv_args = self.config.settings.get('openrv_args', [])
         # Unique session per test so each test runs on its own RabbitMQ exchange —
         # isolates the broker so leftover state/peers from a prior test cannot
         # leak in (the cause of suite-only flakiness).
         session_id = f"otio-sync-{test_name}-{uuid.uuid4().hex[:8]}"
-        with AppSpawner(test_name, executables, session_id=session_id) as spawner:
+        with AppSpawner(test_name, executables, session_id=session_id, openrv_args=openrv_args) as spawner:
             # Mirror all runner logging to a file in the test's log directory so
             # CI failures are diagnosable without live stdout capture.
             runner_log_path = os.path.join(spawner.logs_dir, "runner.log")

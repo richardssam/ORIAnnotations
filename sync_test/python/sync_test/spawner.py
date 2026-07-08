@@ -8,7 +8,7 @@ class AppSpawner:
     Manages launching XStudio and OpenRV as subprocesses, handles log redirection,
     and ensures clean teardown without leaving zombie processes.
     """
-    def __init__(self, test_name, executables=None, session_id="otio-sync-demo"):
+    def __init__(self, test_name, executables=None, session_id="otio-sync-demo", openrv_args=None):
         self.test_name = test_name
         # Per-test session id isolates each test on its own RabbitMQ exchange so
         # leftover state/peers from a prior test cannot bleed in (the cause of
@@ -18,6 +18,12 @@ class AppSpawner:
         self.executables = executables or {}
         self.processes = []
         self.log_files = []
+        
+        if isinstance(openrv_args, str):
+            import shlex
+            self.openrv_args = shlex.split(openrv_args)
+        else:
+            self.openrv_args = list(openrv_args) if openrv_args else []
         
         # Ensure log directory exists
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -125,10 +131,13 @@ class AppSpawner:
             # Session file (if any) goes before -pyeval so RV loads it first,
             # then the inspector hook attaches to the already-populated session.
             cmd = [openrv_bin]
+            if self.openrv_args:
+                cmd += self.openrv_args
             if session_file:
                 cmd.append(os.path.abspath(session_file))
             cmd += ["-pyeval", pyeval_cmd]
-            logging.info(f"Launching OpenRV on port {http_port}. Logging to {log_path}")
+
+            logging.info(f"Launching OpenRV on port {http_port} with cmd: {cmd}. Logging to {log_path}")
             
             env = os.environ.copy()
             # Per-port log: two OpenRV instances in one test (RV-vs-RV) would

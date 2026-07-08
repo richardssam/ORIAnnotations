@@ -80,7 +80,7 @@ def arrow_polyline(start_xy: Sequence[float], end_xy: Sequence[float]) -> List[P
         uy = dy / length
         nx = -uy
         ny = ux
-        hl = min(0.3, length * 0.25)
+        hl = min(0.025, length * 0.075)
         lx = end_val[0] - hl * ux + 0.5 * hl * nx
         ly = end_val[1] - hl * uy + 0.5 * hl * ny
         rx_val = end_val[0] - hl * ux - 0.5 * hl * nx
