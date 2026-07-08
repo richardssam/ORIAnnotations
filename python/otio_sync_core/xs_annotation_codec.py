@@ -38,7 +38,20 @@ from otio_sync_core.manager import sync_event_schema
 # --- xStudio unit conversions (owned here, NOT in coords) ------------------
 
 #: OTIO ``TextAnnotation.font_size`` → xStudio caption ``font_size`` multiplier.
-XS_FONT_SCALE: float = 2.5
+#:
+#: 1.0 because both hosts' native font-size units are now anchored to the
+#: same "reference frame" convention: RV's ``fontSize`` (WCS fraction of
+#: image height) round-trips through ``RV_FONT_SCALE = 1080`` (see
+#: ``rv_annotation_codec``), and xStudio's own ``font_size`` is already
+#: pixels at a 1920-wide/1080-tall reference (``font.cpp``'s
+#: ``text_size * 2.0 / 1920.0``) — so no extra multiplier is needed. Verified
+#: empirically: rendering the same caption in both hosts and measuring
+#: on-screen glyph height gave a ratio of ~2.45 with the old value of 2.5,
+#: i.e. almost exactly proportional to the old constant itself, confirming
+#: 1.0 (not some other independently-tuned number) is the right value once
+#: the RV side reads ``fontSize`` correctly instead of the dead legacy
+#: ``size``/ptsize convention.
+XS_FONT_SCALE: float = 1.0
 
 # Lazily resolved — requires OTIO_PLUGIN_MANIFEST_PATH to be populated first.
 _SyncEvent = None
@@ -426,6 +439,15 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
         text = _get("text", "") or ""
         font = _get("font", "") or ""
         font_size = float(_get("font_size", coords.DEFAULT_FONT_SIZE) or coords.DEFAULT_FONT_SIZE)
+        # xStudio has no per-caption scale field (see "TextAnnotation Scale
+        # Round-Trip" in otio-annotation-sync), so a host that DOES have one
+        # (RV, whose interactive text tool resizes via this field rather than
+        # `size` — its drag-to-resize handle drives `scale`, not `font_size`)
+        # must have that multiplier folded into font_size here, or it is
+        # silently dropped and the caption renders at the host's on-screen
+        # size as if scale were always 1.0 — verified empirically to produce
+        # a ~10x size mismatch for a real RV-drawn caption with scale=0.1.
+        scale = float(_get("scale", 1.0) or 1.0)
         uuid_val = _get("uuid", "") or ""
 
         # xStudio requires a valid font name to render text; default to one of its built-ins
@@ -440,7 +462,7 @@ def sync_events_to_xs_captions(commands: list, aspect_half: float) -> list:
             "opacity": rgba[3] if len(rgba) > 3 else 1.0,
             "position": ["vec2", 1, x_xs, y_xs],
             "font_name": font,
-            "font_size": font_size * XS_FONT_SCALE,
+            "font_size": font_size * scale * XS_FONT_SCALE,
             "text": text,
             "wrap_width": 1.5,
             "justification": 0,

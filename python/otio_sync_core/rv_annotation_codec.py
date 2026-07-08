@@ -62,13 +62,27 @@ SUPPORTED_KINDS = frozenset({"pen", "erase", "text", "ellipse", "rect", "arrow"}
 
 # --- RV unit conversions (owned here, NOT in coords) ----------------------
 
-#: OTIO ``TextAnnotation.font_size`` → RV text-node ``.size`` divisor.
-#: Calibrated against the current OpenRV build's font renderer, which draws
-#: text smaller per unit ``.size`` than the previous build did (its
-#: `Font`/FTGL glyph-rendering path is otherwise unchanged, so this is a
-#: renderer-specific display-size difference, not a formula bug) — divided
-#: by 1.3 (5000 / 1.3) so annotation text keeps its prior on-screen size.
-RV_FONT_SCALE: float = 5000.0 / 1.3
+#: OTIO ``TextAnnotation.font_size`` <-> RV text-node ``fontSize`` reference
+#: height, in pixels.
+#:
+#: The `openrv_annotations` fork removed FTGL: all text now renders via
+#: QPainter, using the paint-node's ``fontSize`` property directly as a WCS
+#: fraction of image height (``PaintIPNode.cpp::compileTextComponent``,
+#: "fontSize is a WCS fraction of image height, the old size prop was a point
+#: value normalized for a 1080p image"). The legacy ``size``/``ptsize``
+#: convention (``size * 10000``) is "retained for session-file compatibility
+#: but no longer used for rendering" — so it MUST NOT be used to derive the
+#: synced font size; only ``fontSize`` (or, for sessions predating it, the
+#: same ptsize/1080 fallback the C++ reader itself uses — see
+#: :func:`otio_sync_core.rv_paint_applier.read_stroke`) reflects what's
+#: actually on screen.
+#:
+#: 1080.0 anchors this fraction back to the same "reference frame" convention
+#: xStudio's own ``font_size`` already uses (pixels at a 1920-wide reference,
+#: i.e. 1080 tall for 16:9 — see ``annotations_core_plugin``/``font.cpp``'s
+#: ``text_size * 2.0 / 1920.0``), so the two hosts' native units land in
+#: comparable magnitudes without needing a separately-tuned fudge factor.
+RV_FONT_SCALE: float = 1080.0
 
 #: ``PaintVertices.size`` → RV pen ``.width`` multiplier.
 RV_WIDTH_SCALE: float = 0.6
@@ -83,13 +97,19 @@ PaintNodeSpec = Dict[str, Any]
 
 
 def font_size_to_rv(font_size: float) -> float:
-    """Convert OTIO ``font_size`` to the RV text-node ``.size`` value."""
+    """Convert OTIO ``font_size`` to RV's ``fontSize`` (WCS fraction of image height)."""
     return float(font_size) / RV_FONT_SCALE
 
 
-def rv_to_font_size(rv_size: float) -> float:
-    """Convert an RV text-node ``.size`` value back to OTIO ``font_size``."""
-    return float(rv_size) * RV_FONT_SCALE
+def rv_to_font_size(rv_font_size_wcs: float) -> float:
+    """Convert RV's ``fontSize`` (WCS fraction of image height) back to OTIO ``font_size``.
+
+    ``rv_font_size_wcs`` is expected to already be the scale-exclusive,
+    fallback-resolved value :func:`otio_sync_core.rv_paint_applier.read_stroke`
+    computes (i.e. ``fontSize`` when present, else the legacy ptsize/1080
+    reconstruction) — not the raw legacy ``.size`` property.
+    """
+    return float(rv_font_size_wcs) * RV_FONT_SCALE
 
 
 # --- Helpers --------------------------------------------------------------
@@ -237,14 +257,24 @@ def _pen_spec(stroke: dict) -> PaintNodeSpec:
 
 def _text_spec(stroke: dict, frame: int) -> PaintNodeSpec:
     spacing = stroke["spacing"] if stroke["spacing"] else coords.DEFAULT_SPACING
+    scale = float(stroke["scale"]) if stroke["scale"] else 1.0
+    font_size_wcs = font_size_to_rv(stroke["font_size"])
     props = [
         ("position", TYPE_FLOAT, list(stroke["position"]), 2),
         ("color", TYPE_FLOAT, [float(x) for x in stroke["rgba"]], 4),
         ("spacing", TYPE_FLOAT, [float(spacing)], 1),
-        ("size", TYPE_FLOAT, [font_size_to_rv(stroke["font_size"])], 1),
+        # Legacy ``size`` — no longer used for rendering (see RV_FONT_SCALE's
+        # docstring) but kept populated, in the same relationship the C++
+        # fallback expects, for older RV builds predating ``fontSize`` that
+        # might still open this session.
+        ("size", TYPE_FLOAT, [stroke["font_size"] / 10000.0], 1),
+        # Authoritative on-screen size: WCS fraction of image height,
+        # inclusive of `scale` (matching how RV's own annotate tool bakes
+        # scale into fontSize at creation time).
+        ("fontSize", TYPE_FLOAT, [font_size_wcs * scale], 1),
         ("font", TYPE_STRING, [""], 1),
         ("text", TYPE_STRING, [stroke["text"]], 1),
-        ("scale", TYPE_FLOAT, [float(stroke["scale"]) if stroke["scale"] else 1.0], 1),
+        ("scale", TYPE_FLOAT, [scale], 1),
         ("rotation", TYPE_FLOAT, [float(stroke["rotation"]) if stroke["rotation"] else 0.0], 1),
         ("origin", TYPE_STRING, [""], 1),
         ("debug", TYPE_INT, [0], 1),

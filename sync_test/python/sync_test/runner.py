@@ -300,6 +300,7 @@ class TestRunner:
         ("rect", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_border_width,
         ("ellipse", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_ellipse_border_width,
         ("arrow", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_arrow_thickness,
+        ("text", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_font_size_from_rv_size,
     }
 
     def _verify_annotation_geometry(self, app_ports, cfg):
@@ -344,8 +345,11 @@ class TestRunner:
 
         last = state["annotations"][-1]
         if peer_name == "xstudio":
-            thicknesses = last.get("stroke_thickness") or []
-            actual = thicknesses[-1] if thicknesses else None
+            if kind == "text":
+                values = last.get("caption_font_size") or []
+            else:
+                values = last.get("stroke_thickness") or []
+            actual = values[-1] if values else None
         else:
             actual = last.get("width") if kind == "pen" else last.get("size")
             if isinstance(actual, list):
@@ -358,6 +362,29 @@ class TestRunner:
             )
         except AssertionError as e:
             return False, str(e)
+
+        # Text also carries a position, checked as an additive assertion
+        # within the same round-trip config block rather than a parallel
+        # verification path (see design D5) — only exercised when the yaml
+        # `annotation_geometry` block opts in with a `position` field.
+        position_cfg = cfg.get("position")
+        if position_cfg is not None and kind == "text" and peer_name == "xstudio":
+            expected_pos = annotation_assertions.expected_xstudio_caption_position_from_rv_position(
+                tuple(float(v) for v in position_cfg)
+            )
+            positions = last.get("caption_position") or []
+            actual_pos = positions[-1] if positions else None
+            if actual_pos is None:
+                return False, f"{peer_name} reported no caption position"
+            for axis, (actual_axis, expected_axis) in enumerate(zip(actual_pos, expected_pos)):
+                try:
+                    annotation_assertions.assert_almost_equal(
+                        actual_axis, expected_axis, tolerance=tolerance,
+                        msg=f"{peer_name} {kind} position[{axis}] round-trip from {driver_name}",
+                    )
+                except AssertionError as e:
+                    return False, str(e)
+
         return True, ""
 
     def _capture_and_measure(self, app_ports, app_name, cfg, kind, geometry, color, otio_thickness, logs_dir):

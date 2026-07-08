@@ -156,13 +156,27 @@ def get_xstudio_state(port=14441):
                         data = ann.get("Data", {})
                         pen_strokes = data.get("pen_strokes", [])
                         ann_state["strokes"] = len(pen_strokes)
-                        ann_state["captions"] = len(data.get("captions", []))
+                        captions = data.get("captions", [])
+                        ann_state["captions"] = len(captions)
                         # Surface native geometry per stroke, additive to the
                         # counts above — lets callers assert on drawn/received
                         # geometry (e.g. round-tripped pen width), not just
                         # presence.
                         ann_state["stroke_thickness"] = [
                             s.get("thickness") for s in pen_strokes
+                        ]
+                        # Same idea for captions: raw native font_size and
+                        # position (kept in xStudio-native units, not
+                        # pre-converted to OTIO) so the test's expected-value
+                        # formula does the conversion explicitly, same as
+                        # every other kind.
+                        ann_state["caption_font_size"] = [
+                            c.get("font_size") for c in captions
+                        ]
+                        ann_state["caption_position"] = [
+                            [pos[2], pos[3]] if isinstance((pos := c.get("position")), list) and len(pos) >= 4
+                            else None
+                            for c in captions
                         ]
                 except Exception:
                     pass

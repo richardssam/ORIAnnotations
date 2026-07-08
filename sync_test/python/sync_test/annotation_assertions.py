@@ -15,6 +15,7 @@ import time
 from typing import Callable, Optional
 
 from otio_sync_core import coords, rv_annotation_codec
+from otio_sync_core.xs_annotation_codec import XS_FONT_SCALE
 
 # Mirrors xstudio_plugin/ori_sync/annotation_sync.py's
 # AnnotationSyncController.DEBOUNCE_SECONDS (0.25) and
@@ -162,6 +163,33 @@ def expected_xstudio_thickness_from_rv_arrow_thickness(
     aspect_half = coords.DEFAULT_ASPECT_HALF if aspect_half is None else aspect_half
     otio_size = _otio_size_from_rv_arrow_thickness(rv_thickness, aspect_half)
     return otio_size / (2.0 * aspect_half)
+
+
+def expected_xstudio_font_size_from_rv_size(
+    rv_size: float, aspect_half: Optional[float] = None
+) -> float:
+    """RV-native text ``.size`` -> OTIO font_size (RV reverse text codec) -> xStudio caption font_size (xStudio forward text codec).
+
+    Imports ``XS_FONT_SCALE`` directly from ``xs_annotation_codec`` rather than
+    duplicating the literal — this formula exists specifically because that
+    constant was found to be miscalibrated; a second inline copy here would
+    reintroduce the same drift risk it's meant to catch.
+    """
+    otio_font_size = rv_annotation_codec.rv_to_font_size(rv_size)
+    return otio_font_size * XS_FONT_SCALE
+
+
+def expected_xstudio_caption_position_from_rv_position(
+    rv_position, aspect_half: Optional[float] = None
+):
+    """RV-native (OTIO-normalized) text position -> xStudio caption position.
+
+    Same ``aspect_half`` transform already proven correct for pen/shape
+    points (``x_xs = x_otio / aspect_half``, ``y_xs = -y_otio / aspect_half``).
+    """
+    aspect_half = coords.DEFAULT_ASPECT_HALF if aspect_half is None else aspect_half
+    x_otio, y_otio = rv_position
+    return (x_otio / aspect_half, -y_otio / aspect_half)
 
 
 def wait_for_predicate(

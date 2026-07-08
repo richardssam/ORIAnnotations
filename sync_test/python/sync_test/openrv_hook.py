@@ -363,6 +363,67 @@ def _draw_openrv_annotation(payload):
                 ("softDeleted", TYPE_INT, [0], 1),
             ],
         }
+    elif kind == "text":
+        # Raw native fontSize (WCS fraction of image height) — the value
+        # under test, deliberately NOT derived from any OTIO font_size via
+        # font_size_to_rv (that's the forward conversion; this harness tests
+        # the reverse of it, same convention as pen's raw "width" above).
+        # Matches what RV's real annotate tool actually writes post-FTGL
+        # removal (`annotate_mode.mu`'s `fontSize = size * scale`) — the
+        # legacy `size` field is also populated for old-build compatibility
+        # but is no longer what any current rendering/sync reads.
+        position = payload.get("position", [0.15, -0.08])
+        text = payload.get("text", "sync test")
+        color = payload.get("color", [1.0, 1.0, 1.0, 1.0])
+        scale = float(payload.get("scale", 1.0))
+        base_props = [
+            ("position", TYPE_FLOAT, list(position), 2),
+            ("color", TYPE_FLOAT, list(color), 4),
+            ("spacing", TYPE_FLOAT, [0.8], 1),
+            ("font", TYPE_STRING, [""], 1),
+            ("text", TYPE_STRING, [text], 1),
+            ("scale", TYPE_FLOAT, [scale], 1),
+            ("rotation", TYPE_FLOAT, [0.0], 1),
+            ("origin", TYPE_STRING, [""], 1),
+            ("debug", TYPE_INT, [0], 1),
+            ("startFrame", TYPE_INT, [frame], 1),
+            ("duration", TYPE_INT, [1], 1),
+            ("mode", TYPE_INT, [0], 1),
+            ("uuid", TYPE_STRING, [str(uuid_mod.uuid4())], 1),
+            ("softDeleted", TYPE_INT, [0], 1),
+        ]
+        if "legacy_size" in payload:
+            # Simulates a session/broadcast predating the QPainter renderer:
+            # only the old raw `size` (ptsize/10000 convention) exists, no
+            # `fontSize` property at all — exercises
+            # rv_paint_applier.read_stroke's fallback reconstruction
+            # (`size*10000/1080*scale`) rather than reading `fontSize`
+            # directly.
+            legacy_size = float(payload["legacy_size"])
+            size_props = [("size", TYPE_FLOAT, [legacy_size], 1)]
+        else:
+            # Matches what RV's real annotate tool writes post-FTGL removal
+            # (`annotate_mode.mu`'s `fontSize = size * scale`) — the value
+            # under test, deliberately NOT derived from any OTIO font_size
+            # via font_size_to_rv (that's the forward conversion; this
+            # harness tests the reverse of it, same convention as pen's raw
+            # "width" above). Legacy `size` is also populated (chosen so the
+            # C++ fallback formula would reconstruct the same fontSize on an
+            # older build — scale cancels out of that reconstruction, see
+            # rv_annotation_codec's analogous `_text_spec` derivation) purely
+            # for old-build compatibility; current rendering/sync ignore it
+            # whenever `fontSize` is present.
+            font_size_wcs = float(payload.get("font_size_wcs", 0.0444))
+            size_props = [
+                ("size", TYPE_FLOAT, [font_size_wcs * 1080.0 / 10000.0], 1),
+                ("fontSize", TYPE_FLOAT, [font_size_wcs * scale], 1),
+            ]
+        spec = {
+            "kind": "text",
+            "uuid": str(uuid_mod.uuid4()),
+            "user": "sync_test",
+            "props": base_props + size_props,
+        }
     elif kind == "arrow":
         thickness = float(payload.get("thickness", 1.0))
         color = payload.get("color", [1.0, 1.0, 1.0, 1.0])
