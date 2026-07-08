@@ -41,6 +41,25 @@ class DisplaySyncController:
         "RGBA": "RGB", "R": "Red", "G": "Green", "B": "Blue", "A": "Alpha",
     }
 
+    # Protocol pan lives in the same host-neutral space as annotation geometry
+    # (otio_sync_core.coords: H-normalised, Y-up, centre-origin — one unit is
+    # one full image *height*; see coords.px_to_otio/otio_to_px). RV's own
+    # rv.extra_commands.translation() is passed straight through as this
+    # value with zero conversion (rvplugin/ori_sync/display_sync.py), so it
+    # is being treated as already living in that space.
+    #
+    # xStudio's raw vp.pan (== state_.translate_, see Viewport::pan()/
+    # set_pan()) is instead one unit per *half* of the viewport's own
+    # extent per axis (viewport.cpp's mouse-pan handler builds it from
+    # NDC in [-1, 1]) — i.e. twice as sensitive per unit as the protocol
+    # space, uniformly on both axes (update_matrix()'s projection_matrix_
+    # never lets any .scale() call touch the translation row, so x/y reach
+    # the renderer identically; no aspect term belongs here — an x-only
+    # aspect factor tried earlier was based on the mouse-drag interaction
+    # code, a different, unrelated path we don't go through when writing
+    # vp.pan directly). Hence the flat factor of 2 in both directions.
+    _XS_PAN_UNITS_PER_PROTOCOL_UNIT = 2.0
+
     def __init__(self, plugin) -> None:
         self.plugin = plugin
 
@@ -142,6 +161,9 @@ class DisplaySyncController:
                 h = float(size[1]) if len(size) > 1 else 0.0
                 aspect = w / h if h > 0.0 else 1.0
 
+                translate_x = float(translate[0]) if len(translate) > 0 else 0.0
+                translate_y = float(translate[1]) if len(translate) > 1 else 0.0
+
                 fit_mode = vp.get_attribute("Fit (F)").value()
                 if fit_mode != "Off":
                     self._xs_base_scale = raw_scale
@@ -151,9 +173,18 @@ class DisplaySyncController:
                     if self._xs_base_scale is None and raw_scale > 0.0:
                         self._xs_base_scale = raw_scale
                     state["zoom"] = (raw_scale / self._xs_base_scale) if self._xs_base_scale else 1.0
-                    translate_x = float(translate[0]) if len(translate) > 0 else 0.0
-                    translate_y = float(translate[1]) if len(translate) > 1 else 0.0
-                    state["pan"] = [translate_x * aspect, -translate_y * aspect]
+                    # Inverse of apply_display_state's write conversion — see
+                    # _XS_PAN_UNITS_PER_PROTOCOL_UNIT above. Both axes are also
+                    # inverted between the two apps' pan conventions (confirmed
+                    # empirically — panning in either app moved the peer the
+                    # opposite way on both x/y).
+                    k = self._XS_PAN_UNITS_PER_PROTOCOL_UNIT
+                    state["pan"] = [-translate_x / k, translate_y / k]
+                # Raw uncorrected values, for cross-checking against RV's SEND log line.
+                _log(f"RAW xs read: fit={fit_mode} raw_scale={raw_scale:.5f} "
+                     f"base_scale={self._xs_base_scale} raw_translate=({translate_x:.5f},{translate_y:.5f}) "
+                     f"size=({w:.1f},{h:.1f}) aspect={aspect:.5f} "
+                     f"-> pan={state['pan']} zoom={state['zoom']}")
         except Exception as e:
             _log(f"read_xs_display_state: read failed ({e}) — dropping stale viewport")
             self._viewport = None
@@ -208,7 +239,13 @@ class DisplaySyncController:
                     vp.scale = float(zoom) * self._xs_base_scale
 
                 if pan is not None:
-                    vp.pan = (float(pan[0]) / aspect, -float(pan[1]) / aspect)
+                    k = self._XS_PAN_UNITS_PER_PROTOCOL_UNIT
+                    vp.pan = (-float(pan[0]) * k, float(pan[1]) * k)
+
+                _log(f"RAW xs write: fit={fit_mode} base_scale={self._xs_base_scale} "
+                     f"size=({w:.1f},{h:.1f}) aspect={aspect:.5f} "
+                     f"in_pan={pan} in_zoom={zoom} -> vp.scale={getattr(vp, 'scale', None)} "
+                     f"vp.pan={getattr(vp, 'pan', None)}")
             except Exception as e:
                 _log(f"RECV display: pan/zoom set failed: {e}")
 
