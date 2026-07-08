@@ -115,6 +115,21 @@ class TestApplierReconcile(unittest.TestCase):
         applier.apply_specs([_pen_spec("u1")], c, rv_node="G", frame=7, mode="reconcile")
         self.assertEqual(c.getStringProperty("G.frame:7.order"), ["pen:1:7:sam"])
 
+    def test_reconcile_of_other_kind_does_not_prune_pen(self):
+        # Regression: annotation_sync.py reconciles text/shape kinds one at a
+        # time (or excludes strokes entirely on a "replace"), never mentioning
+        # pen uuids in that call's specs. A reconcile batch that says nothing
+        # about a kind must leave that kind's existing nodes alone -- it was
+        # wiping out already-drawn pen strokes on every unrelated text/shape
+        # update.
+        c = FakeCommands()
+        self._seed(c)
+        applier.apply_specs([_text_spec("t1")], c, rv_node="G", frame=7, mode="reconcile")
+        order = c.getStringProperty("G.frame:7.order")
+        self.assertIn("pen:1:7:sam", order)
+        self.assertIn("pen:2:7:sam", order)
+        self.assertIn("text:3:7:sam", order)
+
 
 class TestApplierGuards(unittest.TestCase):
     def test_unknown_kind_raises(self):

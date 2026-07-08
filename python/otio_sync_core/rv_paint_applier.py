@@ -166,6 +166,7 @@ def _apply_reconcile(specs, commands, *, rv_node, frame, start_id) -> int:
             existing_by_uuid[uid] = item
 
     incoming_uuids = set()
+    incoming_prefixes = {_ORDER_PREFIX[spec["kind"]] for spec in specs}
     for spec in specs:
         uid = spec["uuid"]
         incoming_uuids.add(uid)
@@ -180,9 +181,19 @@ def _apply_reconcile(specs, commands, *, rv_node, frame, start_id) -> int:
             order.append(item)
             strokeid += 1
 
-    # Prune managed items whose uuid is gone.
+    # Prune managed items whose uuid is gone -- but only among the prefixes
+    # (kinds) actually represented in this batch. Callers routinely reconcile
+    # one kind (or even a single item) at a time -- e.g. one shape per
+    # broadcast, or text-only on a "replace" that deliberately omits pen
+    # strokes (see annotation_sync._apply_annotation_replace) -- so a spec
+    # list that says nothing about pen items must never be read as "no pen
+    # items exist anymore".
     pruned = []
     for item in order:
+        prefix = item.split(":", 1)[0]
+        if prefix not in incoming_prefixes:
+            pruned.append(item)
+            continue
         uid = _node_uuid(commands, rv_node, item)
         if uid and uid not in incoming_uuids:
             continue
@@ -257,16 +268,32 @@ def read_stroke(commands, rv_node: str, item: str) -> Optional[dict]:
             "user": user,
         }
     if item.startswith("text:"):
-        size = _read_float(commands, f"{base}.size", [0.0])
+        raw_scale = (_read_float(commands, f"{base}.scale", [1.0]) or [1.0])[0] or 1.0
+        # RV's QPainter-based renderer (FTGL removed) uses `fontSize` — a WCS
+        # fraction-of-image-height — as the sole authoritative on-screen size;
+        # the legacy `size`/ptsize convention is "retained for session-file
+        # compatibility but no longer used for rendering" (PaintIPNode.cpp).
+        # Sessions/broadcasts predating `fontSize` have only `size`, so fall
+        # back to reconstructing the same value PaintIPNode.cpp's own
+        # fallback computes: `(size * 100 * 100 / 1080) * scale`.
+        font_size_prop = _read_float(commands, f"{base}.fontSize", [])
+        if font_size_prop:
+            font_size_wcs = font_size_prop[0]
+        else:
+            raw_size = (_read_float(commands, f"{base}.size", [0.01]) or [0.01])[0]
+            font_size_wcs = (raw_size * 100.0 * 100.0 / 1080.0) * raw_scale
         return {
             "kind": "text",
             "color": _read_float(commands, f"{base}.color", [1.0, 1.0, 1.0, 1.0]),
             "position": _read_float(commands, f"{base}.position", [0.0, 0.0]),
             "spacing": (_read_float(commands, f"{base}.spacing", [0.0]) or [0.0])[0],
-            "size": (size or [0.0])[0],
+            # Scale-exclusive nominal size (fontSize/scale) — symmetric with
+            # every other kind, where the nominal geometry and `scale` are
+            # kept as separate fields and composed on receipt.
+            "size": font_size_wcs / raw_scale,
             "font": (_read_string(commands, f"{base}.font", [""]) or [""])[0],
             "text": (_read_string(commands, f"{base}.text", [""]) or [""])[0],
-            "scale": (_read_float(commands, f"{base}.scale", [1.0]) or [1.0])[0],
+            "scale": raw_scale,
             "rotation": (_read_float(commands, f"{base}.rotation", [0.0]) or [0.0])[0],
             "uuid": (_read_string(commands, f"{base}.uuid", [""]) or [""])[0],
             "user": user,

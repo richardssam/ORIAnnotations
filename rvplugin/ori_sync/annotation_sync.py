@@ -56,6 +56,8 @@ class AnnotationSyncController:
         self._stroke_timer = None              # repeating partial-broadcast timer during drawing
         self._last_partial_point_count = 0
         self._partial_pen_nodes = {}           # stroke_uuid → rv pen node name (e.g. "pen:3:42:remote")
+        self._partial_pen_nodes_by_key = {}    # (clip_guid, rv_frame) → [pen node names created mid-gesture]
+        self._live_stroke_node = {}            # (clip_guid, rv_frame) → in-progress pen node name
         self._last_sent_replace_sig = {}       # ann_clip_guid → JSON sig of last broadcast
         self._ignore_annotations_until = 0.0
         self._pending_shape = None             # (node_name, frame) awaiting a coalesced broadcast
@@ -222,10 +224,23 @@ class AnnotationSyncController:
     def _apply_partial_annotation(self, payload):
         """Render a mid-stroke partial annotation from a remote peer.
 
-        The stroke is drawn into RV paint using the same UUID as the final
-        stroke.  If this UUID was already seen (a previous partial), the
-        existing paint node's points are updated in-place instead of
-        creating a duplicate.  The OTIO timeline is not modified.
+        The sender does not keep a stable ``uuid`` for a gesture across
+        ticks — every partial broadcast mints a fresh one, even though the
+        point list is cumulative from the same gesture start. Worse, RV does
+        not allow mutating a dynamically-created pen node's properties from
+        outside the call that created it (verified experimentally:
+        ``commands.setFloatProperty`` throws ``"invalid property name"`` even
+        long after creation, not just immediately after — a hard constraint,
+        not a timing quirk), so true in-place updates aren't possible either.
+
+        Continuity is instead tracked by ``(clip_guid, rv_frame)``: at most
+        one live gesture is assumed in flight per clip+frame at a time
+        (mirroring the sender's own assumption). Every tick creates a fresh
+        pen node with this tick's full cumulative point list, then removes
+        the *previous* tick's node for that key — so only the latest,
+        longest version of the growing stroke is ever visible, instead of
+        every tick's node piling up and overlapping. The OTIO timeline is not
+        modified.
 
         :param payload: Dict with keys ``clip_guid``, ``frame``, ``fps``, ``events``.
         """
@@ -296,41 +311,136 @@ class AnnotationSyncController:
             if not node:
                 continue
 
-            existing_pen = self._partial_pen_nodes.get(stroke_uuid)
-            if existing_pen and rv.commands.propertyExists(f"{node}.{existing_pen}.points"):
-                # Update points in-place for an already-started partial stroke.
-                try:
-                    rv.commands.setFloatProperty(
-                        f"{node}.{existing_pen}.points", points_flat, True
-                    )
-                    widths = [w * rv_annotation_codec.RV_WIDTH_SCALE
-                              for w in (pts_ev.points.size if pts_ev.points.size else [2.0])]
-                    if len(widths) == 1:
-                        widths = widths * (len(points_flat) // 2)
-                    rv.commands.setFloatProperty(
-                        f"{node}.{existing_pen}.width", widths, True
-                    )
-                    if QtCore:
-                        QtCore.QTimer.singleShot(0, rv.commands.redraw)
-                except Exception as e:
-                    _log(f"_apply_partial_annotation: update failed: {e}")
-            else:
-                # First partial for this UUID — create a new pen node.
-                color = list(ev_dict.rgba) if ev_dict.rgba else [1.0, 1.0, 1.0, 1.0]
-                brush = ev_dict.brush or "circle"
-                widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
-                mode = 1 if getattr(ev_dict, "type", "color") == "erase" else 0
-                self._apply_annotation({
-                    "media_path": media_path,
-                    "frame": rv_frame,
-                    "node_name": None,
-                    "points": points_flat,
-                    "color": color,
-                    "brush": brush,
-                    "width": widths,
-                    "mode": mode,
-                    "_stroke_uuid": stroke_uuid,
-                })
+            key = (clip_guid, rv_frame)
+            color = list(ev_dict.rgba) if ev_dict.rgba else [1.0, 1.0, 1.0, 1.0]
+            brush = ev_dict.brush or "circle"
+            widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
+            mode = 1 if getattr(ev_dict, "type", "color") == "erase" else 0
+            self._apply_annotation({
+                "media_path": media_path,
+                "frame": rv_frame,
+                "clip_guid": clip_guid,
+                "node_name": None,
+                "points": points_flat,
+                "color": color,
+                "brush": brush,
+                "width": widths,
+                "mode": mode,
+                "_stroke_uuid": stroke_uuid,
+            })
+            new_pen_node = self._partial_pen_nodes.pop(stroke_uuid, None)
+            if new_pen_node:
+                self._live_stroke_node[key] = new_pen_node
+                self._partial_pen_nodes_by_key.setdefault(key, []).append(new_pen_node)
+                # Sweep away the previous tick's node(s) for this gesture now
+                # that this longer one supersedes them.
+                self._cleanup_partial_debris(node, clip_guid, rv_frame, keep=new_pen_node)
+
+    def _cleanup_partial_debris(self, node, clip_guid, rv_frame, keep=None):
+        """Remove stray mid-gesture pen nodes once a gesture's final stroke lands.
+
+        Each partial tick for a drag mints its own pen node (see
+        :meth:`_apply_partial_annotation`) because the sender's live-stroke
+        broadcast does not reuse a stable uuid across a gesture — so without
+        this sweep, every intermediate node would linger in the frame's
+        ``order`` forever, piling up overlapping fragments at the gesture's
+        start point. Mirrors xStudio's own ``refresh_annotation_bookmark``,
+        which unconditionally rebuilds from the authoritative final state
+        when a gesture completes.
+
+        :param node: The paint node the gesture's frame lives on.
+        :param clip_guid: The synced clip guid the gesture belongs to.
+        :param rv_frame: The RV paint frame the gesture belongs to.
+        :param keep: A pen node name to keep even if it was tracked as
+            partial debris (e.g. it was reused/finalised in place).
+        """
+        stale = self._partial_pen_nodes_by_key.pop((clip_guid, rv_frame), [])
+        if not stale or not node:
+            return
+        to_remove = set(stale)
+        to_remove.discard(keep)
+        if not to_remove:
+            return
+        order_prop = f"{node}.frame:{rv_frame}.order"
+        # Not gated on rv.commands.propertyExists() first -- as elsewhere in
+        # this file, that check has been observed to unreliably report False
+        # for a property that was in fact just written; read/write it
+        # directly and treat a genuine absence as a no-op via the exception.
+        try:
+            order = list(rv.commands.getStringProperty(order_prop) or [])
+        except Exception:
+            return
+        new_order = [item for item in order if item not in to_remove]
+        if len(new_order) != len(order):
+            try:
+                rv.commands.setStringProperty(order_prop, new_order, True)
+            except Exception as e:
+                _log(f"_cleanup_partial_debris: failed to prune order: {e}")
+
+    def _finalize_pen_stroke_events(self, stroke_events, media_path, clip_guid, rv_frame,
+                                     paint_node_cache=None) -> int:
+        """Group PaintStart/PaintPoints pairs by uuid and apply each as the
+        authoritative, fully-committed stroke.
+
+        Called from the ``insert_child``/``annotation_commands_added`` delta
+        path (:meth:`_apply_annotation_render`) — a true delta, each stroke
+        appearing exactly once, never resent — so no idempotency bookkeeping
+        is needed here beyond what :meth:`_cleanup_partial_debris` already
+        does. (Deliberately NOT wired into :meth:`_apply_annotation_replace`
+        too: that path resends the clip's entire cumulative
+        ``annotation_commands`` on every call with fresh random uuids each
+        time, which would make every resend look like a brand new stroke.)
+
+        RV does not allow mutating a dynamically-created pen node's
+        properties from outside the call that created it (a hard
+        constraint — see :meth:`_apply_partial_annotation`), so every
+        completed gesture here is applied as a brand-new node; any
+        mid-gesture partial nodes tracked for it are then swept away via
+        :meth:`_cleanup_partial_debris` rather than reused.
+
+        :param stroke_events: Deserialised ``PaintStart``/``PaintPoints``/
+            ``PaintEnd`` SyncEvent objects (other kinds are ignored).
+        :returns: Number of strokes finalised.
+        """
+        event_groups = {}
+        for ev in stroke_events:
+            ev_uuid = getattr(ev, "uuid", None) or str(id(ev))
+            if ev_uuid not in event_groups:
+                event_groups[ev_uuid] = {"start": None, "points": None}
+            if isinstance(ev, otio.schemadef.SyncEvent.PaintStart):
+                event_groups[ev_uuid]["start"] = ev
+            elif isinstance(ev, otio.schemadef.SyncEvent.PaintPoints):
+                event_groups[ev_uuid]["points"] = ev
+
+        rendered = 0
+        for grp in event_groups.values():
+            start_event = grp["start"]
+            points_event = grp["points"]
+            if not start_event or not points_event:
+                continue
+            ev_uuid = getattr(start_event, "uuid", None)
+            node = paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+            if ev_uuid:
+                self._partial_pen_nodes.pop(ev_uuid, None)
+
+            points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
+            self._apply_annotation({
+                "media_path": media_path,
+                "frame": rv_frame,
+                "clip_guid": clip_guid,
+                "node_name": None,
+                "points": points_flat,
+                "color": list(start_event.rgba),
+                "brush": start_event.brush,
+                "width": list(points_event.points.size),
+                "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
+                "_stroke_uuid": ev_uuid,
+            })
+            rendered += 1
+            new_pen_node = self._partial_pen_nodes.pop(ev_uuid, None) if ev_uuid else None
+            self._cleanup_partial_debris(node, clip_guid, rv_frame, keep=new_pen_node)
+            self._live_stroke_node.pop((clip_guid, rv_frame), None)
+        return rendered
 
     def _apply_annotation_render(self, ann_clip):
         """Render an annotation clip received via insert_child into RV paint.
@@ -368,10 +478,11 @@ class AnnotationSyncController:
         except Exception:
             pass
 
-        # Group events by stroke UUID so that multi-stroke deltas (e.g. when
-        # the user draws several strokes before the debounce fires) are all
-        # rendered, not just the last PaintStart/PaintPoints pair.
-        event_groups = {}
+        # Stroke (PaintStart/PaintPoints) events are collected and finalised
+        # together via _finalize_pen_stroke_events, so that multi-stroke
+        # deltas (e.g. when the user draws several strokes before the
+        # debounce fires) are all rendered, not just the last pair.
+        stroke_events = []
         rendered = 0
         # Cache the paint node once for the UUID-existence checks below.
         _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
@@ -450,52 +561,14 @@ class AnnotationSyncController:
                     })
                     rendered += 1
                 else:
-                    ev_uuid = getattr(ev, "uuid", None) or str(id(ev))
-                    if ev_uuid not in event_groups:
-                        event_groups[ev_uuid] = {"start": None, "points": None}
-                    if isinstance(ev, otio.schemadef.SyncEvent.PaintStart):
-                        event_groups[ev_uuid]["start"] = ev
-                    elif isinstance(ev, otio.schemadef.SyncEvent.PaintPoints):
-                        event_groups[ev_uuid]["points"] = ev
+                    stroke_events.append(ev)
             except Exception as e:
                 _log(f"RECV annotation: failed to deserialise event: {e}")
                 pass
 
-        for grp in event_groups.values():
-            start_event = grp["start"]
-            points_event = grp["points"]
-            if not start_event or not points_event:
-                continue
-            ev_uuid = getattr(start_event, "uuid", None)
-            if ev_uuid and ev_uuid in self._partial_pen_nodes:
-                # A partial render already placed this stroke; update its final
-                # points in-place rather than creating a duplicate pen node.
-                node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
-                pen_node = self._partial_pen_nodes.pop(ev_uuid)
-                if node and rv.commands.propertyExists(f"{node}.{pen_node}.points"):
-                    points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
-                    rv.commands.setFloatProperty(f"{node}.{pen_node}.points", points_flat, True)
-                    widths = [w * rv_annotation_codec.RV_WIDTH_SCALE for w in points_event.points.size]
-                    if len(widths) == 1:
-                        widths = widths * (len(points_flat) // 2)
-                    rv.commands.setFloatProperty(f"{node}.{pen_node}.width", widths, True)
-                    if QtCore:
-                        QtCore.QTimer.singleShot(0, rv.commands.redraw)
-                    rendered += 1
-                continue
-            points_flat = [v for pair in zip(points_event.points.x, points_event.points.y) for v in pair]
-            self._apply_annotation({
-                "media_path": media_path,
-                "frame": rv_frame,
-                "clip_guid": clip_guid,
-                "node_name": None,
-                "points": points_flat,
-                "color": list(start_event.rgba),
-                "brush": start_event.brush,
-                "width": list(points_event.points.size),
-                "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
-            })
-            rendered += 1
+        rendered += self._finalize_pen_stroke_events(
+            stroke_events, media_path, clip_guid, rv_frame, _paint_node_cache
+        )
 
         if rendered == 0:
             _log("RECV annotation: no valid annotation events found")
@@ -512,7 +585,13 @@ class AnnotationSyncController:
 
         Stroke commands (``PaintStart``/``PaintPoints``/``PaintEnd``) are
         excluded — they are already painted in RV and are not part of a
-        "replace" (text-edit / drag-move) broadcast.
+        "replace" (text-edit / drag-move) broadcast. They also MUST NOT be
+        routed through :meth:`_finalize_pen_stroke_events` here: unlike
+        ``insert_child`` deltas, this payload's stroke uuids are not stable
+        across repeated ``REPLACE_ANNOTATION_COMMANDS`` broadcasts for the
+        same clip (each resend re-mints fresh random uuids for the same
+        underlying strokes), so uuid-keyed finalisation would treat every
+        resend as new strokes and duplicate them without bound.
 
         Note: reconcile-mode updates overwrite every property the codec
         writes (including ``softDeleted``, always 0), whereas the original

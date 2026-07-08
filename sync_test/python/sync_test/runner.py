@@ -877,6 +877,7 @@ class TestRunner:
             # correctness is intentionally not asserted here (punted for now);
             # this only catches the "annotations silently dropped" failure.
             if not failed and expect_annotations:
+                counts_by_app = {}
                 for name, port in app_ports:
                     st = self.fetch_state(port)
                     cnt = st.get("annotation_count")
@@ -894,6 +895,32 @@ class TestRunner:
                         fail_reason = f"{name} created no annotations"
                     else:
                         logging.info(f"✅ {name} created {cnt} annotation stroke(s)")
+                        counts_by_app[name] = cnt
+
+                # Cross-app sanity check: apps should report roughly the same
+                # number of annotations. A large spread (e.g. RV reporting 60+
+                # against xStudio's 20) is exactly the signature of an
+                # undetected duplication/pile-up bug -- a single pen gesture
+                # fragmenting into many overlapping partial-tick nodes on one
+                # side rather than settling into one final stroke -- not a
+                # legitimate difference in how each host counts annotations.
+                # Warning rather than failing: a modest divergence can be
+                # legitimate, and this repo currently has one known,
+                # unresolved source of inflation (see annotation_sync.py's
+                # mid-drag debris notes), so hard-failing here would make
+                # already-accepted flakiness look like a new regression.
+                ANNOTATION_COUNT_RATIO_WARN = 1.5
+                if len(counts_by_app) >= 2:
+                    lo_name, lo = min(counts_by_app.items(), key=lambda kv: kv[1])
+                    hi_name, hi = max(counts_by_app.items(), key=lambda kv: kv[1])
+                    if lo > 0 and (hi / lo) > ANNOTATION_COUNT_RATIO_WARN:
+                        logging.warning(
+                            f"⚠  annotation_count mismatch across apps in '{test_name}': "
+                            + ", ".join(f"{n}={c}" for n, c in counts_by_app.items())
+                            + f" ({hi_name}/{lo_name} ratio {hi / lo:.1f}x > "
+                            f"{ANNOTATION_COUNT_RATIO_WARN}x) — possible "
+                            "duplicate/undeduplicated annotations on one side"
+                        )
 
             # Final structural consensus: the apps must agree on timeline
             # structure (clip set + order). Catches desyncs that the lightweight
@@ -992,7 +1019,9 @@ class TestRunner:
                 except Exception as e:
                     logging.error(f"Failed to save {name} session: {e}")
 
-            self._report_log_errors(app_ports, spawner.logs_dir)
+            if self._report_log_errors(app_ports, spawner.logs_dir):
+                failed = True
+                fail_reason = fail_reason or "known-bad signature found in a plugin log"
 
             if failed:
                 logging.error(f"Test '{test_name}' FAILED.")
@@ -1051,8 +1080,40 @@ class TestRunner:
                 i += 1
         return counts
 
+    #: Known-bad ori_sync plugin-log signatures. Unlike the generic
+    #: traceback scan below (which only warns — any exception could be
+    #: benign or unrelated), these are specific, previously-diagnosed
+    #: signs of real correctness bugs in the annotation-sync path (see the
+    #: pen-stroke debris investigation), so a match here is a hard failure.
+    _KNOWN_BAD_PLUGIN_LOG_SIGNATURES = (
+        "invalid property name",
+        "RECV annotation dropped",
+        "no paint node for",
+        "Failed to apply remote annotation",
+        "failed to deserialise event",
+    )
+
+    def _scan_plugin_log_for_known_bad(self, log_path):
+        """Return a Counter of {signature: count} of known-bad lines in a plugin log."""
+        counts = Counter()
+        if not os.path.exists(log_path):
+            return counts
+        try:
+            with open(log_path, errors="replace") as f:
+                for line in f:
+                    for sig in self._KNOWN_BAD_PLUGIN_LOG_SIGNATURES:
+                        if sig in line:
+                            counts[sig] += 1
+        except OSError:
+            pass
+        return counts
+
     def _report_log_errors(self, app_ports, logs_dir):
-        """Scan all app log files and emit a warning for any exceptions found."""
+        """Scan console and ori_sync plugin logs for problems.
+
+        :returns: True if any known-bad plugin-log signature was found
+            (callers should treat this as a test failure).
+        """
         for app_name, port in app_ports:
             log_path = os.path.join(logs_dir, f"{app_name}_{port}.log")
             counts = self._scan_log_for_errors(log_path)
@@ -1066,6 +1127,21 @@ class TestRunner:
                 logging.warning(f"    {n:3}x  {msg}")
             if len(counts) > 5:
                 logging.warning(f"    ... and {len(counts) - 5} more distinct error type(s)")
+
+        found_known_bad = False
+        for app_name, port in app_ports:
+            plugin_log_path = os.path.join(logs_dir, f"{app_name}_plugin_{port}.log")
+            counts = self._scan_plugin_log_for_known_bad(plugin_log_path)
+            if not counts:
+                continue
+            found_known_bad = True
+            total = sum(counts.values())
+            logging.error(
+                f"❌ {app_name} plugin log has {total} known-bad signature(s) — {plugin_log_path}"
+            )
+            for msg, n in counts.most_common():
+                logging.error(f"    {n:3}x  {msg!r}")
+        return found_known_bad
 
     def run_all(self, script_driven=False):
         results = {}
