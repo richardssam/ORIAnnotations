@@ -63,7 +63,12 @@ SUPPORTED_KINDS = frozenset({"pen", "erase", "text", "ellipse", "rect", "arrow"}
 # --- RV unit conversions (owned here, NOT in coords) ----------------------
 
 #: OTIO ``TextAnnotation.font_size`` → RV text-node ``.size`` divisor.
-RV_FONT_SCALE: float = 5000.0
+#: Calibrated against the current OpenRV build's font renderer, which draws
+#: text smaller per unit ``.size`` than the previous build did (its
+#: `Font`/FTGL glyph-rendering path is otherwise unchanged, so this is a
+#: renderer-specific display-size difference, not a formula bug) — divided
+#: by 1.3 (5000 / 1.3) so annotation text keeps its prior on-screen size.
+RV_FONT_SCALE: float = 5000.0 / 1.3
 
 #: ``PaintVertices.size`` → RV pen ``.width`` multiplier.
 RV_WIDTH_SCALE: float = 0.6

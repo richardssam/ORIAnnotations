@@ -14,8 +14,9 @@ pixel ↔ OTIO-normalized transforms, and shared annotation defaults.
 Host-specific *unit* conversions do **not** live here — they belong in that
 host's codec, mirroring how :mod:`otio_sync_core.xs_annotation_codec` keeps
 xStudio's ``font_size * 2.5`` factor inline. In particular, RV's
-``font_size ↔ .size`` factor (``5000.0``) and pen-width factor (``0.6``) live
-in :mod:`otio_sync_core.rv_annotation_codec`, not here.
+``font_size ↔ .size`` factor (``RV_FONT_SCALE``) and pen-width factor
+(``RV_WIDTH_SCALE``) live in :mod:`otio_sync_core.rv_annotation_codec`, not
+here.
 
 .. rubric:: OTIO-normalized space
 

@@ -59,13 +59,13 @@ class TestRvCodecForward(unittest.TestCase):
 
     def test_text_prop_set_and_scale(self):
         ta = se.TextAnnotation(rgba=[1.0, 1.0, 1.0, 1.0], position=[0.1, -0.2], spacing=0.0,
-                               friendly_name="bob", font_size=5000.0, font="", text="hi",
+                               friendly_name="bob", font_size=codec.RV_FONT_SCALE, font="", text="hi",
                                rotation=0.0, scale=1.5, uuid="t1")
         specs = codec.sync_events_to_rv_specs([ta], {"frame": 9})
         p = _props(specs[0])
         self.assertEqual(specs[0]["kind"], "text")
         self.assertEqual(p["scale"], [1.5])
-        self.assertEqual(p["size"], [1.0])              # 5000 / RV_FONT_SCALE
+        self.assertEqual(p["size"], [1.0])              # font_size / RV_FONT_SCALE
         self.assertEqual(p["spacing"], [0.8])           # 0.0 → DEFAULT_SPACING
         self.assertEqual(p["startFrame"], [9])
         self.assertEqual(p["position"], [0.1, -0.2])

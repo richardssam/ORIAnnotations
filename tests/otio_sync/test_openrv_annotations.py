@@ -48,6 +48,7 @@ sys.modules['rv.qt_utils'] = MagicMock()
 
 import opentimelineio as otio
 from plugin import OpenRVSyncPlugin
+from otio_sync_core.rv_annotation_codec import RV_FONT_SCALE
 
 # Ensure SyncEvent schema is registered (force reload manifest only if not already registered to avoid pytest alphabetical load caching issues)
 try:
@@ -134,7 +135,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.properties[f"{full_prop}.text"] = ["Hello OpenRV Annotation"]
         self.properties[f"{full_prop}.color"] = [1.0, 0.0, 0.0, 1.0] # red
         self.properties[f"{full_prop}.position"] = [0.1, 0.2]
-        self.properties[f"{full_prop}.size"] = [0.015] # 0.015 * 5000 = 75.0 font_size
+        self.properties[f"{full_prop}.size"] = [1.0] # 1.0 * RV_FONT_SCALE font_size
         self.properties[f"{full_prop}.spacing"] = [0.8]
         self.properties[f"{full_prop}.scale"] = [1.2]
         self.properties[f"{full_prop}.rotation"] = [15.0]
@@ -161,7 +162,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.assertEqual(event_dict["text"], "Hello OpenRV Annotation")
         self.assertEqual(event_dict["rgba"], [1.0, 0.0, 0.0, 1.0])
         self.assertEqual(event_dict["position"], [0.1, 0.2])
-        self.assertEqual(event_dict["font_size"], 75.0)
+        self.assertEqual(event_dict["font_size"], RV_FONT_SCALE)
         self.assertEqual(event_dict["font"], "LiberationSans")
         self.assertEqual(event_dict["scale"], 1.2)
         self.assertEqual(event_dict["rotation"], 15.0)
@@ -174,7 +175,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
             "position": [0.1, 0.2],
             "color": [1.0, 0.0, 0.0, 1.0],
             "spacing": 0.8,
-            "size": 0.015, # 75.0 / 5000.0
+            "size": 0.015, # passed straight through to the RV property, untouched by RV_FONT_SCALE
             "scale": 1.2,
             "rotation": 15.0,
             "font": "LiberationSans",
@@ -350,7 +351,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.assertEqual(self.properties[f"{node}.{text_node_name}.text"], ["Updated text annotation"])
         self.assertEqual(self.properties[f"{node}.{text_node_name}.position"], [0.2, 0.3])
         self.assertEqual(self.properties[f"{node}.{text_node_name}.color"], [0.0, 1.0, 0.0, 1.0])
-        self.assertEqual(self.properties[f"{node}.{text_node_name}.size"], [75.0 / 5000.0])
+        self.assertEqual(self.properties[f"{node}.{text_node_name}.size"], [75.0 / RV_FONT_SCALE])
         
         # Check that no new property order was added
         self.assertEqual(self.properties[order_prop], [text_node_name])

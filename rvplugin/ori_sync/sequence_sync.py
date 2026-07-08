@@ -22,6 +22,8 @@ except ImportError:
     ORIGIN_NATIVE = "native"
     ORIGIN_OTIO_IMPORT = "otio_import"
 
+from otio_sync_core.rv_annotation_codec import font_size_to_rv
+
 # RV's native OTIO reader/writer (the `otio_reader` rv-package). Imported
 # defensively: a build without the package must degrade to native handling
 # rather than crash, so OTIO-origin timelines are simply not snapshot-synced.
@@ -1575,7 +1577,7 @@ class SequenceSyncController:
                                 if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
                                     if not (event.text or "").strip():
                                         continue
-                                    rv_size = float(event.font_size) / 5000.0 if getattr(event, "font_size", None) else 0.01
+                                    rv_size = font_size_to_rv(event.font_size) if getattr(event, "font_size", None) else 0.01
                                     uuid_val = event.uuid or ""
                                     # Guard against duplicates when INSERT_CHILD already painted
                                     # this node before the snapshot arrived.
