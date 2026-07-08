@@ -1,15 +1,22 @@
 #!/bin/bash
 
 rm -f otiosyncdemo-1.2.rvpkg
-rm -rf pika
 
-# Copy pika from the pyenv site-packages to vendor it into the package
-PIKA_PATH="/Users/sam/.pyenv/versions/3.10.13/lib/python3.10/site-packages/pika"
-if [ -d "$PIKA_PATH" ]; then
-    cp -r "$PIKA_PATH" .
-    echo "Vendored pika"
+# Vendor pika into the package via pip (pika is pure python, so this is
+# portable across interpreters), unless it's already present locally.
+if [ ! -f "pika/__init__.py" ]; then
+    rm -rf _pika_tmp
+    pip install --target=_pika_tmp pika
+    if [ -d "_pika_tmp/pika" ]; then
+        cp -r _pika_tmp/pika .
+        rm -rf _pika_tmp
+        echo "Vendored pika via pip"
+    else
+        echo "ERROR: could not vendor pika (pip install failed)" >&2
+        exit 1
+    fi
 else
-    echo "Warning: pika not found at $PIKA_PATH"
+    echo "Using existing vendored pika/"
 fi
 
 # Zip plugin files from this directory

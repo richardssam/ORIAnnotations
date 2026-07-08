@@ -18,6 +18,9 @@ folders:
   - folder: otio_sync_core
     location: Python
     description: 'OTIO Sync Core Library'
+  - folder: pika
+    location: Python
+    description: 'Vendored pika AMQP client library'
 
 description: |
     <p>
