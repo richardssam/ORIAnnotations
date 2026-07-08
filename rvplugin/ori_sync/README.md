@@ -38,7 +38,7 @@ Install into OpenRV:
 | Variable | Type | Description |
 |---|---|---|
 | `DEBUG_OTIO_SYNC` | any non-empty value | Enables console logging of all sync events. Set to any non-empty string to activate (e.g. `export DEBUG_OTIO_SYNC=1`). |
-| `RV_OTIO_SYNC_LOG_FILE` | file path | Writes timestamped debug logs to the specified file (e.g. `export RV_OTIO_SYNC_LOG_FILE=/tmp/otio_sync.log`). Independent of `DEBUG_OTIO_SYNC` — both can be active at the same time. |
+| `ORI_SYNC_LOG_FILE` | file path | Writes timestamped debug logs to the specified file (e.g. `export ORI_SYNC_LOG_FILE=/tmp/otio_sync.log`). Independent of `DEBUG_OTIO_SYNC` — both can be active at the same time. |
 
 Both variables are read at plugin load time. Changes made after OpenRV starts will have no effect.
 
@@ -46,7 +46,7 @@ Both variables are read at plugin load time. Changes made after OpenRV starts wi
 
 ```bash
 export DEBUG_OTIO_SYNC=1
-export RV_OTIO_SYNC_LOG_FILE=/tmp/otio_sync.log
+export ORI_SYNC_LOG_FILE=/tmp/otio_sync.log
 open /Applications/OpenRV.app
 ```
 

@@ -2,7 +2,7 @@
 
 The plugin lives in `xstudio_plugin/ori_sync/ori_sync_plugin.py`.  Set
 `ORI_SYNC_LOG_FILE=/path/to/xstudio_client.log` before launching xStudio so
-the plugin writes a persistent log (mirrors `RV_OTIO_SYNC_LOG_FILE` for RV).
+the plugin writes a persistent log (same `ORI_SYNC_LOG_FILE` variable RV uses).
 
 ## ⚠️ xStudio OTIO export strips ALL metadata — no sync GUIDs survive
 

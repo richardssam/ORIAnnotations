@@ -144,7 +144,7 @@ class AppSpawner:
             # otherwise interleave into one file, corrupting it and making
             # per-peer diagnosis impossible.
             plugin_log_path = os.path.join(self.logs_dir, f"openrv_plugin_{http_port}.log")
-            env["RV_OTIO_SYNC_LOG_FILE"] = plugin_log_path
+            env["ORI_SYNC_LOG_FILE"] = plugin_log_path
             env["ORI_SESSION"] = self.session_id
             env["RV_NO_CONSOLE_REDIRECT"] = "1"
             # Without $OCIO, RV falls back to its own built-in default config
