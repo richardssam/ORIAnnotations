@@ -708,12 +708,15 @@ class SequenceSyncController:
                 path = os.path.abspath(path)
             # Prefer the fps stored in the media itself over the session fps;
             # rv.commands.fps() can return 24 at init time before media is read.
-            try:
-                media_fps = rv.commands.getFloatProperty(f"{file_source_node}.media.fps")[0]
+            # Not all sources expose this property (e.g. image sequences), so
+            # guard with propertyExists rather than a bare try/except -- RV logs
+            # an ERROR to the console for any exception thrown across the
+            # command boundary, caught or not.
+            fps_prop = f"{file_source_node}.media.fps"
+            if rv.commands.propertyExists(fps_prop):
+                media_fps = rv.commands.getFloatProperty(fps_prop)[0]
                 if media_fps and media_fps > 0:
                     fps = media_fps
-            except Exception:
-                pass
             # The media's available_range must reflect its embedded timecode,
             # not a hardcoded frame 0. sourceMediaInfo reports startFrame/endFrame
             # derived from the QuickTime's timecode track (a movie whose timecode
