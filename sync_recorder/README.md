@@ -60,6 +60,29 @@ Options:
 - `--wait-for-peer`: Hold playback until a peer has joined and received the `STATE_SNAPSHOT`, then wait `--post-snapshot-delay` seconds before sending the first recorded event. The player will also start early if it detects peer activity before the delay expires.
 - `--post-snapshot-delay SECONDS`: Seconds to wait after delivering the state snapshot before playback begins (default: `3.0`). Only used with `--wait-for-peer`.
 
+### Converting a Recording to an OTIO Timeline
+
+To review a recorded session offline as a single, continuous clip, convert the recording into an OTIO timeline. The converter replays the recording's playback, scrub, clip-switching, and drawing events over wall-clock time and reconstructs them as OTIO cuts:
+
+```bash
+python -m sync_recorder.convert_recording_to_timeline -i my_recording.jsonl -o my_timeline.otio
+```
+
+Options:
+
+- `-i`, `--input`: Path to the input recording `.jsonl` (Required).
+- `-o`, `--output`: Path to write the output `.otio` timeline (Required).
+- `--fps`: Target frame rate for the output timeline (default: `24.0`).
+
+How it works:
+
+- **Playback projection model** — the converter maintains a live projection over the OTIO structure carried by the recording's `STATE_SNAPSHOT` (and any later `ADD_TIMELINE`). It treats each `current_time` as a timeline/view frame and resolves it to a real **media** frame through the clip under the playhead (using the clip's `source_range`, or its `media_reference.available_range` when `source_range` is `None`, e.g. media with embedded timecode). This is why a clip that reads as "frame 0" in the session correctly maps to its true media frame (such as `98499`).
+- **Playing** segments advance through the media at wall-clock rate, splitting into separate clips as the playhead crosses cuts in a multi-clip sequence, and wrapping to the sequence start when playback reaches the end in `loop` mode.
+- **Pause / scrub** segments become freeze frames — a clip holding the resolved media frame via a `LinearTimeWarp(time_scalar=0.0)` effect, stretched to the wall-clock duration of the hold.
+- **Drawing** events are rendered to transparent PNG overlays in a `<output-stem>_annotations/` folder beside the `.otio`, laid out on a second "Annotations Overlay" track anchored to the same resolved media frames so overlays sit on the picture they were drawn on.
+
+The output has a "Background Media" track and, when the session contained drawings, an "Annotations Overlay" track.
+
 ### Session Initialization & Replay Handshake
 
 For a joining peer (like an empty OpenRV session) to successfully apply replayed events, its internal timeline structure and GUIDs must match the recording. The package handles this automatically using a Master/Joiner handshake:
