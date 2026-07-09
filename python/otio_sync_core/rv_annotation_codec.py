@@ -80,9 +80,13 @@ SUPPORTED_KINDS = frozenset({"pen", "erase", "text", "ellipse", "rect", "arrow"}
 #: 1080.0 anchors this fraction back to the same "reference frame" convention
 #: xStudio's own ``font_size`` already uses (pixels at a 1920-wide reference,
 #: i.e. 1080 tall for 16:9 — see ``annotations_core_plugin``/``font.cpp``'s
-#: ``text_size * 2.0 / 1920.0``), so the two hosts' native units land in
-#: comparable magnitudes without needing a separately-tuned fudge factor.
-RV_FONT_SCALE: float = 1080.0
+#: ``text_size * 2.0 / 1920.0``). The ``/ 2.5`` on top is an empirical
+#: correction: QPainter renders noticeably smaller glyphs per unit
+#: ``fontSize`` than the 1080-based derivation alone predicts, so this was
+#: tuned against the testchart's font-alignment chart (visual match against
+#: the chart's PIL-rendered reference text at 12pt-96pt) rather than derived
+#: analytically.
+RV_FONT_SCALE: float = 1080.0 / 2.5
 
 #: ``PaintVertices.size`` → RV pen ``.width`` multiplier.
 RV_WIDTH_SCALE: float = 0.6

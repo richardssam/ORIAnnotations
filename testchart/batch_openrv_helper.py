@@ -204,7 +204,9 @@ def _run_batch_impl():
         annotated_frames = extra_commands.findAnnotatedFrames()
         if annotated_frames:
             # Locate rvio
-            rvio_bin = os.path.join(os.path.dirname(sys.argv[0]), "rvio")
+            rvio_bin = os.path.join(os.path.dirname(sys.executable), "rvio")
+            if not os.path.exists(rvio_bin):
+                rvio_bin = os.path.join(os.path.dirname(sys.argv[0]), "rvio")
             if not os.path.exists(rvio_bin):
                 rvio_bin = "/Applications/OpenRV.app/Contents/MacOS/rvio"
                 
@@ -225,25 +227,49 @@ def _run_batch_impl():
                     print(f"Attempting GUI fallback grab for frame {globalframe}...")
                     
                     # Locate RV binary
-                    rv_bin = os.path.join(os.path.dirname(sys.argv[0]), "RV")
+                    rv_bin = os.path.join(os.path.dirname(sys.executable), "RV")
+                    if not os.path.exists(rv_bin):
+                        rv_bin = os.path.join(os.path.dirname(sys.argv[0]), "RV")
                     if not os.path.exists(rv_bin):
                         rv_bin = "/Users/sam/git/openrv_annotations/_build/stage/app/RV.app/Contents/MacOS/RV"
                         
                     grab_script = os.path.join(os.path.dirname(__file__), "grab_frame.py")
                     
+                    # Determine source size for viewport grab resolution
+                    width = 1920
+                    height = 1080
+                    for source in commands.sourcesAtFrame(globalframe):
+                        source_group = commands.nodeGroup(source)
+                        media_path = sg_to_media.get(source_group)
+                        if media_path and os.path.exists(media_path):
+                            try:
+                                from PySide6.QtGui import QImage
+                            except ImportError:
+                                from PySide2.QtGui import QImage
+                            img = QImage(media_path)
+                            if img.width() > 0 and img.height() > 0:
+                                width = img.width()
+                                height = img.height()
+                                break
+
                     env_grab = os.environ.copy()
                     env_grab["GRAB_FRAME"] = str(globalframe)
                     env_grab["GRAB_OUTPUT_PATH"] = export_file
+                    env_grab["GRAB_WIDTH"] = str(width)
+                    env_grab["GRAB_HEIGHT"] = str(height)
                     
                     cmd_grab = [
                         rv_bin,
                         temp_session_name,
+                        "-geometry", "0", "0", str(width), str(height),
                         "-pyeval",
                         f"exec(open('{grab_script}').read())"
                     ]
                     try:
-                        subprocess.run(cmd_grab, env=env_grab, check=True)
+                        subprocess.run(cmd_grab, env=env_grab, check=True, timeout=15)
                         print(f"Successfully generated frame {globalframe} via GUI fallback grab.")
+                    except subprocess.TimeoutExpired as e_timeout:
+                        print(f"Warning: GUI fallback grab timed out: {e_timeout}")
                     except Exception as e_grab:
                         print(f"Warning: GUI fallback grab failed: {e_grab}")
                         if os.path.exists(export_file):

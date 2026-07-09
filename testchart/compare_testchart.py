@@ -193,23 +193,33 @@ def analyse_text_label(img_arr, px, py, font_px, weights=TEXT_LABEL_WEIGHTS,
 
 
 def _load_cropped(rendered_path):
-    """Load *rendered_path*, auto-cropping letterbox/pillarbox bars."""
+    """Load *rendered_path*, auto-cropping letterbox/pillarbox bars assuming a 16:9 target aspect ratio."""
     img = Image.open(rendered_path).convert("RGB")
     arr_full = np.array(img)
-    corner = arr_full[0, 0].astype(int)
-    diff = np.max(np.abs(arr_full.astype(int) - corner), axis=2)
-    mask = diff > 20
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    if rows.any() and cols.any():
-        r0, r1 = np.where(rows)[0][[0, -1]]
-        c0, c1 = np.where(cols)[0][[0, -1]]
-        cropped = arr_full[r0:r1+1, c0:c1+1]
-        if cropped.shape[:2] != arr_full.shape[:2]:
-            print(f"Auto-cropped letterbox: {arr_full.shape[1]}×{arr_full.shape[0]}"
-                  f" → {cropped.shape[1]}×{cropped.shape[0]} (offset {c0},{r0})")
-        return cropped
-    return arr_full
+    H, W = arr_full.shape[:2]
+    
+    # Target aspect ratio is 16:9
+    ar_target = 16.0 / 9.0
+    ar_win = W / H
+    
+    if ar_win > ar_target:
+        # Pillarbox: media height is full window height
+        h_media = H
+        w_media = int(round(H * ar_target))
+        x0 = (W - w_media) // 2
+        y0 = 0
+    else:
+        # Letterbox: media width is full window width
+        w_media = W
+        h_media = int(round(W / ar_target))
+        x0 = 0
+        y0 = (H - h_media) // 2
+        
+    cropped = arr_full[y0:y0+h_media, x0:x0+w_media]
+    if cropped.shape[:2] != arr_full.shape[:2]:
+        print(f"Auto-cropped letterbox: {W}×{H}"
+              f" → {cropped.shape[1]}×{cropped.shape[0]} (offset {x0},{y0})")
+    return cropped
 
 
 def run_colors_mode(img_arr, threshold):
