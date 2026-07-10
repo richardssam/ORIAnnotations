@@ -155,11 +155,6 @@ class DisplaySyncController:
                 vp_state = json.loads(js.dump())["base"]
                 raw_scale = float(vp_state["scale"])
                 translate = _parse_vec(vp_state.get("translate"))
-                size = _parse_vec(vp_state.get("size"))
-
-                w = float(size[0]) if len(size) > 0 else 0.0
-                h = float(size[1]) if len(size) > 1 else 0.0
-                aspect = w / h if h > 0.0 else 1.0
 
                 translate_x = float(translate[0]) if len(translate) > 0 else 0.0
                 translate_y = float(translate[1]) if len(translate) > 1 else 0.0
@@ -180,11 +175,6 @@ class DisplaySyncController:
                     # opposite way on both x/y).
                     k = self._XS_PAN_UNITS_PER_PROTOCOL_UNIT
                     state["pan"] = [-translate_x / k, translate_y / k]
-                # Raw uncorrected values, for cross-checking against RV's SEND log line.
-                _log(f"RAW xs read: fit={fit_mode} raw_scale={raw_scale:.5f} "
-                     f"base_scale={self._xs_base_scale} raw_translate=({translate_x:.5f},{translate_y:.5f}) "
-                     f"size=({w:.1f},{h:.1f}) aspect={aspect:.5f} "
-                     f"-> pan={state['pan']} zoom={state['zoom']}")
         except Exception as e:
             _log(f"read_xs_display_state: read failed ({e}) — dropping stale viewport")
             self._viewport = None
@@ -221,10 +211,6 @@ class DisplaySyncController:
                     100, vp.remote, serialise_atom()
                 )[0]
                 vp_state = json.loads(js.dump())["base"]
-                size = _parse_vec(vp_state.get("size"))
-                w = float(size[0]) if len(size) > 0 else 0.0
-                h = float(size[1]) if len(size) > 1 else 0.0
-                aspect = w / h if h > 0.0 else 1.0
 
                 fit_mode = vp.get_attribute("Fit (F)").value()
                 if fit_mode != "Off":
@@ -241,11 +227,6 @@ class DisplaySyncController:
                 if pan is not None:
                     k = self._XS_PAN_UNITS_PER_PROTOCOL_UNIT
                     vp.pan = (-float(pan[0]) * k, float(pan[1]) * k)
-
-                _log(f"RAW xs write: fit={fit_mode} base_scale={self._xs_base_scale} "
-                     f"size=({w:.1f},{h:.1f}) aspect={aspect:.5f} "
-                     f"in_pan={pan} in_zoom={zoom} -> vp.scale={getattr(vp, 'scale', None)} "
-                     f"vp.pan={getattr(vp, 'pan', None)}")
             except Exception as e:
                 _log(f"RECV display: pan/zoom set failed: {e}")
 
