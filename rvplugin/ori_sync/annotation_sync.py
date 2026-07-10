@@ -483,6 +483,15 @@ class AnnotationSyncController:
         # deltas (e.g. when the user draws several strokes before the
         # debounce fires) are all rendered, not just the last pair.
         stroke_events = []
+        # TextAnnotation specs are collected and reconciled together, in one
+        # apply_specs(mode="reconcile") call, for the same reason strokes are
+        # batched above: reconcile mode prunes every existing node of a kind
+        # not represented in *that call's* spec list, so calling it once per
+        # event (with a single-item spec list each time) makes each text spec
+        # prune away every *other* text node just written moments earlier by
+        # the previous iteration — e.g. two captions on one bookmark would
+        # each wipe the other out in turn instead of coexisting.
+        text_specs = []
         rendered = 0
         # Cache the paint node once for the UUID-existence checks below.
         _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
@@ -495,15 +504,6 @@ class AnnotationSyncController:
                     text_val = ev.text or ""
                     if not text_val.strip():
                         continue
-                    # Reconcile mode subsumes the old manual dup-uuid scan:
-                    # snapshot replay sending the full clip as insert_child
-                    # (already painted by _rebuild_rv_session) updates the
-                    # existing node in place instead of duplicating it; a
-                    # genuinely new uuid gets added.
-                    node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
-                    if not node:
-                        _log(f"RECV annotation: no paint node for text uuid={uuid_val[:8]!r}")
-                        continue
                     specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": rv_frame})
                     for spec in specs:
                         spec["user"] = "remote"
@@ -511,10 +511,8 @@ class AnnotationSyncController:
                             (name, ptype, [ev.font or ""] if name == "font" else val, dim)
                             for (name, ptype, val, dim) in spec["props"]
                         ]
-                    rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile")
-                    _log(f"RECV annotation: reconciled text uuid={uuid_val[:8]!r} (text={text_val!r})")
-                    if QtCore:
-                        QtCore.QTimer.singleShot(0, rv.commands.redraw)
+                    text_specs.extend(specs)
+                    _log(f"RECV annotation: queued text uuid={uuid_val[:8]!r} (text={text_val!r}) for reconcile")
                     rendered += 1
                 elif isinstance(ev, otio.schemadef.SyncEvent.EllipseAnnotation):
                     self._apply_shape_annotation({
@@ -565,6 +563,23 @@ class AnnotationSyncController:
             except Exception as e:
                 _log(f"RECV annotation: failed to deserialise event: {e}")
                 pass
+
+        if text_specs:
+            node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+            if node:
+                # prune=False: this is an insert_child delta (one more
+                # annotation clip layered onto a frame that may already have
+                # others), not the complete set of text for this frame — e.g.
+                # a caption added afterwards on its own, delta-only clip must
+                # not prune an earlier, unrelated caption still on this frame.
+                rv_paint_applier.apply_specs(
+                    text_specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile", prune=False
+                )
+                _log(f"RECV annotation: reconciled {len(text_specs)} text spec(s) in one batch (prune=False)")
+                if QtCore:
+                    QtCore.QTimer.singleShot(0, rv.commands.redraw)
+            else:
+                _log("RECV annotation: no paint node for queued text specs")
 
         rendered += self._finalize_pen_stroke_events(
             stroke_events, media_path, clip_guid, rv_frame, _paint_node_cache
@@ -946,8 +961,11 @@ class AnnotationSyncController:
             specs = rv_annotation_codec.sync_events_to_rv_specs([shape_event], {"frame": frame})
             for spec in specs:
                 spec["user"] = "remote"
-            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="reconcile")
-            _log(f"  _apply_shape_annotation: wrote {shape_type} node to {node}.frame:{frame}.order")
+            # prune=False: only ever called from the insert_child path (an
+            # incremental delta), never a true replace — see the matching
+            # comment on the text batch call in _apply_annotation_render.
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="reconcile", prune=False)
+            _log(f"  _apply_shape_annotation: wrote {shape_type} node to {node}.frame:{frame}.order (prune=False)")
             if QtCore:
                 QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:

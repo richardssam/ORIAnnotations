@@ -502,10 +502,10 @@ class AnnotationSyncController:
 
         # Detect in-place text edits: caption count is unchanged but content
         # differs.  Delta tracking (count-based) misses these, so we replace the
-        # full command list on the existing clip instead of appending a delta.
-        #
-        # Guard: only REPLACE when ann_clip_guid is in _our_annotation_clip_guids
-        # (a clip this peer created or previously broadcast to).
+        # full command list on the existing clip instead of appending a delta —
+        # regardless of whether that clip originated locally or from a remote
+        # peer (see the comment below on why "add a parallel clip instead" is
+        # unsafe).
         if sent_captions > 0 and sent_captions == len(all_captions):
             cap_key = str(bm_uuid)
             current_sig = self.caption_signature(all_captions)
@@ -521,58 +521,44 @@ class AnnotationSyncController:
                     f" ({len(all_captions)} captions)"
                 )
             if saved_sig != current_sig:
-                with self._our_bookmark_uuids_lock:
-                    is_remote_bookmark = str(bm_uuid) in self._our_bookmark_uuids
-
                 ann_clip_guid = self.plugin.manager.annotation_clip_guid_at(
                     clip_guid, int(clip_local_time.value)
                 )
                 if ann_clip_guid:
-                    if is_remote_bookmark or ann_clip_guid not in self._our_annotation_clip_guids:
-                        # Broadcast as a new independent annotation to avoid
-                        # overwriting a remote peer's annotation clip.
-                        all_events = (
-                            xs_strokes_to_sync_events(
-                                all_strokes, aspect_half, uuid_list=uuid_cache
-                            )
-                            + xs_captions_to_sync_events(all_captions, aspect_half)
+                    # Always replace the existing clip's commands in place —
+                    # regardless of whether it originated locally or from a
+                    # remote peer — rather than broadcasting a parallel new
+                    # clip ("add"). An "add" here used to be the only way to
+                    # avoid clobbering a remote peer's clip, but it leaves the
+                    # remote peer's *stale* original clip sitting in the OTIO
+                    # tree alongside the new one: count_annotation_commands
+                    # then counts both, sent_captions permanently exceeds the
+                    # real (single) caption count, and every future edit to
+                    # this bookmark silently no-ops (delta = all_captions[N:]
+                    # on a list shorter than N). Reusing the existing caption
+                    # uuids (extract_caption_uuids) is what keeps this safe:
+                    # the peer matches nodes by uuid and updates them in
+                    # place, so replacing the clip's contents doesn't drop or
+                    # duplicate anything it already has.
+                    existing_uuids = self.extract_caption_uuids(ann_clip_guid)
+                    all_events = (
+                        xs_strokes_to_sync_events(
+                            all_strokes, aspect_half, uuid_list=uuid_cache
                         )
-                        reason = (
-                            "local edit on remote bookmark"
-                            if is_remote_bookmark
-                            else "new local annotation at remote-owned frame"
+                        + xs_captions_to_sync_events(
+                            all_captions, aspect_half, existing_uuids
                         )
-                        _log(
-                            f"Broadcasting annotation add: {len(all_events)} event(s)"
-                            f" ({reason}) at frame={frame} clip={clip_guid[:8]}"
-                        )
-                        new_guid = self.plugin.manager.broadcast_add_annotation(
-                            annotation_track_guid=annotation_track_guid,
-                            clip_guid=clip_guid,
-                            clip_local_time=clip_local_time,
-                            events=all_events,
-                        )
-                        if new_guid:
-                            self._our_annotation_clip_guids.add(new_guid)
-                        with self._our_bookmark_uuids_lock:
-                            self._our_bookmark_uuids.discard(str(bm_uuid))
-                    else:
-                        existing_uuids = self.extract_caption_uuids(ann_clip_guid)
-                        all_events = (
-                            xs_strokes_to_sync_events(
-                                all_strokes, aspect_half, uuid_list=uuid_cache
-                            )
-                            + xs_captions_to_sync_events(
-                                all_captions, aspect_half, existing_uuids
-                            )
-                        )
-                        _log(
-                            f"Broadcasting annotation replace: {len(all_events)} event(s)"
-                            f" (caption edit) at frame={frame} clip={clip_guid[:8]}"
-                        )
-                        self.plugin.manager.broadcast_replace_annotation_commands(
-                            ann_clip_guid, all_events
-                        )
+                    )
+                    _log(
+                        f"Broadcasting annotation replace: {len(all_events)} event(s)"
+                        f" (caption edit) at frame={frame} clip={clip_guid[:8]}"
+                    )
+                    self.plugin.manager.broadcast_replace_annotation_commands(
+                        ann_clip_guid, all_events
+                    )
+                    self._our_annotation_clip_guids.add(ann_clip_guid)
+                    with self._our_bookmark_uuids_lock:
+                        self._our_bookmark_uuids.discard(str(bm_uuid))
                     self._last_sent_captions[cap_key] = current_sig
                     # Keep cache consistent so future ADD scans don't re-detect captions.
                     self._bookmark_captions_cache[bm_key] = all_captions

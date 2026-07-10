@@ -111,7 +111,7 @@ def _node_uuid(commands, rv_node: str, item: str) -> str:
 
 
 def apply_specs(specs: List[PaintNodeSpec], commands, *, rv_node: str, frame: int,
-                mode: str = "append", start_id=None) -> int:
+                mode: str = "append", start_id=None, prune: bool = True) -> int:
     """Write ``PaintNodeSpec`` entries to ``rv_node`` for ``frame``.
 
     :param specs: Ordered specs from :func:`sync_events_to_rv_specs`.
@@ -120,6 +120,14 @@ def apply_specs(specs: List[PaintNodeSpec], commands, *, rv_node: str, frame: in
     :param frame: Frame the annotations belong to (embedded in node names).
     :param mode: ``"append"`` or ``"reconcile"``.
     :param start_id: Optional starting strokeid (else read from ``paint.nextId``).
+    :param prune: ``"reconcile"``-only. When ``True`` (default), managed items
+        of a kind represented in ``specs`` whose uuid is absent get removed —
+        correct for true "replace" semantics (this payload is the complete set
+        for that kind, e.g. a text-edit/drag-move broadcast). Pass ``False``
+        for incremental adds (e.g. one more annotation clip layered onto a
+        frame that already has others): the caller's ``specs`` describe only
+        the *new* delta, not everything that should still exist, so pruning
+        would delete unrelated, still-valid items of the same kind.
     :returns: The next free strokeid after writing.
     :raises ValueError: on an unknown spec ``kind``.
     """
@@ -128,7 +136,7 @@ def apply_specs(specs: List[PaintNodeSpec], commands, *, rv_node: str, frame: in
             raise ValueError(f"apply_specs: unknown paint kind {spec['kind']!r}")
 
     if mode == "reconcile":
-        return _apply_reconcile(specs, commands, rv_node=rv_node, frame=frame, start_id=start_id)
+        return _apply_reconcile(specs, commands, rv_node=rv_node, frame=frame, start_id=start_id, prune=prune)
     if mode == "append":
         return _apply_append(specs, commands, rv_node=rv_node, frame=frame, start_id=start_id)
     raise ValueError(f"apply_specs: unknown mode {mode!r}")
@@ -152,7 +160,7 @@ def _apply_append(specs, commands, *, rv_node, frame, start_id) -> int:
     return strokeid
 
 
-def _apply_reconcile(specs, commands, *, rv_node, frame, start_id) -> int:
+def _apply_reconcile(specs, commands, *, rv_node, frame, start_id, prune: bool = True) -> int:
     _ensure_paint_tags(commands, rv_node)
     strokeid = _next_id(commands, rv_node, start_id)
     frame_node = f"{rv_node}.frame:{frame}"
@@ -188,16 +196,25 @@ def _apply_reconcile(specs, commands, *, rv_node, frame, start_id) -> int:
     # strokes (see annotation_sync._apply_annotation_replace) -- so a spec
     # list that says nothing about pen items must never be read as "no pen
     # items exist anymore".
-    pruned = []
-    for item in order:
-        prefix = item.split(":", 1)[0]
-        if prefix not in incoming_prefixes:
+    #
+    # prune=False skips this step entirely: the caller's specs describe an
+    # incremental delta (e.g. one more annotation clip layered onto a frame
+    # that already has others via insert_child), not the complete set of that
+    # kind that should exist -- pruning would delete unrelated, still-valid
+    # items of the same kind that simply weren't part of this delta.
+    if not prune:
+        pruned = order
+    else:
+        pruned = []
+        for item in order:
+            prefix = item.split(":", 1)[0]
+            if prefix not in incoming_prefixes:
+                pruned.append(item)
+                continue
+            uid = _node_uuid(commands, rv_node, item)
+            if uid and uid not in incoming_uuids:
+                continue
             pruned.append(item)
-            continue
-        uid = _node_uuid(commands, rv_node, item)
-        if uid and uid not in incoming_uuids:
-            continue
-        pruned.append(item)
 
     _write_order(commands, frame_node, pruned)
     _set_paint_next_id(commands, rv_node, strokeid)
