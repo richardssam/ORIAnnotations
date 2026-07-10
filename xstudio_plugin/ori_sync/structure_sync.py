@@ -19,7 +19,9 @@ try:
 except ImportError:
     _add_media_atom = None
 from otio_sync_core.manager import STATE_SYNCED
-from .utils import _log, _log_exc, _uri_to_posix_path
+from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
+
+_MEDIA_NAME_TIMEOUT_MS = 2000
 
 
 class StructureSyncController:
@@ -988,7 +990,17 @@ class StructureSyncController:
             except Exception:
                 continue
 
-            current_media_name_set = {m.name for m in current_media}
+            # Bound each name read: a media actor can be torn down mid-poll
+            # (rapid drag-drop, dedup reload) and an unbounded read on a dead
+            # actor blocks the poll thread for the full 100 s default timeout —
+            # skip stale entries instead of letting the whole poll hang/crash.
+            current_media_name_set = set()
+            for m in current_media:
+                try:
+                    with bounded_timeout(self.plugin.connection, _MEDIA_NAME_TIMEOUT_MS):
+                        current_media_name_set.add(m.name)
+                except Exception:
+                    _log(f"[2F] poll_sequence_new_media: stale media actor on tl={tl_guid[:8]} — name read timed out, skipping")
 
             # --- Deletions: broadcast REMOVE_CHILD for media removed from the bin ---
             prev_media_names = self._xs_sequence_media_names.get(tl_guid, set())
@@ -1008,12 +1020,18 @@ class StructureSyncController:
 
             # --- Additions (from media bin) ---
             for media in current_media:
-                if media.name in known_names:
+                try:
+                    with bounded_timeout(self.plugin.connection, _MEDIA_NAME_TIMEOUT_MS):
+                        media_name = media.name
+                except Exception:
+                    _log(f"[2F] poll_sequence_new_media: stale media actor on tl={tl_guid[:8]} — name read timed out, skipping")
+                    continue
+                if media_name in known_names:
                     continue
                 # Also check basename so full-path entries for known clips are skipped.
-                _bn = os.path.basename(media.name)
+                _bn = os.path.basename(media_name)
                 if _bn in known_names:
-                    known_names = known_names | {media.name}
+                    known_names = known_names | {media_name}
                     continue
                 try:
                     ms = media.media_source()
@@ -1056,9 +1074,9 @@ class StructureSyncController:
                         self.plugin.media.register(media, clip_guid, tl_guid)
                     self.plugin.manager.insert_child(track_guid, clip, new_index)
                     _log(f"sequence new media: {_bn!r} at index {new_index}")
-                    known_names = known_names | {media.name, _bn}
+                    known_names = known_names | {media_name, _bn}
                 except Exception:
-                    _log_exc(f"sequence new media: failed for {media.name!r}")
+                    _log_exc(f"sequence new media: failed for {media_name!r}")
 
             # --- Additions (direct track dragging) ---
             _log(

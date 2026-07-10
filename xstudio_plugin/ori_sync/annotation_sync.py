@@ -26,6 +26,22 @@ from .utils import _log, _log_exc, bounded
 _ANNOTATION_TIMEOUT_MS = 2000
 
 
+def _frame_start_timedelta(frame: int, fps: float) -> "datetime.timedelta":
+    """Return a ``timedelta`` that lands inside frame *frame*'s time window.
+
+    xStudio derives a bookmark's integer frame back from its stored time via
+    ``std::floor(flicks / rate)`` (``FrameRateDuration::frame``) — it never
+    rounds. ``frame / fps`` is the frame's exact *leading* edge, so any tiny
+    shortfall (``datetime.timedelta`` truncates to microseconds, losing a
+    sub-microsecond remainder for almost any non-multiple-of-fps frame) floors
+    down to ``frame - 1`` instead of ``frame``. Requesting the frame's
+    midpoint instead keeps the value safely inside ``[frame/fps,
+    (frame+1)/fps)`` even after that truncation, so it always floors back to
+    the intended frame.
+    """
+    return datetime.timedelta(seconds=(frame + 0.5) / fps)
+
+
 class AnnotationSyncController:
     """Owns annotation send/receive state and methods.
 
@@ -736,7 +752,7 @@ class AnnotationSyncController:
                     target=media
                 )
                 detail = BookmarkDetail()
-                detail.start = datetime.timedelta(seconds=frame / fps)
+                detail.start = _frame_start_timedelta(frame, fps)
                 detail.duration = datetime.timedelta(seconds=0)
                 self.plugin.connection.request_receive(
                     bm.remote, bookmark_detail_atom(), detail
@@ -995,7 +1011,7 @@ class AnnotationSyncController:
                 )
                 # Set start and duration in a single BookmarkDetail message.
                 detail = BookmarkDetail()
-                detail.start = datetime.timedelta(seconds=frame / fps)
+                detail.start = _frame_start_timedelta(frame, fps)
                 detail.duration = datetime.timedelta(seconds=0)
                 detail.author = "ORI Sync"
                 detail.note = "Annotation"

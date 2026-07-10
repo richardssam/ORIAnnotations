@@ -933,6 +933,8 @@ class SequenceSyncController:
             def _build_path_to_guid():
                 result = {}
                 for clip in media_track:
+                    if not isinstance(clip, otio.schema.Clip):
+                        continue
                     ref = clip.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
                         result[_media_path(ref.target_url)] = clip.metadata.get("sync", {}).get("guid")
@@ -957,7 +959,9 @@ class SequenceSyncController:
             otio_path_counts = Counter(
                 _media_path(clip.media_reference.target_url)
                 for clip in media_track
-                if hasattr(clip.media_reference, "target_url") and clip.media_reference.target_url
+                if isinstance(clip, otio.schema.Clip)
+                and hasattr(clip.media_reference, "target_url")
+                and clip.media_reference.target_url
             )
             seen_counts = Counter()
             valid_sgs_before = 0  # count of path-resolved source groups before current position
@@ -1271,6 +1275,8 @@ class SequenceSyncController:
                 path_to_sg = self._path_to_source_group_map()
                 new_inputs = []
                 for c in track:
+                    if not isinstance(c, otio.schema.Clip):
+                        continue
                     ref = c.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
                         sg = path_to_sg.get(_media_path(ref.target_url))
@@ -1300,6 +1306,8 @@ class SequenceSyncController:
                 path_to_sg = self._path_to_source_group_map()
                 new_inputs = []
                 for clip in track:
+                    if not isinstance(clip, otio.schema.Clip):
+                        continue
                     ref = clip.media_reference
                     if hasattr(ref, "target_url") and ref.target_url:
                         sg = path_to_sg.get(_media_path(ref.target_url))
@@ -1325,6 +1333,8 @@ class SequenceSyncController:
                     path_to_sg = self._path_to_source_group_map()
                     new_inputs = []
                     for clip in track:
+                        if not isinstance(clip, otio.schema.Clip):
+                            continue
                         ref = clip.media_reference
                         if hasattr(ref, "target_url") and ref.target_url:
                             sg = path_to_sg.get(_media_path(ref.target_url))

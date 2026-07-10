@@ -39,19 +39,18 @@ from otio_sync_core.manager import sync_event_schema
 
 #: OTIO ``TextAnnotation.font_size`` → xStudio caption ``font_size`` multiplier.
 #:
-#: 1.0 because both hosts' native font-size units are now anchored to the
-#: same "reference frame" convention: RV's ``fontSize`` (WCS fraction of
-#: image height) round-trips through ``RV_FONT_SCALE = 1080`` (see
-#: ``rv_annotation_codec``), and xStudio's own ``font_size`` is already
-#: pixels at a 1920-wide/1080-tall reference (``font.cpp``'s
-#: ``text_size * 2.0 / 1920.0``) — so no extra multiplier is needed. Verified
-#: empirically: rendering the same caption in both hosts and measuring
-#: on-screen glyph height gave a ratio of ~2.45 with the old value of 2.5,
-#: i.e. almost exactly proportional to the old constant itself, confirming
-#: 1.0 (not some other independently-tuned number) is the right value once
-#: the RV side reads ``fontSize`` correctly instead of the dead legacy
-#: ``size``/ptsize convention.
-XS_FONT_SCALE: float = 1.0
+#: Paired with ``RV_FONT_SCALE`` in ``rv_annotation_codec`` — the two must be
+#: recalibrated together. When ``RV_FONT_SCALE`` was ``1080.0`` (both hosts'
+#: native font-size units anchored to the same 1920x1080 reference frame),
+#: this was ``1.0``. ``RV_FONT_SCALE`` was later divided by an empirical 2.5
+#: (tuned against QPainter's real glyph output vs. a PIL testchart
+#: reference — see its docstring), which was never mirrored here. Re-verified
+#: empirically post-fix: rendering ``testchart_annotations.otio``'s
+#: "96pt Font Size Sample Text" caption (``font_size=37.07``) into both hosts
+#: and measuring on-screen glyph height as a fraction of frame height gave a
+#: RV/xStudio ratio of ~2.54 with this at 1.0 — i.e. almost exactly
+#: proportional to the un-mirrored ``/2.5``, confirming 2.5 restores parity.
+XS_FONT_SCALE: float = 2.5
 
 # Lazily resolved — requires OTIO_PLUGIN_MANIFEST_PATH to be populated first.
 _SyncEvent = None
