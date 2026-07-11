@@ -41,7 +41,6 @@ def _frame_start_timedelta(frame: int, fps: float) -> "datetime.timedelta":
     """
     return datetime.timedelta(seconds=(frame + 0.5) / fps)
 
-
 class AnnotationSyncController:
     """Owns annotation send/receive state and methods.
 
@@ -903,7 +902,6 @@ class AnnotationSyncController:
         try:
             self._bookmark_strokes_cache[bm_key] = pen_strokes
             self._bookmark_captions_cache[bm_key] = captions
-            _log_stroke_thickness("refresh_annotation_bookmark", pen_strokes)
             bm.set_annotation(strokes=pen_strokes, captions=captions)
             _log(
                 f"Refreshed annotation bookmark: {len(pen_strokes)} stroke(s),"
