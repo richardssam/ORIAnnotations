@@ -18,6 +18,13 @@ The plugin SHALL support runtime-configurable session identity. The session name
 - **THEN** it SHALL request a full state snapshot from the Master peer
 - **AND** it SHALL rebuild its local RV session (media sources, timeline) based on the received snapshot.
 
+#### Scenario: A failed annotation replay does not block the rest of the join
+
+- **WHEN** the joining instance replays the snapshot's annotation clips and one clip's event raises an exception (e.g. an unexpected event shape, or a lookup that fails for that specific clip)
+- **THEN** that one event's replay SHALL be skipped and logged
+- **AND** every other event, clip, and kind SHALL still be replayed
+- **AND** the join SHALL still apply playback state, display state, and color sync, none of which SHALL be silently skipped as a side effect of the annotation-replay failure
+
 #### Scenario: Session name from ORI_SESSION
 
 - **WHEN** `ORI_SESSION` is set at launch
