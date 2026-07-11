@@ -1587,96 +1587,109 @@ class SequenceSyncController:
                                         event = otio.adapters.read_from_string(otio.adapters.write_to_string(event, "otio_json"), "otio_json")
                                     except Exception:
                                         pass
-                                if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
-                                    if not (event.text or "").strip():
-                                        continue
-                                    rv_size = font_size_to_rv(event.font_size) if getattr(event, "font_size", None) else 0.01
-                                    uuid_val = event.uuid or ""
-                                    # Guard against duplicates when INSERT_CHILD already painted
-                                    # this node before the snapshot arrived.
-                                    paint_node = self.plugin.annotation._find_paint_node_for_media(media_path, frame) if media_path else None
-                                    if paint_node and self.plugin.annotation._text_uuid_exists_in_rv(paint_node, frame, uuid_val):
-                                        _log(f"  _rebuild_rv_session: skip dup text uuid={uuid_val[:8]!r}")
-                                        continue
-                                    text_data = {
-                                        "frame": frame,
-                                        "node_name": node_name,
-                                        "media_path": media_path,
-                                        "position": list(event.position) if getattr(event, "position", None) else [0.0, 0.0],
-                                        "color": list(event.rgba) if getattr(event, "rgba", None) else [1.0, 1.0, 1.0, 1.0],
-                                        "spacing": float(event.spacing) if getattr(event, "spacing", None) is not None else 0.8,
-                                        "size": rv_size,
-                                        "scale": float(event.scale) if getattr(event, "scale", None) is not None else 1.0,
-                                        "rotation": float(event.rotation) if getattr(event, "rotation", None) is not None else 0.0,
-                                        "font": event.font or "",
-                                        "text": event.text or "",
-                                        "uuid": uuid_val,
-                                    }
-                                    self.plugin.annotation._apply_text_annotation(text_data)
-                                elif isinstance(event, otio.schemadef.SyncEvent.EllipseAnnotation):
-                                    self.plugin.annotation._apply_shape_annotation({
-                                        "frame": frame,
-                                        "node_name": node_name,
-                                        "media_path": media_path,
-                                        "type": "ellipse",
-                                        "min": list(event.min),
-                                        "max": list(event.max),
-                                        "rgba": list(event.rgba),
-                                        "size": event.size,
-                                        "inner_rgba": list(event.inner_rgba),
-                                        "uuid": event.uuid,
-                                    })
-                                elif isinstance(event, otio.schemadef.SyncEvent.RectangleAnnotation):
-                                    self.plugin.annotation._apply_shape_annotation({
-                                        "frame": frame,
-                                        "node_name": node_name,
-                                        "media_path": media_path,
-                                        "type": "rect",
-                                        "min": list(event.min),
-                                        "max": list(event.max),
-                                        "rgba": list(event.rgba),
-                                        "size": event.size,
-                                        "inner_rgba": list(event.inner_rgba),
-                                        "uuid": event.uuid,
-                                    })
-                                elif isinstance(event, otio.schemadef.SyncEvent.ArrowAnnotation):
-                                    self.plugin.annotation._apply_shape_annotation({
-                                        "frame": frame,
-                                        "node_name": node_name,
-                                        "media_path": media_path,
-                                        "type": "arrow",
-                                        "start": list(event.start),
-                                        "end": list(event.end),
-                                        "rgba": list(event.rgba),
-                                        "size": event.size,
-                                        "uuid": event.uuid,
-                                    })
-                                elif hasattr(event, "uuid"):
-                                    if event.uuid not in event_groups:
-                                        event_groups[event.uuid] = {"start": None, "points": None}
-                                    if isinstance(event, otio.schemadef.SyncEvent.PaintStart):
-                                        event_groups[event.uuid]["start"] = event
-                                    elif isinstance(event, otio.schemadef.SyncEvent.PaintPoints):
-                                        event_groups[event.uuid]["points"] = event
+                                try:
+                                    if isinstance(event, otio.schemadef.SyncEvent.TextAnnotation):
+                                        if not (event.text or "").strip():
+                                            continue
+                                        rv_size = font_size_to_rv(event.font_size) if getattr(event, "font_size", None) else 0.01
+                                        uuid_val = event.uuid or ""
+                                        # Guard against duplicates when INSERT_CHILD already painted
+                                        # this node before the snapshot arrived.
+                                        paint_node, paint_native_frame = (
+                                            self.plugin.annotation._find_paint_node_for_media(media_path, frame)
+                                            if media_path else (None, frame)
+                                        )
+                                        if paint_node and self.plugin.annotation._text_uuid_exists_in_rv(paint_node, paint_native_frame, uuid_val):
+                                            _log(f"  _rebuild_rv_session: skip dup text uuid={uuid_val[:8]!r}")
+                                            continue
+                                        text_data = {
+                                            "frame": frame,
+                                            "node_name": node_name,
+                                            "media_path": media_path,
+                                            "position": list(event.position) if getattr(event, "position", None) else [0.0, 0.0],
+                                            "color": list(event.rgba) if getattr(event, "rgba", None) else [1.0, 1.0, 1.0, 1.0],
+                                            "spacing": float(event.spacing) if getattr(event, "spacing", None) is not None else 0.8,
+                                            "size": rv_size,
+                                            "scale": float(event.scale) if getattr(event, "scale", None) is not None else 1.0,
+                                            "rotation": float(event.rotation) if getattr(event, "rotation", None) is not None else 0.0,
+                                            "font": event.font or "",
+                                            "text": event.text or "",
+                                            "uuid": uuid_val,
+                                        }
+                                        self.plugin.annotation._apply_text_annotation(text_data)
+                                    elif isinstance(event, otio.schemadef.SyncEvent.EllipseAnnotation):
+                                        self.plugin.annotation._apply_shape_annotation({
+                                            "frame": frame,
+                                            "node_name": node_name,
+                                            "media_path": media_path,
+                                            "type": "ellipse",
+                                            "min": list(event.min),
+                                            "max": list(event.max),
+                                            "rgba": list(event.rgba),
+                                            "size": event.size,
+                                            "inner_rgba": list(event.inner_rgba),
+                                            "uuid": event.uuid,
+                                        })
+                                    elif isinstance(event, otio.schemadef.SyncEvent.RectangleAnnotation):
+                                        self.plugin.annotation._apply_shape_annotation({
+                                            "frame": frame,
+                                            "node_name": node_name,
+                                            "media_path": media_path,
+                                            "type": "rect",
+                                            "min": list(event.min),
+                                            "max": list(event.max),
+                                            "rgba": list(event.rgba),
+                                            "size": event.size,
+                                            "inner_rgba": list(event.inner_rgba),
+                                            "uuid": event.uuid,
+                                        })
+                                    elif isinstance(event, otio.schemadef.SyncEvent.ArrowAnnotation):
+                                        self.plugin.annotation._apply_shape_annotation({
+                                            "frame": frame,
+                                            "node_name": node_name,
+                                            "media_path": media_path,
+                                            "type": "arrow",
+                                            "start": list(event.start),
+                                            "end": list(event.end),
+                                            "rgba": list(event.rgba),
+                                            "size": event.size,
+                                            "uuid": event.uuid,
+                                        })
+                                    elif hasattr(event, "uuid"):
+                                        if event.uuid not in event_groups:
+                                            event_groups[event.uuid] = {"start": None, "points": None}
+                                        if isinstance(event, otio.schemadef.SyncEvent.PaintStart):
+                                            event_groups[event.uuid]["start"] = event
+                                        elif isinstance(event, otio.schemadef.SyncEvent.PaintPoints):
+                                            event_groups[event.uuid]["points"] = event
+                                except Exception as e:
+                                    _log(f"  _rebuild_rv_session: failed to replay {type(event).__name__} event "
+                                         f"for clip '{node_name}': {e}")
+                                    continue
 
                             for uuid, grp in event_groups.items():
                                 start_event = grp["start"]
                                 points_event = grp["points"]
                                 if not start_event or not points_event:
                                     continue
-                                data = {
-                                    "frame": frame,
-                                    "node_name": node_name,
-                                    "media_path": media_path,
-                                    "color": list(start_event.rgba),
-                                    "brush": start_event.brush,
-                                    "width": list(points_event.points.size),
-                                    "points": [val for pair in zip(points_event.points.x, points_event.points.y) for val in pair],
-                                    "join": 3,
-                                    "cap": 1,
-                                    "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
-                                }
-                                self.plugin.annotation._apply_annotation(data)
+                                try:
+                                    data = {
+                                        "frame": frame,
+                                        "node_name": node_name,
+                                        "media_path": media_path,
+                                        "color": list(start_event.rgba),
+                                        "brush": start_event.brush,
+                                        "width": list(points_event.points.size),
+                                        "points": [val for pair in zip(points_event.points.x, points_event.points.y) for val in pair],
+                                        "join": 3,
+                                        "cap": 1,
+                                        "mode": 1 if getattr(start_event, "type", "color") == "erase" else 0,
+                                    }
+                                    self.plugin.annotation._apply_annotation(data)
+                                except Exception as e:
+                                    _log(f"  _rebuild_rv_session: failed to replay pen/erase event "
+                                         f"uuid={uuid[:8]!r} for clip '{node_name}': {e}")
+                                    continue
 
         # Set active media track so do_add_clip works on clients too
         active_tl = self.plugin.sync_manager._timelines.get(self.plugin.sync_manager.active_timeline_guid)

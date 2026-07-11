@@ -808,6 +808,36 @@ class AnnotationSyncController:
                     pass
         return None, frame
 
+    def _text_uuid_exists_in_rv(self, node, frame, uuid_val):
+        """Return True if a `text:`-prefixed item at *node*'s frame:*frame*
+        bucket already carries *uuid_val* on its `.uuid` property.
+
+        Duplicate guard for join-time annotation replay: a live INSERT_CHILD
+        may have already painted this text annotation before the snapshot
+        arrived. Mirrors the `.uuid` property convention `_apply_annotation`
+        writes for pen strokes (``{node}.{item}.uuid``).
+        """
+        order_prop = f"{node}.frame:{frame}.order"
+        if not rv.commands.propertyExists(order_prop):
+            return False
+        try:
+            items = rv.commands.getStringProperty(order_prop) or []
+        except Exception:
+            return False
+        for item in items:
+            if not item.startswith("text:"):
+                continue
+            uuid_prop = f"{node}.{item}.uuid"
+            if not rv.commands.propertyExists(uuid_prop):
+                continue
+            try:
+                vals = rv.commands.getStringProperty(uuid_prop)
+            except Exception:
+                continue
+            if vals and vals[0] == uuid_val:
+                return True
+        return False
+
     def _apply_annotation(self, data):
         """Write a received pen/erase stroke to RV paint via the shared codec."""
         try:
