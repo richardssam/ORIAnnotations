@@ -40,6 +40,64 @@ _ORDER_PREFIX = {
 }
 
 
+#: Property names each item kind's component may have, keyed by the same
+#: prefix as ``_ORDER_PREFIX``. Mirrors OpenRV's own
+#: ``annotate_mode.mu::deleteStroke``, which removes a stroke by calling
+#: ``deleteProperty`` on each of its known sub-property paths. Sourced from
+#: ``rv_annotation_codec.py``'s spec-writing functions -- ``_pen_spec``,
+#: ``_text_spec``, ``_box_shape_spec`` (ellipse/rect share it), ``_arrow_spec``
+#: -- plus the pen-only ``uuid`` extra ``annotation_sync._apply_annotation``
+#: sets outside the codec. Keep these in sync with those functions' property
+#: tuples; listing a property an item never had is safe, since deletion
+#: absorbs "already gone" errors.
+_PEN_PROPS = (
+    "brush", "color", "debug", "join", "cap", "splat", "mode", "width", "points",
+    "startFrame", "duration", "softDeleted", "uuid",
+)
+_TEXT_PROPS = (
+    "position", "color", "spacing", "size", "fontSize", "font", "text",
+    "scale", "rotation", "origin", "debug", "startFrame", "duration", "mode",
+    "uuid", "softDeleted",
+)
+_BOX_SHAPE_PROPS = (
+    "min", "max", "borderColor", "innerColor", "borderWidth", "startFrame",
+    "duration", "eye", "uuid", "softDeleted",
+)
+_ARROW_PROPS = (
+    "startPos", "endPos", "borderColor", "innerColor", "borderWidth",
+    "thickness", "startFrame", "duration", "eye", "uuid", "softDeleted",
+)
+
+_DELETE_PROPS_BY_PREFIX = {
+    "pen": _PEN_PROPS,
+    "text": _TEXT_PROPS,
+    "ellipse": _BOX_SHAPE_PROPS,
+    "rect": _BOX_SHAPE_PROPS,
+    "arrow": _ARROW_PROPS,
+}
+
+
+def _delete_item_properties(commands, rv_node: str, item: str) -> None:
+    """Delete every RV property of a paint item's component.
+
+    The deletion counterpart of :func:`_write_spec_props`. Mirrors OpenRV's
+    own ``annotate_mode.mu::deleteStroke``: enumerate the item kind's known
+    sub-property names and delete each individually, absorbing errors for
+    properties already gone (or never set for this item).
+
+    :param commands: RV ``commands`` module (or a compatible fake).
+    :param rv_node: Paint node ``item`` belongs to.
+    :param item: Order-list entry, e.g. ``"pen:3:42:sam"``.
+    """
+    prefix = item.split(":", 1)[0]
+    base = f"{rv_node}.{item}"
+    for prop in _DELETE_PROPS_BY_PREFIX.get(prefix, ()):
+        try:
+            commands.deleteProperty(f"{base}.{prop}")
+        except Exception:
+            pass
+
+
 def _rv_type(commands, tag: str):
     return {
         TYPE_STRING: commands.StringType,
@@ -213,6 +271,7 @@ def _apply_reconcile(specs, commands, *, rv_node, frame, start_id, prune: bool =
                 continue
             uid = _node_uuid(commands, rv_node, item)
             if uid and uid not in incoming_uuids:
+                _delete_item_properties(commands, rv_node, item)
                 continue
             pruned.append(item)
 

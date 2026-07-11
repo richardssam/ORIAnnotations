@@ -307,11 +307,17 @@ class AnnotationSyncController:
                 continue
 
             points_flat = [v for pair in zip(pts_ev.points.x, pts_ev.points.y) for v in pair]
-            node = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+            node, native_frame = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
             if not node:
                 continue
 
-            key = (clip_guid, rv_frame)
+            # Use native_frame (RV's own per-source frame number, e.g. from
+            # embedded timecode) — not rv_frame — as the tracking key: it's
+            # what _apply_annotation below will actually write the stroke's
+            # frame:<N> bucket under (it independently resolves the same
+            # value from the same media_path/rv_frame/clip_guid), so cleanup
+            # must key off it too or it will never find the node to prune.
+            key = (clip_guid, native_frame)
             color = list(ev_dict.rgba) if ev_dict.rgba else [1.0, 1.0, 1.0, 1.0]
             brush = ev_dict.brush or "circle"
             widths = list(pts_ev.points.size) if pts_ev.points.size else [2.0]
@@ -334,7 +340,7 @@ class AnnotationSyncController:
                 self._partial_pen_nodes_by_key.setdefault(key, []).append(new_pen_node)
                 # Sweep away the previous tick's node(s) for this gesture now
                 # that this longer one supersedes them.
-                self._cleanup_partial_debris(node, clip_guid, rv_frame, keep=new_pen_node)
+                self._cleanup_partial_debris(node, clip_guid, native_frame, keep=new_pen_node)
 
     def _cleanup_partial_debris(self, node, clip_guid, rv_frame, keep=None):
         """Remove stray mid-gesture pen nodes once a gesture's final stroke lands.
@@ -402,6 +408,11 @@ class AnnotationSyncController:
 
         :param stroke_events: Deserialised ``PaintStart``/``PaintPoints``/
             ``PaintEnd`` SyncEvent objects (other kinds are ignored).
+        :param paint_node_cache: Optional ``(node, native_frame)`` tuple, as
+            returned by :meth:`_find_paint_node_for_media`, to reuse instead
+            of re-resolving it. ``native_frame`` (not *rv_frame*) is what
+            :meth:`_cleanup_partial_debris` must be keyed by, since that is
+            the frame bucket :meth:`_apply_annotation` actually writes to.
         :returns: Number of strokes finalised.
         """
         event_groups = {}
@@ -414,6 +425,11 @@ class AnnotationSyncController:
             elif isinstance(ev, otio.schemadef.SyncEvent.PaintPoints):
                 event_groups[ev_uuid]["points"] = ev
 
+        if paint_node_cache is not None:
+            node, native_frame = paint_node_cache
+        else:
+            node, native_frame = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+
         rendered = 0
         for grp in event_groups.values():
             start_event = grp["start"]
@@ -421,7 +437,6 @@ class AnnotationSyncController:
             if not start_event or not points_event:
                 continue
             ev_uuid = getattr(start_event, "uuid", None)
-            node = paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
             if ev_uuid:
                 self._partial_pen_nodes.pop(ev_uuid, None)
 
@@ -440,7 +455,7 @@ class AnnotationSyncController:
             })
             rendered += 1
             new_pen_node = self._partial_pen_nodes.pop(ev_uuid, None) if ev_uuid else None
-            self._cleanup_partial_debris(node, clip_guid, rv_frame, keep=new_pen_node)
+            self._cleanup_partial_debris(node, clip_guid, native_frame, keep=new_pen_node)
             self._live_stroke_node.pop((clip_guid, rv_frame), None)
         return rendered
 
@@ -496,7 +511,11 @@ class AnnotationSyncController:
         text_specs = []
         rendered = 0
         # Cache the paint node once for the UUID-existence checks below.
+        # native_frame is RV's own per-source frame number for this node
+        # (see _find_paint_node_for_media) -- the frame:<N> bucket and
+        # startFrame RV actually renders against, not rv_frame.
         _paint_node_cache = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+        _cached_node, _cached_native_frame = _paint_node_cache
         for ev in events_data:
             try:
                 if isinstance(ev, (dict, collections.abc.Mapping)):
@@ -506,7 +525,7 @@ class AnnotationSyncController:
                     text_val = ev.text or ""
                     if not text_val.strip():
                         continue
-                    specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": rv_frame})
+                    specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": _cached_native_frame})
                     for spec in specs:
                         spec["user"] = "remote"
                         spec["props"] = [
@@ -567,7 +586,7 @@ class AnnotationSyncController:
                 pass
 
         if text_specs:
-            node = _paint_node_cache or self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+            node = _cached_node
             if node:
                 # prune=False: this is an insert_child delta (one more
                 # annotation clip layered onto a frame that may already have
@@ -575,7 +594,7 @@ class AnnotationSyncController:
                 # a caption added afterwards on its own, delta-only clip must
                 # not prune an earlier, unrelated caption still on this frame.
                 rv_paint_applier.apply_specs(
-                    text_specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile", prune=False
+                    text_specs, rv.commands, rv_node=node, frame=_cached_native_frame, mode="reconcile", prune=False
                 )
                 _log(f"RECV annotation: reconciled {len(text_specs)} text spec(s) in one batch (prune=False)")
                 if QtCore:
@@ -635,9 +654,25 @@ class AnnotationSyncController:
         else:
             rv_frame = self._media_frame_base(media_path) + _clip_local
 
-        node = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
+        node, native_frame = self._find_paint_node_for_media(media_path, rv_frame, clip_guid)
         if not node:
             _log(f"RECV annotation replace: no paint node for media_path={media_path} frame={rv_frame}")
+            return
+
+        if not events_data:
+            # Authoritatively empty replace (a full local clear on the sending
+            # peer, not merely a replace that omits a kind on purpose -- see
+            # otio-annotation-sync's "Authoritative Empty Replace Semantics").
+            # apply_specs' reconcile mode infers which kinds it may prune from
+            # what's present in `specs`, so an empty `specs` list reads as "no
+            # opinion, prune nothing" rather than "this frame is now empty" --
+            # hard-clear the frame's order property directly instead.
+            order_prop = f"{node}.frame:{native_frame}.order"
+            if rv.commands.propertyExists(order_prop):
+                rv.commands.setStringProperty(order_prop, [], True)
+                _log(f"RECV annotation replace: hard-cleared {order_prop}")
+            if QtCore:
+                QtCore.QTimer.singleShot(0, rv.commands.redraw)
             return
 
         _STROKE_TYPES = (otio.schemadef.SyncEvent.PaintStart, otio.schemadef.SyncEvent.PaintPoints,
@@ -654,7 +689,7 @@ class AnnotationSyncController:
             if isinstance(ev, _STROKE_TYPES):
                 continue
 
-            ev_specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": rv_frame})
+            ev_specs = rv_annotation_codec.sync_events_to_rv_specs([ev], {"frame": native_frame})
             for spec in ev_specs:
                 spec["user"] = "remote"
                 if spec["kind"] == "text":
@@ -666,7 +701,7 @@ class AnnotationSyncController:
                 _log(f"RECV annotation replace: reconciling {spec['kind']} uuid={spec['uuid'][:8]!r}")
             specs.extend(ev_specs)
 
-        rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=rv_frame, mode="reconcile")
+        rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=native_frame, mode="reconcile")
 
         if QtCore:
             QtCore.QTimer.singleShot(0, rv.commands.redraw)
@@ -686,6 +721,18 @@ class AnnotationSyncController:
         can differ by many frames in a cut sequence with repeated media).
         frameStart() — 0 for OTIO sequences, 1 for native — replaces the
         historic hardcoded +1 so the formula is correct in both contexts.
+
+        :returns: ``(node, native_frame)``. ``native_frame`` is RV's own
+            per-source frame number for *node* — the value
+            ``metaEvaluateClosestByType`` reports (e.g. ``96899`` for a clip
+            with embedded timecode), NOT the caller's *frame* or the
+            sequence-position *seq_frame* computed below. RV keys a paint
+            node's ``frame:<N>`` bucket and each stroke's ``startFrame`` by
+            this native number; writing under any other number means RV's
+            render pass never finds the stroke. Callers MUST use the
+            returned ``native_frame`` (not *frame*) for both. Falls back to
+            *frame* only in the no-sequence-in-graph branch below, where
+            there is no ``MetaEvalInfo`` to read a native frame from.
         """
         seq_frame = frame
         if self.plugin.sync_manager:
@@ -744,29 +791,25 @@ class AnnotationSyncController:
                             _log(f"  _find_paint_node: could not get sequence frame: {e}")
 
         eval_infos = rv.commands.metaEvaluateClosestByType(seq_frame, "RVPaint")
-        _log(f"  _find_paint_node: metaEval local_frame={frame} seq_frame={seq_frame} → {[e.get('node') for e in eval_infos] if eval_infos else None}")
+        _log(f"  _find_paint_node: metaEval local_frame={frame} seq_frame={seq_frame} → "
+             f"{[(e.get('node'), e.get('frame')) for e in eval_infos] if eval_infos else None}")
         if eval_infos:
-            return eval_infos[0]['node']
-        # Fallback for source-view contexts (no sequence in the graph).
+            return eval_infos[0]['node'], eval_infos[0]['frame']
+        # Fallback for source-view contexts (no sequence in the graph): no
+        # MetaEvalInfo to read a native frame from, so keep the caller's frame.
         source_group = self.plugin.sequence._path_to_source_group_map().get(media_path)
         if source_group:
             for n in rv.commands.nodesInGroup(source_group):
                 try:
                     if rv.commands.nodeType(n) == "RVPaint":
                         _log(f"  _find_paint_node: fallback source-level node {n}")
-                        return n
+                        return n, frame
                 except Exception:
                     pass
-        return None
+        return None, frame
 
     def _apply_annotation(self, data):
-        """Write a received pen/erase stroke to RV paint via the shared codec.
-
-        ``hold``/``ghost``/``ghostBefore``/``ghostAfter`` are local RV display
-        properties, not part of the sync schema — they are always written as
-        fixed defaults (0) here, never derived from network data (matching
-        ``_construct_annotation_events``'s send-side note).
-        """
+        """Write a received pen/erase stroke to RV paint via the shared codec."""
         try:
             frame = data.get("frame")
             points = data.get("points")
@@ -777,8 +820,8 @@ class AnnotationSyncController:
             media_path = data.get("media_path")
             ann_clip_guid = data.get("clip_guid")
             _log(f"RECV annotation frame={frame} brush={brush} node={node_name} npts={len(points) // 2 if points else 0}")
-            node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
-            _log(f"  _apply_annotation: using node={node}")
+            node, native_frame = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
+            _log(f"  _apply_annotation: using node={node} native_frame={native_frame}")
             if not node:
                 # Last resort: sender's node name verbatim
                 if node_name and rv.commands.nodeExists(node_name):
@@ -799,12 +842,12 @@ class AnnotationSyncController:
             y = [p for p in points[1::2]]
             points_event = se.PaintPoints(uuid=pairing_uuid, points=se.PaintVertices(x, y, list(width)))
 
-            specs = rv_annotation_codec.sync_events_to_rv_specs([start_event, points_event], {"frame": frame})
+            specs = rv_annotation_codec.sync_events_to_rv_specs([start_event, points_event], {"frame": native_frame})
             for spec in specs:
                 spec["user"] = "remote"
-            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="append")
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=native_frame, mode="append")
 
-            order_prop = f"{node}.frame:{frame}.order"
+            order_prop = f"{node}.frame:{native_frame}.order"
             pen_items = [i for i in rv.commands.getStringProperty(order_prop) if i.startswith(("pen:",))]
             if not pen_items:
                 return
@@ -850,8 +893,8 @@ class AnnotationSyncController:
             uuid_val = data.get("uuid", "")
 
             _log(f"RECV text annotation frame={frame} text={text} uuid={uuid_val}")
-            node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
-            _log(f"  _apply_text_annotation: using node={node}")
+            node, native_frame = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
+            _log(f"  _apply_text_annotation: using node={node} native_frame={native_frame}")
             if not node:
                 if node_name and rv.commands.nodeExists(node_name):
                     node = node_name
@@ -872,15 +915,15 @@ class AnnotationSyncController:
                 scale=float(data.get("scale", 1.0)),
                 uuid=uuid_val,
             )
-            specs = rv_annotation_codec.sync_events_to_rv_specs([text_event], {"frame": frame})
+            specs = rv_annotation_codec.sync_events_to_rv_specs([text_event], {"frame": native_frame})
             for spec in specs:
                 spec["user"] = "remote"
                 spec["props"] = [
                     (name, ptype, [data.get("font", "")] if name == "font" else val, dim)
                     for (name, ptype, val, dim) in spec["props"]
                 ]
-            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="append")
-            _log(f"  _apply_text_annotation: wrote text node to {node}.frame:{frame}.order")
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=native_frame, mode="append")
+            _log(f"  _apply_text_annotation: wrote text node to {node}.frame:{native_frame}.order")
             if QtCore:
                 QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:
@@ -945,8 +988,8 @@ class AnnotationSyncController:
             uuid_val = data.get("uuid")
 
             _log(f"RECV shape annotation frame={frame} type={shape_type} uuid={uuid_val}")
-            node = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
-            _log(f"  _apply_shape_annotation: using node={node}")
+            node, native_frame = self._find_paint_node_for_media(media_path, frame, ann_clip_guid)
+            _log(f"  _apply_shape_annotation: using node={node} native_frame={native_frame}")
             if not node:
                 if node_name and rv.commands.nodeExists(node_name):
                     node = node_name
@@ -966,14 +1009,14 @@ class AnnotationSyncController:
                     rgba=list(data.get("rgba")), size=float(data.get("size", 1.0)),
                     inner_rgba=list(data.get("inner_rgba")), uuid=uuid_val)
 
-            specs = rv_annotation_codec.sync_events_to_rv_specs([shape_event], {"frame": frame})
+            specs = rv_annotation_codec.sync_events_to_rv_specs([shape_event], {"frame": native_frame})
             for spec in specs:
                 spec["user"] = "remote"
             # prune=False: only ever called from the insert_child path (an
             # incremental delta), never a true replace — see the matching
             # comment on the text batch call in _apply_annotation_render.
-            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=frame, mode="reconcile", prune=False)
-            _log(f"  _apply_shape_annotation: wrote {shape_type} node to {node}.frame:{frame}.order (prune=False)")
+            rv_paint_applier.apply_specs(specs, rv.commands, rv_node=node, frame=native_frame, mode="reconcile", prune=False)
+            _log(f"  _apply_shape_annotation: wrote {shape_type} node to {node}.frame:{native_frame}.order (prune=False)")
             if QtCore:
                 QtCore.QTimer.singleShot(0, rv.commands.redraw)
         except Exception as e:

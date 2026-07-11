@@ -241,7 +241,7 @@ def _points_xyz(pts: Any):
 
 # --- Convert: intermediate strokes → PaintNodeSpec ------------------------
 
-def _pen_spec(stroke: dict) -> PaintNodeSpec:
+def _pen_spec(stroke: dict, frame: int) -> PaintNodeSpec:
     brush_name = "gauss" if str(stroke["brush"]).lower() in ("gauss", "gaussian") else "circle"
     width = stroke["width"] or []
     props = [
@@ -251,11 +251,17 @@ def _pen_spec(stroke: dict) -> PaintNodeSpec:
         ("join", TYPE_INT, [3], 1),
         ("cap", TYPE_INT, [1], 1),
         ("splat", TYPE_INT, [1 if brush_name == "gauss" else 0], 1),
+        ("mode", TYPE_INT, [1 if stroke["kind"] == "erase" else 0], 1),
     ]
-    if stroke["kind"] == "erase":
-        props.append(("mode", TYPE_INT, [1], 1))
     props.append(("width", TYPE_FLOAT, [w * RV_WIDTH_SCALE for w in width], 1))
     props.append(("points", TYPE_FLOAT, list(stroke["points"]), 2))
+    # startFrame/duration/softDeleted mirror what RV's own native pen tool
+    # writes (see _text_spec/_box_shape_spec) -- without them the stroke has
+    # no active-interval RV's render pass can test the current frame
+    # against, so it sits in the node's properties but never actually draws.
+    props.append(("startFrame", TYPE_INT, [frame], 1))
+    props.append(("duration", TYPE_INT, [1], 1))
+    props.append(("softDeleted", TYPE_INT, [0], 1))
     return {"kind": stroke["kind"], "uuid": stroke["uuid"], "user": stroke["user"], "props": props}
 
 
@@ -358,8 +364,8 @@ def sync_events_to_rv_specs(events: List[Any], ctx: Optional[dict] = None) -> Li
     Pure: no ``rv.commands`` import, so this is unit-testable outside RV.
 
     :param events: SyncEvent objects (or serialised dicts) for one frame.
-    :param ctx: Optional context. ``ctx["frame"]`` sets ``startFrame`` on text
-        and shape specs (default 0).
+    :param ctx: Optional context. ``ctx["frame"]`` sets ``startFrame`` on
+        pen/text/shape specs (default 0).
     :returns: Ordered list of ``PaintNodeSpec`` dicts.
     """
     frame = int((ctx or {}).get("frame", 0))
@@ -370,7 +376,7 @@ def sync_events_to_rv_specs(events: List[Any], ctx: Optional[dict] = None) -> Li
             stroke = _degrade_shape_to_pen(stroke)
             kind = "pen"
         if kind in ("pen", "erase"):
-            specs.append(_pen_spec(stroke))
+            specs.append(_pen_spec(stroke, frame))
         elif kind == "text":
             specs.append(_text_spec(stroke, frame))
         elif kind in ("ellipse", "rect"):
