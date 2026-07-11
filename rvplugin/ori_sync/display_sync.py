@@ -91,20 +91,52 @@ class DisplaySyncController:
         nodes = rv.commands.nodesOfType("RVColor")
         return nodes[0] if nodes else None
 
+    def _read_annotations_visible(self):
+        """Return the session-wide annotation visibility, read from RV's
+        per-source ``<RVPaint node>.paint.show`` toggle ("Show Drawings").
+
+        Must read the *currently viewed* ``RVPaint`` node specifically (via
+        ``metaEvaluateClosestByType``, the same resolution
+        ``annotation_sync._find_paint_node_for_media`` uses) rather than "any
+        node that happens to have the property set" -- since a remote peer's
+        broadcast is applied to *every* ``RVPaint`` node (this feature's
+        session-wide scope), several nodes can hold different values at once,
+        and scanning for the first one found could read a stale node instead
+        of the one the local user just toggled.
+
+        The property only exists on a node once "Show Drawings" has been
+        toggled for it at least once (freshly-created nodes have no opinion)
+        -- default to visible (``True``) if absent, matching this feature's
+        documented "absent means visible" semantics.
+        """
+        try:
+            eval_infos = rv.commands.metaEvaluateClosestByType(rv.commands.frame(), "RVPaint")
+            if eval_infos:
+                prop = f"{eval_infos[0]['node']}.paint.show"
+                if rv.commands.propertyExists(prop):
+                    return bool(rv.commands.getIntProperty(prop)[0])
+        except Exception as e:
+            _log(f"WARN _read_annotations_visible: {e}")
+        return True
+
     def _read_rv_display_state(self):
-        """Return a dict with pan, zoom, exposure and channel for the current session.
+        """Return a dict with pan, zoom, exposure, channel and annotation
+        visibility for the current session.
 
         Pan/zoom come from ``rv.extra_commands.translation()`` / ``.scale()``.
         Exposure comes from the ``RVColor.color.exposure`` node for the
         *currently visible* source (the ``e`` key; 3-element RGB array, channel
         0 used as scalar).  Channel comes from ``RVDisplayColor.color.channelFlood``
-        (``r``/``g``/``b``/``a`` keys; 0=RGBA 1=R 2=G 3=B 4=A).
+        (``r``/``g``/``b``/``a`` keys; 0=RGBA 1=R 2=G 3=B 4=A). Annotation
+        visibility comes from the per-source "Show Drawings" toggle, applied
+        session-wide on receive (see :meth:`_apply_display_state`).
         """
         state = {
             "pan": [0.0, 0.0],
             "zoom": 1.0,
             "exposure": 0.0,
             "channel": "RGBA",
+            "annotations_visible": self._read_annotations_visible(),
         }
         # Pan and zoom via rv.extra_commands (viewer-level, not a node property).
         try:
@@ -212,8 +244,10 @@ class DisplaySyncController:
         zoom = data.get("zoom")
         exposure = data.get("exposure", 0.0)
         channel = data.get("channel", "RGBA")
+        annotations_visible = data.get("annotations_visible", True)
         _log(f"RECV display pan={pan} zoom={zoom} "
-             f"exposure={exposure:.3f} channel={channel}")
+             f"exposure={exposure:.3f} channel={channel} "
+             f"annotations_visible={annotations_visible}")
 
         if pan is not None:
             try:
@@ -243,6 +277,19 @@ class DisplaySyncController:
             except Exception as e:
                 _log(f"RECV display: channel set failed ({dc}): {e}")
 
+        # Annotation visibility ("Show Drawings") is applied session-wide --
+        # every RVPaint node, not just the one that originated the change on
+        # the sending peer -- matching xStudio's own global toggle scope.
+        try:
+            show_val = 1 if annotations_visible else 0
+            for node in rv.commands.nodesOfType("RVPaint"):
+                prop = f"{node}.paint.show"
+                if not rv.commands.propertyExists(prop):
+                    rv.commands.newProperty(prop, rv.commands.IntType, 1)
+                rv.commands.setIntProperty(prop, [show_val], True)
+        except Exception as e:
+            _log(f"RECV display: annotations_visible set failed: {e}")
+
         # Keep _last_display_state consistent with what we actually hold.
         # If the sender omitted pan/zoom, preserve our current read-back values
         # so the next broadcast comparison doesn't spuriously see a change.
@@ -252,5 +299,6 @@ class DisplaySyncController:
             "zoom": float(zoom) if zoom is not None else cur["zoom"],
             "exposure": exposure,
             "channel": channel,
+            "annotations_visible": annotations_visible,
         }
         rv.commands.redraw()

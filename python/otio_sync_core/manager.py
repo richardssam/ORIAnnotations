@@ -65,6 +65,28 @@ def sync_event_schema(cmd: Any) -> str:
     return ""
 
 
+def _cmd_uuid(cmd: Any) -> "str | None":
+    """Return the ``uuid`` field of a SyncEvent object or a serialised dict.
+
+    Centralises the ``getattr(cmd, "uuid", None) or cmd.get("uuid")`` pattern
+    used throughout annotation-handling code. Duck-types the dict-like
+    fallback via ``.get`` rather than ``isinstance(cmd, dict)`` -- a dict
+    written into OTIO ``metadata`` and read back is an
+    ``opentimelineio.core.AnyDictionary``, which supports ``.get`` but is not
+    an ``isinstance`` match for ``dict``.
+
+    :param cmd: A deserialised SyncEvent object or a raw/OTIO-wrapped dict.
+    :returns: The command's uuid string, or ``None`` if absent.
+    :rtype: str or None
+    """
+    uid = getattr(cmd, "uuid", None)
+    if uid is None:
+        get = getattr(cmd, "get", None)
+        if callable(get):
+            uid = get("uuid")
+    return uid
+
+
 #: Session has not yet started.
 STATE_NONE = "NONE"
 #: Broadcasting ``WHO_IS_MASTER``; waiting for a response.
@@ -1202,6 +1224,57 @@ class SyncManager:
                 elif schema.startswith("TextAnnotation"):
                     n_captions += 1
         return n_strokes, n_captions
+
+    def annotation_clip_guid_for_stroke_uuid(self, stroke_uuid: str) -> "str | None":
+        """Return the sync GUID of the annotation clip containing *stroke_uuid*.
+
+        Scans every timeline's Annotations track(s) for a clip whose
+        ``annotation_commands`` includes a command with this uuid. Used to
+        resolve a host-reported deleted-stroke uuid (e.g. RV's ``clear-paint``
+        / ``clear-all-paint`` internal events) back to the owning annotation
+        clip without re-deriving the host's own frame/node context.
+
+        :param stroke_uuid: The uuid of a ``PaintStart``, ``TextAnnotation``,
+            or shape command to look up.
+        :returns: The owning annotation clip's sync GUID, or ``None`` if not found.
+        :rtype: str or None
+        """
+        for timeline in self._timelines.values():
+            for track in timeline.tracks:
+                if not track.name or "annotation" not in track.name.lower():
+                    continue
+                for item in track:
+                    if not isinstance(item, otio.schema.Clip):
+                        continue
+                    for cmd in item.metadata.get("annotation_commands", []):
+                        if _cmd_uuid(cmd) == stroke_uuid:
+                            return item.metadata.get("sync", {}).get("guid")
+        return None
+
+    def surviving_annotation_commands(
+        self, annotation_clip_guid: str, deleted_uuids: "set[str]"
+    ) -> list:
+        """Return *annotation_clip_guid*'s current commands minus *deleted_uuids*.
+
+        Shared helper for both RV and xStudio delete-detection paths: given
+        the set of stroke/text/shape uuids a host reported as locally
+        deleted, compute the surviving command list to broadcast via
+        :meth:`broadcast_replace_annotation_commands`.
+
+        :param annotation_clip_guid: Sync GUID of the annotation clip to read.
+        :param deleted_uuids: Set of command uuids that were deleted locally.
+        :returns: The clip's remaining commands, in original order. Empty if
+            every command was deleted, or if the clip is not found.
+        :rtype: list
+        """
+        clip = self._object_map.get(annotation_clip_guid)
+        if clip is None:
+            return []
+        return [
+            cmd
+            for cmd in clip.metadata.get("annotation_commands", [])
+            if _cmd_uuid(cmd) not in deleted_uuids
+        ]
 
     def broadcast_add_annotation(
         self,

@@ -88,12 +88,22 @@ class AnnotationSyncController:
 
     # ── annotation event handlers ──────────────────────────────────────
 
-    def on_annotation_event(self, data) -> None:
-        """Called by xStudio when the user completes a stroke in the viewport.
+    #: AnnotationsUI event names that mean "annotation visibility changed",
+    #: handled by broadcasting display_settings instead of scheduling a
+    #: bookmark scan. See annotations_ui_plugin.cpp's toggle_visibility_hotkey_.
+    _VISIBILITY_EVENTS = ("HideDrawings", "ShowDrawings")
 
-        Fired by the AnnotationsUI plugin's event group whenever a stroke is
-        committed (``annotation_atom``).  Records the time so the poll thread
-        can find and broadcast the new bookmark after debounce.
+    def on_annotation_event(self, data) -> None:
+        """Called by xStudio when the user completes a stroke, clears a
+        drawing, or toggles annotation visibility in the viewport.
+
+        Fired by the AnnotationsUI plugin's event group for a variety of
+        actions (``annotation_atom``), including ``PaintClear``,
+        ``HideDrawings``/``ShowDrawings``, tool switches, etc. — the JsonStore
+        payload's ``"event"`` field discriminates which. Visibility events are
+        broadcast immediately as a display-state change; every other
+        recognised or unrecognised event (including ``PaintClear``) schedules
+        the existing debounced bookmark scan, unchanged from prior behavior.
 
         :param data: Event tuple from the AnnotationsUI plugin events group.
             Shape: ``(event_atom, annotation_atom, JsonStore)``.
@@ -111,7 +121,23 @@ class AnnotationSyncController:
             return
         if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
             return
-        _log("Annotation event from AnnotationsUI — scheduling broadcast scan")
+
+        event_name = None
+        try:
+            payload = data[2]
+            if isinstance(payload, JsonStore):
+                payload = json.loads(payload.dump())
+            if isinstance(payload, dict):
+                event_name = payload.get("event")
+        except Exception:
+            event_name = None
+
+        if event_name in self._VISIBILITY_EVENTS:
+            _log(f"Annotation event from AnnotationsUI: {event_name} — broadcasting visibility")
+            self.plugin.display.poll_and_broadcast_display()
+            return
+
+        _log(f"Annotation event from AnnotationsUI (event={event_name!r}) — scheduling broadcast scan")
         self.plugin._annotation_pending_time = time.monotonic()
 
     def on_core_annotation_event(self, data) -> None:
@@ -141,13 +167,27 @@ class AnnotationSyncController:
                 f" len={len(data)} types={types}"
             )
         if not (
-            len(data) >= 4
+            len(data) >= 3
             and isinstance(data[0], event_atom)
             and isinstance(data[1], annotation_data_atom)
         ):
             _log(f"[2C] guard rejected event #{self._core_events_received}")
             return
         if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
+            return
+
+        if len(data) == 3:
+            # AnnotationsCore::clear_annotation's post-clear broadcast: a
+            # 3-tuple (event_atom, annotation_data_atom, AnnotationBasePtr) --
+            # a different, shorter shape than the 4/5-tuple live-stroke events
+            # below (see annotations_core_plugin.cpp: "for Sync plugin,
+            # broadcast new state of annotation after clear"). The annotation
+            # payload itself isn't parsed here -- schedule the existing
+            # debounced flush so broadcast_local_bookmark's count-decrease
+            # detection picks up the clear on the next scan (~250ms) instead
+            # of waiting for the 30s fallback scan.
+            _log("[2C] AnnotationsCore: clear-annotation broadcast — scheduling flush")
+            self.plugin._annotation_pending_time = time.monotonic()
             return
 
         # Discriminate by tuple length, NOT by data[2] type.
@@ -500,6 +540,47 @@ class AnnotationSyncController:
         # UUIDs for the delta strokes start at index sent_strokes.
         delta_uuids = uuid_cache[sent_strokes:len(all_strokes)]
 
+        # Detect local deletion: a stroke/caption count that *dropped* below
+        # what's already broadcast (e.g. Ctrl+D "Delete all strokes", or any
+        # gesture that removes some but not all annotations on this frame).
+        # The plain delta above (`all_strokes[sent_strokes:]`) silently
+        # computes an empty slice on a decrease and would otherwise drop the
+        # deletion entirely -- rebuild and broadcast the complete surviving
+        # state instead, reusing existing uuids so unaffected items are
+        # matched in place (not duplicated) on every peer.
+        if len(all_strokes) < sent_strokes or len(all_captions) < sent_captions:
+            ann_clip_guid = self.plugin.manager.annotation_clip_guid_at(
+                clip_guid, int(clip_local_time.value)
+            )
+            if ann_clip_guid:
+                existing_caption_uuids = self.extract_caption_uuids(ann_clip_guid)
+                all_events = (
+                    xs_strokes_to_sync_events(all_strokes, aspect_half, uuid_list=uuid_cache)
+                    + xs_captions_to_sync_events(all_captions, aspect_half, existing_caption_uuids)
+                )
+                _log(
+                    f"Broadcasting annotation replace: {len(all_events)} event(s)"
+                    f" (local delete: strokes {sent_strokes}->{len(all_strokes)},"
+                    f" captions {sent_captions}->{len(all_captions)})"
+                    f" at frame={frame} clip={clip_guid[:8]}"
+                )
+                self.plugin.manager.broadcast_replace_annotation_commands(
+                    ann_clip_guid, all_events
+                )
+                self._our_annotation_clip_guids.add(ann_clip_guid)
+                with self._our_bookmark_uuids_lock:
+                    self._our_bookmark_uuids.discard(str(bm_uuid))
+                # Keep caches consistent with the new (smaller) authoritative
+                # state so future scans diff against the post-delete baseline.
+                self._bookmark_strokes_cache[bm_key] = all_strokes
+                self._bookmark_captions_cache[bm_key] = all_captions
+                if all_captions:
+                    self._last_sent_captions[str(bm_uuid)] = self.caption_signature(all_captions)
+                return True
+            # No annotation clip on record for this bookmark (never broadcast
+            # in the first place) -- nothing to replace.
+            return False
+
         # Detect in-place text edits: caption count is unchanged but content
         # differs.  Delta tracking (count-based) misses these, so we replace the
         # full command list on the existing clip instead of appending a delta —
@@ -802,11 +883,27 @@ class AnnotationSyncController:
         pen_strokes = sync_events_to_xs_strokes(all_commands, aspect_half)
         captions = sync_events_to_xs_captions(all_commands, aspect_half)
         if not pen_strokes and not captions:
+            if not all_commands:
+                # Authoritatively empty (see otio-annotation-sync's
+                # "Authoritative Empty Replace Semantics") -- unlike a
+                # non-empty command list that happens to decode to nothing,
+                # an empty incoming command list means the sending peer's
+                # clip now genuinely has zero annotations. Apply it
+                # unconditionally rather than early-returning below, which
+                # would otherwise leave stale strokes/captions on the bookmark.
+                try:
+                    self._bookmark_strokes_cache[bm_key] = []
+                    self._bookmark_captions_cache[bm_key] = []
+                    bm.set_annotation(strokes=[], captions=[])
+                    _log(f"Hard-cleared annotation bookmark at frame {frame}")
+                except Exception:
+                    _log_exc("refresh_annotation_bookmark: hard-clear failed")
             return
 
         try:
             self._bookmark_strokes_cache[bm_key] = pen_strokes
             self._bookmark_captions_cache[bm_key] = captions
+            _log_stroke_thickness("refresh_annotation_bookmark", pen_strokes)
             bm.set_annotation(strokes=pen_strokes, captions=captions)
             _log(
                 f"Refreshed annotation bookmark: {len(pen_strokes)} stroke(s),"

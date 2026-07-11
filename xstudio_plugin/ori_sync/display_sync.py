@@ -125,6 +125,24 @@ class DisplaySyncController:
 
     # ── read ──────────────────────────────────────────────────────────────────
 
+    def _read_annotations_visible(self) -> bool:
+        """Return the session-wide annotation visibility, read from the
+        ``AnnotationsUI`` plugin's ``"Visibility"`` boolean attribute (the
+        state driven by the global 'V' "Toggle annotation visibility" hotkey).
+
+        Defaults to visible (``True``) if the plugin handle isn't available
+        or the attribute can't be read, matching this feature's documented
+        "absent means visible" semantics.
+        """
+        ann_ui = getattr(self.plugin, "_ann_ui_plugin", None)
+        if ann_ui is None:
+            return True
+        try:
+            return bool(ann_ui.get_attribute("Visibility").value())
+        except Exception as e:
+            _log(f"WARN _read_annotations_visible: {e}")
+            return True
+
     def read_xs_display_state(self) -> dict:
         """Return a display state dict read from the active xStudio viewport.
 
@@ -134,7 +152,10 @@ class DisplaySyncController:
         fails fast instead of freezing the poll thread; on failure the cached
         viewport is dropped so the next call re-acquires a live one.
         """
-        state: dict = {"pan": None, "zoom": None, "exposure": 0.0, "channel": "RGBA"}
+        state: dict = {
+            "pan": None, "zoom": None, "exposure": 0.0, "channel": "RGBA",
+            "annotations_visible": self._read_annotations_visible(),
+        }
         vp = self.get_viewport()
         if vp is None:
             return state
@@ -178,7 +199,10 @@ class DisplaySyncController:
         except Exception as e:
             _log(f"read_xs_display_state: read failed ({e}) — dropping stale viewport")
             self._viewport = None
-            return {"pan": [0.0, 0.0], "zoom": 1.0, "exposure": 0.0, "channel": "RGBA"}
+            return {
+                "pan": [0.0, 0.0], "zoom": 1.0, "exposure": 0.0, "channel": "RGBA",
+                "annotations_visible": state["annotations_visible"],
+            }
         return state
 
     # ── apply ─────────────────────────────────────────────────────────────────
@@ -193,6 +217,22 @@ class DisplaySyncController:
         zoom = state.get("zoom")
         exposure = state.get("exposure", 0.0)
         channel = state.get("channel", "RGBA")
+        annotations_visible = state.get("annotations_visible", True)
+
+        # Setting the "Visibility" boolean attribute directly is a no-op:
+        # AnnotationsUI::attribute_changed() has no branch for it at all, only
+        # for action_attribute_. The real 'V' hotkey path sets
+        # action_attribute_'s value to ["HideVisibility"/"ShowVisibility"],
+        # which both updates annotations_visible_ AND (critically) calls
+        # send_event(...) to notify AnnotationsCore's hide_all_drawings_ flag
+        # -- the thing that actually affects rendering. Drive the same path.
+        ann_ui = getattr(self.plugin, "_ann_ui_plugin", None)
+        if ann_ui is not None:
+            try:
+                action = "ShowVisibility" if annotations_visible else "HideVisibility"
+                ann_ui.set_attribute("action_attribute", [action])
+            except Exception as e:
+                _log(f"RECV display: annotations_visible set failed: {e}")
 
         try:
             vp.colour_pipeline.exposure.set_value(float(exposure))
@@ -236,9 +276,10 @@ class DisplaySyncController:
             "zoom": readback["zoom"],
             "exposure": exposure,
             "channel": channel,
+            "annotations_visible": annotations_visible,
         }
         _log(f"RECV display exposure={exposure:.3f} channel={channel} "
-             f"zoom={zoom} pan={pan}")
+             f"zoom={zoom} pan={pan} annotations_visible={annotations_visible}")
 
     # ── poll ──────────────────────────────────────────────────────────────────
 

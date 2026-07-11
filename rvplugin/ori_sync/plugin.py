@@ -72,6 +72,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             ("frame-changed", self.on_rv_frame_changed, "Broadcast Frame"),
             ("selection-changed", self.on_rv_selection_changed, "Broadcast Selection"),
             ("graph-state-change", self.on_rv_graph_state_change, "Broadcast Annotation"),
+            ("clear-paint", self.annotation.on_clear_paint, "Broadcast Annotation Clear"),
+            ("clear-all-paint", self.annotation.on_clear_paint, "Broadcast Annotation Clear All"),
             ("after-graph-view-change", self.on_rv_view_changed, "Broadcast View"),
             ("pointer-1--release",      self.on_rv_pen_up, "Pen up (release)"),
             ("pointer--leave",          self.on_rv_pen_up, "Pen up (leave viewport)"),

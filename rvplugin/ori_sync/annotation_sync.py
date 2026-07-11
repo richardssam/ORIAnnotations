@@ -372,6 +372,8 @@ class AnnotationSyncController:
             return
         new_order = [item for item in order if item not in to_remove]
         if len(new_order) != len(order):
+            for item in to_remove:
+                rv_paint_applier._delete_item_properties(rv.commands, node, item)
             try:
                 rv.commands.setStringProperty(order_prop, new_order, True)
             except Exception as e:
@@ -808,10 +810,16 @@ class AnnotationSyncController:
                 return
             pen_node = pen_items[-1]
             full_pen = f"{node}.{pen_node}"
-            for prop_name in ("hold", "ghost", "ghostBefore", "ghostAfter"):
-                if not rv.commands.propertyExists(f"{full_pen}.{prop_name}"):
-                    rv.commands.newProperty(f"{full_pen}.{prop_name}", rv.commands.IntType, 1)
-                rv.commands.setIntProperty(f"{full_pen}.{prop_name}", [0], True)
+            # Persist the sync uuid onto RV's own `.uuid` property too
+            # (mirroring the send-side fix in _construct_annotation_events),
+            # so a LOCAL clear of a remotely-drawn stroke -- via RV's
+            # clearPaint/clearAllPaint, which read this exact property to
+            # report deleted-stroke uuids -- can be resolved back to its OTIO
+            # annotation clip instead of being silently un-clearable forever.
+            uuid_prop = f"{full_pen}.uuid"
+            if not rv.commands.propertyExists(uuid_prop):
+                rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
+            rv.commands.setStringProperty(uuid_prop, [pairing_uuid], True)
             _log(f"  _apply_annotation: wrote {pen_node} to {order_prop}")
 
             # Record UUID→pen_node so partial updates can find this node,
@@ -999,9 +1007,7 @@ class AnnotationSyncController:
         is_shape = prefix in ("rect:", "ellipse:", "arrow:")
 
         # Text/shape UUIDs must be stable across repeated broadcasts (e.g. a
-        # text edit re-sends the same node), so persist one if missing. Pens
-        # track their UUID in-memory instead (_pending_stroke/_partial_pen_nodes)
-        # and never persist a `.uuid` property, matching pre-existing behaviour.
+        # text edit re-sends the same node), so persist one if missing.
         if is_text or is_shape:
             uuid_prop = f"{full_prop}.uuid"
             if rv.commands.propertyExists(uuid_prop):
@@ -1012,6 +1018,32 @@ class AnnotationSyncController:
                 rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
         else:
             ann_uuid = stroke_uuid if stroke_uuid else str(uuid.uuid4())
+            # Also persist this broadcast uuid to RV's own `.uuid` property
+            # (previously pen-only in-memory tracking, matching a pre-existing
+            # comment here that this was never done for pens). RV's native
+            # annotate_mode auto-assigns *some* uuid to every pen stroke for
+            # its own undo/redo bookkeeping regardless of what we do -- but its
+            # clearPaint/clearAllPaint report *that* value via clear-paint/
+            # clear-all-paint, not this broadcast's uuid, so without this the
+            # two identifier spaces never match and a local clear can never be
+            # resolved back to the OTIO annotation clip via
+            # annotation_clip_guid_for_stroke_uuid. Overwriting is safe: RV's
+            # undo bookkeeping only cares that a uuid is present, not whose.
+            uuid_prop = f"{full_prop}.uuid"
+            if not rv.commands.propertyExists(uuid_prop):
+                rv.commands.newProperty(uuid_prop, rv.commands.StringType, 1)
+            rv.commands.setStringProperty(uuid_prop, [ann_uuid], True)
+            # Read back immediately to confirm the write actually landed and
+            # is visible via propertyExists -- diagnosing whether "Clear All
+            # Frames on Timeline" missing some strokes on a multi-stroke frame
+            # is an RV-side enumeration limitation or a write that didn't
+            # stick for some of them.
+            readback_exists = rv.commands.propertyExists(uuid_prop)
+            readback_val = rv.commands.getStringProperty(uuid_prop)[0] if readback_exists else None
+            _log(
+                f"  _construct_annotation_events: pen uuid write {full_prop}"
+                f" -> {ann_uuid[:8]} (readback exists={readback_exists} val={str(readback_val)[:8]})"
+            )
 
         if is_text:
             soft_deleted_prop = f"{full_prop}.softDeleted"
@@ -1195,6 +1227,13 @@ class AnnotationSyncController:
             self.plugin.display._broadcast_display_state()
             event.reject()
             return
+        # Annotation visibility toggle: <RVPaint node>.paint.show written by
+        # the "Show Drawings" menu item. Broadcast immediately, same as channel.
+        if contents.endswith(".paint.show"):
+            _log(f"on_graph_state_change: paint.show matched ({contents!r}) — broadcasting display state")
+            self.plugin.display._broadcast_display_state()
+            event.reject()
+            return
 
         # New stroke: paint.nextId incremented — flush the previous stroke (if
         # any) and prepare a fresh UUID.  The matching .points event that follows
@@ -1248,9 +1287,39 @@ class AnnotationSyncController:
             parts = contents.split(".")
             if len(parts) >= 2:
                 node_name, component = parts[0], parts[1]
-                # Consume the UUID prepared by paint.nextId
-                stroke_uuid = self._next_stroke_uuid or str(uuid.uuid4())
-                self._next_stroke_uuid = None
+                if (self._pending_stroke and self._pending_stroke[0] == node_name
+                        and self._pending_stroke[1] == component):
+                    # Same gesture continuing (another .points change on the
+                    # same pen component) -- keep the uuid stable for the
+                    # whole drag rather than minting a fresh one on every
+                    # tick. A per-tick uuid was harmless while pen uuids were
+                    # never persisted anywhere; now that RV's own `.uuid`
+                    # property is written on every broadcast (needed so a
+                    # local clear can resolve back to the OTIO clip), an
+                    # unstable uuid caused one physical stroke to get
+                    # committed multiple times under different uuids, each
+                    # permanently orphaned the moment a later tick overwrote
+                    # RV's `.uuid` property with a newer value.
+                    stroke_uuid = self._pending_stroke[2]
+                else:
+                    # _pending_stroke doesn't match -- either a genuinely new
+                    # gesture, or (observed in practice) a premature flush
+                    # fired mid-drag on this same component (e.g. a spurious
+                    # pointer--leave) that already reset _pending_stroke and
+                    # committed once. Check RV's own `.uuid` property first:
+                    # if this component was already broadcast at all, reuse
+                    # its uuid so this is treated as the same stroke
+                    # continuing rather than minting a second, different one
+                    # for what the user experiences as a single unbroken
+                    # drag. Only fall back to paint.nextId's fresh uuid when
+                    # the property genuinely doesn't exist yet.
+                    existing_uuid_prop = f"{node_name}.{component}.uuid"
+                    if rv.commands.propertyExists(existing_uuid_prop):
+                        vals = rv.commands.getStringProperty(existing_uuid_prop)
+                        stroke_uuid = vals[0] if vals else (self._next_stroke_uuid or str(uuid.uuid4()))
+                    else:
+                        stroke_uuid = self._next_stroke_uuid or str(uuid.uuid4())
+                    self._next_stroke_uuid = None
                 self._pending_stroke = (node_name, component, stroke_uuid)
                 # Repeating partial broadcast (50 ms) — fires while user is drawing.
                 if self._stroke_timer is None:
@@ -1263,3 +1332,61 @@ class AnnotationSyncController:
             # what RV fires for sequence reorders and other structural changes.
             _log(f"graph-state-change (unhandled): {contents!r}")
         event.reject()
+
+    def on_clear_paint(self, event):
+        """Handle RV's ``clear-paint`` / ``clear-all-paint`` internal events.
+
+        Both events carry the identical payload shape — a pipe-joined list of
+        the stroke/text/shape uuids RV just soft-deleted locally (see
+        ``annotate_mode.mu``'s ``clearPaint``/``clearAllPaint``, whose
+        ``eventContents`` is ``string.join(affectedStrokes, "|")`` in both
+        cases) — so one handler covers both bindings.
+
+        Deleted uuids are resolved against the local ``sync_manager``'s
+        Annotations tracks (:meth:`SyncManager.annotation_clip_guid_for_stroke_uuid`)
+        rather than RV's own frame/node context, so this works the same way
+        whether one frame or every frame in the session was just cleared.
+        """
+        try:
+            contents = event.contents()
+            _log(f"on_clear_paint: fired, contents={contents!r}")
+            if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
+                _log(
+                    f"on_clear_paint: skipped (rv_updating={self.plugin._rv_updating}, "
+                    f"sync_manager={self.plugin.sync_manager is not None}, "
+                    f"status={getattr(self.plugin.sync_manager, 'status', None)})"
+                )
+                return
+            if not contents:
+                _log("on_clear_paint: empty contents, nothing to do")
+                return
+            deleted_uuids = [u for u in contents.split("|") if u]
+            if not deleted_uuids:
+                _log("on_clear_paint: no uuids parsed from contents")
+                return
+
+            manager = self.plugin.sync_manager
+            affected_clips: dict[str, set] = {}
+            unresolved = []
+            for stroke_uuid in deleted_uuids:
+                clip_guid = manager.annotation_clip_guid_for_stroke_uuid(stroke_uuid)
+                if clip_guid:
+                    affected_clips.setdefault(clip_guid, set()).add(stroke_uuid)
+                else:
+                    unresolved.append(stroke_uuid)
+            _log(
+                f"on_clear_paint: {len(deleted_uuids)} deleted uuid(s), "
+                f"{len(affected_clips)} affected clip(s), {len(unresolved)} unresolved: {unresolved}"
+            )
+
+            for clip_guid, clip_deleted_uuids in affected_clips.items():
+                survivors = manager.surviving_annotation_commands(clip_guid, clip_deleted_uuids)
+                _log(
+                    f"SEND annotation clear: clip={clip_guid[:8]} "
+                    f"deleted={len(clip_deleted_uuids)} survivors={len(survivors)}"
+                )
+                manager.broadcast_replace_annotation_commands(clip_guid, survivors)
+        except Exception as e:
+            _log_exc(f"Failed to broadcast annotation clear: {e}")
+        finally:
+            event.reject()
