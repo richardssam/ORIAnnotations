@@ -11,6 +11,28 @@ Launching rabbitmq on macOS:
 CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/rabbitmq/sbin/rabbitmq-server
 ```
 
+# Demos
+* Sync: - do recording.
+   * play
+   * stop
+   * scrub
+   * RGBA toggling
+   * Exposure
+   * colorspace change
+   * Pan/Zoom
+* Sync 2 - do recording.
+   * Clip Selection
+   * Pen Annotations
+   * Text Annotations (including moving them around)
+   * Shapes
+* Sync Reorder:
+   * Adding clips
+   * Removing clips
+   * Re-ordering clips
+* Do Varient of sync 2 with play, scrub and sequence, and then convert to OTIO.
+* Show Recording to OTIO.
+
+
 # Todo Critical
 
 - [x] Annotations are still different sizes between RV and xSTUDIO need to investigate.
@@ -60,6 +82,7 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 - [ ] Handle clear annotations, not clear if we need to handle the undo/redo delete.
 - [x] Handle partial annotations.
 - [ ] Handle Shapes as OTIO objects: draw a Square/Circle/Arrow/Line; confirm **no** mid-drag partial is broadcast and the shape appears only on pen-up.
+- [ ] When selecting a clip, the very first time it will play-once, rather than loop.
 
 ## Known Limitations
 
