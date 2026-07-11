@@ -9,9 +9,11 @@ sync and annotation broadcast/receive using SyncManager from ORIAnnotations.
 Threading model
 ---------------
 xStudio calls plugin event handlers (``_on_bookmark_event``,
-``_on_playhead_event``, etc.) on its own message-dispatch thread.  The
-RabbitMQ send path (``RabbitMQNetwork.send_payload``) uses a
-BlockingConnection and must not run on xStudio's thread.
+``_on_playhead_event``, etc.) on its own message-dispatch thread.
+``RabbitMQNetwork.send_payload`` itself is non-blocking (it enqueues onto a
+dedicated publisher thread that owns the BlockingConnection), but the
+``SyncManager`` is not thread-safe: its state must only ever be read and
+mutated by a single thread.
 
 All calls that mutate the manager are therefore pushed onto ``_cmd_queue``
 or handled by ``_flush_pending_local_bookmarks`` — both executed by the poll
