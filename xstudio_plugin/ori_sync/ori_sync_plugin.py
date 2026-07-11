@@ -117,6 +117,10 @@ class ORISyncPlugin(PluginBase):
 
         # ── xStudio handles ────────────────────────────────────────────────
         self.active_playhead: Playhead | None = None
+        # Handle to the AnnotationsUI plugin, retained (not just a subscribe-time
+        # local) so remote annotations_visible changes can be applied via its
+        # "Visibility" attribute (see display_sync.apply_display_state).
+        self._ann_ui_plugin = None
         self.subscribe_to_global_playhead_events(self._on_global_playhead_event)
 
         # ── runtime state ──────────────────────────────────────────────────
@@ -405,6 +409,7 @@ class ORISyncPlugin(PluginBase):
         # the same pattern used by xstudio_live_review.py (proven to work).
         try:
             ann_plugin = self.get_plugin("AnnotationsUI")
+            self._ann_ui_plugin = ann_plugin
             self.subscribe_to_plugin_events(ann_plugin, self._on_annotation_event)
             _log("Subscribed to AnnotationsUI plugin events")
         except Exception:
@@ -469,6 +474,7 @@ class ORISyncPlugin(PluginBase):
         self.display._viewport = None
         self.display._last_display_state = {}
         self.display._xs_base_scale = None
+        self._ann_ui_plugin = None
         self._sync_playlists.clear()
         self.structure._xs_flat_playlists.clear()
         self.structure._xs_sequence_playlists.clear()
