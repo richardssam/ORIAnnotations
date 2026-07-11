@@ -2,6 +2,7 @@ import rv.commands
 import rv.extra_commands
 import rv.rvtypes
 import os
+import sys
 import time
 
 from utils import _log, _show_warning, _parse_ori_session, _media_path, _is_media_track
@@ -10,10 +11,12 @@ try:
     from otio_sync_core import SyncManager, RabbitMQNetwork
     from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED
     from otio_sync_core.protocol_messages import timeline_origin, ORIGIN_OTIO_IMPORT
+    from otio_sync_core.rabbitmq_network import resolve_host
     import opentimelineio as otio
 except ImportError as e:
     SyncManager = None
     RabbitMQNetwork = None
+    resolve_host = None
     _log(f"Import error: {e}")
 
     def timeline_origin(_tl):
@@ -244,6 +247,14 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if not SyncManager or not RabbitMQNetwork:
             _log("SyncManager/RabbitMQNetwork not available — cannot connect")
             return
+        if resolve_host:
+            try:
+                resolve_host(host)
+            except ValueError as e:
+                _log(f"ORI_SESSION connect aborted: {e}")
+                print(f"[OTIOSync] {e}", file=sys.stderr)
+                _show_warning(str(e))
+                return
         self.disconnect_from_session()
         self._current_host = host
         self._current_session_name = session_name
@@ -291,6 +302,11 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         @self.sync_manager.on_synced
         def _on_synced():
+            role = "MASTER" if self.sync_manager.is_master else "CLIENT"
+            print(
+                f"[OTIOSync] Connected to session '{session_name}' on {host} as {role}",
+                file=sys.stderr,
+            )
             if not self.sync_manager.is_master:
                 self._rv_updating = True
                 try:

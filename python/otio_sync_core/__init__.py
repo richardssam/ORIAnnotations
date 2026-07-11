@@ -15,7 +15,7 @@ try:
     from . import color
     from .manager import SyncManager, sync_event_schema
     from .network import SyncNetworkProtocol, UDPNetwork
-    from .rabbitmq_network import RabbitMQNetwork
+    from .rabbitmq_network import RabbitMQNetwork, resolve_host
     from .proxy import OTIOSyncProxy
 except ImportError:  # pragma: no cover - exercised on annotations-only installs
     pass

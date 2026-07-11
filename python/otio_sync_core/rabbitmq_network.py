@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging as _logging
 import queue
+import socket
 import threading
 import uuid
 from typing import Any
@@ -17,6 +18,35 @@ _logger = _logging.getLogger("otio_sync")
 def _log(msg: str) -> None:
     if _logger.handlers:
         _logger.debug(msg)
+
+
+def resolve_host(host: str) -> str:
+    """Validate that *host* (or the hostname embedded in an AMQP URL) is DNS-resolvable.
+
+    Called synchronously before spinning up :class:`RabbitMQNetwork`'s background
+    threads, which otherwise retry a bad hostname silently forever (their errors
+    only surface via ``_log``, which is invisible unless debug logging is on).
+
+    :param host: RabbitMQ broker hostname, IP, or full AMQP/AMQPS URL.
+    :returns: *host*, unchanged, when resolution succeeds.
+    :raises ValueError: with a clear, user-facing message when the hostname
+        cannot be resolved.
+    """
+    if host.startswith("amqp://") or host.startswith("amqps://"):
+        from urllib.parse import urlparse
+        hostname = urlparse(host).hostname
+    else:
+        hostname = host
+    if not hostname:
+        raise ValueError(f"Could not determine a hostname from '{host}'.")
+    try:
+        socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(
+            f"Could not resolve RabbitMQ host '{hostname}': {e}. "
+            "Check ORI_SESSION / ORI_RMQ_HOST for typos, or that the host is reachable."
+        ) from e
+    return host
 
 
 def _get_connection_params(host: str, port: int) -> pika.ConnectionParameters | pika.URLParameters:

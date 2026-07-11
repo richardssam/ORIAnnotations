@@ -51,6 +51,7 @@ from .color_sync import ColorSyncController  # noqa: E402
 import os
 import json
 import queue
+import sys
 import threading
 import time
 
@@ -59,7 +60,7 @@ from xstudio.connection import Connection
 from xstudio.api.session.playhead import Playhead
 
 from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED, SyncManager  # noqa: E402
-from otio_sync_core.rabbitmq_network import RabbitMQNetwork  # noqa: E402
+from otio_sync_core.rabbitmq_network import RabbitMQNetwork, resolve_host  # noqa: E402
 from xstudio.plugin import PluginBase  # noqa: E402
 
 # ── plugin ─────────────────────────────────────────────────────────────────────
@@ -320,18 +321,25 @@ class ORISyncPlugin(PluginBase):
         :param session_name: Session / exchange name; falls back to ``session_id_attr``
             if ``None``.
         """
+        if host is None:
+            host = self.mq_host_attr.value()
+        if session_name is None:
+            session_name = self.session_id_attr.value()
+
+        try:
+            resolve_host(host)
+        except ValueError as e:
+            _log(f"connect_to_session aborted: {e}")
+            print(f"[OTIOSync] {e}", file=sys.stderr)
+            self.popup_message_box("Cannot Connect", str(e))
+            return
+
+        self.mq_host_attr.set_value(host)
+        self.session_id_attr.set_value(session_name)
+
         self.disconnect()
         self._poll_stop.clear()
         self.annotation._last_annotation_scan = time.monotonic()
-
-        if host is None:
-            host = self.mq_host_attr.value()
-        else:
-            self.mq_host_attr.set_value(host)
-        if session_name is None:
-            session_name = self.session_id_attr.value()
-        else:
-            self.session_id_attr.set_value(session_name)
 
         port = int(self.mq_port_attr.value())
 
@@ -860,6 +868,12 @@ class ORISyncPlugin(PluginBase):
 
     def _on_synced(self) -> None:
         _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
+        role = "MASTER" if self.manager.is_master else "CLIENT"
+        print(
+            f"[OTIOSync] Connected to session '{self.session_id_attr.value()}' "
+            f"on {self.mq_host_attr.value()} as {role}",
+            file=sys.stderr,
+        )
         # Reset the scan timer so the first bookmarks.bookmarks call is deferred
         # by at least ANNOTATION_SCAN_INTERVAL seconds after STATE_SYNCED.
         # Without this, the scan fires immediately while xStudio's bookmark actor
