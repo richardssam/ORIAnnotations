@@ -66,14 +66,18 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
             ],
             None,
             [
-                ("Tools",
+                ("File",
                 [
-                        #("Set OTIO Event Log Directory", self.set_directory, None, None),
-                        ("Import annotations", self.import_annotations, None, None),
-                        ("Export annotations", self.export_annotations, None, None),
-                        #("test Module", self.test_module, None, None),
-                        #("test Export", self.test_export, None, None),
-                        #("OTIO Event Logging", self.enable_event_logging, None, None),
+                    ("Import",
+                    [
+                        ("As OTIO Annotation Import ...", self.import_annotations, None, None),
+                    ]
+                    ),
+                    ("Export",
+                    [
+                        ("OTIO Annotation Export ...", self.export_annotations, None, None),
+                    ]
+                    )
                 ]
                 )
             ]
@@ -153,9 +157,8 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         from otio_sync_core import rv_annotation_codec, rv_paint_applier
         print("Setting OTIO event log directory to:", basepath)
 
-        import ORIAnnotations
-
         otio.schema.schemadef.module_from_name('SyncEvent')
+        import ORIAnnotations
 
         frames = extra_commands.findAnnotatedFrames()
         if export_annotation_media:
@@ -273,10 +276,10 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
     def _import_annotations_from_file(self, otiofile):
         """Headless import entry point (no Qt dialog) — callable from batch/test code."""
-        import otio_reader
-        import ORIAnnotations
         from otio_sync_core import rv_annotation_codec, rv_paint_applier
         otio.schema.schemadef.module_from_name('SyncEvent')
+        import otio_reader
+        import ORIAnnotations
 
         commands.addSourceBegin()
         newtimeline = otio.adapters.read_from_file(otiofile)
@@ -361,6 +364,12 @@ def createMode():
     )
     print("PLUGINS:", os.environ["OTIO_PLUGIN_MANIFEST_PATH"])
     sys.path.append(support_files_path)
+
+    # Force OTIO to reload the plugin manifest after setting the environment variable
+    try:
+        otio.plugins.manifest._MANIFEST = None
+    except:
+        pass
 
     return ORIAnnotationsPlugin()
 
