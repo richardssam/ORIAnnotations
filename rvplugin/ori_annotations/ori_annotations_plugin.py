@@ -102,8 +102,8 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                 self.includeMedia.setChecked(True)  # Default to checked
                 self.exportAnnotationMedia = QCheckBox("Include Annotation Media")
                 self.exportAnnotationMedia.setChecked(True)  # Default to checked
-                self.nestedStacks = QCheckBox("Export as Nested Stacks")
-                self.nestedStacks.setChecked(True)  # Default to Checked
+                #self.nestedStacks = QCheckBox("Export as Nested Stacks")
+                #self.nestedStacks.setChecked(True)  # Default to Checked
                 self.otioName = QLineEdit("OTIO Export Name")
                 self.otioName.setText("annotationreview.otio")  # Default text
                 #self.combobox = QComboBox()
@@ -114,7 +114,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
                 layout.addWidget(QLabel("Additional Options:"))
                 layout.addWidget(self.includeMedia)
                 layout.addWidget(self.exportAnnotationMedia)
-                layout.addWidget(self.nestedStacks)
+                #layout.addWidget(self.nestedStacks)
                 layout.addWidget(QLabel("OTIO Export Name:"))
                 layout.addWidget(self.otioName)
                 #layout.addWidget(self.combobox)
@@ -144,7 +144,7 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
         export_media = dialog.includeMedia.isChecked()
         export_annotation_media = dialog.exportAnnotationMedia.isChecked()
-        as_nested_stacks = dialog.nestedStacks.isChecked()
+        as_nested_stacks = False # Disabling this for now. dialog.nestedStacks.isChecked()
         otio_export_name = dialog.otioName.text()
         if not otio_export_name.endswith(".otio"):
             otio_export_name += ".otio"
