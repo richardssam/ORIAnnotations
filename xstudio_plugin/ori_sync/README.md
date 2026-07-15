@@ -2,7 +2,7 @@
 layout: default
 title: XStudio ORI Sync Plugin
 parent: ORI Sync Tools
-nav_order: 3.6
+nav_order: 3.2
 ---
 # ORI Sync Review — xStudio Plugin
 

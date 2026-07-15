@@ -1,6 +1,6 @@
 ---
 layout: default
-title: Sync Testing Framework.
+title: Sync Testing Framework
 parent: ORI Sync Tools
 nav_order: 3.5
 ---

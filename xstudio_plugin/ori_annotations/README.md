@@ -1,6 +1,6 @@
 ---
 layout: default
-title: XStudio Annotation Plugins
+title: XStudio Annotation Plugin
 parent: ORI Annotations
 nav_order: 2.4
 ---
