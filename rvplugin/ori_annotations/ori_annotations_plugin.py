@@ -248,13 +248,19 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
             medialist.append(media)
             ri = ORIAnnotations.ReviewItem(media=media)
             reviewitems.append(ri)
+            # The annotation dict is keyed by the RV source frame (which carries
+            # embedded timecode, e.g. 96899). Write portable 1-based media-local
+            # frames to OTIO — the convention the import path and xStudio expect.
+            source_start = annotations[uiname].get('startframe') or 1
             frames = []
-            for frame, frameinfo in annotations[uiname]['annotations'].items():
-                frame = ORIAnnotations.ReviewItemFrame(note=frameinfo['note'], 
-                                                       annotation_commands=frameinfo['events'],
-                                                       annotation_image=frameinfo['annotationframe'], 
-                                                       frame=frame, review_item=ri)
-                frames.append(frame)
+            for rv_source_frame, frameinfo in annotations[uiname]['annotations'].items():
+                otio_frame = rv_annotation_codec.rv_frame_to_media_local(
+                    rv_source_frame, source_start)
+                frameobj = ORIAnnotations.ReviewItemFrame(note=frameinfo['note'],
+                                                          annotation_commands=frameinfo['events'],
+                                                          annotation_image=frameinfo['annotationframe'],
+                                                          frame=otio_frame, review_item=ri)
+                frames.append(frameobj)
             ri.review_frames = frames
 
         review = ORIAnnotations.Review(title="Review", review_items=reviewitems)
@@ -279,30 +285,62 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         self._import_annotations_from_file(otiofile)
 
     def _import_annotations_from_file(self, otiofile):
-        """Headless import entry point (no Qt dialog) — callable from batch/test code."""
+        """Headless import entry point (no Qt dialog) — callable from batch/test code.
+
+        Mirrors the proven batch pipeline (testchart/batch_openrv_helper.py):
+        annotations are written to each media's own sequence-level paint node
+        (``defaultSequence_p_<sourceGroup>*``). Those paint nodes use the
+        source's RV frame numbering, which starts at the media's start frame —
+        carrying any embedded timecode — so each 1-based media-local review
+        frame is mapped onto that numbering before being applied.
+        """
         from otio_sync_core import rv_annotation_codec, rv_paint_applier
         otio.schema.schemadef.module_from_name('SyncEvent')
         import otio_reader
         import ORIAnnotations
 
-        commands.addSourceBegin()
         newtimeline = otio.adapters.read_from_file(otiofile)
-        print("Read OTIO file:", otiofile)
+
+        # Convert file:// target URLs to plain absolute POSIX paths for OpenRV.
+        from urllib.parse import urlparse, unquote
+        for clip in newtimeline.find_clips():
+            if clip.media_reference and isinstance(clip.media_reference, otio.schema.ExternalReference):
+                url = clip.media_reference.target_url
+                if url and url.startswith("file:"):
+                    parsed = urlparse(url)
+                    path = unquote(parsed.path)
+                    if path.startswith("//"):
+                        path = path[1:]
+                    clip.media_reference.target_url = path
+
         rg = ORIAnnotations.ReviewGroup()
         rg.read_otio_timeline(newtimeline)
-        context = {"otio_file": otiofile}
-        new_seq = otio_reader._create_track(newtimeline.tracks[0], context)
-        commands.addSourceEnd()
-        print("NEW SEQ:", new_seq)
 
-        # Build clipmap using sequence-level paint nodes.
-        # Annotations must go to defaultSequence_p_<sourceGroup>* nodes.
+        # Load the media track (first track named "Media", else the first track).
+        media_track = next((t for t in newtimeline.tracks if t.name == "Media"), None)
+        if not media_track and len(newtimeline.tracks) > 0:
+            media_track = newtimeline.tracks[0]
+
+        commands.addSourceBegin()
+        context = {"otio_file": otiofile}
+        otio_reader._create_track(media_track, context)
+        commands.addSourceEnd()
+        # The sequence-level paint nodes live under "defaultSequence_p_*" — the
+        # view the annotations render in — regardless of the media track's name.
+        new_seq = "defaultSequence"
+        commands.setViewNode(new_seq)
+
+        # Build clip map using sequence-level paint nodes. Annotations must go to
+        # defaultSequence_p_<sourceGroup>* nodes — the ones that render in the
+        # sequence view. These paint nodes are per-source, so the review frame
+        # value is applied directly.
         all_paint_nodes = commands.nodesOfType("RVPaint")
-        seq_paint_map = {}
+        seq_paint_map = {}  # sourceGroupName → sequence-level paint node
+        prefix = f"{new_seq}_p_"
         for pn in all_paint_nodes:
-            if not pn.startswith("defaultSequence_p_"):
+            if not pn.startswith(prefix):
                 continue
-            sg = pn[len("defaultSequence_p_"):].replace("_switchGroup", "")
+            sg = pn[len(prefix):].replace("_switchGroup", "")
             seq_paint_map[sg] = pn
 
         sg_to_media = {}
@@ -317,38 +355,68 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
         clipmap = {}
         for sg, media_path in sg_to_media.items():
             paint_node = seq_paint_map.get(sg)
-            print(f"Source group {sg}: media={os.path.basename(media_path)} paint_node={paint_node}")
-            clipinfo = {'media_path': media_path, 'paint_node': paint_node}
+            # RV numbers a source's frames from its media start frame, which for
+            # media carrying embedded timecode is NOT 1 (e.g. 96899). The
+            # per-source paint node uses that same source-local numbering, so we
+            # need the start frame to place annotations on the right picture.
+            try:
+                source_start = get_movie_first_frame(sg)
+            except Exception:
+                source_start = None
+            if source_start is None:
+                source_start = 1
+            clipinfo = {'media_path': media_path, 'paint_node': paint_node,
+                        'source_start': int(source_start)}
             clipmap[media_path] = clipinfo
             clipmap[os.path.basename(media_path)] = clipinfo
-        print("Clipmap:", clipmap)
+            clipmap[os.path.splitext(os.path.basename(media_path))[0]] = clipinfo
 
+        applied = 0
         for review in rg.reviews:
             for ri in review.review_items:
-                if ri.media.media_path not in clipmap:
-                    print("WARNING: Media not found in clipmap for review item:", ri.media.media_path)
-                    continue
-                rv_node = clipmap[ri.media.media_path]['paint_node']
-                if not rv_node:
-                    print(f"Warning: No paint node found for {ri.media.media_path}")
-                    continue
-
                 strokeid = 1
-                for frame in ri.review_frames:
-                    if frame.annotation_commands is None:
-                        continue
-                    print("Processing review item:", ri.media.media_path, "Frame:", frame.frame)
+                media_key = ri.media.media_path
+                clipinfo = clipmap.get(media_key)
+                if not clipinfo:
+                    clipinfo = clipmap.get(os.path.basename(media_key))
+                if not clipinfo:
+                    clipinfo = clipmap.get(os.path.splitext(os.path.basename(media_key))[0])
+                if not clipinfo:
+                    print(f"ORIAnnotations: media not found in RV session for {media_key}")
+                    continue
 
-                    # Convert SyncEvents → RV paint-node specs (pure codec) and
-                    # write them via the shared applier — the same code path
-                    # the testchart batch and live-sync plugin use.
-                    rv_frame = int(frame.frame)
+                rv_node = clipinfo['paint_node']
+                if not rv_node:
+                    print(f"ORIAnnotations: no paint node found for {media_key}")
+                    continue
+
+                source_start = clipinfo.get('source_start', 1)
+                for frame in ri.review_frames:
+                    if not frame.annotation_commands:
+                        continue
+
+                    # frame.frame is a 1-based media-local frame. Map it onto the
+                    # source's RV frame numbering (which starts at source_start,
+                    # carrying any embedded timecode) so the annotation lands on
+                    # the right picture. For no-timecode media source_start == 1,
+                    # so this reduces to frame.frame.
+                    rv_frame = rv_annotation_codec.media_local_to_rv_frame(
+                        frame.frame, source_start)
                     specs = rv_annotation_codec.sync_events_to_rv_specs(
                         frame.annotation_commands, {"frame": rv_frame})
-                    strokeid = rv_paint_applier.apply_specs(
-                        specs, commands, rv_node=rv_node, frame=rv_frame,
-                        mode="append", start_id=strokeid)
-        commands.addSourceEnd()
+                    try:
+                        strokeid = rv_paint_applier.apply_specs(
+                            specs, commands, rv_node=rv_node, frame=rv_frame,
+                            mode="append", start_id=strokeid)
+                        applied += 1
+                    except Exception as e:
+                        print(f"ORIAnnotations: error applying annotation to "
+                              f"{media_key} frame {rv_frame}: {e}")
+
+        # Force RV to refresh/update the display after applying all specs.
+        commands.redraw()
+        print(f"ORIAnnotations: imported {applied} annotation frame(s) from "
+              f"{os.path.basename(otiofile)}")
 
 
 

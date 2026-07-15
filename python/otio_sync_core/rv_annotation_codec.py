@@ -116,6 +116,42 @@ def rv_to_font_size(rv_font_size_wcs: float) -> float:
     return float(rv_font_size_wcs) * RV_FONT_SCALE
 
 
+def media_local_to_rv_frame(local_frame: int, source_start_frame: int) -> int:
+    """Map a 1-based media-local review frame to a source's RV frame number.
+
+    RV numbers a source's frames from ``source_start_frame`` — the media start
+    frame reported by ``commands.sourceMediaInfo(...)["startFrame"]`` — which
+    carries any embedded timecode (e.g. ``96899``) and is ``1`` for media with
+    no timecode. A review frame is a 1-based offset into the media, so local
+    frame ``1`` is the source's first frame. The per-source paint node uses this
+    same source-local numbering, so annotations must be written at the mapped
+    frame or they land off the media's real range and never render.
+
+    :param local_frame: 1-based media-local frame from the OTIO Review clip.
+    :param source_start_frame: RV start frame for the source.
+    :returns: The RV frame to write the annotation to.
+    """
+    return int(source_start_frame) + (int(local_frame) - 1)
+
+
+def rv_frame_to_media_local(rv_frame: int, source_start_frame: int) -> int:
+    """Map a source's RV frame number back to a 1-based media-local frame.
+
+    Inverse of :func:`media_local_to_rv_frame`. Used on export so annotations
+    drawn on media carrying embedded timecode (``rv_frame`` in the source's
+    numbering, e.g. ``96899``) are written to the OTIO Review track as portable
+    1-based media-local frames — the same convention hosts like xStudio use and
+    that :func:`media_local_to_rv_frame` reads back — rather than a raw
+    timecode frame that falls outside a 0-based media's declared range.
+
+    :param rv_frame: The frame in the source's RV numbering (e.g. the value
+        ``extra_commands.sourceFrame`` returns).
+    :param source_start_frame: RV start frame for the source.
+    :returns: The 1-based media-local frame to write to OTIO.
+    """
+    return int(rv_frame) - int(source_start_frame) + 1
+
+
 # --- Helpers --------------------------------------------------------------
 
 def _schema(ev: Any) -> str:

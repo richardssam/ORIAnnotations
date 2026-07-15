@@ -194,5 +194,46 @@ class TestRvCodecReverse(unittest.TestCase):
         self.assertAlmostEqual(events[0].max[1], el.max[1])
 
 
+class TestFrameMapping(unittest.TestCase):
+    """Media-local ⇄ RV-source frame mapping (timecode handling on im/export)."""
+
+    def test_no_timecode_is_identity_for_first_frame(self):
+        # PNG / no-timecode media: source starts at RV frame 1, so a 1-based
+        # media-local frame 1 maps straight to RV frame 1 (matches the testchart
+        # batch, which renders paint at frame:1).
+        self.assertEqual(codec.media_local_to_rv_frame(1, 1), 1)
+        self.assertEqual(codec.media_local_to_rv_frame(2, 1), 2)
+
+    def test_timecode_source_offsets_by_start_frame(self):
+        # car_ACES_sRGB.mov: RV numbers frames from 96899.
+        self.assertEqual(codec.media_local_to_rv_frame(1, 96899), 96899)
+        self.assertEqual(codec.media_local_to_rv_frame(2, 96899), 96900)
+
+    def test_export_inverts_timecode_to_media_local(self):
+        # A stroke drawn on the first frame of a timecode source is stored at RV
+        # frame 96899; export must write portable media-local frame 1.
+        self.assertEqual(codec.rv_frame_to_media_local(96899, 96899), 1)
+        self.assertEqual(codec.rv_frame_to_media_local(96900, 96899), 2)
+        self.assertEqual(codec.rv_frame_to_media_local(1, 1), 1)
+
+    def test_import_export_are_inverse(self):
+        for source_start in (1, 1001, 96899):
+            for local in (1, 2, 5, 24):
+                rv = codec.media_local_to_rv_frame(local, source_start)
+                self.assertEqual(
+                    codec.rv_frame_to_media_local(rv, source_start), local)
+
+    def test_mapped_frame_lands_in_startframe_prop(self):
+        # End-to-end: the mapped RV frame is what the codec stamps as startFrame,
+        # i.e. what actually keys the paint component in RV.
+        events = [
+            se.PaintStart(brush="gauss", rgba=[1.0, 0.0, 0.0, 1.0], uuid="u1"),
+            se.PaintPoints(uuid="u1", points=se.PaintVertices([0.1], [0.0], [0.01])),
+        ]
+        rv_frame = codec.media_local_to_rv_frame(2, 96899)  # -> 96900
+        specs = codec.sync_events_to_rv_specs(events, {"frame": rv_frame})
+        self.assertEqual(_props(specs[0])["startFrame"], [96900])
+
+
 if __name__ == "__main__":
     unittest.main()
