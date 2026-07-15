@@ -121,13 +121,17 @@ class ORIAnnotationsPlugin(rvtypes.MinorMode):
 
                 self.extra_widget.setLayout(layout)
 
-                # Get the dialog's layout and insert your custom widget
-                layout = self.layout()
-                layout.addWidget(self.extra_widget)
                 self.setFileMode(QFileDialog.Directory)
                 self.setOption(QFileDialog.ShowDirsOnly, True)
                 self.setWindowTitle("Select Directory to export the annotations to")
                 self.setLabelText(QFileDialog.Accept, "Set Directory")
+
+                # Get the dialog's layout and add custom widget after the standard widgets
+                dialog_layout = self.layout()
+                # Add at the bottom spanning all columns
+                last_row = dialog_layout.rowCount()
+                if hasattr(dialog_layout, 'addWidget'):
+                    dialog_layout.addWidget(self.extra_widget, last_row, 0, 1, dialog_layout.columnCount())
 
         basepath = "/Users/sam/git/Annotations/test_export"
         dialog = QAnnotationFileDialog()
