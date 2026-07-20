@@ -1,7 +1,7 @@
 # ORIAnnotations
 A toolkit for sharing annotations between review systems.
 
-See: [docs/html/introduction.html](https://richardssam.github.io/ORIAnnotations/docs/html/introduction.html)
+See: [https://richardssam.github.io/ORIAnnotations/](https://richardssam.github.io/ORIAnnotations/) for more detailed documentation.
 
 ## Requirements
 
