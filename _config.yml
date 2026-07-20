@@ -18,7 +18,7 @@ exclude:
   - docs/plugin_tasks.md
   - docs/openrv_constraints.md
   - docs/sync_viewer_constraints.md
-  - docs/docs/xstudio_constraints.md
+  - docs/xstudio_constraints.md
   - docs/conf.py
   - examples
   - test_media/source
