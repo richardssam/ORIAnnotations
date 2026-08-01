@@ -163,8 +163,9 @@ class ORISyncPlugin(PluginBase):
         # local strokes.
         self._reload_suppress_until: float = 0.0
 
-        # Cross-thread annotation trigger: set on xStudio thread by _on_annotation_event /
-        # _on_core_annotation_event; read and cleared on poll thread by flush_pending_annotations.
+        # Cross-thread annotation trigger: set on xStudio thread by
+        # _on_annotation_draw_event; read and cleared on poll thread by
+        # flush_pending_annotations.
         self._annotation_pending_time: float | None = None
 
         # Polling-based scrub detection: last frame seen by the poll loop and
@@ -406,28 +407,39 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("Could not initialize active playhead at connect time")
 
-        # Subscribe to the AnnotationsUI plugin so we hear annotation_atom
-        # events whenever the user completes a stroke in xStudio.  This is
-        # the same pattern used by xstudio_live_review.py (proven to work).
+        # Retain a handle to AnnotationsUI so remote annotations_visible changes
+        # can be applied via its "Visibility" attribute (display_sync).  We do
+        # NOT subscribe to it: nothing is ever broadcast on a plugin's events
+        # group.
         try:
-            ann_plugin = self.get_plugin("AnnotationsUI")
-            self._ann_ui_plugin = ann_plugin
-            self.subscribe_to_plugin_events(ann_plugin, self._on_annotation_event)
-            _log("Subscribed to AnnotationsUI plugin events")
+            self._ann_ui_plugin = self.get_plugin("AnnotationsUI")
         except Exception:
-            _log_exc("Could not subscribe to AnnotationsUI events")
+            _log_exc("Could not get a handle to the AnnotationsUI plugin")
 
-        # [2C] Subscribe to AnnotationsCore's plugin_events_ group to receive
-        # (event_atom, annotation_data_atom, user_id, stroke_completed) events.
+        # [2C] Subscribe to AnnotationsCore's draw-events group.  It carries
+        # both kinds of event we need:
+        #
+        #   (event_atom, annotation_atom, JsonStore)                 raw draw
+        #       interaction — PaintClear, HideDrawings/ShowDrawings, tool changes
+        #   (event_atom, annotation_data_atom, JsonStore, Uuid, bool)  the
+        #       serialised live stroke, with user_id and stroke_completed
+        #
         # stroke_completed=True fires at PaintEnd (pen-up); False fires at
         # PaintStart/PaintPoint (mid-stroke).  This replaces the show_atom
         # hot-scan activation and the 33 ms poll as the primary annotation trigger.
+        #
+        # Both handlers previously subscribed to the AnnotationsUI and
+        # AnnotationsCore *plugin events* groups instead.  PluginBase spawns
+        # those without an owner and nothing ever broadcasts on them, so neither
+        # handler had ever fired — confirmed by probe against both the develop
+        # and per-subscription-listener xStudio builds.  The group used here is
+        # the one AnnotationsCore exposes for exactly this purpose, via
+        # get_event_group_atom + annotation_atom.
         try:
-            ann_core_plugin = self.get_plugin("AnnotationsCore")
-            self.subscribe_to_plugin_events(ann_core_plugin, self._on_core_annotation_event)
+            self.subscribe_to_annotation_draw_events(self._on_annotation_draw_event)
             _log("Subscribed to AnnotationsCore plugin events [2C]")
         except Exception:
-            _log_exc("Could not subscribe to AnnotationsCore events")
+            _log_exc("Could not subscribe to AnnotationsCore draw events")
 
         # Subscribe to the current viewed container's event group for add_media
         # detection.  If there's no container yet (peer joined an empty session),
@@ -906,11 +918,8 @@ class ORISyncPlugin(PluginBase):
     def _on_test_container_event(self, event) -> None:
         self.structure.on_test_container_event(event)
 
-    def _on_annotation_event(self, data) -> None:
-        self.annotation.on_annotation_event(data)
-
-    def _on_core_annotation_event(self, data) -> None:
-        self.annotation.on_core_annotation_event(data)
+    def _on_annotation_draw_event(self, event_data, user_id, stroke_completed) -> None:
+        self.annotation.on_draw_event(event_data, user_id, stroke_completed)
 
     def playhead_attribute_changed(self, attr, role) -> None:
         self.playback.on_playhead_attribute_changed(attr, role)

@@ -8,10 +8,7 @@ import threading
 import time
 import uuid
 import opentimelineio as otio
-from xstudio.core import (
-    BookmarkDetail, bookmark_detail_atom, event_atom,
-    annotation_atom, annotation_data_atom, JsonStore,
-)
+from xstudio.core import BookmarkDetail, bookmark_detail_atom, JsonStore
 from otio_sync_core.manager import STATE_SYNCED, sync_event_schema
 from otio_sync_core.xs_annotation_codec import (
     xs_strokes_to_sync_events, xs_captions_to_sync_events,
@@ -92,117 +89,99 @@ class AnnotationSyncController:
     #: bookmark scan. See annotations_ui_plugin.cpp's toggle_visibility_hotkey_.
     _VISIBILITY_EVENTS = ("HideDrawings", "ShowDrawings")
 
-    def on_annotation_event(self, data) -> None:
-        """Called by xStudio when the user completes a stroke, clears a
-        drawing, or toggles annotation visibility in the viewport.
+    def on_draw_event(self, event_data, user_id, stroke_completed) -> None:
+        """[2C] Entry point for every event on AnnotationsCore's draw-events group.
 
-        Fired by the AnnotationsUI plugin's event group for a variety of
-        actions (``annotation_atom``), including ``PaintClear``,
-        ``HideDrawings``/``ShowDrawings``, tool switches, etc. — the JsonStore
-        payload's ``"event"`` field discriminates which. Visibility events are
-        broadcast immediately as a display-state change; every other
-        recognised or unrecognised event (including ``PaintClear``) schedules
-        the existing debounced bookmark scan, unchanged from prior behavior.
+        ``plugin_base.subscribe_to_annotation_draw_events`` decodes the
+        ``JsonStore`` payload and flattens the two message shapes that group
+        carries into a single callback signature:
 
-        :param data: Event tuple from the AnnotationsUI plugin events group.
-            Shape: ``(event_atom, annotation_atom, JsonStore)``.
+        * ``stroke_completed is None`` — a raw draw *interaction*
+          (``(event_atom, annotation_atom, JsonStore)``).  ``event_data`` is the
+          interaction payload whose ``"event"`` field names the action
+          (``PaintClear``, ``HideDrawings``, tool changes, …).  Routed to
+          :meth:`on_annotation_event`.
+        * otherwise — a serialised *live stroke*
+          (``(event_atom, annotation_data_atom, JsonStore, user_id, bool)``).
+          ``event_data`` is the annotation JSON.  Routed to
+          :meth:`on_core_annotation_event`.
+
+        :param event_data: Decoded JSON payload for the event.
+        :param user_id: :class:`Uuid` of the drawing user, ``None`` for
+            interactions.
+        :param stroke_completed: ``True`` at pen-up, ``False`` mid-stroke,
+            ``None`` when this is an interaction rather than a stroke.
         """
-        # [TEST annotation_atom] Log every event from this subscription so we
-        # can see whether annotation_atom actually arrives in this xStudio build.
-        t1 = type(data[1]).__name__ if len(data) > 1 else "n/a"
-        matched = (
-            len(data) >= 3
-            and isinstance(data[0], event_atom)
-            and isinstance(data[1], annotation_atom)
-        )
-        _log(f"[TEST annotation_atom] event len={len(data)}, t1={t1}, matched={matched}")
-        if not matched:
-            return
+        self._core_events_received += 1
+        if self._core_events_received == 1:
+            _log("[2C] First AnnotationsCore event received")
+        if self._core_events_received <= 3:
+            shape = (
+                f"keys={sorted(event_data)[:6]}"
+                if isinstance(event_data, dict)
+                else type(event_data).__name__
+            )
+            _log(
+                f"[2C] raw event #{self._core_events_received}: {shape}"
+                f" user_id={user_id} stroke_completed={stroke_completed}"
+            )
         if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
             return
 
-        event_name = None
-        try:
-            payload = data[2]
-            if isinstance(payload, JsonStore):
-                payload = json.loads(payload.dump())
-            if isinstance(payload, dict):
-                event_name = payload.get("event")
-        except Exception:
-            event_name = None
+        if stroke_completed is None:
+            self.on_annotation_event(event_data)
+        else:
+            self.on_core_annotation_event(event_data, stroke_completed)
+
+    def on_annotation_event(self, payload) -> None:
+        """Handle a raw draw interaction from AnnotationsCore's draw-events group.
+
+        Fired for a variety of actions (``annotation_atom``), including
+        ``PaintClear``, ``HideDrawings``/``ShowDrawings``, tool switches, etc. —
+        the payload's ``"event"`` field discriminates which. Visibility events
+        are broadcast immediately as a display-state change; every other
+        recognised or unrecognised event (including ``PaintClear``) schedules
+        the existing debounced bookmark scan, unchanged from prior behavior.
+
+        These interactions used to be sought on the AnnotationsUI plugin's own
+        events group, where they never arrived: ``AnnotationsUI::send_event()``
+        sends them point-to-point to the AnnotationsCore actor, which is what
+        re-broadcasts them here (annotations_core_plugin.cpp:95-105).
+
+        :param payload: Decoded interaction payload; ``"event"`` names the action.
+        """
+        event_name = payload.get("event") if isinstance(payload, dict) else None
 
         if event_name in self._VISIBILITY_EVENTS:
-            _log(f"Annotation event from AnnotationsUI: {event_name} — broadcasting visibility")
+            _log(f"Draw interaction: {event_name} — broadcasting visibility")
             self.plugin.display.poll_and_broadcast_display()
             return
 
-        _log(f"Annotation event from AnnotationsUI (event={event_name!r}) — scheduling broadcast scan")
+        _log(f"Draw interaction (event={event_name!r}) — scheduling broadcast scan")
         self.plugin._annotation_pending_time = time.monotonic()
 
-    def on_core_annotation_event(self, data) -> None:
-        """[2C] Called when AnnotationsCore broadcasts a live stroke event.
+    def on_core_annotation_event(self, anno_json, stroke_completed) -> None:
+        """[2C] Handle a live stroke broadcast by AnnotationsCore.
 
         Fired on every PaintStart/PaintPoint/PaintEnd via ``broadcast_live_stroke``.
-
-        New shape (post C++ serialisation fix):
-        ``(event_atom, annotation_data_atom, JsonStore, user_id, stroke_completed)``
-
-        Legacy shape (pre-fix builds, no stroke data):
-        ``(event_atom, annotation_data_atom, user_id, stroke_completed)``
 
         ``stroke_completed=True`` at PaintEnd (pen-up): schedule annotation flush.
         ``stroke_completed=False`` at PaintStart/PaintPoint: broadcast partial stroke
         directly from the live JSON data (no bookmark scan needed).
 
-        :param data: Event tuple from AnnotationsCore plugin_events_.
+        A local clear no longer arrives here — ``AnnotationsCore::clear_annotation``
+        broadcasts its post-clear state on ``live_edit_event_group_``, which is not
+        reachable from Python.  The equivalent signal is the ``PaintClear``
+        interaction handled by :meth:`on_annotation_event`, which schedules the
+        same debounced flush.
+
+        :param anno_json: Serialised annotation for the in-progress stroke, shape
+            ``{"Annotation Serialiser Version": N, "Data": {"pen_strokes": [...]}}``.
+            Empty when the C++ serialisation produced null, and for shape tools
+            mid-drag (AnnotationsCore only serialises those once completed).
+        :param stroke_completed: ``True`` at pen-up, ``False`` mid-stroke.
         """
-        # Raw invocation counter — logged before any guard so we can tell if
-        # the callback fires but the guard rejects it.
-        self._core_events_received += 1
-        if self._core_events_received <= 3:
-            types = [type(d).__name__ for d in data]
-            _log(
-                f"[2C] raw event #{self._core_events_received}:"
-                f" len={len(data)} types={types}"
-            )
-        if not (
-            len(data) >= 3
-            and isinstance(data[0], event_atom)
-            and isinstance(data[1], annotation_data_atom)
-        ):
-            _log(f"[2C] guard rejected event #{self._core_events_received}")
-            return
-        if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
-            return
-
-        if len(data) == 3:
-            # AnnotationsCore::clear_annotation's post-clear broadcast: a
-            # 3-tuple (event_atom, annotation_data_atom, AnnotationBasePtr) --
-            # a different, shorter shape than the 4/5-tuple live-stroke events
-            # below (see annotations_core_plugin.cpp: "for Sync plugin,
-            # broadcast new state of annotation after clear"). The annotation
-            # payload itself isn't parsed here -- schedule the existing
-            # debounced flush so broadcast_local_bookmark's count-decrease
-            # detection picks up the clear on the next scan (~250ms) instead
-            # of waiting for the 30s fallback scan.
-            _log("[2C] AnnotationsCore: clear-annotation broadcast — scheduling flush")
-            self.plugin._annotation_pending_time = time.monotonic()
-            return
-
-        # Discriminate by tuple length, NOT by data[2] type.
-        # 5-element (new shape): data[2]=JsonStore/None, data[3]=user_id, data[4]=bool
-        # 4-element (legacy):    data[2]=user_id, data[3]=bool
-        is_new_shape = len(data) >= 5
-        if is_new_shape:
-            stroke_completed = bool(data[4])
-            # data[2] may be JsonStore, dict, or None (if serialise threw and
-            # anno_json was default-constructed to null)
-            raw_json = data[2]
-            has_json = isinstance(raw_json, (JsonStore, dict)) and bool(raw_json)
-        else:
-            stroke_completed = bool(data[3])
-            has_json = False
-            raw_json = None
+        has_json = isinstance(anno_json, (JsonStore, dict)) and bool(anno_json)
 
         if stroke_completed:
             _log("[2C] AnnotationsCore: pen-up — scheduling flush")
@@ -213,9 +192,9 @@ class AnnotationSyncController:
         elif has_json:
             # Sole mid-stroke path: broadcast the live stroke directly from the
             # event JSON. No bookmark hot-scan — nothing exists to scan mid-stroke.
-            self.plugin._cmd_queue.put_nowait(("live_stroke", raw_json))
-        # else: legacy build without geometry (4-tuple) or empty JSON. No partial
-        # is broadcast; the committed stroke still syncs via the pen-up flush above.
+            self.plugin._cmd_queue.put_nowait(("live_stroke", anno_json))
+        # else: empty JSON — no geometry to send. No partial is broadcast; the
+        # committed stroke still syncs via the pen-up flush above.
 
     # ── live stroke broadcast ──────────────────────────────────────────
 
@@ -224,9 +203,8 @@ class AnnotationSyncController:
         """Broadcast a partial annotation from a live-stroke JSON payload.
 
         Called on every PaintPoint by the poll loop when the AnnotationsCore
-        ``plugin_events_`` broadcast includes a ``JsonStore``
-        (post C++ serialisation fix).  The JSON contains exactly one pen stroke
-        representing the in-progress drawing.
+        draw-events broadcast includes stroke geometry.  The JSON contains
+        exactly one pen stroke representing the in-progress drawing.
 
         Resolves the current clip/frame from the active playhead, assigns a
         stable UUID (so peers can update in-place on subsequent PaintPoints),
