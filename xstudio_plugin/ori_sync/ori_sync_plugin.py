@@ -443,6 +443,19 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("Could not subscribe to AnnotationsCore draw events")
 
+        # Bookmarks appear and disappear by routes the draw events never see —
+        # the notes panel, a script, another plugin — and a clear deletes its
+        # bookmark outright.  The bookmarks actor broadcasts add/remove on its
+        # event group, so subscribing gives prompt detection for all of them
+        # instead of waiting out ANNOTATION_SCAN_INTERVAL.
+        try:
+            self.subscribe_to_event_group(
+                self.connection.api.session.bookmarks, self._on_bookmarks_event
+            )
+            _log("Subscribed to bookmarks add/remove events")
+        except Exception:
+            _log_exc("Could not subscribe to bookmarks events")
+
         # Subscribe to the current viewed container's event group for add_media
         # detection.  If there's no container yet (peer joined an empty session),
         # on_global_playhead_event re-subscribes once one is viewed.
@@ -923,6 +936,9 @@ class ORISyncPlugin(PluginBase):
 
     def _on_annotation_draw_event(self, event_data, user_id, stroke_completed) -> None:
         self.annotation.on_draw_event(event_data, user_id, stroke_completed)
+
+    def _on_bookmarks_event(self, event) -> None:
+        self.annotation.on_bookmarks_event(event)
 
     def playhead_attribute_changed(self, attr, role) -> None:
         self.playback.on_playhead_attribute_changed(attr, role)

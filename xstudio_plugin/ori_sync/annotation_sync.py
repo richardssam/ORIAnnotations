@@ -8,7 +8,10 @@ import threading
 import time
 import uuid
 import opentimelineio as otio
-from xstudio.core import BookmarkDetail, bookmark_detail_atom, JsonStore
+from xstudio.core import (
+    BookmarkDetail, bookmark_detail_atom, JsonStore,
+    add_bookmark_atom, remove_bookmark_atom, event_atom,
+)
 from otio_sync_core.manager import STATE_SYNCED, sync_event_schema
 from otio_sync_core.xs_annotation_codec import (
     xs_strokes_to_sync_events, xs_captions_to_sync_events,
@@ -53,6 +56,10 @@ class AnnotationSyncController:
     #: Sentinel stored in ``_last_sent_captions`` immediately after a remote
     #: annotation is applied, before xStudio has committed the annotation_data.
     _CAPTION_SIG_UNCONFIRMED = "\x00unconfirmed\x00"
+    #: How long to keep retrying a flush that finds a not-yet-ready bookmark.
+    #: Bounded by time rather than attempt count: the old 5-attempt budget was
+    #: ~1.25s, and the mapping can legitimately take longer while media loads.
+    STALE_RETRY_WINDOW = 10.0
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -73,6 +80,11 @@ class AnnotationSyncController:
         self._broadcast_annotation_keys: dict[tuple, str] = {}
         self._last_sent_captions: dict[str, str] = {}
         self._annotation_flush_retries: int = 0
+        # Deadline while a flush keeps finding a bookmark that is not ready
+        # yet (no annotation_data committed, or no clip mapping for its
+        # frame).  Bookmark add/remove events arrive as soon as the bookmark
+        # exists, which can be before either is true.
+        self._annotation_retry_deadline: float | None = None
         self._core_events_received: int = 0
         self._stroke_uuid_cache: dict[str, list] = {}
         self._live_stroke_current_key: str | None = None
@@ -102,6 +114,31 @@ class AnnotationSyncController:
     #: Draw interactions that arrive at pointer rate.  Handled normally, but not
     #: logged — one line per point buries everything else in the log.
     _HIGH_RATE_EVENTS = ("PaintPoint",)
+
+    def on_bookmarks_event(self, event) -> None:
+        """Schedule a flush when a bookmark appears or disappears.
+
+        ``BookmarksActor`` broadcasts ``(event_atom, add_bookmark_atom, UuidActor)``
+        and ``(event_atom, remove_bookmark_atom, uuid)`` on its event group
+        (bookmarks_actor.cpp:384, :449, :75).  Draw events only cover annotations
+        made with the paint tools; a bookmark created or destroyed by any other
+        route — the notes panel, a script, another plugin — produces no draw
+        event at all, and would otherwise wait up to ``ANNOTATION_SCAN_INTERVAL``
+        to be noticed.
+
+        Both directions matter: an add carries a new annotation to broadcast, and
+        a remove is what the disappearance diff in
+        :meth:`flush_pending_annotations` needs to see promptly to send the clear.
+
+        :param event: Event tuple from the bookmarks actor's event group.
+        """
+        if not (len(event) >= 2 and isinstance(event[0], event_atom)):
+            return
+        if not isinstance(event[1], (add_bookmark_atom, remove_bookmark_atom)):
+            return
+        if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
+            return
+        self.plugin._annotation_pending_time = time.monotonic()
 
     def on_draw_event(self, event_data, user_id, stroke_completed) -> None:
         """[2C] Entry point for every event on AnnotationsCore's draw-events group.
@@ -440,14 +477,28 @@ class AnnotationSyncController:
         # xStudio may not have committed annotation_data yet when the debounce fires.
         # Only retry when a bookmark explicitly returned None (empty annotation_data);
         # if all bookmarks returned False the timeline is already up-to-date.
-        if stale_any and self._annotation_flush_retries < 5:
-            self._annotation_flush_retries += 1
-            _log(
-                f"flush_pending_annotations: stale annotation_data,"
-                f" retry {self._annotation_flush_retries}/5"
-            )
-            self.plugin._annotation_pending_time = time.monotonic()
+        if stale_any:
+            now = time.monotonic()
+            if self._annotation_retry_deadline is None:
+                self._annotation_retry_deadline = now + self.STALE_RETRY_WINDOW
+            if now < self._annotation_retry_deadline:
+                self._annotation_flush_retries += 1
+                _log(
+                    f"flush_pending_annotations: not ready,"
+                    f" retry {self._annotation_flush_retries}"
+                    f" ({self._annotation_retry_deadline - now:.1f}s left)"
+                )
+                self.plugin._annotation_pending_time = now
+            else:
+                _log(
+                    f"flush_pending_annotations: gave up after"
+                    f" {self.STALE_RETRY_WINDOW:.0f}s"
+                    f" ({self._annotation_flush_retries} retries)"
+                )
+                self._annotation_retry_deadline = None
+                self._annotation_flush_retries = 0
         else:
+            self._annotation_retry_deadline = None
             self._annotation_flush_retries = 0
 
     # ── broadcast local bookmark ───────────────────────────────────────
@@ -545,8 +596,15 @@ class AnnotationSyncController:
                         f" → clip {clip_guid[:8]} frame {frame}"
                     )
                 else:
-                    _log(f"broadcast_local_bookmark: no clip at frame {frame}")
-                    return False
+                    # Return None, not False, so flush_pending_annotations
+                    # retries.  A bookmark can be seen before the clip mapping
+                    # that resolves its frame is ready — the add_bookmark event
+                    # arrives as soon as the bookmark exists, which is earlier
+                    # than the periodic scan ever looked.  Treating "no clip
+                    # yet" as terminal drops the annotation permanently; it is
+                    # a not-ready condition, exactly like empty annotation_data.
+                    _log(f"broadcast_local_bookmark: no clip at frame {frame} — will retry")
+                    return None
 
         annotation_track_guid = self.plugin.manager.annotation_track_guid_for_clip(clip_guid)
         if annotation_track_guid is None:
