@@ -65,6 +65,12 @@ class AnnotationSyncController:
         self._our_bookmark_uuids_lock = threading.Lock()
         self._our_annotation_clip_guids: set = set()
         self._our_bookmark_clip_frame: dict[str, tuple[str, int]] = {}
+        # (clip_guid, frame) -> bookmark uuid str, recorded whenever
+        # broadcast_local_bookmark successfully broadcasts for that key.  Used
+        # by flush_pending_annotations to detect a bookmark that has since
+        # disappeared (the usual outcome of clearing a drawing) and broadcast
+        # the clear peers otherwise never receive.
+        self._broadcast_annotation_keys: dict[tuple, str] = {}
         self._last_sent_captions: dict[str, str] = {}
         self._annotation_flush_retries: int = 0
         self._core_events_received: int = 0
@@ -81,6 +87,10 @@ class AnnotationSyncController:
         """Set the last annotation scan timestamp (called from _on_synced)."""
         self._last_annotation_scan = t
         self._last_partial_render_time.clear()
+
+    def reset(self) -> None:
+        """Clear per-session broadcast bookkeeping (called from disconnect())."""
+        self._broadcast_annotation_keys.clear()
 
     # ── annotation event handlers ──────────────────────────────────────
 
@@ -338,6 +348,16 @@ class AnnotationSyncController:
         Iterates ``session.bookmarks.bookmarks``, skips UUIDs in
         ``_our_bookmark_uuids`` (bookmarks we created from remote annotations),
         and broadcasts any strokes not yet present in the OTIO timeline.
+
+        Also diffs ``_broadcast_annotation_keys`` against the bookmarks that
+        currently exist and broadcasts an empty ``REPLACE_ANNOTATION_COMMANDS``
+        for any key whose bookmark has disappeared entirely — the usual result
+        of clearing a drawing with no note text, which xStudio deletes outright
+        rather than leaving empty (``AnnotationsCore::clear_annotation``). That
+        leaves no surviving bookmark for the count-decrease path below to
+        observe, so it is detected here instead, after the per-bookmark scan
+        (so a bookmark recreated under a new uuid this same tick re-records its
+        key first, rather than being mistaken for a deletion).
         """
         ANNOTATION_SCAN_INTERVAL = self.plugin.ANNOTATION_SCAN_INTERVAL
 
@@ -368,8 +388,7 @@ class AnnotationSyncController:
         # delta check inside broadcast_local_bookmark correctly handles
         # deduplication — remote strokes are already in the timeline so delta=0.
         scan_uuids = [bm.uuid for bm in all_bms]
-        if not scan_uuids:
-            return
+        scan_uuid_strs = {str(u) for u in scan_uuids}
 
         stale_any = False
         for bm_uuid in scan_uuids:
@@ -379,6 +398,37 @@ class AnnotationSyncController:
                     stale_any = True
             except Exception:
                 _log_exc("flush_pending_annotations: failed to broadcast bookmark")
+
+        # Detect bookmarks that disappeared since we broadcast for them.  Runs
+        # after the per-bookmark scan above, not before it: xStudio itself can
+        # replace a bookmark with a new uuid on the same frame when a fresh
+        # bookmark hasn't propagated back yet (see the "really awkward" comment
+        # in AnnotationsCore::push_live_edit_to_bookmark) -- scanning first lets
+        # a still-alive bookmark re-record its key under the new uuid before we
+        # ever look for it, so that race isn't mistaken for a deletion. Runs
+        # unconditionally, including when scan_uuids is empty -- the
+        # all-annotations-cleared case leaves zero live bookmarks and is
+        # exactly the case that must not be skipped.
+        for key in list(self._broadcast_annotation_keys):
+            bm_uuid_str = self._broadcast_annotation_keys[key]
+            if bm_uuid_str in scan_uuid_strs:
+                continue
+            del self._broadcast_annotation_keys[key]
+            try:
+                clip_guid, frame = key
+                ann_clip_guid = self.plugin.manager.annotation_clip_guid_at(clip_guid, frame)
+                if ann_clip_guid is None:
+                    continue
+                _log(
+                    f"flush_pending_annotations: bookmark {bm_uuid_str[:8]} disappeared"
+                    f" — broadcasting clear at frame={frame} clip={clip_guid[:8]}"
+                )
+                self.plugin.manager.broadcast_replace_annotation_commands(ann_clip_guid, [])
+            except Exception:
+                _log_exc("flush_pending_annotations: failed to broadcast clear for disappeared bookmark")
+
+        if not scan_uuids:
+            return
 
         # xStudio may not have committed annotation_data yet when the debounce fires.
         # Only retry when a bookmark explicitly returned None (empty annotation_data);
@@ -394,6 +444,23 @@ class AnnotationSyncController:
             self._annotation_flush_retries = 0
 
     # ── broadcast local bookmark ───────────────────────────────────────
+
+    def _record_broadcast_key(self, bm_key: tuple, bm_uuid_str: str) -> None:
+        """Record that annotations were just broadcast for *bm_key*.
+
+        Skipped for bookmarks in ``_our_bookmark_uuids`` — those were created
+        locally to mirror a remote peer's annotation, so when the remote peer
+        clears it and our mirror disappears too, that disappearance must not
+        be echoed back as a clear of our own.
+
+        :param bm_key: ``(clip_guid, frame)`` key, as resolved in
+            :meth:`broadcast_local_bookmark`.
+        :param bm_uuid_str: The originating bookmark's uuid, as a string.
+        """
+        with self._our_bookmark_uuids_lock:
+            if bm_uuid_str in self._our_bookmark_uuids:
+                return
+        self._broadcast_annotation_keys[bm_key] = bm_uuid_str
 
     @bounded(_ANNOTATION_TIMEOUT_MS)
     def broadcast_local_bookmark(self, bm_uuid) -> "bool | None":
@@ -553,6 +620,7 @@ class AnnotationSyncController:
                 self._bookmark_captions_cache[bm_key] = all_captions
                 if all_captions:
                     self._last_sent_captions[str(bm_uuid)] = self.caption_signature(all_captions)
+                self._record_broadcast_key(bm_key, bm_uuid_str)
                 return True
             # No annotation clip on record for this bookmark (never broadcast
             # in the first place) -- nothing to replace.
@@ -620,6 +688,7 @@ class AnnotationSyncController:
                     self._last_sent_captions[cap_key] = current_sig
                     # Keep cache consistent so future ADD scans don't re-detect captions.
                     self._bookmark_captions_cache[bm_key] = all_captions
+                    self._record_broadcast_key(bm_key, bm_uuid_str)
                     return True
 
         events = (
@@ -646,6 +715,7 @@ class AnnotationSyncController:
         if new_captions:
             cap_key = str(bm_uuid)
             self._last_sent_captions[cap_key] = self.caption_signature(all_captions)
+        self._record_broadcast_key(bm_key, bm_uuid_str)
         return True
 
     # ── caption helpers ────────────────────────────────────────────────

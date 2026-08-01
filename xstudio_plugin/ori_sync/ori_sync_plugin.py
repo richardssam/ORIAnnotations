@@ -495,6 +495,7 @@ class ORISyncPlugin(PluginBase):
         self.structure._xs_sequence_media_names.clear()
         self.media.reset()
         self.color.reset()
+        self.annotation.reset()
         self.structure._timeline_item_sub_ids.clear()
         with self.structure._timeline_item_lock:
             self.structure._timeline_item_dirty.clear()
