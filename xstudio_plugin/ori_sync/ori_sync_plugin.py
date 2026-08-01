@@ -75,11 +75,13 @@ class ORISyncPlugin(PluginBase):
 
     #: How long to wait for a master before self-electing (seconds).
     DISCOVERY_TIMEOUT = 2.0
-    #: Fallback scan interval (seconds).  AnnotationsCore plugin_events_ events
-    #: (stroke_completed=True) are the preferred pen-up signal when they fire.
-    #: This scan catches strokes in builds where those events are absent.
-    #: Set to 1.0 until AnnotationsCore events are confirmed in the target build.
-    ANNOTATION_SCAN_INTERVAL = 1.0
+    #: Fallback scan interval (seconds).  AnnotationsCore draw events
+    #: (stroke_completed=True) are the pen-up signal, and a bookmark that
+    #: disappears is detected on the same scan, so this is a safety net for
+    #: strokes neither path sees — not a primary detection route.
+    #: Was 1.0 while those events were going to a group nothing broadcast on;
+    #: they are confirmed live since fix-xs-annotation-draw-subscription.
+    ANNOTATION_SCAN_INTERVAL = 30.0
 
     def __init__(self, connection):
         PluginBase.__init__(

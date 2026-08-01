@@ -154,16 +154,18 @@ All network send/receive, annotation events, and session state transitions are l
 
 ### Diagnosing the annotation event schema
 
-xStudio's AnnotationsUI delivers annotation events as an opaque `JsonStore`. The exact field names for pen lifecycle events (`pen_down`, `pen_up`, etc.) and the stroke data layout depend on the xStudio version. To inspect them, temporarily add a print to `_on_annotation_event` in [ori_sync_plugin.py](ori_sync_plugin.py):
+Annotation events reach the plugin through `subscribe_to_annotation_draw_events`, which joins AnnotationsCore's draw-events group and hands every event to `_on_annotation_draw_event(event_data, user_id, stroke_completed)` with the `JsonStore` already decoded. Two kinds arrive on that one callback, told apart by whether `stroke_completed` is present:
+
+- **draw interactions** (`stroke_completed is None`) — `{"event": "PaintStart" | "PaintPoint" | "PaintEnd" | "PaintClear" | "HideDrawings" | ..., "payload": {...}}`
+- **live strokes** — the serialised annotation, `{"Annotation Serialiser Version": N, "Data": {"pen_strokes": [...]}, "user_id": ..., "stroke_completed": bool}`
+
+To inspect the exact shapes for your xStudio version, raise the raw-event log cap in `AnnotationSyncController.on_draw_event` — it already logs the first three events of a session with their top-level keys:
 
 ```python
-def _on_annotation_event(self, data):
-    if len(data) == 3 and isinstance(data[0], event_atom) and isinstance(data[1], annotation_atom):
-        import json
-        print("ANNOTATION EVENT:", json.loads(data[2].dump()))
+if self._core_events_received <= 3:   # raise this while investigating
 ```
 
-The plugin currently assumes `event == "pen_down"` and `event == "pen_up"` as the stroke lifecycle markers, and `ann["base"]["annotation"]["Data"]["pen_strokes"]` as the stroke payload — the same schema used by the `ori_annotations` export plugin. Adjust the field names in `_on_annotation_event` and `_do_broadcast_annotation` if your xStudio version differs.
+Do **not** subscribe to the AnnotationsUI or AnnotationsCore *plugin events* groups to get at this. `PluginBase` spawns those without an owner and nothing is ever broadcast on them, so the subscription silently delivers nothing — the bug that kept this whole path dead until `fix-xs-annotation-draw-subscription`. See [docs/xstudio_constraints.md](../../docs/xstudio_constraints.md) for the full account.
 
 ---
 

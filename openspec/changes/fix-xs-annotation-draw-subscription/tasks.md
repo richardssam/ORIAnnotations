@@ -25,21 +25,22 @@
 
 ## 4. Documentation
 
-- [ ] 4.1 Correct `docs/xstudio_constraints.md` — it states `on_core_annotation_event` is confirmed firing on AnnotationsCore's `plugin_events_`, which was true of an older xStudio build and is now wrong; record that live strokes moved to `live_edit_`/`draw_events_`
-- [ ] 4.2 Update the `[2C]` entry in `TODO.md`, which specifies subscribing to `live_edit_event_group_` via `join_broadcast_atom() + annotation_atom()` — not reachable from Python
-- [ ] 4.3 Refresh the stale `_on_annotation_event` inspection recipe in `xstudio_plugin/ori_sync/README.md`
+- [x] 4.1 Correct `docs/xstudio_constraints.md` — rewritten around the draw-events group, with the "nothing is ever broadcast on a `plugin_events_` group" rule stated up front, the unreachability of `live_edit_event_group_` recorded, and the count-decrease section extended with bookmark disappearance and its two traps
+- [x] 4.2 Update the `[2C]` entry in `TODO.md` — marked done, and corrected: it specified `live_edit_event_group_` via `join_broadcast_atom() + annotation_atom()`, which Python cannot reach
+- [x] 4.3 Refresh the stale `_on_annotation_event` inspection recipe in `xstudio_plugin/ori_sync/README.md` — replaced with the two payload shapes and how to raise the raw-event log cap
 
 ## 5. Now that the event path is confirmed live
 
-- [ ] 5.1 Restore `ANNOTATION_SCAN_INTERVAL` to 30 s (`ori_sync_plugin.py:81` — "Set to 1.0 until AnnotationsCore events are confirmed in the target build"). At 1.0 s it violates the existing `xs-event-annotation` requirement that the fallback be at least 30 seconds, and it is what produces one `broadcast_local_bookmark` line per second for an entire session
-- [ ] 5.2 Stop logging every draw interaction — `PaintPoint` arrives at pointer rate (130 lines for three strokes). Log stroke-lifecycle events and unrecognised ones; drop or demote the per-point line
-- [ ] 5.3 Confirm the fallback scan does not trigger between strokes once 5.1 lands, now that interactions also refresh the debounce timestamp
+- [x] 5.1 Restore `ANNOTATION_SCAN_INTERVAL` to 30 s. Safe now that both the draw events and the disappearance diff (`xs-detect-deleted-bookmarks`) are live, so the scan is genuinely a safety net again
+- [x] 5.2 Stop logging every draw interaction — `PaintPoint` added to `_HIGH_RATE_EVENTS` and skipped. Confirmed live: 0 `PaintPoint` log lines across five strokes, against 130 for three strokes before
+- [x] 5.3 Confirm the fallback scan does not trigger between strokes — confirmed: scans now only follow events (9 across a five-stroke session, none during a 5 s idle gap), where before it was one per second continuously
+- [ ] 5.4 Consider not scheduling a scan on `PaintPoint` at all. Points still refresh the debounce timestamp, so a stroke whose points arrive slower than the 250 ms debounce triggers a scan per point — visible with the synthetic probe (points 0.4 s apart → a scan every ~0.4 s). Harmless (nothing is committed mid-stroke to find) and invisible at real pointer rates, but it is wasted work, and the `[2C]` live-stroke path already covers mid-stroke
 
 ## 6. Follow-up found during verification
 
 - [x] 6.1 Investigate why `PaintClear` produced no `REPLACE_ANNOTATION_COMMANDS` — **root cause found**. A clear on a drawing with no note text deletes the whole bookmark: `AnnotationsCore::clear_annotation` computes `bookmark_is_empty = !(detail.note_ && !detail.note_->empty())` and `ClearAnnotation::redo` calls `plugin_->remove_bookmark(bm_id_)` (annotations_core_plugin.cpp:1459-1460, :1514). ORIAnnotations detects a clear as a stroke-count *decrease* while iterating `session.bookmarks.bookmarks`, and `flush_pending_annotations` returns early at `if not scan_uuids: return` when the list is empty — so a deleted bookmark is invisible and nothing is ever broadcast. Confirmed live with `xstudio/scratch/annotation_clear_probe.py`: bookmark list goes `[] → [25902086…] → []` across draw/clear, and the plugin log shows `Draw interaction (event='PaintClear') — scheduling broadcast scan` followed by no scan output at all. Peers keep the annotation indefinitely
 - [ ] 6.2 Establish whether the absence of a committed `Annotation.1` broadcast after pen-up is by design — the clear-probe session sent none, but an `OTIO_SESSION_1.0` update followed the pen-up scan, so the committed state may already propagate that way
-- [ ] 6.3 Fix the send side: track the (clip, frame) keys last broadcast, diff against the surviving bookmark set on each scan *before* the empty-list early return, and emit an empty `REPLACE_ANNOTATION_COMMANDS` for keys that have vanished. The receive side already specifies this — `annotation-lifecycle-sync` requires an empty replace to be applied as an authoritative hard clear. Note this also covers deleting a note from the notes panel, and belongs in `annotation-lifecycle-sync` scope — likely its own change rather than this one
+- [x] 6.3 Fix the send side — split out as the `xs-detect-deleted-bookmarks` change and landed in `ef43d8e`. Implemented as: track the (clip, frame) keys last broadcast, diff against the surviving bookmark set on each scan, and emit an empty `REPLACE_ANNOTATION_COMMANDS` for keys that have vanished. The receive side already specifies this — `annotation-lifecycle-sync` requires an empty replace to be applied as an authoritative hard clear. Note this also covers deleting a note from the notes panel, and belongs in `annotation-lifecycle-sync` scope — likely its own change rather than this one
 
 ## 7. Regression check
 

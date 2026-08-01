@@ -96,13 +96,20 @@ leaving nothing to match on.  See `docs/plugin_tasks.md` for the two fix paths.
 
 ## API Improvement Tasks (from xstudio_questions.md replies)
 
-### [2C] Event-driven annotation detection
+### [2C] Event-driven annotation detection — DONE
 
-Replace the hot-scan (33 ms poll) and 1 s fallback scan with a subscription to
-`ANNOTATIONS_CORE_PLUGIN`'s `live_edit_event_group_`.  Subscribe via
-`join_broadcast_atom() + annotation_atom()` and handle
-`(event_atom, annotation_data_atom, AnnotationBasePtr, user_id, stroke_completed)`.
-The `stroke_completed=True` flag on `PaintEnd` is the pen-up signal.
+Done in `fix-xs-annotation-draw-subscription`; the fallback scan is back to 30 s.
+
+Not as specified below, though: `live_edit_event_group_` is **not reachable from
+Python** — it is exposed only through a four-argument `join_broadcast` handler the
+Python API cannot send, so its `AnnotationBasePtr` messages are unusable. The
+serialised equivalent, with `user_id` and `stroke_completed`, is broadcast on
+AnnotationsCore's *draw-events* group alongside the raw draw interactions, and
+`plugin_base.subscribe_to_annotation_draw_events` joins it. `stroke_completed=True`
+at `PaintEnd` is still the pen-up signal.
+
+The two subscriptions this originally shipped with joined `plugin_events_` groups,
+which nothing ever broadcasts on, so none of it fired until that was corrected.
 
 **Testing:**
 

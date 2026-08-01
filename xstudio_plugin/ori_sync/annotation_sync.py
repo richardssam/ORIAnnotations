@@ -99,6 +99,10 @@ class AnnotationSyncController:
     #: bookmark scan. See annotations_ui_plugin.cpp's toggle_visibility_hotkey_.
     _VISIBILITY_EVENTS = ("HideDrawings", "ShowDrawings")
 
+    #: Draw interactions that arrive at pointer rate.  Handled normally, but not
+    #: logged — one line per point buries everything else in the log.
+    _HIGH_RATE_EVENTS = ("PaintPoint",)
+
     def on_draw_event(self, event_data, user_id, stroke_completed) -> None:
         """[2C] Entry point for every event on AnnotationsCore's draw-events group.
 
@@ -167,7 +171,10 @@ class AnnotationSyncController:
             self.plugin.display.poll_and_broadcast_display()
             return
 
-        _log(f"Draw interaction (event={event_name!r}) — scheduling broadcast scan")
+        # PaintPoint arrives at pointer rate (~130 events for three strokes), so
+        # log the gesture boundaries and anything unfamiliar, not every point.
+        if event_name not in self._HIGH_RATE_EVENTS:
+            _log(f"Draw interaction (event={event_name!r}) — scheduling broadcast scan")
         self.plugin._annotation_pending_time = time.monotonic()
 
     def on_core_annotation_event(self, anno_json, stroke_completed) -> None:
