@@ -419,8 +419,14 @@ class SyncPlayer:
             new_dict = {}
             for k, v in payload.items():
                 if k == "target_url" and isinstance(v, str):
-                    if v.startswith("file:///"):
+                    if v.startswith("file:///") or v.startswith("file://localhost/"):
                         # Fully-qualified absolute URI — pass through unchanged.
+                        # xStudio emits the "file://localhost/..." authority form
+                        # for the same path RV writes as "file:///...".  Without
+                        # the second test, "file:/" below strips the scheme and
+                        # tries to resolve "/localhost//Users/..." against the
+                        # project root, which always fails — producing a
+                        # "not found" warning for a file that is present.
                         new_dict[k] = v
                     elif v.startswith("file:/"):
                         # file:/ prefix signals a project-relative path.
