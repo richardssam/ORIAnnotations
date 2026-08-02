@@ -83,7 +83,7 @@ tests:
       - "openrv"
       - "xstudio"
   - name: "xstudio_selects"
-    recording: "recordings/xstudio_selects.jsonl"
+    recording: "recordings/xstudio_selects_v2.jsonl"
     #script_driven: true
     apps:
       - "openrv"

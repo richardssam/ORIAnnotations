@@ -9,12 +9,21 @@
   - The harness normalises RV to the same space: `frame() - frameStart() + 1` ([openrv_hook.py:40](sync_test/python/sync_test/openrv_hook.py#L40)), matching `validate_checkpoint`'s `expected_frame + 1`. Source-view checkpoints are therefore comparable across hosts.
 - [ ] 1.2 Record the answer in `docs/` alongside the existing frame-base notes, since this is the third time frame-base semantics have cost an investigation
 
-## 2. xStudio receiver
+## 2. xStudio receiver — NOT NEEDED, already works
 
-- [ ] 2.1 Add a manager helper that resolves a `timeline_guid` to a clip guid by derivation (`uuid5(NAMESPACE_OID, f"clip_timeline:{clip_guid}")`), checking the clips the peer knows rather than only `_clip_timelines`
-- [ ] 2.2 In `playback_sync.apply_playback_state`, attempt that resolution before declaring a mismatch; on success apply the playback as source-view playback for the resolved clip
-- [ ] 2.3 Keep the ignore path for a guid that resolves to nothing, and keep the existing "apply a play command even on mismatch" behaviour
-- [ ] 2.4 Make sure applying does not echo back — the capability already requires this for incoming clip changes
+Verified against the re-recorded `xstudio_selects_v2.jsonl` (2026-08-02): two of its
+three checkpoints are source-mode against clip-timeline guids, one asserting frame 28
+inside an isolated clip, and the test **passes**. No receiver change is required.
+
+`unify-view-state-sync` closed this incidentally: `view_mode="source"` and `clip_guid`
+now arrive on the same message, so the receiver's view block runs `apply_selection`
+first, which sets `active_timeline_guid = get_or_create_clip_timeline(clip_guid)` — the
+same derived guid the sender used. The mismatch guard is never reached.
+
+- [x] 2.1 ~~Manager helper resolving a `timeline_guid` by derivation~~ — unnecessary; `apply_selection` already establishes the match
+- [x] 2.2 ~~Attempt resolution before declaring a mismatch~~ — the mismatch never occurs
+- [x] 2.3 ~~Keep the ignore path~~ — unchanged, still in place
+- [x] 2.4 ~~Verify applying does not echo back~~ — unchanged behaviour, exercised by the passing two-app run
 
 ## 3. RV
 
@@ -27,19 +36,27 @@
   - So RV hits `view_mode is None` and skips the entire view-switch block. It never learns it should be in source view, applies the frame against the sequence it is still showing, and `_last_applied_*` is never updated. Nothing in RV's code is wrong; it was never told.
   - A **current** sender always includes both fields on the hot path ([playback_sync.py:636-637](xstudio_plugin/ori_sync/playback_sync.py#L636-L637)), so RV's `_switch_to_source_view` would fire.
 
-- [ ] 3.2 Fix per that diagnosis — do not assume it is the same defect as xStudio's
+- [x] 3.2 Fix per that diagnosis — do not assume it is the same defect as xStudio's
 
-  Per 3.1 there is no RV-side defect to fix. Close this once 1.1/3.1 are accepted, or re-open if a re-recorded run shows a genuine RV failure.
+  No RV-side defect. Confirmed by the re-recorded run: RV follows source-view playback and the suite passes.
 
 ## 4. Verify
 
-- [ ] 4.1 `xstudio_selects` passes, and passes repeatedly (it has been failing on the t=36.2 s checkpoint, which asserts exactly this behaviour)
-- [ ] 4.2 Isolate a clip, scrub, and confirm the peer lands on the same *image*, not merely the same frame number
-- [ ] 4.3 Two-peer run: confirm an applied clip-timeline playback does not echo back to the sender
-- [ ] 4.4 Confirm playback for a genuinely unknown timeline is still ignored
-- [ ] 4.5 Confirm sequence-view playback is unchanged, including the deliberate non-actioning of a sequence-mode `clip_guid`
+- [x] 4.1 `xstudio_selects` passes — with `xstudio_selects_v2.jsonl`. **Still to confirm it passes repeatedly**, not just once
+- [ ] 4.2 Isolate a clip, scrub, and confirm the peer lands on the same *image*, not merely the same frame number. **Still genuinely open**: both source-mode checkpoints have `timeline_name=None` (a clip-timeline guid is never declared in the snapshot), so only the frame number is asserted — the pass proves frame following, not image following
+- [x] 4.3 Two-peer run: no echo observed in the passing run
+- [ ] 4.4 Confirm playback for a genuinely unknown timeline is still ignored — untouched code path, but unexercised by this recording
+- [x] 4.5 Sequence-view playback unchanged — the recording is a near-even 236 sequence / 230 source split and passes both
 
 ## 5. Test-side follow-ups found alongside this
 
 - [ ] 5.1 `sync_test` has three intermittent tests — `add_media`, `delete_media_xstudio`, `reorder_media` all failed in a suite run and passed in isolation or on re-run. Flakiness at that rate makes every suite result ambiguous and is worth its own investigation
-- [ ] 5.2 Decide whether `derive_checkpoints` should skip checkpoints whose `timeline_guid` was never declared in the recording. It was implemented and then reverted deliberately: while source-view playback is unfollowable those checkpoints are unsatisfiable, but skipping them would have hidden this very bug. Once this change lands they become satisfiable and the question may be moot
+- [x] 5.2 Decide whether `derive_checkpoints` should skip checkpoints whose `timeline_guid` was never declared in the recording. **Resolved: do not skip.** They are satisfiable — two such checkpoints pass in the current recording. The revert was correct; skipping would have hidden the fact that the failure was a stale recording. Note they remain *weak* (frame only, no clip assertion), which is what task 4.2 covers
+
+## 6. Recording hygiene learned here
+
+A snapshot asserts whatever state the session happened to be in when recording began. The first `xstudio_selects_v2` attempt failed at the t=0.2 s structural checkpoint for two reasons unrelated to playback, both worth avoiding when recording:
+
+- [x] 6.1 Park the playhead at frame 0 before recording — the first attempt captured `current_time.value = 87.0`, a position nothing in the recording ever drives the apps to
+- [x] 6.2 Record against a real sequence, not a bare flat playlist with clip timelines already materialised — RV always creates its own `'Default Sequence'`, which then shows up as an undeclared extra timeline
+- [ ] 6.3 Consider whether the projection should ignore an app-created default sequence regardless, so recording technique is not load-bearing for a passing suite
