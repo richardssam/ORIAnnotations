@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines how the xStudio sync plugin uses AnnotationsCore plugin events to drive immediate annotation detection and broadcast, replacing the previous polling-only approach with an event-driven path. Mid-stroke partials broadcast directly from event-carried geometry (no bookmark read or per-tick scan); pen-up flushes the committed stroke immediately. A 30-second fallback scan remains as a safety net only.
+Defines how the xStudio sync plugin uses AnnotationsCore's draw events to drive immediate annotation detection and broadcast, replacing the previous polling-only approach with an event-driven path. Mid-stroke partials broadcast directly from event-carried geometry (no bookmark read or per-tick scan); pen-up flushes the committed stroke immediately. A 30-second fallback scan remains as a safety net only.
 
 ---
 
@@ -10,29 +10,38 @@ Defines how the xStudio sync plugin uses AnnotationsCore plugin events to drive 
 
 ### Requirement: AnnotationsCore event subscription
 
-The xStudio plugin SHALL subscribe to AnnotationsCore's `plugin_events_` broadcast group at session connect time. The plugin SHALL consume the geometry-bearing 5-tuple `(event_atom, annotation_data_atom, JsonStore, user_id, stroke_completed)` as the primary shape, and SHALL tolerate the legacy geometry-less 4-tuple `(event_atom, annotation_data_atom, user_id, stroke_completed)` from older builds. Shape discrimination SHALL be by tuple length, not by inspecting the type of the third element.
+The xStudio plugin SHALL subscribe to AnnotationsCore's draw-events broadcast group at session connect time, via the API xStudio provides for that purpose (`subscribe_to_annotation_draw_events`). The plugin SHALL NOT subscribe to any plugin's `plugin_events_` group for annotation traffic: nothing is broadcast there, so such a subscription is silently inert.
+
+That group carries two kinds of event, which the subscription API delivers through one callback signature `(event_data, user_id, stroke_completed)`:
+
+- a **live stroke** — the serialised in-progress annotation, with `user_id` and a `stroke_completed` flag;
+- a **draw interaction** — the raw interaction payload whose `"event"` field names the action, delivered with `user_id` and `stroke_completed` both absent.
+
+The plugin SHALL discriminate the two by whether `stroke_completed` is present, and SHALL NOT discriminate by tuple length or by inspecting CAF message element types.
 
 #### Scenario: Subscription succeeds
 - **WHEN** the plugin connects to a session
 - **THEN** the plugin SHALL log "Subscribed to AnnotationsCore plugin events [2C]"
 - **AND** SHALL receive PaintStart, PaintPoint, and PaintEnd events during drawing
 
-#### Scenario: New 5-tuple with geometry
-- **WHEN** a mid-stroke event arrives from a build carrying serialized geometry
-- **THEN** the plugin SHALL read the `JsonStore` from `data[2]`
+#### Scenario: Live stroke with geometry
+- **WHEN** an event arrives carrying a `stroke_completed` flag
+- **THEN** the plugin SHALL treat the payload as serialised annotation geometry
 - **AND** SHALL take the direct live-stroke broadcast path using that geometry
 
-#### Scenario: Legacy 4-tuple without geometry
-- **WHEN** a mid-stroke event arrives from a build that sends no geometry
-- **THEN** the plugin SHALL detect the shorter tuple length
-- **AND** SHALL degrade to pen-up-only broadcasting (final stroke on flush), without a per-tick bookmark hot-scan
+#### Scenario: Draw interaction
+- **WHEN** an event arrives with no `stroke_completed` flag
+- **THEN** the plugin SHALL treat the payload as a draw interaction and dispatch on its `"event"` field
+
+#### Scenario: Live stroke carries no geometry
+- **WHEN** a live-stroke event arrives whose payload is empty, as AnnotationsCore sends for shape tools before the shape is completed
+- **THEN** the plugin SHALL NOT broadcast a partial for that event
+- **AND** the committed stroke SHALL still be broadcast by the pen-up flush
 
 #### Scenario: Subscription fails gracefully
-- **WHEN** `get_plugin("AnnotationsCore")` raises or returns nothing
+- **WHEN** the subscription call raises
 - **THEN** the plugin SHALL log the exception and continue without the subscription
 - **AND** the 30-second fallback scan path SHALL remain active as the only safety net
-
----
 
 ### Requirement: PaintPoint triggers direct live-stroke broadcast
 
@@ -108,32 +117,25 @@ The fallback scan interval (`ANNOTATION_SCAN_INTERVAL`) SHALL be at least 30 sec
 - **WHEN** AnnotationsCore events are being received normally
 - **THEN** the fallback scan MUST NOT trigger between strokes, only after 30 s of inactivity
 
-### Requirement: AnnotationsUI event type discrimination
+### Requirement: Draw interaction event discrimination
 
-The xStudio plugin's `on_annotation_event` handler SHALL inspect the `data["event"]` string of each `(event_atom, annotation_atom, JsonStore)` payload received from the `AnnotationsUI` plugin, rather than treating every such payload identically as a generic "schedule a bookmark scan" trigger. `PaintClear`, `HideDrawings`, and `ShowDrawings` SHALL each be handled according to their own requirements (deletion detection, visibility broadcast) in addition to — or instead of — the existing generic scan scheduling.
+The xStudio plugin SHALL inspect the `"event"` field of each draw interaction received from AnnotationsCore's draw-events group, rather than treating every interaction identically as a generic "schedule a bookmark scan" trigger. `PaintClear`, `HideDrawings`, and `ShowDrawings` SHALL each be handled according to their own requirements (deletion detection, visibility broadcast) in addition to — or instead of — the generic scan scheduling.
 
-#### Scenario: PaintClear still schedules the debounced scan
+These interactions originate in AnnotationsUI, which sends them point-to-point to the AnnotationsCore actor; AnnotationsCore re-broadcasts them on its draw-events group. They are therefore only observable there, never on AnnotationsUI's own event group.
 
-- **WHEN** `on_annotation_event` receives a payload with `data["event"] == "PaintClear"`
-- **THEN** the plugin SHALL schedule the existing debounced flush scan, as it does today for any annotation event
+#### Scenario: PaintClear schedules the debounced scan
+
+- **WHEN** a draw interaction with `"event" == "PaintClear"` is received
+- **THEN** the plugin SHALL schedule the existing debounced flush scan
 
 #### Scenario: HideDrawings/ShowDrawings broadcast visibility instead of scanning bookmarks
 
-- **WHEN** `on_annotation_event` receives a payload with `data["event"]` equal to `"HideDrawings"` or `"ShowDrawings"`
+- **WHEN** a draw interaction with `"event"` equal to `"HideDrawings"` or `"ShowDrawings"` is received
 - **THEN** the plugin SHALL broadcast the corresponding `annotations_visible` boolean via `display_settings`
 - **AND** SHALL NOT schedule a bookmark scan for this event
 
-#### Scenario: Unrecognised events keep today's behavior
+#### Scenario: Unrecognised interactions schedule the generic scan
 
-- **WHEN** `on_annotation_event` receives a payload whose `data["event"]` is not one of the recognised values (e.g. a tool-switch or display-mode change)
-- **THEN** the plugin SHALL continue to schedule the generic debounced flush scan, unchanged from current behavior
+- **WHEN** a draw interaction whose `"event"` is not one of the recognised values (e.g. a tool switch or display-mode change) is received
+- **THEN** the plugin SHALL schedule the generic debounced flush scan
 
-### Requirement: A local clear is detected even though the AnnotationsUI event channel does not deliver it
-
-`on_annotation_event`'s subscription (`self.get_plugin("AnnotationsUI")` + `subscribe_to_plugin_events`, which joins `plugin_events_group_atom()`) does not receive `AnnotationsUI::send_event()`'s traffic in practice — that method sends `PaintClear`/`HideDrawings`/`ShowDrawings` as a direct point-to-point message to the AnnotationsCore actor, not to AnnotationsUI's own event group. The plugin SHALL NOT depend on `on_annotation_event` alone to detect a local clear; `on_core_annotation_event` (subscribed to AnnotationsCore's `plugin_events_`, which is confirmed to deliver live-stroke events) SHALL also recognise `AnnotationsCore::clear_annotation()`'s 3-tuple `(event_atom, annotation_data_atom, AnnotationBasePtr)` broadcast — one element shorter than the 4/5-tuple live-stroke shape — as a signal to schedule the same debounced flush scan.
-
-#### Scenario: A 3-tuple AnnotationsCore event schedules a flush
-
-- **WHEN** `on_core_annotation_event` receives an event tuple of exactly 3 elements matching `(event_atom, annotation_data_atom, ...)`
-- **THEN** the plugin SHALL schedule the existing debounced flush scan
-- **AND** SHALL NOT require parsing the third element to do so
