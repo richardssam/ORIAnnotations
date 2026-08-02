@@ -40,4 +40,18 @@ The xStudio failure is understood and reproducible. RV's is not. The task list t
 
 ## Open Questions
 
-- Is a source-view frame clip-local on both hosts, or does either send sequence-relative values? The recording shows `frame=3` immediately after isolating a clip, which reads as clip-local, but this needs confirming on both senders before the receiver's translation is written.
+- ~~Is a source-view frame clip-local on both hosts?~~ **Answered (tasks 1.1): clip-local on both, and no new translation is needed.** Both senders already subtract their own view base, and RV's receiver re-reads `frameStart()` after the view switch. See tasks.md 1.1.
+
+## Findings that revise this design
+
+Diagnosis (tasks 1.1 and 3.1) materially narrows the defect. Recorded here rather than silently rewriting the proposal, because it changes what is worth building.
+
+**1. `xstudio_selects.jsonl` replays a retired protocol.** It was recorded 2026-06-02; `d18ec21` (2026-07-01) retired `SELECTION_1.0` and folded view state into `PLAYBACK_SETTINGS_1.0`. Its playback messages carry no `view_mode`/`clip_guid`, and its `SELECTION_1.0` messages are ignored by both receivers because `SelectionSet` no longer exists. The proposal's claim that the receiver "has the clip guid from the preceding `SELECTION_1.0` message" is **false against current code** — that message is dropped.
+
+**2. The xStudio bug is probably already fixed.** With a *current* sender, `view_mode="source"` + `clip_guid` arrive on the same message. The receiver's view block runs `apply_selection(source)` first, which sets `manager.active_timeline_guid = get_or_create_clip_timeline(clip_guid)` — the same derived guid the sender used. By the time the mismatch guard is reached the two guids are equal, so nothing is dropped. `unify-view-state-sync` appears to have closed this as a side effect.
+
+The mismatch therefore only bites when the receiver never ran `apply_selection` for that clip — precisely what a recording with no `view_mode` produces. **The observed failure is a stale-recording artefact, not a live sync defect.**
+
+**3. Fixing the receiver would make `xstudio_selects` pass hollowly.** Resolving the derived guid would let xStudio apply frame 3 — but in *sequence* view, since the stale recording never asks it to isolate. RV would do the same. The checkpoint asserts frame only (`timeline_name` is `None`, as the clip-timeline guid is never declared), so both land on ~frame 4 of the sequence and the test goes green while the two hosts show a different image from the one recorded. That is exactly the "sync works but shows the wrong frame" failure this design's Risks section warns against — reached by fixing the receiver rather than by neglecting to.
+
+**Implication.** The load-bearing work is re-recording `xstudio_selects` against the current protocol, not changing receiver code. Derivation-based resolution is still defensible as belt-and-braces for a peer that misses the isolating message, but it should be justified on its own merits and verified against a recording that actually exercises source view — not adopted on the strength of a failure it does not explain.
