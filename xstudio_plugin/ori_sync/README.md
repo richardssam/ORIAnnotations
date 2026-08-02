@@ -51,10 +51,30 @@ functionally required by the plugin; one is a local build convenience.
 | `a099681e` | `build: upgrade FFmpeg vcpkg override to 8.0.1#2` | **Local build convenience only — NOT functionally required.** Omit for a clean upstream-tracking build. | Not for upstream. |
 
 Note: the original event-routing work also patched `plugin_base.py` for playhead
-events; that part was **dropped**. The plugin instead uses the maintainer-recommended
-`subscribe_to_playhead_events()` + `playhead_attribute_changed` path. Only the
-generic event-group owner-actor routing (`module.py` + `py_context.cpp`) survives
-and is required.
+events; that part was **dropped**. Only the generic event-group owner-actor routing
+(`module.py` + `py_context.cpp`) survives and is required.
+
+The plugin briefly used the maintainer-recommended `subscribe_to_playhead_events()`
++ `playhead_attribute_changed` path, but **no longer calls it** — on `develop` it
+silently kills the very subscription it sets up, and with it all position/playback
+sync. Two compounding causes, both documented in
+`xstudio/scratch/python-event-routing-notes.md`:
+
+- it calls `subscribe_to_global_playhead_events()` a second time on top of the
+  plugin's own call, and `PlayheadGlobalEventsActor` delegates **both** join and
+  leave to its single `event_group_`
+  (`playhead_global_events_actor.cpp:101-105`), collapsing both routes onto one
+  `BroadcastActor::subscribers_` entry; and
+- its `__connect_to_playhead` calls `cleanup_message_handler()` on the previous
+  playhead at every `viewport_playhead_atom` event, and with one shared listener
+  per connection that leave revokes the membership the plugin's own `Playhead`
+  objects depend on.
+
+`PlaybackSyncController._adopt_playhead` now does the one thing the base call was
+wanted for — assigning `attribute_changed` — at every site that acquires a
+playhead, without issuing the fatal leave. Revisit if
+`pr/python-per-subscription-listeners` lands upstream, which fixes this
+structurally by giving each subscription its own listener actor.
 
 ### Build (macOS, as used here)
 

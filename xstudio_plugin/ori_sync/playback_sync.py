@@ -417,13 +417,14 @@ class PlaybackSyncController:
             _log(f"viewport_playhead_atom Form-1 (ignored): len={len(event)}")
             return
         ph_remote = event[3]
-        current_remote = getattr(self.plugin.active_playhead, "remote", None)
-        if ph_remote != current_remote:
+        # Compare BEFORE constructing: building a Playhead subscribes it to the
+        # playhead's attribute events group, so constructing one per event just to
+        # discard it churns subscriptions on a group we are already listening to.
+        if str(ph_remote) != self._remote_key(self.plugin.active_playhead):
             try:
                 new_ph = Playhead(self.plugin.connection, ph_remote)
-                self._carry_over_playback_mode(new_ph)
-                self.plugin.active_playhead = new_ph
-                _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
+                if self._adopt_playhead(new_ph):
+                    _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
             except Exception:
                 _log_exc("on_global_playhead_event: failed to update playhead")
 
@@ -529,6 +530,52 @@ class PlaybackSyncController:
 
     # ── active playhead management ─────────────────────────────────────
 
+    @staticmethod
+    def _remote_key(obj) -> "str | None":
+        """Stable identity for a playhead's remote actor handle.
+
+        The raw handles returned by ``ph.remote`` are fresh wrapper objects on
+        every access and do not compare equal even when they address the same
+        actor, so ``a.remote != b.remote`` is effectively always True.  That made
+        every playhead observation look like a *change*: the connect-time log
+        showed 21 "active playhead updated" lines all carrying the identical
+        address, each one re-adopting (and re-subscribing to) the same playhead.
+        Comparing the string form makes the change detection real.
+        """
+        if obj is None:
+            return None
+        remote = getattr(obj, "remote", None)
+        return str(remote) if remote is not None else None
+
+    def _adopt_playhead(self, ph) -> bool:
+        """Adopt *ph* as the active playhead, wiring its attribute events.
+
+        Constructing a ``Playhead`` subscribes it to that playhead's attribute
+        events group (``ModuleMeta.__call__`` auto-runs ``setup_message_handler``),
+        but the callback only reaches us once ``attribute_changed`` is assigned —
+        which is what actually delivers "Logical Frame"/"playing" changes to
+        :meth:`on_playhead_attribute_changed` and thus every position broadcast.
+
+        This used to be done by ``PluginBase.subscribe_to_playhead_events()``.  We
+        do it here instead so the base class never builds a competing ``Playhead``
+        of its own; see the comment at that (now removed) call site in
+        ``ori_sync_plugin.connect`` for why sharing that job was fatal on develop.
+
+        :returns: True if the active playhead actually changed.
+        """
+        if ph is None:
+            return False
+        new_key = self._remote_key(ph)
+        if new_key is not None and new_key == self._remote_key(self.plugin.active_playhead):
+            return False
+        try:
+            ph.attribute_changed = self.plugin.playhead_attribute_changed
+        except Exception:
+            _log_exc("_adopt_playhead: could not wire attribute_changed")
+        self._carry_over_playback_mode(ph)
+        self.plugin.active_playhead = ph
+        return True
+
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def check_and_update_active_playhead(self) -> None:
         """Query the active playhead from xStudio and cache its reference if changed."""
@@ -537,12 +584,8 @@ class PlaybackSyncController:
         except Exception:
             return
 
-        if ph:
-            current_remote = getattr(self.plugin.active_playhead, "remote", None)
-            if ph.remote != current_remote:
-                self._carry_over_playback_mode(ph)
-                self.plugin.active_playhead = ph
-                _log(f"[position_atom] active playhead updated: {ph.remote}")
+        if ph and self._adopt_playhead(ph):
+            _log(f"[position_atom] active playhead updated: {ph.remote}")
 
     def _reacquire_active_playhead(self) -> None:
         """Re-acquire a live playhead after the previous reference went stale.
@@ -556,9 +599,7 @@ class PlaybackSyncController:
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
                 ph = self.plugin.current_playhead()
-                if ph:
-                    self._carry_over_playback_mode(ph)
-                    self.plugin.active_playhead = ph
+                if ph and self._adopt_playhead(ph):
                     _log(f"[position_atom] re-acquired live playhead: {ph.remote}")
         except Exception:
             _log_exc("_reacquire_active_playhead: failed")

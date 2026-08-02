@@ -396,16 +396,40 @@ class ORISyncPlugin(PluginBase):
 
         self.manager.start_session()
 
-        # Grab the current playhead and subscribe to its position events.
-        # subscribe_to_playhead_events() wires the playhead's attribute_changed
-        # callback (via the base __connect_to_playhead) to playhead_attribute_changed
-        # → on_playhead_attribute_changed, which is how scrub/position changes reach
-        # us and get broadcast.  (The base __connect_to_playhead had a bogus
-        # add_message_callback line referencing an undefined event_group, fixed in
-        # plugin_base.py; without that fix this call raises NameError.)
+        # Grab the current playhead and wire its attribute events ourselves.
+        #
+        # We deliberately do NOT call PluginBase.subscribe_to_playhead_events().
+        # On develop that call is actively harmful here, for two compounding
+        # reasons:
+        #
+        #   1. It calls subscribe_to_global_playhead_events() a SECOND time (see
+        #      plugin_base.subscribe_to_playhead_events) on top of our own call in
+        #      __init__.  PlayheadGlobalEventsActor delegates both join AND leave
+        #      to its single event_group_ (playhead_global_events_actor.cpp:101-105),
+        #      so the two routes collapse onto one entry in
+        #      BroadcastActor::subscribers_ — the "two callbacks reaching the same
+        #      group by different routes" case in xstudio/scratch/
+        #      python-event-routing-notes.md, which predates 70aaaa3f.
+        #   2. Its __connect_to_playhead calls cleanup_message_handler() on the
+        #      previous playhead on every viewport_playhead_atom event.  With one
+        #      shared listener actor per connection, that leave revokes the shared
+        #      membership our own Playhead objects rely on, leaving their
+        #      attribute_changed callbacks registered but permanently silent.
+        #
+        # Net effect on develop: "Logical Frame"/"playing" events stopped arriving
+        # almost immediately, so on_playhead_attribute_changed never ran and NO
+        # position or play/stop state was ever broadcast — scrubbing and playback
+        # simply did not sync, while selection-driven view-state messages (which
+        # take a different path) kept working and masked it.  Confirmed against a
+        # two-peer session log: zero "queuing playback state broadcast" lines in
+        # either process, every PLAYBACK_SETTINGS_1.0 carrying frame=0.0.
+        #
+        # _adopt_playhead does the one thing we actually needed from the base call
+        # (assign attribute_changed), at every site that acquires a playhead, and
+        # never issues the killing leave.  Revisit if/when the per-subscription
+        # listener change (pr/python-per-subscription-listeners) lands upstream.
         try:
             self.playback.check_and_update_active_playhead()
-            self.subscribe_to_playhead_events()
         except Exception:
             _log_exc("Could not initialize active playhead at connect time")
 
