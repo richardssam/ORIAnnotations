@@ -250,6 +250,22 @@ def execute_xstudio_command(payload, port):
                         
             raise ValueError(f"Could not find sequence or media matching name: {name}")
 
+        elif action == "set_frame":
+            # `frame` is the protocol's 0-indexed local frame value; per
+            # get_xstudio_state's `state["frame"] = ph.position` (compared
+            # directly against protocol_value + 1 elsewhere), ph.position
+            # is 1-indexed, so add 1 to match.
+            frame = int(payload.get("frame"))
+            from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+            from xstudio.api.session.playhead import Playhead
+            gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+            ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+            if not ph_actor:
+                raise RuntimeError("set_frame: no active playhead")
+            ph = Playhead(conn, ph_actor)
+            ph.position = frame + 1
+            return {"action": action, "status": "success"}
+
         elif action == "save_session":
             path = payload.get("filepath")
             if not path.startswith("file://"):

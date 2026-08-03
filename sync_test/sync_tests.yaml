@@ -84,10 +84,25 @@ tests:
       - "xstudio"
   - name: "xstudio_selects"
     recording: "recordings/xstudio_selects_v2.jsonl"
+    checkpoint_validation_delay: 2.5
     #script_driven: true
     apps:
       - "openrv"
       - "xstudio"
+  - name: "xstudio_selects_script_rv"
+    recording: "recordings/xstudio_selects_v2.jsonl"
+    #checkpoint_validation_delay: 2.5
+    script_driven: true
+    apps:
+      - "openrv"
+      - "xstudio"
+  - name: "xstudio_selects_script_xstudio"
+    recording: "recordings/xstudio_selects_v2.jsonl"
+    #checkpoint_validation_delay: 2.5
+    script_driven: true
+    apps:
+      - "xstudio"
+      - "openrv"
   #- name: "missing_media"
   #  recording: "recordings/missing_media.jsonl"
   #  script_driven: true
@@ -164,6 +179,7 @@ tests:
 
   - name: "color_tests"
     recording: "recordings/color_tests.jsonl"
+    checkpoint_validation_delay: 2.5
     script_driven: false
     apps:
       - "xstudio"

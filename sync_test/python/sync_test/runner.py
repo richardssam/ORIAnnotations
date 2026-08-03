@@ -706,6 +706,7 @@ class TestRunner:
                     )
 
                 logging.info(f"Driving {driver_app[0]} via commands...")
+                last_frame_cmd = None
                 for cmd in commands:
                     logging.info(f"  -> Sending command: {cmd}")
                     res = self.send_command(driver_app[1], cmd)
@@ -713,12 +714,39 @@ class TestRunner:
                         logging.error(f"Command execution failed: {res['error']}")
                         failed = True
                         break
+                    if cmd.get("action") == "set_frame":
+                        last_frame_cmd = cmd
                     time.sleep(1.0)
 
                 convergence_wait = float(test_data.get("convergence_wait", 3.0))
                 logging.info(f"Command sequence completed. Waiting {convergence_wait}s for convergence...")
                 time.sleep(convergence_wait)
                 playing_state["playing"] = False
+
+                # A `set_frame` command drives a real playhead seek (a
+                # "shuttle") on the driver app; verify the peer(s) actually
+                # followed it. compare_states ignores "frame" entirely
+                # (it's transient noise during recording playback), but here
+                # it is the exact thing under test, so check it explicitly
+                # via the same tolerance logic as recording-mode frame
+                # checkpoints.
+                if not failed and last_frame_cmd is not None:
+                    states = [self.fetch_state(port) for _, port in app_ports]
+                    shuttle_cp = {
+                        "time_offset": 0.0,
+                        "frame": last_frame_cmd["frame"],
+                        "timeline_name": None,
+                        "frame_tolerance": frame_tolerance,
+                    }
+                    ok, msg = self.validate_checkpoint(states, [a[0] for a in app_ports], shuttle_cp)
+                    if ok:
+                        logging.info(
+                            f"✅ Shuttle check passed: frame ~{int(last_frame_cmd['frame']) + 1}"
+                        )
+                    else:
+                        logging.error(f"❌ FAIL: {msg}")
+                        failed = True
+                        fail_reason = msg
 
             while playing_state["playing"]:
                 if time.time() - last_check_time > 0.5:
@@ -1385,6 +1413,32 @@ def derive_commands_from_recording(jsonl_path):
     """
     commands = []
     guid_to_name = {}
+
+    # Track the current clip-selection "segment" — the span of frames the
+    # recording actually shuttled through while a given clip/sequence was
+    # selected — so a `set_frame` command can be derived alongside each
+    # `set_selection`, using the frame the segment ends on (not just its
+    # first sample). Reset whenever a new set_selection is appended,
+    # regardless of which branch below appended it.
+    segment_name = None
+    segment_first_frame = None
+    segment_last_frame = None
+
+    def _append_selection(name):
+        nonlocal segment_name, segment_first_frame, segment_last_frame
+        commands.append({"action": "set_selection", "name": name})
+        segment_name = name
+        segment_first_frame = None
+        segment_last_frame = None
+
+    def _flush_shuttle():
+        # Only emit a shuttle if the playhead actually moved within the
+        # segment — a bare clip switch shouldn't manufacture a no-op seek.
+        if (segment_last_frame is not None
+                and segment_first_frame is not None
+                and segment_last_frame != segment_first_frame):
+            commands.append({"action": "set_frame", "frame": int(segment_last_frame)})
+
     with open(jsonl_path, 'r') as f:
         for line in f:
             try:
@@ -1455,23 +1509,39 @@ def derive_commands_from_recording(jsonl_path):
 
                 elif command_schema == "PLAYBACK_SETTINGS_1.0" and event == "SET":
                     tl_guid = inner.get("timeline_guid")
-                    if tl_guid:
-                        name = guid_to_name.get(tl_guid)
-                        if name:
-                            last_sel = next((c for c in reversed(commands) if c.get("action") == "set_selection"), None)
-                            if not last_sel or last_sel.get("name") != name:
-                                commands.append({"action": "set_selection", "name": name})
+                    clip_guid = inner.get("clip_guid")
+                    # A directly-viewed clip (`view_mode: "source"`) gets an
+                    # ephemeral per-view timeline_guid that never appears in
+                    # guid_to_name — it isn't part of any recorded
+                    # timeline/OTIO structure. clip_guid is the stable
+                    # identity for that selection, so fall back to it
+                    # whenever timeline_guid doesn't resolve; otherwise every
+                    # direct clip select (as opposed to switching back to a
+                    # named sequence/playlist) is silently dropped.
+                    name = guid_to_name.get(tl_guid) if tl_guid else None
+                    if not name and clip_guid:
+                        name = guid_to_name.get(clip_guid)
+                    if name:
+                        if name != segment_name:
+                            _flush_shuttle()
+                            _append_selection(name)
+                        ct = inner.get("current_time", {})
+                        frame = ct.get("value")
+                        if frame is not None:
+                            if segment_first_frame is None:
+                                segment_first_frame = frame
+                            segment_last_frame = frame
 
                 elif command_schema == "SELECTION_1.0" and event == "SET":
                     selected_guids = inner.get("selected_guids", [])
                     if selected_guids:
                         clip_guid = selected_guids[0]
                         name = guid_to_name.get(clip_guid)
-                        if name:
-                            last_sel = next((c for c in reversed(commands) if c.get("action") == "set_selection"), None)
-                            if not last_sel or last_sel.get("name") != name:
-                                commands.append({"action": "set_selection", "name": name})
+                        if name and name != segment_name:
+                            _flush_shuttle()
+                            _append_selection(name)
 
             except Exception:
                 continue
+    _flush_shuttle()
     return commands

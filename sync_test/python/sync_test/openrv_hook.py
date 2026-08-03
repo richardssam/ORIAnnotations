@@ -245,6 +245,16 @@ def execute_openrv_command(payload):
                         
         raise ValueError(f"Could not find sequence or clip matching name: {name}")
 
+    elif action == "set_frame":
+        # `frame` is the protocol's 0-indexed local frame value (see
+        # get_openrv_state's `frame() - frameStart() + 1` comment on the
+        # inverse conversion); apply it against frameStart() so timecode
+        # media (non-zero frameStart) shuttles to the same point as
+        # non-timecode media.
+        frame = int(payload.get("frame"))
+        rv.commands.setFrame(rv.commands.frameStart() + frame)
+        return {"action": action, "status": "success"}
+
     elif action == "save_session":
         path = payload.get("filepath")
         rv.commands.saveSession(path)
