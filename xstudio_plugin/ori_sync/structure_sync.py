@@ -23,6 +23,10 @@ from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
 
 _MEDIA_NAME_TIMEOUT_MS = 2000
 
+# Fan-out label for the viewed-container handler.  There is only ever one of it,
+# so unlike the per-timeline item handlers it needs no guid in the name.
+_VIEWED_LABEL = "viewed-container"
+
 
 class StructureSyncController:
     """Owns playlist/timeline structural sync state and methods.
@@ -34,12 +38,46 @@ class StructureSyncController:
         self.plugin = plugin
 
         # ── owned state ───────────────────────────────────────────────
+        # Maps tl_guid → (xs_playlist, [media_name_order]) for flat-Playlist
+        # timelines built by build_otio_from_playlist_media.  Only populated on
+        # the master; used by poll_flat_playlist_reorders to detect bin reorders
+        # and broadcast MOVE_CHILD to peers.
         self._xs_flat_playlists: dict[str, tuple] = {}
+        # Maps tl_guid → (xs_playlist, xs_timeline) for sequence Timelines built
+        # by build_otio_timelines on the master.  Used by poll_sequence_new_media
+        # to detect added clips and broadcast INSERT_CHILD.
         self._xs_sequence_playlists: dict[str, tuple] = {}
+        # Maps tl_guid → set of media names last seen in xs_playlist.media for
+        # sequence Timelines.  Used by poll_sequence_new_media to detect deletions:
+        # names present here but absent in the current poll are broadcast as REMOVE_CHILD.
         self._xs_sequence_media_names: dict[str, set] = {}
+        # Last-observed xStudio track clip name list per sequence timeline.
+        # None = not yet recorded (e.g. just after load_otio); the next poll
+        # records without comparing.  Only the poll AFTER that can detect real deletions.
         self._xs_sequence_track_names: dict[str, list | None] = {}
+        # Tracks the current OTIO clip-GUID order for the Media track of each
+        # synced timeline.  Keyed by tl_guid, value is a list of clip sync-GUIDs
+        # in the order they appear in the xStudio timeline track.  Initialised
+        # from the OTIO track at load time and kept in sync by
+        # apply_remote_move_child so we never have to query xStudio clip actors.
         self._xs_media_order: dict[str, list] = {}
+        # Per-timeline record of clip identities this peer has already
+        # broadcast via the "direct track dragging" incremental path in
+        # poll_sequence_new_media. Diffed against instead of the manager's
+        # live video track, so a wholesale rebuild replacing that track
+        # cannot make an already-sent insert look unsent — see
+        # fix-sequence-track-reconciliation. Reseeded from the manager's
+        # current OTIO wherever a sequence timeline is (re)registered, and
+        # cleared on teardown.
+        self._xs_sequence_broadcast_clips: dict[str, list[dict]] = {}
+        # [2F] Event-driven clip insertion: subscription IDs keyed by tl_guid.
+        # When item_atom fires on a Timeline's event group, tl_guid is added to
+        # _timeline_item_dirty so the poll thread can call poll_sequence_new_media
+        # for just that timeline without waiting for the next 0.5 s scan.
         self._timeline_item_sub_ids: dict = {}
+        # tl_guid → the event-group key its handler is attached to, so the
+        # handler can be detached again by key.
+        self._timeline_item_group_keys: dict = {}
         self._sequence_playlist_sub_ids: dict = {}
         # Maps a host playlist's sync guid → the local xStudio playlist we
         # created for it, so multiple sequences sharing one parent playlist
@@ -51,13 +89,23 @@ class StructureSyncController:
         self._pending_sequence_rebuilds: set = set()
         self._timeline_item_dirty: set = set()
         self._timeline_item_lock = threading.Lock()
-        self._test_container_sub_id = None
-        # uuid of the container currently subscribed for add_media events, so the
-        # subscription can be re-established when the viewed container changes
-        # (e.g. a peer that joined an empty session and only later views media).
+        # uuid of the container currently watched for add_media events, so the
+        # handler can be moved when the viewed container changes (e.g. a peer
+        # that joined an empty session and only later views media).
         self._test_container_uuid: str | None = None
+        # Event-group key the viewed-container handler is currently attached to.
+        self._test_container_group_key: str | None = None
+        # Event-group joins are owned by the plugin (join_event_group) so all
+        # subscription paths share one join-once/never-leave rule; see there.
+        # Requester GUIDs that sent STATE_REQUEST when we had no timelines yet.
+        # On each poll tick we retry send_state_snapshot until it succeeds.
         self._pending_snapshot_requesters: list[str] = []
         self._last_structure_scan: float = 0.0
+        # Monotonic deadline before which xStudio events caused by our own
+        # structural mutations (reorders, timeline teardown) are not
+        # re-broadcast.  Read by playback via
+        # self.plugin.structure._structural_mutation_suppress_until.
+        self._structural_mutation_suppress_until: float = 0.0
 
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
@@ -66,37 +114,56 @@ class StructureSyncController:
         self._xs_sequence_media_names.clear()
         self._xs_sequence_track_names.clear()
         self._xs_media_order.clear()
+        self._xs_sequence_broadcast_clips.clear()
         self._timeline_item_sub_ids.clear()
+        self._timeline_item_group_keys.clear()
         self._sequence_playlist_sub_ids.clear()
         self._parent_playlist_map.clear()
         self._pending_sequence_rebuilds.clear()
         with self._timeline_item_lock:
             self._timeline_item_dirty.clear()
-        self._test_container_sub_id = None
         self._test_container_uuid = None
+        self._test_container_group_key = None
         self._pending_snapshot_requesters.clear()
         self._last_structure_scan = 0.0
+        self._structural_mutation_suppress_until = 0.0
 
     # ── timeline item event subscription ──────────────────────────────
 
     def subscribe_timeline_item_events(self, tl_guid: str, xs_tl) -> None:
-        """Subscribe to *xs_tl*'s event group to receive item_atom notifications.
+        """Register for *xs_tl*'s item_atom notifications.
 
-        Called whenever a new sequence Timeline is registered.  Stores the
-        subscription ID in ``_timeline_item_sub_ids`` so duplicates are skipped.
+        Called whenever a new sequence Timeline is registered.  Guarded by
+        ``_timeline_item_sub_ids`` so duplicates are skipped.  Goes through the
+        plugin's ``join_event_group``, so if the viewed-container path already
+        joined this object's group — which it does at connect, before the flat
+        playlist is registered as a timeline — this adds a second handler behind
+        that one join rather than taking out a competing subscription.
 
         :param tl_guid: Sync GUID identifying the timeline in the manager.
         :param xs_tl: The xStudio Timeline object whose event group to join.
         """
         if tl_guid in self._timeline_item_sub_ids:
             return
-        try:
-            cb = functools.partial(self.on_timeline_item_event, tl_guid)
-            sub_id = self.plugin.subscribe_to_event_group(xs_tl, cb)
-            self._timeline_item_sub_ids[tl_guid] = sub_id
-            _log(f"[2F] subscribed to item_atom events for timeline {tl_guid[:8]}")
-        except Exception:
-            _log_exc(f"[2F] subscribe_to_event_group failed for timeline {tl_guid[:8]}")
+        key = self.plugin.event_group_key(xs_tl)
+        cb = functools.partial(self.on_timeline_item_event, tl_guid)
+        if not self.plugin.join_event_group(xs_tl, f"item:{tl_guid[:8]}", cb):
+            return
+        # Presence marker only; the group key lives in _timeline_item_group_keys.
+        self._timeline_item_sub_ids[tl_guid] = True
+        if key:
+            self._timeline_item_group_keys[tl_guid] = key
+        _log(f"[2F] subscribed to item_atom events for timeline {tl_guid[:8]}")
+
+    def _release_timeline_item_sub(self, tl_guid: str) -> None:
+        """Stop delivering item events for *tl_guid*.
+
+        Detaches the handler only — the underlying group join is deliberately
+        never left; see the plugin's ``join_event_group``.
+        """
+        self._timeline_item_sub_ids.pop(tl_guid, None)
+        key = self._timeline_item_group_keys.pop(tl_guid, None)
+        self.plugin.detach_event_group_handler(key, f"item:{tl_guid[:8]}")
 
     def subscribe_sequence_playlist_events(self, tl_guid: str, xs_playlist) -> None:
         """No-op placeholder — see poll_sequence_new_media in the periodic poll.
@@ -115,10 +182,14 @@ class StructureSyncController:
 
         The viewed container can change after connect — most importantly, a peer
         that joins an empty session has no container at connect time, then later
-        views/creates one.  Without re-subscribing, that peer never detects media
-        dragged into its own sequence.  Mirrors ``subscribe_container_selection``:
-        guarded by uuid, unsubscribes the previous one first.  Safe to tear down
-        now that the py_context broadcast_down_atom handler purges dead callbacks.
+        views/creates one.  Without subscribing then, that peer never detects
+        media dragged into its own sequence.
+
+        Goes through the plugin's ``join_event_group``, which both dedupes (a
+        sequence Timeline is very often already joined by the item path) and
+        never leaves.  The previous container's handler is detached but its join
+        is kept: leaving it made the whole plugin deaf.  A stale join costs one
+        no-op dispatch.
         """
         try:
             container_uuid = str(container.uuid)
@@ -126,23 +197,20 @@ class StructureSyncController:
             return
         if container_uuid == self._test_container_uuid:
             return
-        if self._test_container_sub_id is not None:
-            try:
-                self.plugin.unsubscribe_from_event_group(self._test_container_sub_id)
-            except Exception:
-                pass
-            self._test_container_sub_id = None
-        try:
-            self._test_container_sub_id = self.plugin.subscribe_to_event_group(
-                container, self.plugin._on_test_container_event
-            )
-            self._test_container_uuid = container_uuid
-            _log(
-                f"[2F] (re)subscribed to viewed-container events"
-                f" (type={type(container).__name__} uuid={container_uuid[:8]})"
-            )
-        except Exception:
-            _log_exc("[2F] subscribe_viewed_container_events failed")
+        key = self.plugin.event_group_key(container)
+        self.plugin.detach_event_group_handler(
+            self._test_container_group_key, _VIEWED_LABEL
+        )
+        if not self.plugin.join_event_group(
+            container, _VIEWED_LABEL, self.plugin._on_test_container_event
+        ):
+            return
+        self._test_container_uuid = container_uuid
+        self._test_container_group_key = key
+        _log(
+            f"[2F] (re)subscribed to viewed-container events"
+            f" (type={type(container).__name__} uuid={container_uuid[:8]})"
+        )
 
     def on_test_container_event(self, event) -> None:
         """Handle events from the viewed container's event group.
@@ -155,7 +223,7 @@ class StructureSyncController:
         during the flat→sequence actor swap delivered a broadcast_down_atom to
         a torn-down callback.)  We enqueue a one-shot sequence scan in response.
         """
-        if time.monotonic() < self.plugin._structural_mutation_suppress_until:
+        if time.monotonic() < self._structural_mutation_suppress_until:
             return
         if not (len(event) > 1 and isinstance(event[0], event_atom)):
             return
@@ -181,7 +249,7 @@ class StructureSyncController:
         :param tl_guid: Sync GUID of the timeline/container that fired the event.
         :param event: Event tuple from xStudio's CAF message bus.
         """
-        if time.monotonic() < self.plugin._structural_mutation_suppress_until:
+        if time.monotonic() < self._structural_mutation_suppress_until:
             return
 
         # DIAGNOSTIC: log every timeline event's shape so we can see what the
@@ -189,6 +257,22 @@ class StructureSyncController:
         # the item_atom/action filtering below may be missing the new signal.
         _t1 = type(event[1]).__name__ if len(event) > 1 else "n/a"
         _log(f"[2F-DIAG] timeline event tl={tl_guid[:8]} t1={_t1} len={len(event)}")
+
+        if not (len(event) > 1 and isinstance(event[0], event_atom)):
+            return
+
+        # add_media_atom: fires when the user drags media into a sequence track.
+        # Handled here as well as in on_test_container_event because when the
+        # viewed container IS this timeline we deliberately do not create a
+        # second subscription for it (see subscribe_viewed_container_events) —
+        # this callback is then the only one that will see it.
+        if _add_media_atom is not None and isinstance(event[1], _add_media_atom):
+            _log(
+                f"[2F] add_media on tracked timeline {tl_guid[:8]}"
+                f" — queuing sequence scan"
+            )
+            self.plugin._cmd_queue.put(("sync_sequences", None))
+            return
 
         if not (len(event) > 2 and isinstance(event[0], event_atom)):
             return
@@ -265,6 +349,136 @@ class StructureSyncController:
             self.poll_flat_playlist_reorders(only_guid=tl_guid)
             self.poll_new_playlists()
             self.poll_playlist_renames()
+
+    # ── sequence reconciliation authority ────────────────────────────────
+
+    @staticmethod
+    def _sequence_video_track(otio_tl: "otio.schema.Timeline | None"):
+        """Return the sequence's principal Video track, excluding Annotations.
+
+        Shared selection logic used everywhere a single "the" video track for
+        a sequence timeline is needed — reconciliation, fingerprinting, and
+        the broadcast record all need to agree on which track that is.
+        """
+        if otio_tl is None:
+            return None
+        return next(
+            (t for t in otio_tl.tracks
+             if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
+            next(
+                (t for t in otio_tl.tracks if t.kind == otio.schema.TrackKind.Video),
+                None,
+            ),
+        )
+
+    @staticmethod
+    def _sequence_fingerprint(video_track) -> list:
+        """Order-independent fingerprint of clip source_ranges and gap durations.
+
+        Used to decide whether a sequence needs a wholesale rebuild — sorted
+        so a pure reorder doesn't look like a change, but a trim, a
+        reposition, or a different clip count (e.g. an addition) does.
+        """
+        result = []
+        if video_track is None:
+            return result
+        for c in video_track:
+            if isinstance(c, otio.schema.Clip):
+                sr = c.source_range
+                result.append(('c', () if sr is None else (
+                    sr.start_time.value, sr.start_time.rate,
+                    sr.duration.value, sr.duration.rate)))
+            elif isinstance(c, otio.schema.Gap):
+                sr = c.source_range
+                result.append(('g', () if sr is None else (
+                    sr.duration.value, sr.duration.rate)))
+        result.sort()
+        return result
+
+    @staticmethod
+    def _sequence_all_video_items(otio_tl: "otio.schema.Timeline | None") -> list:
+        """Flatten every non-Annotations Video-kind track's items into one list.
+
+        xStudio places a directly-dragged clip on a fresh ``Dropped`` track
+        rather than the existing principal track (see
+        fix-sequence-track-reconciliation), so a rebuild-need check based on
+        ``_sequence_video_track`` alone — one track — never converges once
+        the incremental path folds that clip into the manager's single
+        track: xStudio's *own* principal track will never show it. Fingerprint
+        against this instead so both sides describe the same set of clips.
+        The manager's OTIO mirror only ever has one video track, so this is a
+        no-op there; only the xStudio-side read gains the missing tracks.
+        """
+        items: list = []
+        if otio_tl is None:
+            return items
+        for t in otio_tl.tracks:
+            if t.kind != otio.schema.TrackKind.Video or t.name == "Annotations":
+                continue
+            items.extend(t)
+        return items
+
+    @staticmethod
+    def _sequence_clip_identity(clip: "otio.schema.Clip") -> dict:
+        """Extract the matchable identity of a clip for the broadcast record.
+
+        Mirrors the primary (sync GUID) / fallback (URL, then filename stem)
+        matching order used by the incremental reconciliation in
+        ``poll_sequence_new_media``.
+        """
+        guid = clip.metadata.get("sync", {}).get("guid")
+        url = ""
+        if isinstance(clip.media_reference, otio.schema.ExternalReference):
+            url = clip.media_reference.target_url or ""
+        path = _uri_to_posix_path(url)
+        norm_path = os.path.normpath(path) if path else ""
+        stem = os.path.splitext(os.path.basename(path))[0].lower() if path else ""
+        return {"guid": guid, "path": norm_path, "stem": stem}
+
+    def _reset_sequence_broadcast_record(
+        self, tl_guid: str, otio_tl: "otio.schema.Timeline | None" = None
+    ) -> None:
+        """(Re)seed the broadcast record for *tl_guid* from current OTIO state.
+
+        Must run wherever the manager's timeline object for a sequence is
+        replaced wholesale — initial registration, a local rebuild, or a
+        remote INSERT_CHILD/REPLACE_TIMELINE applied locally — so the
+        incremental diff never treats state it cannot see as unsent. See
+        fix-sequence-track-reconciliation.
+
+        :param tl_guid: Sync GUID of the sequence timeline.
+        :param otio_tl: The new OTIO timeline; looked up from the manager if
+            omitted.
+        """
+        if otio_tl is None:
+            otio_tl = (
+                self.plugin.manager.timelines.get(tl_guid)
+                if self.plugin.manager else None
+            )
+        # All non-Annotations video-kind tracks, not just the principal one —
+        # a rebuild's OTIO can itself be multi-track (mirroring an xStudio
+        # 'Dropped' track split), and a single-track seed here would make the
+        # incremental path treat clips sitting on the other track as unsent,
+        # re-inserting duplicates of content the rebuild already carried.
+        self._xs_sequence_broadcast_clips[tl_guid] = [
+            self._sequence_clip_identity(c)
+            for c in self._sequence_all_video_items(otio_tl)
+            if isinstance(c, otio.schema.Clip)
+        ]
+
+    def _forget_broadcast_clip(self, tl_guid: str, clip_guid: str | None) -> None:
+        """Drop *clip_guid* from the broadcast record for *tl_guid*, if present.
+
+        Called wherever a clip leaves a sequence's track so a later re-add of
+        the same clip is recognised as new rather than silently skipped as
+        already broadcast — the under-broadcast direction the design flags as
+        the dangerous one.
+        """
+        if not clip_guid:
+            return
+        record = self._xs_sequence_broadcast_clips.get(tl_guid)
+        if record:
+            record[:] = [r for r in record if r.get("guid") != clip_guid]
 
     # ── media order ────────────────────────────────────────────────────
 
@@ -682,12 +896,7 @@ class StructureSyncController:
                     )
                     self._xs_flat_playlists.pop(pl_uuid, None)
                     self.plugin._sync_playlists.pop(pl_uuid, None)
-                    sub_id = self._timeline_item_sub_ids.pop(pl_uuid, None)
-                    if sub_id:
-                        try:
-                            self.plugin.unsubscribe_from_event_group(sub_id)
-                        except Exception:
-                            pass
+                    self._release_timeline_item_sub(pl_uuid)
                     try:
                         self.plugin.manager.broadcast_remove_timeline(pl_uuid)
                     except Exception:
@@ -731,16 +940,9 @@ class StructureSyncController:
                     self.plugin.media.bootstrap_mapping(playlist, tl, xs_tl)
                     self.plugin.manager.register_timeline(tl)
                     self._xs_sequence_track_names[tl_guid] = None
+                    self._reset_sequence_broadcast_record(tl_guid, tl)
 
-                    _media_tr_np = next(
-                        (t for t in tl.tracks
-                         if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
-                        next(
-                            (t for t in tl.tracks
-                             if t.kind == otio.schema.TrackKind.Video),
-                            None,
-                        ),
-                    )
+                    _media_tr_np = self._sequence_video_track(tl)
                     _known_np = {
                         c.name for c in (_media_tr_np or [])
                         if isinstance(c, otio.schema.Clip)
@@ -814,18 +1016,14 @@ class StructureSyncController:
         self._xs_sequence_media_names.pop(tl_guid, None)
         self._xs_sequence_track_names.pop(tl_guid, None)
         self._xs_media_order.pop(tl_guid, None)
-        sub_id = self._timeline_item_sub_ids.pop(tl_guid, None)
-        if sub_id:
-            try:
-                self.plugin.unsubscribe_from_event_group(sub_id)
-            except Exception:
-                pass
-        pl_sub_id = self._sequence_playlist_sub_ids.pop(tl_guid, None)
-        if pl_sub_id:
-            try:
-                self.plugin.unsubscribe_from_event_group(pl_sub_id)
-            except Exception:
-                pass
+        self._xs_sequence_broadcast_clips.pop(tl_guid, None)
+        self._release_timeline_item_sub(tl_guid)
+        # No sequence-playlist subscription to release: that path is a no-op
+        # placeholder (see subscribe_sequence_playlist_events), so the dict is
+        # always empty.  The unsubscribe that used to live here was dead code,
+        # and a leave is exactly what must never happen — see the plugin's
+        # join_event_group.
+        self._sequence_playlist_sub_ids.pop(tl_guid, None)
 
     def delete_local_container(self, tl_guid: str) -> None:
         """Remove the xStudio container for a remotely-removed timeline.
@@ -845,7 +1043,7 @@ class StructureSyncController:
         # into a sync_container scan, re-detecting the sequence and re-broadcasting
         # it as a brand-new timeline — resurrecting the delete. Every other
         # remote-apply path sets this guard for the same reason.
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         # remove_container keys on the *container* uuid (create_playlist's first
         # return value), NOT the Playlist actor's uuid. We only stored the
         # Playlist object, so passing it removes nothing (wrong uuid) and the
@@ -970,15 +1168,7 @@ class StructureSyncController:
             if otio_tl is None:
                 _log(f"[2F] poll_sequence_new_media: tl={tl_guid[:8]} not in manager — skip")
                 continue
-            video_track = next(
-                (t for t in otio_tl.tracks
-                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
-                next(
-                    (t for t in otio_tl.tracks
-                     if t.kind == otio.schema.TrackKind.Video),
-                    None,
-                ),
-            )
+            video_track = self._sequence_video_track(otio_tl)
             if video_track is None:
                 continue
             track_guid = video_track.metadata.get("sync", {}).get("guid")
@@ -1014,6 +1204,7 @@ class StructureSyncController:
                         child_guid = clip.metadata.get("sync", {}).get("guid")
                         if child_guid:
                             self.plugin.manager.broadcast_remove_child(track_guid, child_guid)
+                            self._forget_broadcast_clip(tl_guid, child_guid)
                             _log(f"sequence deleted media: {clip.name!r} removed")
                             known_names = known_names - {clip.name}
             self._xs_sequence_media_names[tl_guid] = current_media_name_set
@@ -1079,18 +1270,9 @@ class StructureSyncController:
                     _log_exc(f"sequence new media: failed for {media_name!r}")
 
             # --- Additions (direct track dragging) ---
-            _log(
-                f"[2F] track path entry: tl={tl_guid[:8]}"
-                f" manager_clips={len([c for c in video_track if isinstance(c, otio.schema.Clip)])}"
-                f" bin_media={len(list(current_media))}"
-            )
             try:
                 xs_otio_str = xs_tl.to_otio_string()
                 xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
-                _log(
-                    f"[2F] track path: tl={tl_guid[:8]} tracks={len(list(xs_tl_parsed.tracks))}"
-                    f" track_names={[t.name for t in xs_tl_parsed.tracks]}"
-                )
                 # Collect clips from ALL video-kind tracks except Annotations.
                 # xStudio places drag-dropped media in a new 'Dropped' track
                 # rather than the existing 'Video Track', so we must scan all.
@@ -1104,107 +1286,148 @@ class StructureSyncController:
                         c for c in _trk if isinstance(c, otio.schema.Clip)
                     )
                 xs_clips = xs_clips_ordered
-                _log(
-                    f"[2F] track path: xs_clips={len(xs_clips)}"
-                )
             except Exception:
                 xs_clips = []
+                xs_tl_parsed = None
                 _log_exc(f"Failed to read track clips for {tl_guid[:8]}")
 
-            manager_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
-            pool = list(manager_clips)
+            # One authority per pass: if poll_sequence_source_ranges is about to
+            # rebuild this timeline wholesale, it derives the full clip list from
+            # xStudio and will carry any new clip via REPLACE_TIMELINE — so the
+            # incremental diff below must sit out this pass. Running both against
+            # the same state is what made the old code re-broadcast every insert
+            # forever (see fix-sequence-track-reconciliation).
+            #
+            # Fingerprint across ALL non-Annotations video-kind tracks (not
+            # just the principal one) — a directly-dragged clip lands on a
+            # fresh xStudio 'Dropped' track, and the incremental path below
+            # folds it into the manager's single track, so a single-track
+            # comparison here would never converge once that merge happens.
+            # Manager side must also span all tracks: once a rebuild has run,
+            # the manager's own OTIO can itself be multi-track (it mirrors
+            # whatever xStudio returned), and a single-track read here would
+            # recreate the same never-resolving mismatch on every later pass.
+            rebuild_needed = self._sequence_fingerprint(
+                self._sequence_all_video_items(xs_tl_parsed)
+            ) != self._sequence_fingerprint(self._sequence_all_video_items(otio_tl))
 
-            for new_idx, clip in enumerate(xs_clips):
-                # Primary: match by sync GUID from item_prop-stamped metadata.
-                xs_clip_guid = clip.metadata.get("sync", {}).get("guid")
-                matched_mc = None
-                if xs_clip_guid:
-                    matched_mc = next(
-                        (mc for mc in pool
-                         if mc.metadata.get("sync", {}).get("guid") == xs_clip_guid),
-                        None,
-                    )
+            # Single bounded, greppable per-pass line carrying the counts that
+            # used to require three unconditional per-poll log lines — enough
+            # to answer "is manager_clips converging?" from a log tail without
+            # the volume that made the old loop's log unreadable.
+            _log(
+                f"[2F] sync authority: tl={tl_guid[:8]}"
+                f" {'rebuild' if rebuild_needed else 'incremental'}"
+                f" manager_clips={len([c for c in self._sequence_all_video_items(otio_tl) if isinstance(c, otio.schema.Clip)])}"
+                f" bin_media={len(list(current_media))}"
+            )
+            if rebuild_needed:
+                # DIAGNOSTIC (temporary, fix-sequence-track-reconciliation
+                # follow-up): only logged on the rare rebuild-decided pass, so
+                # it stays bounded. Confirms/denies whether a fresh xStudio
+                # 'Dropped' track is why the single-video-track fingerprint
+                # never resolves after a direct drag.
+                _log(
+                    f"[2F-DIAG] rebuild track layout: tl={tl_guid[:8]}"
+                    f" xs_tracks={[t.name for t in (xs_tl_parsed.tracks if xs_tl_parsed else [])]}"
+                    f" manager_tracks={[t.name for t in otio_tl.tracks]}"
+                )
 
-                if matched_mc is None:
-                    # Fallback: URL/stem matching for clips without an item_prop GUID.
-                    clip_url = ""
-                    if isinstance(clip.media_reference, otio.schema.ExternalReference):
-                        clip_url = clip.media_reference.target_url or ""
-                    clip_path = _uri_to_posix_path(clip_url)
-                    norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
-                    clip_stem = (
-                        os.path.splitext(os.path.basename(clip_path))[0].lower()
-                        if clip_path else ""
-                    )
-                    for mc in pool:
-                        mc_url = ""
-                        if isinstance(mc.media_reference, otio.schema.ExternalReference):
-                            mc_url = mc.media_reference.target_url or ""
-                        mc_path = _uri_to_posix_path(mc_url)
-                        norm_mc_path = os.path.normpath(mc_path) if mc_path else ""
-                        if norm_clip_path and norm_clip_path == norm_mc_path:
-                            matched_mc = mc
-                            break
-                        mc_stem = (
-                            os.path.splitext(os.path.basename(mc_path))[0].lower()
-                            if mc_path else ""
+            if not rebuild_needed:
+                record = self._xs_sequence_broadcast_clips.setdefault(tl_guid, [])
+                pool = list(record)
+                new_clip_inserted = False
+
+                for new_idx, clip in enumerate(xs_clips):
+                    # Primary: match by sync GUID from item_prop-stamped metadata.
+                    xs_clip_guid = clip.metadata.get("sync", {}).get("guid")
+                    matched_mc = None
+                    if xs_clip_guid:
+                        matched_mc = next(
+                            (mc for mc in pool if mc.get("guid") == xs_clip_guid),
+                            None,
                         )
-                        if clip_stem and clip_stem == mc_stem:
-                            matched_mc = mc
-                            break
-                else:
-                    clip_url = ""
-                    clip_path = ""
-                    norm_clip_path = ""
 
-                if matched_mc is not None:
-                    pool.remove(matched_mc)
-                else:
-                    # No match found in current manager clips -> this is a new track clip addition!
-                    try:
-                        # The clip came from xs_tl_parsed (via a 'Dropped' or 'Video Track'
-                        # inside that parsed tree) and still has that track as its parent.
-                        # OTIO refuses to reparent a child that already has one, so we
-                        # deepcopy to get a detached clone before stamping and inserting.
-                        clip = copy.deepcopy(clip)
-                        # Clips dragged into a track come back from to_otio_string()
-                        # with an empty name — the name lives on the media reference,
-                        # not the clip.  Derive it from the media path so peers show
-                        # a proper clip name instead of a blank.
-                        if not clip.name and clip_path:
-                            clip.name = os.path.splitext(os.path.basename(clip_path))[0]
-                        self.plugin.manager._ensure_guid_and_map(clip)
-                        clip_guid = clip.metadata.get("sync", {}).get("guid")
-
-                        # Register in media mapping if we can find a matching Media object in current_media
-                        matched_media = None
-                        for media in current_media:
-                            if media.name == clip.name or os.path.basename(media.name) == clip.name:
-                                matched_media = media
+                    if matched_mc is None:
+                        # Fallback: URL/stem matching for clips without an item_prop GUID.
+                        clip_url = ""
+                        if isinstance(clip.media_reference, otio.schema.ExternalReference):
+                            clip_url = clip.media_reference.target_url or ""
+                        clip_path = _uri_to_posix_path(clip_url)
+                        norm_clip_path = os.path.normpath(clip_path) if clip_path else ""
+                        clip_stem = (
+                            os.path.splitext(os.path.basename(clip_path))[0].lower()
+                            if clip_path else ""
+                        )
+                        for mc in pool:
+                            if norm_clip_path and norm_clip_path == mc.get("path"):
+                                matched_mc = mc
                                 break
-                            try:
-                                m_uri = str(media.media_source().media_reference.uri())
-                                m_path = _uri_to_posix_path(m_uri)
-                                if m_path and norm_clip_path == os.path.normpath(m_path):
+                            if clip_stem and clip_stem == mc.get("stem"):
+                                matched_mc = mc
+                                break
+                    else:
+                        clip_url = ""
+                        clip_path = ""
+                        norm_clip_path = ""
+
+                    if matched_mc is not None:
+                        pool.remove(matched_mc)
+                    else:
+                        # Not in the broadcast record -> this is a new track clip addition!
+                        try:
+                            # The clip came from xs_tl_parsed (via a 'Dropped' or 'Video Track'
+                            # inside that parsed tree) and still has that track as its parent.
+                            # OTIO refuses to reparent a child that already has one, so we
+                            # deepcopy to get a detached clone before stamping and inserting.
+                            clip = copy.deepcopy(clip)
+                            # Clips dragged into a track come back from to_otio_string()
+                            # with an empty name — the name lives on the media reference,
+                            # not the clip.  Derive it from the media path so peers show
+                            # a proper clip name instead of a blank.
+                            if not clip.name and clip_path:
+                                clip.name = os.path.splitext(os.path.basename(clip_path))[0]
+                            self.plugin.manager._ensure_guid_and_map(clip)
+                            clip_guid = clip.metadata.get("sync", {}).get("guid")
+
+                            # Register in media mapping if we can find a matching Media object in current_media
+                            matched_media = None
+                            for media in current_media:
+                                if media.name == clip.name or os.path.basename(media.name) == clip.name:
                                     matched_media = media
                                     break
-                            except Exception:
-                                pass
+                                try:
+                                    m_uri = str(media.media_source().media_reference.uri())
+                                    m_path = _uri_to_posix_path(m_uri)
+                                    if m_path and norm_clip_path == os.path.normpath(m_path):
+                                        matched_media = media
+                                        break
+                                except Exception:
+                                    pass
 
-                        if matched_media and clip_guid:
-                            self.plugin.media.register(matched_media, clip_guid, tl_guid)
+                            if matched_media and clip_guid:
+                                self.plugin.media.register(matched_media, clip_guid, tl_guid)
 
-                        self.plugin.manager.insert_child(track_guid, clip, new_idx)
-                        _log(
-                            f"sequence track new media: {clip.name!r} inserted at index {new_idx}"
-                        )
-                        known_names = known_names | {clip.name}
-                        if matched_media:
-                            known_names = known_names | {matched_media.name}
-                    except Exception:
-                        _log_exc(
-                            f"sequence track new media: failed to insert {clip.name!r}"
-                        )
+                            self.plugin.manager.insert_child(track_guid, clip, new_idx)
+                            _log(
+                                f"sequence track new media: {clip.name!r} inserted at index {new_idx}"
+                            )
+                            known_names = known_names | {clip.name}
+                            if matched_media:
+                                known_names = known_names | {matched_media.name}
+                            # Record this clip as broadcast so a later pass — even
+                            # one that runs after the manager's live track has been
+                            # replaced by a rebuild — recognises it as already sent
+                            # instead of re-inserting it.
+                            record.append(self._sequence_clip_identity(clip))
+                            new_clip_inserted = True
+                        except Exception:
+                            _log_exc(
+                                f"sequence track new media: failed to insert {clip.name!r}"
+                            )
+
+                if not new_clip_inserted:
+                    _log(f"[2F] tl={tl_guid[:8]} incremental pass: no track changes")
 
             self._xs_sequence_playlists[tl_guid] = (xs_playlist, xs_tl, known_names)
 
@@ -1302,6 +1525,7 @@ class StructureSyncController:
                                 self.plugin.manager.broadcast_remove_child(
                                     track_guid, child_guid
                                 )
+                                self._forget_broadcast_clip(tl_guid, child_guid)
                                 _log(
                                     f"sequence track: deleted {clip_name!r}"
                                     f" from xStudio timeline"
@@ -1333,53 +1557,29 @@ class StructureSyncController:
             try:
                 xs_otio_str = xs_tl.to_otio_string()
                 xs_tl_parsed = otio.adapters.read_from_string(xs_otio_str, "otio_json")
-                xs_video_track = next(
-                    (t for t in xs_tl_parsed.tracks
-                     if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
-                    next(
-                        (t for t in xs_tl_parsed.tracks
-                         if t.kind == otio.schema.TrackKind.Video),
-                        None,
-                    ),
-                )
             except Exception:
                 _log_exc(f"poll_sequence_source_ranges: to_otio_string failed for {tl_guid[:8]}")
                 continue
 
-            def _sr_fingerprint(video_track):
-                # Include both Clip source_ranges AND Gap durations so that
-                # repositioning a clip (which removes/adds/resizes Gaps) triggers
-                # a REPLACE_TIMELINE just like a source_range trim does.  Sort
-                # the result to make the comparison order-independent so pure
-                # clip reorders don't produce a spurious REPLACE_TIMELINE.
-                result = []
-                if video_track is None:
-                    return result
-                for c in video_track:
-                    if isinstance(c, otio.schema.Clip):
-                        sr = c.source_range
-                        result.append(('c', () if sr is None else (
-                            sr.start_time.value, sr.start_time.rate,
-                            sr.duration.value, sr.duration.rate)))
-                    elif isinstance(c, otio.schema.Gap):
-                        sr = c.source_range
-                        result.append(('g', () if sr is None else (
-                            sr.duration.value, sr.duration.rate)))
-                result.sort()
-                return result
-
-            stored_video_track = next(
-                (t for t in stored.tracks
-                 if t.kind == otio.schema.TrackKind.Video and t.name != "Annotations"),
-                next(
-                    (t for t in stored.tracks if t.kind == otio.schema.TrackKind.Video),
-                    None,
-                ),
-            )
-            if _sr_fingerprint(xs_video_track) == _sr_fingerprint(stored_video_track):
+            stored_video_track = self._sequence_video_track(stored)
+            # Fingerprint across ALL non-Annotations video-kind tracks on
+            # both sides — not just the principal one, and not just on the
+            # xStudio side. The manager's own OTIO can itself be multi-track
+            # after a rebuild (it mirrors whatever xStudio returned), so a
+            # single-track read here would recreate the same
+            # never-resolving mismatch on every later pass. Must also agree
+            # with the same check in poll_sequence_new_media, or the two
+            # decide differently against the same pass and neither path
+            # ever sees a fixed point (see fix-sequence-track-reconciliation).
+            if self._sequence_fingerprint(
+                self._sequence_all_video_items(xs_tl_parsed)
+            ) == self._sequence_fingerprint(self._sequence_all_video_items(stored)):
                 continue
 
-            _log(f"[2F] sequence {tl_guid[:8]} source_ranges changed — broadcasting REPLACE_TIMELINE")
+            _log(
+                f"[2F] sync authority: tl={tl_guid[:8]} rebuild"
+                f" — sequence source_ranges changed, broadcasting REPLACE_TIMELINE"
+            )
             try:
                 new_otio = self.plugin.builder.build_single_sequence_otio(playlist, xs_tl)
                 if new_otio is None:
@@ -1440,6 +1640,12 @@ class StructureSyncController:
                 if "xs_bin_media" in stored.metadata:
                     new_otio.metadata["xs_bin_media"] = stored.metadata["xs_bin_media"]
                 self.plugin.manager.register_timeline(new_otio)
+                # The rebuild just replaced the state the incremental diff
+                # compares against — reseed the broadcast record from it so
+                # every clip the rebuild carried (including ones the
+                # incremental path would otherwise have inserted) reads as
+                # already sent, not unsent. See fix-sequence-track-reconciliation.
+                self._reset_sequence_broadcast_record(tl_guid, new_otio)
                 self.update_xs_media_order(tl_guid, new_otio)
                 self.plugin.manager.broadcast_replace_timeline(tl_guid)
             except Exception:
@@ -1598,7 +1804,7 @@ class StructureSyncController:
     def apply_flat_playlist_insert(
         self, clip_obj: "otio.schema.Clip", xs_playlist, xs_timeline, tl_guid: str = None
     ) -> None:
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Add a newly-broadcast clip to a flat xStudio Playlist.
 
         Called when an INSERT_CHILD event arrives for a clip that belongs to a
@@ -1670,7 +1876,7 @@ class StructureSyncController:
         # rebuild is safe because we strip stale xstudio actor UUIDs below before
         # load_otio, so fresh ClipActors are created each time (the ClipActor CAF
         # errors came from reusing those stale UUIDs, not from rebuilding itself).
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         n_clips = sum(
             1 for t in otio_tl.tracks
             for c in t if isinstance(c, otio.schema.Clip)
@@ -1688,7 +1894,7 @@ class StructureSyncController:
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             _t_prep = time.monotonic()
-            self.plugin._reload_suppress_until = time.monotonic() + 2.0
+            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             _log(f"apply_sequence_insert: calling load_otio tl={tl_guid[:8]}")
             xs_timeline.load_otio(otio_str, clear=True)
@@ -1707,14 +1913,20 @@ class StructureSyncController:
                 f"prep={_t_prep-_t0:.2f}s load_otio={_t_load-_t_prep:.2f}s "
                 f"bootstrap={_t_boot-_t_load:.2f}s set_on_screen={_t_sos-_t_boot:.2f}s"
             )
+            # The local xStudio track now reflects otio_tl exactly — reseed the
+            # broadcast record from it so this peer's own incremental
+            # reconciliation recognises every clip it carries (including ones a
+            # remote insert or replace just added) as already sent.
+            if tl_guid in self._xs_sequence_playlists:
+                self._reset_sequence_broadcast_record(tl_guid, otio_tl)
         except Exception:
-            self.plugin._reload_suppress_until = 0.0
+            self.plugin.annotation._reload_suppress_until = 0.0
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")
 
     # ── remote remove/move child ───────────────────────────────────────
 
     def apply_remote_remove_child(self, data: dict) -> None:
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Apply a REMOVE_CHILD event from a remote peer to the local xStudio session.
 
         The manager has already removed the clip from the OTIO track before this
@@ -1799,20 +2011,22 @@ class StructureSyncController:
             prepared_otio = self.plugin.media.prepare_otio_for_load(otio_tl)
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
-            self.plugin._reload_suppress_until = time.monotonic() + 2.0
+            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
             if tl_guid in self.plugin._sync_playlists:
                 playlist = self.plugin._sync_playlists[tl_guid][0]
                 self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
             self.update_xs_media_order(tl_guid, otio_tl)
+            if tl_guid in self._xs_sequence_playlists:
+                self._reset_sequence_broadcast_record(tl_guid, otio_tl)
             _log(f"remote remove_child: reloaded sequence timeline {tl_guid[:8]}")
             try:
                 self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
             except Exception:
                 pass
         except Exception:
-            self.plugin._reload_suppress_until = 0.0
+            self.plugin.annotation._reload_suppress_until = 0.0
             _log_exc(
                 f"remote remove_child: reload failed for timeline {tl_guid[:8]}"
             )
@@ -1844,7 +2058,7 @@ class StructureSyncController:
                 pass
 
     def apply_remote_move_child(self, data: dict) -> None:
-        self.plugin._structural_mutation_suppress_until = time.monotonic() + 1.5
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
         """Reorder a media clip in the xStudio timeline to match a remote MOVE_CHILD event.
 
         ``track.move_children`` triggers xStudio's QML delegate model directly
@@ -1962,7 +2176,7 @@ class StructureSyncController:
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             # Suppress show_atom bursts that xStudio fires when it re-triggers
             # existing bookmarks after the timeline is rebuilt.
-            self.plugin._reload_suppress_until = time.monotonic() + 2.0
+            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             xs_timeline.load_otio(otio_str, clear=True)
             if tl_guid in self.plugin._sync_playlists:
@@ -1980,7 +2194,7 @@ class StructureSyncController:
                 f" — {child_uuid[:8]} now at index {to_index}"
             )
         except Exception:
-            self.plugin._reload_suppress_until = 0.0
+            self.plugin.annotation._reload_suppress_until = 0.0
             _log_exc(f"move_child: failed to reload timeline {tl_guid[:8]}")
             return
 
