@@ -10,7 +10,7 @@ from xstudio.core import serialise_atom
 
 from otio_sync_core.manager import STATE_SYNCED  # noqa: E402
 
-from .utils import _log, bounded_timeout
+from .utils import _log, _log_exc, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread viewport reads — well below the
 # 100 s default so a stale viewport actor fails fast instead of freezing.
@@ -79,6 +79,23 @@ class DisplaySyncController:
         # Timestamps
         self._last_display_scan: float = 0.0
         self._last_viewport_error_log_time: float = 0.0
+        # Handle to the AnnotationsUI plugin, retained (not just a subscribe-time
+        # local) so remote annotations_visible changes can be applied via its
+        # "Visibility" attribute.  Acquired at connect time by
+        # acquire_annotations_ui(); this controller is its only reader.
+        self._ann_ui_plugin = None
+
+    def acquire_annotations_ui(self) -> None:
+        """Retain a handle to the AnnotationsUI plugin (called at connect time).
+
+        We do NOT subscribe to it: nothing is ever broadcast on a plugin's
+        events group.  Failure is non-fatal — the handle stays None and
+        annotation-visibility applies are skipped.
+        """
+        try:
+            self._ann_ui_plugin = self.plugin.get_plugin("AnnotationsUI")
+        except Exception:
+            _log_exc("Could not get a handle to the AnnotationsUI plugin")
 
     def reset(self) -> None:
         """Clear display state on disconnect."""
@@ -87,6 +104,9 @@ class DisplaySyncController:
         self._last_display_state = {}
         self._xs_base_scale = None
         self._last_pinned_source_mode = None
+        self._ann_ui_plugin = None
+        self._last_display_scan = 0.0
+        self._last_viewport_error_log_time = 0.0
 
     # ── viewport ──────────────────────────────────────────────────────────────
 
@@ -134,7 +154,7 @@ class DisplaySyncController:
         or the attribute can't be read, matching this feature's documented
         "absent means visible" semantics.
         """
-        ann_ui = getattr(self.plugin, "_ann_ui_plugin", None)
+        ann_ui = self._ann_ui_plugin
         if ann_ui is None:
             return True
         try:
@@ -226,7 +246,7 @@ class DisplaySyncController:
         # which both updates annotations_visible_ AND (critically) calls
         # send_event(...) to notify AnnotationsCore's hide_all_drawings_ flag
         # -- the thing that actually affects rendering. Drive the same path.
-        ann_ui = getattr(self.plugin, "_ann_ui_plugin", None)
+        ann_ui = self._ann_ui_plugin
         if ann_ui is not None:
             try:
                 action = "ShowVisibility" if annotations_visible else "HideVisibility"

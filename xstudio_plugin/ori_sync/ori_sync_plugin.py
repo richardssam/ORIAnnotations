@@ -51,6 +51,7 @@ from .annotation_sync import AnnotationSyncController  # noqa: E402
 from .color_sync import ColorSyncController  # noqa: E402
 
 import os
+import functools
 import json
 import queue
 import sys
@@ -110,6 +111,12 @@ class ORISyncPlugin(PluginBase):
         self.status_attr = self.add_attribute("Status", "Disconnected")
         self.status_attr.expose_in_ui_attrs_group("ori_sync_conn")
 
+        # Every xStudio event group this plugin has joined, keyed by the
+        # group-owning actor's address string:
+        #   {"sub_id": ..., "callbacks": [(label, cb), ...]}
+        # See join_event_group for the two rules this exists to enforce.
+        self._event_group_subs: dict[str, dict] = {}
+
         # ── controllers ───────────────────────────────────────────────────
         self.media = MediaMapController(self)
         self.display = DisplaySyncController(self)
@@ -121,10 +128,6 @@ class ORISyncPlugin(PluginBase):
 
         # ── xStudio handles ────────────────────────────────────────────────
         self.active_playhead: Playhead | None = None
-        # Handle to the AnnotationsUI plugin, retained (not just a subscribe-time
-        # local) so remote annotations_visible changes can be applied via its
-        # "Visibility" attribute (see display_sync.apply_display_state).
-        self._ann_ui_plugin = None
         self.subscribe_to_global_playhead_events(self._on_global_playhead_event)
 
         # ── runtime state ──────────────────────────────────────────────────
@@ -141,140 +144,12 @@ class ORISyncPlugin(PluginBase):
         # Populated by _do_load_timelines() when we join as a non-master peer.
         self._sync_playlists: dict[str, tuple] = {}
 
-        # Tracks the current OTIO clip-GUID order for the Media track of each
-        # synced timeline.  Keyed by tl_guid, value is a list of clip sync-GUIDs
-        # in the order they appear in the xStudio timeline track.  Initialised
-        # from the OTIO track at load time and kept in sync by
-        # _apply_remote_move_child so we never have to query xStudio clip actors.
-
         # Commands enqueued by xStudio callbacks; drained by poll thread.
         # Items are (command_name, payload_dict).
         self._cmd_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
 
-        # UUIDs of bookmarks we created from *remote* annotations.
-        # show_atom scans skip these so we never re-broadcast them back.
-
-        # Sync GUIDs of annotation clips that THIS peer has created or broadcast to.
-        # Used to guard broadcast_replace_annotation_commands: only replace a clip
-        # that we own.  If ann_clip_guid is not in this set, use broadcast_add_annotation
-        # (parallel annotation) instead of overwriting the remote peer's clip.
-
-        # Monotonic deadline before which show_atom annotation flushes are
-        # suppressed.  Set briefly after load_otio reloads (e.g. on move_child)
-        # so that xStudio's bookmark-re-trigger burst is not mistaken for new
-        # local strokes.
-        self._reload_suppress_until: float = 0.0
-
-        # Cross-thread annotation trigger: set on xStudio thread by
-        # _on_annotation_draw_event; read and cleared on poll thread by
-        # flush_pending_annotations.
-        self._annotation_pending_time: float | None = None
-
-        # Polling-based scrub detection: last frame seen by the poll loop and
-        # last frame applied from a remote PLAYBACK_SETTINGS message.
-        # When the poll sees a frame change that matches _last_applied_frame the
-        # change came from a remote apply, so we skip re-broadcasting (echo guard).
-        self._last_polled_frame: int | None = None
-        self._last_applied_frame: int | None = None
-        self._last_polled_playing: bool | None = None
-        # Monotonic deadline until which local playhead attribute_changed events
-        # are NOT re-broadcast.  Set on every remote playback apply: ph.position
-        # fires attribute_changed asynchronously, and during rapid scrubbing the
-        # single _last_applied_frame guard loses the race (a lagging callback for
-        # an older frame no longer matches), echoing positions back and creating
-        # a feedback loop.  A short rolling window suppresses those echoes while a
-        # peer is driving playback, without blocking genuine local scrubs once it
-        # stops (the window simply expires).
-        self._playback_apply_suppress_until: float = 0.0
-        # Monotonic deadline refreshed whenever we broadcast a *local* playhead
-        # move (scrubbing).  Used only to suppress selection-driven clip-start
-        # seeks while we are the one driving playback — a peer following our scrub
-        # crosses clip boundaries and echoes selections back, and applying those
-        # seeks would snap our own playhead to clip starts.  Kept separate from
-        # _playback_apply_suppress_until, which doubles as the broadcast echo guard.
-        self._local_scrub_active_until: float = 0.0
-        # Monotonic timestamp of when playback last transitioned False→True.
-        # Used to allow the first show_atom after play-start to broadcast even
-        # though _last_polled_playing is already True (race-condition guard).
-        self._playing_started_at: float = 0.0
-        # Timestamp of the last remote playing=False; used to ignore rapid
-        # stop→start (loop restart) events from the peer so they don't flip
-        # _last_polled_playing back to True and suppress show_atom broadcasts.
-        self._last_remote_stop_at: float = 0.0
-
-        # Most recent show_atom media — tracked unconditionally so the PSM
-        # True→False handler can broadcast mode=source even when the show_atom
-        # itself was NOT suppressed (e.g. at play-start within the 0.3 s window).
-        self._last_show_atom_media: str | None = None
-        self._last_show_atom_seq_tl_guid: str | None = None
-        self._last_show_atom_at: float = 0.0
-        # Last clip GUID seen in the viewport (playlist selection or show_atom).
-        # Used as a fallback in the annotation broadcast path for flat playlists,
-        # where _resolve_clip_at_frame returns None.
-        # Deferred seek: when a multi-clip sequence selection is received,
-        # the target frame and its deadline are stored here.  Both Form-2
-        # viewport_playhead_atom events fire within ~200 ms of the source
-        # switch and update active_playhead; the poll loop applies the seek
-        # once the deadline passes and the playhead has settled.
-
-        # Last display state broadcast; compared each poll tick to detect changes.
-        # xStudio's internal viewport scale at the first successful read.  Used
-        # to normalise state_.scale_ (which is image_pixels/viewport_pixels, not
-        # a zoom multiplier) to RV's convention (1.0 = fit-to-window).
-        # Last read value of the playhead "Pinned Source Mode" attribute.
-        # True = full timeline/sequence view; False = single selected-media view.
-        # None on first read (no broadcast on initialisation).
-        # Set to True while _apply_selection is writing Pinned Source Mode so
-        # the poll loop ignores the resulting attribute-change echo.
-        self._applying_pinned_mode: bool = False
-        # Monotonic deadline before which show_atom clip-selection broadcasts are
-        # suppressed.  Set after _apply_selection calls select_all() to prevent
-        # the resulting show_atom burst from echoing individual clip selections
-        # back to remote peers.
-        self._selection_broadcast_suppress_until: float = 0.0
-        self._structural_mutation_suppress_until: float = 0.0
-        # Cached Viewport object; created lazily, cleared on disconnect.
-        # Timeline to set as on-screen source once the viewport is ready.
-        # Set by _do_load_timelines; consumed and cleared by _get_viewport.
-        self._last_selection_scan = 0.0
-        self.display._last_display_scan = 0.0
-        self._last_flat_playlist_scan = 0.0
-        self.structure._last_structure_scan = 0.0
-        # Timestamps to throttle log messages during viewport discovery retry loop.
-
-        # Maps tl_guid → (xs_playlist, [media_name_order]) for flat-Playlist
-        # timelines built by _build_otio_from_playlist_media.  Only populated on
-        # the master; used by _poll_flat_playlist_reorders to detect bin reorders
-        # and broadcast MOVE_CHILD to peers.
-
-        # Maps tl_guid → (xs_playlist, xs_timeline) for sequence Timelines built
-        # by _build_otio_timelines on the master.  Used by _poll_sequence_new_media
-        # to detect added clips and broadcast INSERT_CHILD.
-
-        # Maps tl_guid → set of media names last seen in xs_playlist.media for
-        # sequence Timelines.  Used by _poll_sequence_new_media to detect deletions:
-        # names present here but absent in the current poll are broadcast as REMOVE_CHILD.
-
-        # Viewport container tracking state: caches whether the active viewport
-        # container is a Playlist or Timeline to avoid synchronous API calls in
-        # playhead event handlers.
-        self._viewport_container_is_playlist: bool = False
-        self._viewport_container_is_timeline: bool = False
-        # [TEST] subscription ID returned by subscribe_to_event_group for change_atom probe
-
-        # [2F] Event-driven clip insertion: subscription IDs keyed by tl_guid.
-        # When item_atom fires on a Timeline's event group, tl_guid is added to
-        # _timeline_item_dirty so the poll thread can call _poll_sequence_new_media
-        # for just that timeline without waiting for the next 0.5 s scan.
-
+        # True while the session dialog is open in "create" mode (vs "join").
         self._pending_create_check: bool = False
-
-        # Requester GUIDs that sent STATE_REQUEST when we had no timelines yet.
-        # On each poll tick we retry send_state_snapshot until it succeeds.
-
-        # Last-observed xStudio track clip name list per sequence timeline.
-        # None = not yet recorded (e.g. just after load_otio); the next poll
-        # records without comparing.  Only the poll AFTER that can detect real deletions.
 
         # Add session management menu items.
         self.insert_menu_item(
@@ -426,21 +301,35 @@ class ORISyncPlugin(PluginBase):
         #
         # _adopt_playhead does the one thing we actually needed from the base call
         # (assign attribute_changed), at every site that acquires a playhead, and
-        # never issues the killing leave.  Revisit if/when the per-subscription
-        # listener change (pr/python-per-subscription-listeners) lands upstream.
+        # never issues the killing leave.
+        #
+        # ── IF pr/python-per-subscription-listeners LANDS, REDO THIS ──
+        # That branch gives every subscription its own listener actor, which
+        # changes the ground this workaround stands on in three ways.  Re-verify
+        # each rather than assuming the workaround stays correct or stays needed:
+        #
+        #   * Both reasons above dissolve.  Each subscription gets its own entry
+        #     in BroadcastActor::subscribers_, so a leave can only revoke its own
+        #     membership — subscribe_to_playhead_events() may become safe to use,
+        #     and this hand-rolled ownership could go away.
+        #   * Playhead construction stops being free.  Today a duplicate Playhead
+        #     collapses onto the connection's one shared listener; there it spawns
+        #     a listener actor per subscription.  The "compare the remote key
+        #     BEFORE constructing" guard in on_global_playhead_event and the
+        #     no-op-on-unchanged-key in _adopt_playhead become load-bearing for
+        #     resource use, not just for churn — as does the 1 Hz re-check in
+        #     _poll_loop, which would otherwise spawn a listener every second.
+        #   * The notes warn the fix REMOVES events callbacks used to receive via
+        #     crosstalk.  Playhead attribute events (anon_mail, keyed on the group)
+        #     and playhead events (mail, keyed on the owner) currently collapse
+        #     onto one owner key; if anything here depends on that overlap it will
+        #     go quiet silently.  Diff an event trace, do not eyeball behaviour.
         try:
             self.playback.check_and_update_active_playhead()
         except Exception:
             _log_exc("Could not initialize active playhead at connect time")
 
-        # Retain a handle to AnnotationsUI so remote annotations_visible changes
-        # can be applied via its "Visibility" attribute (display_sync).  We do
-        # NOT subscribe to it: nothing is ever broadcast on a plugin's events
-        # group.
-        try:
-            self._ann_ui_plugin = self.get_plugin("AnnotationsUI")
-        except Exception:
-            _log_exc("Could not get a handle to the AnnotationsUI plugin")
+        self.display.acquire_annotations_ui()
 
         # [2C] Subscribe to AnnotationsCore's draw-events group.  It carries
         # both kinds of event we need:
@@ -473,8 +362,10 @@ class ORISyncPlugin(PluginBase):
         # event group, so subscribing gives prompt detection for all of them
         # instead of waiting out ANNOTATION_SCAN_INTERVAL.
         try:
-            self.subscribe_to_event_group(
-                self.connection.api.session.bookmarks, self._on_bookmarks_event
+            self.join_event_group(
+                self.connection.api.session.bookmarks,
+                "bookmarks",
+                self._on_bookmarks_event,
             )
             _log("Subscribed to bookmarks add/remove events")
         except Exception:
@@ -524,38 +415,13 @@ class ORISyncPlugin(PluginBase):
         if self.manager:
             self.manager.close()
             self.manager = None
-        self.display._viewport = None
-        self.display._last_display_state = {}
-        self.display._xs_base_scale = None
-        self._ann_ui_plugin = None
+        # Controllers own their own teardown; each reset() restores that
+        # controller's post-construction defaults and releases any event-group
+        # subscriptions or cached handles it acquired.
+        for controller in (self.media, self.display, self.builder, self.playback,
+                           self.structure, self.annotation, self.color):
+            controller.reset()
         self._sync_playlists.clear()
-        self.structure._xs_flat_playlists.clear()
-        self.structure._xs_sequence_playlists.clear()
-        self.structure._xs_sequence_media_names.clear()
-        self.media.reset()
-        self.color.reset()
-        self.annotation.reset()
-        self.structure._timeline_item_sub_ids.clear()
-        with self.structure._timeline_item_lock:
-            self.structure._timeline_item_dirty.clear()
-        if self.playback._current_selection_sub_id is not None:
-            try:
-                self.unsubscribe_from_event_group(self.playback._current_selection_sub_id)
-            except Exception:
-                pass
-            self.playback._current_selection_sub_id = None
-        self.playback._current_selection_container_uuid = None
-        self.playback._last_logged_container_uuid = None
-        self.playback._last_logged_clip_name = None
-        self.playback._last_viewed_clip_guid = None
-        self.playback._pending_seek_frame = None
-        self.playback._pending_seek_deadline = 0.0
-        self.playback._last_pinned_source_mode = None
-        self._applying_pinned_mode = False
-        self._selection_broadcast_suppress_until = 0.0
-        self._structural_mutation_suppress_until = 0.0
-        self.structure._pending_snapshot_requesters.clear()
-        self.structure._xs_sequence_track_names.clear()
         self.status_attr.set_value("Disconnected")
 
     def cleanup(self) -> None:
@@ -724,6 +590,25 @@ class ORISyncPlugin(PluginBase):
                     with _timed("color.poll"):
                         self.color.poll_and_broadcast_color()
                     self.color._last_color_scan = now
+
+                # 6.15. Periodic active-playhead re-check (1.0s interval).
+                #
+                # The event-driven acquisition paths do not cover every way the
+                # viewport's playhead can change.  Building a sequence out of a
+                # bin, for instance, fires no viewport_playhead_atom (the C++
+                # handler early-returns when the viewport's playhead is
+                # unchanged) and no selection event — and those two, plus
+                # connect-time, were the only things that ever re-checked.  A
+                # peer that hit that held the pre-sequence playhead for the rest
+                # of the session and silently broadcast no positions at all.
+                #
+                # This makes the wiring self-healing: _adopt_playhead no-ops when
+                # the remote key is unchanged, so the steady-state cost is one
+                # bounded actor read per second and no re-subscription.
+                if now - self.playback._last_playhead_scan >= 1.0:
+                    with _timed("playback.check_playhead"):
+                        self.playback.check_and_update_active_playhead()
+                    self.playback._last_playhead_scan = now
 
                 # 6.2. Periodic full-state dump for the test inspector (0.5s).
                 if now - self._last_fullstate_write >= 0.5:
@@ -944,6 +829,89 @@ class ORISyncPlugin(PluginBase):
             self._cmd_queue.put(("load_timelines", {}))
             if self.manager.display_state:
                 self.display.apply_display_state(self.manager.display_state)
+
+    # ── event-group membership ────────────────────────────────────────────────
+    # All event-group joins in this plugin go through here.  Two rules, both from
+    # xstudio/scratch/python-event-routing-notes.md and both hit in practice:
+    #
+    #   1. Join each group at most once.  The client shares a single listener
+    #      actor per connection, so two subscriptions to one group collapse onto
+    #      a single BroadcastActor::subscribers_ entry and the second silences
+    #      the first.  Reachable from ordinary use: a sequence Timeline is both a
+    #      tracked timeline and, once viewed, the viewed container.  When that
+    #      happened, item events stopped 3 s after the sequence was created and
+    #      its later edits were never broadcast.
+    #   2. Never leave.  A leave revokes that shared entry for *every* callback
+    #      in the process.  Resolving (1) by unsubscribing the first subscriber
+    #      was strictly worse: the plugin went deaf to playhead, selection and
+    #      timeline events alike for the rest of the session.
+    #
+    # So additional handlers are multiplexed in Python behind one join, and a
+    # handler that is finished detaches from the fan-out while the join stays for
+    # the life of the connection.  A stale join costs one no-op dispatch.
+    #
+    # If pr/python-per-subscription-listeners lands upstream, revisit: with a
+    # listener per subscription both rules relax, and keeping joins forever stops
+    # being free (each would hold its own actor).
+
+    @staticmethod
+    def event_group_key(obj) -> "str | None":
+        """Address of the actor whose event group *obj* would have us join.
+
+        String form: raw handles are fresh objects per access and never compare
+        equal, so two wrappers around one actor must be normalised to one key.
+        """
+        remote = getattr(obj, "remote", None)
+        return str(remote) if remote is not None else None
+
+    def _dispatch_event_group(self, key: str, event) -> None:
+        """Fan one group's messages out to every handler registered on it."""
+        entry = self._event_group_subs.get(key)
+        if not entry:
+            return
+        for label, cb in list(entry["callbacks"]):
+            try:
+                cb(event)
+            except Exception:
+                _log_exc(f"event-group handler {label} raised")
+
+    def join_event_group(self, obj, label: str, cb) -> "str | None":
+        """Register *cb* on *obj*'s event group, joining the group at most once.
+
+        :param label: Stable identifier for this handler, used to replace or
+            detach it later.  One label per logical subscriber.
+        :returns: The group key the handler is attached to, or None on failure.
+        """
+        key = self.event_group_key(obj)
+        if key is None:
+            return None
+        entry = self._event_group_subs.get(key)
+        if entry is not None:
+            entry["callbacks"] = [
+                (_l, _c) for _l, _c in entry["callbacks"] if _l != label
+            ]
+            entry["callbacks"].append((label, cb))
+            return key
+        try:
+            sub_id = self.subscribe_to_event_group(
+                obj, functools.partial(self._dispatch_event_group, key)
+            )
+        except Exception:
+            _log_exc(f"join_event_group failed for {label}")
+            return None
+        self._event_group_subs[key] = {"sub_id": sub_id, "callbacks": [(label, cb)]}
+        return key
+
+    def detach_event_group_handler(self, key: "str | None", label: str) -> None:
+        """Remove one handler from a group's fan-out, keeping the join itself."""
+        if not key:
+            return
+        entry = self._event_group_subs.get(key)
+        if not entry:
+            return
+        entry["callbacks"] = [
+            (_l, _c) for _l, _c in entry["callbacks"] if _l != label
+        ]
 
     # ── event handler thin shims ───────────────────────────────────────────────
     # xStudio registers these bound methods on the plugin; they delegate to the

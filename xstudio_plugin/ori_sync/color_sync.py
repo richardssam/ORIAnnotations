@@ -65,6 +65,7 @@ class ColorSyncController:
         """Clear cached colour state on disconnect."""
         self._last_input = {}
         self._last_output = None
+        self._last_color_scan = 0.0
 
     # ── name handling ───────────────────────────────────────────────────────
 

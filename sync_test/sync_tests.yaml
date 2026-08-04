@@ -30,7 +30,7 @@ tests:
       - "xstudio"
       - "openrv"
   - name: "add_media"
-    recording: "recordings/add_media_notc.jsonl"
+    recording: "recordings/add_media_v2.jsonl"
     script_driven: true
     apps:
       - "xstudio"

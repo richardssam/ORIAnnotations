@@ -68,8 +68,14 @@ class AnnotationSyncController:
         self._annotation_bookmarks: dict[tuple, object] = {}
         self._bookmark_strokes_cache: dict[tuple, list] = {}
         self._bookmark_captions_cache: dict[tuple, list] = {}
+        # UUIDs of bookmarks we created from *remote* annotations.
+        # show_atom scans skip these so we never re-broadcast them back.
         self._our_bookmark_uuids: set = set()
         self._our_bookmark_uuids_lock = threading.Lock()
+        # Sync GUIDs of annotation clips that THIS peer has created or broadcast to.
+        # Used to guard broadcast_replace_annotation_commands: only replace a clip
+        # that we own.  If ann_clip_guid is not in this set, use broadcast_add_annotation
+        # (parallel annotation) instead of overwriting the remote peer's clip.
         self._our_annotation_clip_guids: set = set()
         self._our_bookmark_clip_frame: dict[str, tuple[str, int]] = {}
         # (clip_guid, frame) -> bookmark uuid str, recorded whenever
@@ -95,14 +101,44 @@ class AnnotationSyncController:
         # increasingly large cumulative stroke lists at every PARTIAL arrival.
         self._last_partial_render_time: dict[tuple, float] = {}
 
+        # Monotonic deadline before which show_atom annotation flushes are
+        # suppressed.  Set briefly after load_otio reloads (e.g. on move_child)
+        # so that xStudio's bookmark-re-trigger burst is not mistaken for new
+        # local strokes.  Written by structure/playback after a reload via
+        # self.plugin.annotation._reload_suppress_until.
+        self._reload_suppress_until: float = 0.0
+
+        # Cross-thread annotation trigger: set on xStudio thread by
+        # _on_annotation_draw_event; read and cleared on poll thread by
+        # flush_pending_annotations.
+        self._annotation_pending_time: float | None = None
+
     def reset_last_scan(self, t: float) -> None:
         """Set the last annotation scan timestamp (called from _on_synced)."""
         self._last_annotation_scan = t
         self._last_partial_render_time.clear()
 
     def reset(self) -> None:
-        """Clear per-session broadcast bookkeeping (called from disconnect())."""
+        """Clear per-session broadcast bookkeeping (called from disconnect()).
+
+        Deliberately does NOT clear the annotation identity/dedup caches
+        (``_our_bookmark_uuids``, ``_our_annotation_clip_guids``,
+        ``_our_bookmark_clip_frame``, ``_annotation_bookmarks``, the stroke and
+        caption caches).  Those record which local bookmarks originated from a
+        *remote* peer; dropping them would make the next session's flush scan
+        treat those bookmarks as new local annotations and re-broadcast them as
+        duplicates.  They survive disconnect today and must keep doing so.
+        """
         self._broadcast_annotation_keys.clear()
+        # Transient per-session state: guards, counters and scan timestamps.
+        self._annotation_pending_time = None
+        self._reload_suppress_until = 0.0
+        self._annotation_flush_retries = 0
+        self._annotation_retry_deadline = None
+        self._core_events_received = 0
+        self._last_annotation_scan = 0.0
+        self._last_partial_render_time.clear()
+        self._live_stroke_current_key = None
 
     # ── annotation event handlers ──────────────────────────────────────
 
@@ -138,7 +174,7 @@ class AnnotationSyncController:
             return
         if not self.plugin.manager or self.plugin.manager.status != STATE_SYNCED:
             return
-        self.plugin._annotation_pending_time = time.monotonic()
+        self._annotation_pending_time = time.monotonic()
 
     def on_draw_event(self, event_data, user_id, stroke_completed) -> None:
         """[2C] Entry point for every event on AnnotationsCore's draw-events group.
@@ -212,7 +248,7 @@ class AnnotationSyncController:
         # log the gesture boundaries and anything unfamiliar, not every point.
         if event_name not in self._HIGH_RATE_EVENTS:
             _log(f"Draw interaction (event={event_name!r}) — scheduling broadcast scan")
-        self.plugin._annotation_pending_time = time.monotonic()
+        self._annotation_pending_time = time.monotonic()
 
     def on_core_annotation_event(self, anno_json, stroke_completed) -> None:
         """[2C] Handle a live stroke broadcast by AnnotationsCore.
@@ -239,7 +275,7 @@ class AnnotationSyncController:
 
         if stroke_completed:
             _log("[2C] AnnotationsCore: pen-up — scheduling flush")
-            self.plugin._annotation_pending_time = time.monotonic()
+            self._annotation_pending_time = time.monotonic()
             # Signal poll thread to clear the live-stroke key so the next
             # paint gesture gets a fresh UUID slot in _stroke_uuid_cache.
             self.plugin._cmd_queue.put_nowait(("clear_live_stroke", None))
@@ -406,11 +442,11 @@ class AnnotationSyncController:
         ANNOTATION_SCAN_INTERVAL = self.plugin.ANNOTATION_SCAN_INTERVAL
 
         now = time.monotonic()
-        if self.plugin._annotation_pending_time is not None:
-            if now - self.plugin._annotation_pending_time < self.DEBOUNCE_SECONDS:
+        if self._annotation_pending_time is not None:
+            if now - self._annotation_pending_time < self.DEBOUNCE_SECONDS:
                 return
             # Event-triggered flush — clear the pending flag.
-            self.plugin._annotation_pending_time = None
+            self._annotation_pending_time = None
         else:
             # No event — run the periodic fallback scan.
             if now - self._last_annotation_scan < ANNOTATION_SCAN_INTERVAL:
@@ -488,7 +524,7 @@ class AnnotationSyncController:
                     f" retry {self._annotation_flush_retries}"
                     f" ({self._annotation_retry_deadline - now:.1f}s left)"
                 )
-                self.plugin._annotation_pending_time = now
+                self._annotation_pending_time = now
             else:
                 _log(
                     f"flush_pending_annotations: gave up after"
@@ -1031,8 +1067,8 @@ class AnnotationSyncController:
                 # instead of waiting for the full 1-second periodic scan.  This
                 # shrinks the window where a concurrent user drag gets silently
                 # captured as the post-refresh baseline.
-                if self.plugin._annotation_pending_time is None:
-                    self.plugin._annotation_pending_time = time.monotonic()
+                if self._annotation_pending_time is None:
+                    self._annotation_pending_time = time.monotonic()
         except Exception:
             _log_exc("refresh_annotation_bookmark: failed")
 
@@ -1231,7 +1267,7 @@ class AnnotationSyncController:
                 # Suppress the show_atom burst that xStudio fires when displaying
                 # the new bookmark — without this, the flush scan re-runs and
                 # echoes the remote strokes back as if they were drawn locally.
-                self.plugin._reload_suppress_until = time.monotonic() + 0.5
+                self._reload_suppress_until = time.monotonic() + 0.5
                 _log(
                     f"Applied remote annotation: {len(pen_strokes)} stroke(s),"
                     f" {len(captions)} caption(s) at frame {frame}"

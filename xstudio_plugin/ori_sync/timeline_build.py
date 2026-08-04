@@ -85,6 +85,10 @@ class TimelineBuildController:
         # Throttle for the "viewport not ready" log during retry loop.
         self._last_timeline_defer_log_time: float = 0.0
 
+    def reset(self) -> None:
+        """Clear all owned state (called from plugin disconnect)."""
+        self._last_timeline_defer_log_time = 0.0
+
     # ── static helpers ─────────────────────────────────────────────────────────
 
     @staticmethod

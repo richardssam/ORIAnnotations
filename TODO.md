@@ -49,7 +49,7 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 
 
 # TODO Cleanup
-- [ ] Move loader and saver for RV to export/import menu.
+- [x] Move loader and saver for RV to export/import menu.
 - [ ] Figure out if we can move the pika install into the plugin for xstudio
 - [ ] README says it needs a OTIO_PLUGIN_MANIFEST_PATH for xstudio. Can we make it part of the plugin.
 

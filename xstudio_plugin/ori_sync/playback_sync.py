@@ -16,6 +16,7 @@ from xstudio.core import (
     viewport_active_media_container_atom, item_selection_atom,
     selection_actor_atom, selection_changed_atom, source_atom,
     position_atom, play_forward_atom, play_atom,
+    get_global_playhead_events_atom, viewport_atom, active_viewport_atom,
 )
 from otio_sync_core.manager import STATE_SYNCED
 from .utils import _log, _log_exc, bounded, bounded_timeout
@@ -24,6 +25,10 @@ from .utils import _log, _log_exc, bounded, bounded_timeout
 # for a healthy actor (which replies in a few ms) but far below the 100 s default
 # so a stale/destroyed actor fails fast and the poll thread keeps running.
 _PLAYHEAD_TIMEOUT_MS = 2000
+
+# Fan-out label for the container-selection handler (see the plugin's
+# join_event_group).  There is only ever one of it.
+_SELECTION_LABEL = "container-selection"
 
 # Native "Loop Mode" playhead attribute string <-> wire playback_mode string.
 _LOOP_MODE_TO_WIRE = {"Loop": "loop", "Play Once": "play-once", "Ping Pong": "ping-pong"}
@@ -59,19 +64,41 @@ class PlaybackSyncController:
         self.plugin = plugin
 
         # ── owned state ───────────────────────────────────────────────
+        # Deferred seek: when a multi-clip sequence selection is received,
+        # the target frame and its deadline are stored here.  Both Form-2
+        # viewport_playhead_atom events fire within ~200 ms of the source
+        # switch and update active_playhead; the poll loop applies the seek
+        # once the deadline passes and the playhead has settled.
         self._pending_seek_frame: int | None = None
         self._pending_seek_deadline: float = 0.0
         self._last_known_playback_mode: str | None = None
         self._loop_mode_apply_suppress_until: float = 0.0
-        self._current_selection_sub_id: int | None = None
+        # Event-group key the selection handler is currently attached to.
+        self._current_selection_group_key: str | None = None
         self._current_selection_container_uuid: str | None = None
         self._last_logged_container_uuid: str | None = None
         self._last_logged_clip_name: str | None = None
+        # Last clip GUID seen in the viewport (playlist selection or show_atom).
+        # Used as a fallback in the annotation broadcast path for flat playlists,
+        # where _resolve_clip_at_frame returns None.
         self._last_viewed_clip_guid: str | None = None
+        # Last read value of the playhead "Pinned Source Mode" attribute.
+        # True = full timeline/sequence view; False = single selected-media view.
+        # None on first read (no broadcast on initialisation).
         self._last_pinned_source_mode: bool | None = None
         self._last_sel_names = None
         self._last_src_names = None
         self._last_playhead_check: float = 0.0
+        # Poll-thread cadence for the periodic active-playhead re-check (see the
+        # 6.15 step in ori_sync_plugin._poll_loop).
+        self._last_playhead_scan: float = 0.0
+        # Name of the viewport whose playhead we track, learned from Form-2
+        # events.  _viewport_playhead resolves this same viewport every time; see
+        # there for why "whichever viewport answers first" is not good enough.
+        self._viewport_name: str | None = None
+        # Previous poll's playhead key, so the poll only adopts a reading it has
+        # seen twice (see check_and_update_active_playhead).
+        self._last_scanned_playhead_key: str | None = None
         # Timestamp of the most recent selection-actor (source_atom) event — a
         # deliberate user clip selection.  The show_atom handler reads PSM fresh
         # for a few seconds after this so the FIRST selected clip isn't decided
@@ -110,14 +137,64 @@ class PlaybackSyncController:
         self._pending_scrub_state: "dict | None" = None
         self._pending_scrub_due: float = 0.0
 
+        # ── echo guards ───────────────────────────────────────────────
+        # Polling-based scrub detection: last frame seen by the poll loop and
+        # last frame applied from a remote PLAYBACK_SETTINGS message.
+        # When the poll sees a frame change that matches _last_applied_frame the
+        # change came from a remote apply, so we skip re-broadcasting (echo guard).
+        self._last_polled_frame: int | None = None
+        self._last_applied_frame: int | None = None
+        self._last_polled_playing: bool | None = None
+        # Monotonic deadline until which local playhead attribute_changed events
+        # are NOT re-broadcast.  Set on every remote playback apply: ph.position
+        # fires attribute_changed asynchronously, and during rapid scrubbing the
+        # single _last_applied_frame guard loses the race (a lagging callback for
+        # an older frame no longer matches), echoing positions back and creating
+        # a feedback loop.  A short rolling window suppresses those echoes while a
+        # peer is driving playback, without blocking genuine local scrubs once it
+        # stops (the window simply expires).
+        self._playback_apply_suppress_until: float = 0.0
+        # Monotonic deadline refreshed whenever we broadcast a *local* playhead
+        # move (scrubbing).  Used only to suppress selection-driven clip-start
+        # seeks while we are the one driving playback — a peer following our scrub
+        # crosses clip boundaries and echoes selections back, and applying those
+        # seeks would snap our own playhead to clip starts.  Kept separate from
+        # _playback_apply_suppress_until, which doubles as the broadcast echo guard.
+        self._local_scrub_active_until: float = 0.0
+        # Monotonic timestamp of when playback last transitioned False→True.
+        # Used to allow the first show_atom after play-start to broadcast even
+        # though _last_polled_playing is already True (race-condition guard).
+        self._playing_started_at: float = 0.0
+
+        # Most recent show_atom media — tracked unconditionally so the PSM
+        # True→False handler can broadcast mode=source even when the show_atom
+        # itself was NOT suppressed (e.g. at play-start within the 0.3 s window).
+        self._last_show_atom_media: str | None = None
+        self._last_show_atom_seq_tl_guid: str | None = None
+        self._last_show_atom_at: float = 0.0
+
+        # Set to True while _apply_selection is writing Pinned Source Mode so
+        # the poll loop ignores the resulting attribute-change echo.
+        self._applying_pinned_mode: bool = False
+        # Monotonic deadline before which show_atom clip-selection broadcasts are
+        # suppressed.  Set after _apply_selection calls select_all() to prevent
+        # the resulting show_atom burst from echoing individual clip selections
+        # back to remote peers.
+        self._selection_broadcast_suppress_until: float = 0.0
+
+        # Viewport container tracking state: caches whether the active viewport
+        # container is a Playlist or Timeline to avoid synchronous API calls in
+        # playhead event handlers.
+        self._viewport_container_is_playlist: bool = False
+        self._viewport_container_is_timeline: bool = False
+
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
-        if self._current_selection_sub_id is not None:
-            try:
-                self.plugin.unsubscribe_from_event_group(self._current_selection_sub_id)
-            except Exception:
-                pass
-            self._current_selection_sub_id = None
+        # Detach, never leave — see subscribe_container_selection.
+        self.plugin.detach_event_group_handler(
+            self._current_selection_group_key, _SELECTION_LABEL
+        )
+        self._current_selection_group_key = None
         self._current_selection_container_uuid = None
         self._last_logged_container_uuid = None
         self._last_logged_clip_name = None
@@ -143,6 +220,23 @@ class PlaybackSyncController:
         self._last_scrub_broadcast_at = 0.0
         self._pending_scrub_state = None
         self._pending_scrub_due = 0.0
+        self._last_source_atom_at = 0.0
+        self._last_playhead_scan = 0.0
+        self._viewport_name = None
+        self._last_scanned_playhead_key = None
+        self._last_polled_frame = None
+        self._last_applied_frame = None
+        self._last_polled_playing = None
+        self._playback_apply_suppress_until = 0.0
+        self._local_scrub_active_until = 0.0
+        self._playing_started_at = 0.0
+        self._last_show_atom_media = None
+        self._last_show_atom_seq_tl_guid = None
+        self._last_show_atom_at = 0.0
+        self._applying_pinned_mode = False
+        self._selection_broadcast_suppress_until = 0.0
+        self._viewport_container_is_playlist = False
+        self._viewport_container_is_timeline = False
 
     def cached_viewed_timeline_guid(self, ttl: float = 0.5) -> str | None:
         """Return the viewed timeline guid, cached for *ttl* seconds.
@@ -186,8 +280,8 @@ class PlaybackSyncController:
                 self.check_and_update_active_playhead()
                 media_ua = event[2]
                 media_uuid_str = str(media_ua.uuid)
-                is_playlist = getattr(self.plugin, "_viewport_container_is_playlist", False)
-                is_timeline = getattr(self.plugin, "_viewport_container_is_timeline", False)
+                is_playlist = self._viewport_container_is_playlist
+                is_timeline = self._viewport_container_is_timeline
                 _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
                 _media_name_hint = None
                 # Resolve via the timeline actually on screen right now, not
@@ -350,12 +444,12 @@ class PlaybackSyncController:
                 # Track unconditionally — PSM True→False handler reads this to
                 # broadcast mode=source even when the show_atom was not suppressed.
                 if _media_name_hint:
-                    self.plugin._last_show_atom_media = _media_name_hint
-                    self.plugin._last_show_atom_seq_tl_guid = _seq_tl_guid
-                    self.plugin._last_show_atom_at = time.monotonic()
+                    self._last_show_atom_media = _media_name_hint
+                    self._last_show_atom_seq_tl_guid = _seq_tl_guid
+                    self._last_show_atom_at = time.monotonic()
                 # Echo guard: suppress the show_atom burst fired after we call
                 # select_all() / set_on_screen_source in apply_selection.
-                if time.monotonic() < self.plugin._selection_broadcast_suppress_until:
+                if time.monotonic() < self._selection_broadcast_suppress_until:
                     _log("[SEL] → suppressed (echo guard)")
                     return
                 # Extended clip-specific guard: a POLL-SLOW can delay the show_atom
@@ -376,10 +470,10 @@ class PlaybackSyncController:
                 # poll may have already set _last_polled_playing before this fires).
                 # Never suppress when already in single-clip mode: those are always
                 # deliberate user clip-switches, not playback scan-through events.
-                _playing_just_started = (time.monotonic() - self.plugin._playing_started_at < 0.3)
+                _playing_just_started = (time.monotonic() - self._playing_started_at < 0.3)
                 if (
                     _is_seq_media
-                    and self.plugin._last_polled_playing
+                    and self._last_polled_playing
                     and not _playing_just_started
                     and not _in_single_clip
                 ):
@@ -401,11 +495,11 @@ class PlaybackSyncController:
                     _log(f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}")
                 return
 
-            if time.monotonic() < self.plugin._reload_suppress_until:
+            if time.monotonic() < self.plugin.annotation._reload_suppress_until:
                 return
             _log(f"[SEL] show_atom (annotation/bookmark): {_shape} — queuing annotation flush")
             if self.plugin.manager and self.plugin.manager.status == STATE_SYNCED:
-                self.plugin._annotation_pending_time = time.monotonic()
+                self.plugin.annotation._annotation_pending_time = time.monotonic()
             return
 
         if not isinstance(event[1], viewport_playhead_atom):
@@ -417,6 +511,12 @@ class PlaybackSyncController:
             _log(f"viewport_playhead_atom Form-1 (ignored): len={len(event)}")
             return
         ph_remote = event[3]
+        # Remember which viewport this is: _viewport_playhead resolves that same
+        # viewport on every later poll, rather than whichever one answers first.
+        try:
+            self._viewport_name = str(event[2]) or self._viewport_name
+        except Exception:
+            pass
         # Compare BEFORE constructing: building a Playhead subscribes it to the
         # playhead's attribute events group, so constructing one per event just to
         # discard it churns subscriptions on a group we are already listening to.
@@ -424,7 +524,14 @@ class PlaybackSyncController:
             try:
                 new_ph = Playhead(self.plugin.connection, ph_remote)
                 if self._adopt_playhead(new_ph):
-                    _log(f"[SEL] viewport_playhead_atom Form-2: active playhead updated viewport={event[2]!r}")
+                    # Log the actor address, not just the viewport name: when
+                    # diagnosing "scrubbing is not broadcast" the question is
+                    # always *which* playhead we ended up on, and a log without
+                    # the address cannot answer it.
+                    _log(
+                        f"[SEL] viewport_playhead_atom Form-2: active playhead updated"
+                        f" viewport={event[2]!r} playhead={ph_remote}"
+                    )
             except Exception:
                 _log_exc("on_global_playhead_event: failed to update playhead")
 
@@ -444,19 +551,23 @@ class PlaybackSyncController:
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def subscribe_container_selection(self, container) -> None:
-        """Subscribe to the container's selection actor to receive selection events."""
+        """Subscribe to the container's selection actor to receive selection events.
+
+        Routed through the plugin's ``join_event_group``: joins each group once
+        and never leaves.  This used to unsubscribe the previous container's
+        selection actor before subscribing the new one — with one shared listener
+        per connection that leave revokes the membership every callback in the
+        process depends on, which silently deafens the whole plugin (see
+        join_event_group).  The old handler is detached from the fan-out instead.
+        """
         try:
             container_uuid = str(container.uuid)
             if self._current_selection_container_uuid == container_uuid:
                 return
 
-            if self._current_selection_sub_id is not None:
-                try:
-                    self.plugin.unsubscribe_from_event_group(self._current_selection_sub_id)
-                except Exception:
-                    pass
-                self._current_selection_sub_id = None
-                self._current_selection_container_uuid = None
+            self.plugin.detach_event_group_handler(
+                self._current_selection_group_key, _SELECTION_LABEL
+            )
 
             # Get selection actor
             selection_actor = self.plugin.connection.request_receive(
@@ -466,9 +577,8 @@ class PlaybackSyncController:
             from xstudio.api.auxiliary import ActorConnection
             selection_conn = ActorConnection(self.plugin.connection, selection_actor)
 
-            # Subscribe
-            self._current_selection_sub_id = self.plugin.subscribe_to_event_group(
-                selection_conn, self.on_selection_event
+            self._current_selection_group_key = self.plugin.join_event_group(
+                selection_conn, _SELECTION_LABEL, self.on_selection_event
             )
             self._current_selection_container_uuid = container_uuid
             _log(
@@ -513,13 +623,16 @@ class PlaybackSyncController:
 
         The cached ``_last_pinned_source_mode`` only updates when the selection
         poll runs, which lags xStudio; this reads the current value directly.
-        Uses ``current_playhead()`` (the persistent global-playhead actor, not
-        the possibly-stale cached ``active_playhead``) and bounds both reads so a
-        dead actor cannot hang the caller.  Returns ``None`` on any error.
+        Uses ``_viewport_playhead()`` rather than the possibly-stale cached
+        ``active_playhead`` (a destroyed actor here hangs the poll thread for
+        ~100 s) — and rather than ``current_playhead()``, which answers with
+        ``global_active_playhead_`` and so can hand back a *different* playhead's
+        PSM than the one on screen.  Both reads are bounded.  Returns ``None`` on
+        any error.
         """
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
-                _ph = self.plugin.current_playhead()
+                _ph = self._viewport_playhead()
             attr = _ph.get_attribute("Pinned Source Mode") if _ph else None
             if attr is None:
                 return None
@@ -576,29 +689,116 @@ class PlaybackSyncController:
         self.plugin.active_playhead = ph
         return True
 
+    def _viewport_playhead(self):
+        """Return the playhead actually attached to the visible viewport.
+
+        Do NOT use ``PluginBase.current_playhead()`` for this.  That sends a bare
+        ``viewport_playhead_atom`` to ``PlayheadGlobalEventsActor``, which answers
+        with ``global_active_playhead_`` — and that member is *not* the viewport's
+        playhead:
+
+        * it is initialised to a spawned ``"DummyPlayhead"``
+          (``playhead_global_events_actor.cpp:31-33``), which emits no position
+          events at all;
+        * it is only reassigned by the explicit "set the global playhead" handler
+          (``:182``, what ``SessionModel::setCurrentPlayheadFromPlaylist`` sends);
+        * the handler that runs when a *viewport* connects to a playhead
+          (``:189-243``) updates ``viewports_[name].playhead`` and never touches
+          ``global_active_playhead_``.
+
+        So it lags the viewport indefinitely.  Observed consequence: building a
+        sequence from a bin left the plugin holding the pre-sequence playhead for
+        a whole session — ``on_playhead_attribute_changed`` never fired, so
+        scrubbing was silently never broadcast while selection sync kept working
+        and masked it.  The peer log showed the *same* playhead address before the
+        sequence existed and after it was on screen.
+
+        The viewport's own ``viewport_playhead_atom`` is the live one (the
+        "separate issues" note in ``xstudio/scratch/python-event-routing-notes.md``
+        says the same).  Query the viewport actor directly rather than building a
+        ``Viewport`` wrapper: that wrapper is a ``ModuleBase`` (so constructing one
+        subscribes it to the viewport's attribute events) and it memoises
+        ``self.__playhead``, which would hand back a stale playhead on every call
+        after the first.
+
+        Resolve *the same* viewport every time.  Asking for the "active" viewport
+        and otherwise taking whichever viewport happens to come back first is not
+        stable: a session can hold more than one (quickview, offscreen), so
+        consecutive polls can answer with two different viewports' playheads.
+        That produced a 1 Hz flip-flop between two playheads, and since every flip
+        re-adopts — re-wiring ``attribute_changed`` on the shared listener — the
+        churn silently killed the attribute subscription outright, which is the
+        very failure this whole change exists to prevent.  Prefer the viewport
+        name the Form-2 events report (``_viewport_name``), which is the one whose
+        playhead the user is actually driving.
+
+        :returns: a ``Playhead``, or None if no viewport/playhead is reachable.
+        """
+        conn = self.plugin.connection
+        gphev = conn.request_receive(
+            conn.remote(), get_global_playhead_events_atom())[0]
+        vp = None
+        if self._viewport_name:
+            try:
+                vp = conn.request_receive(
+                    gphev, viewport_atom(), self._viewport_name)[0]
+            except Exception:
+                vp = None
+        # Only before any Form-2 event has named a viewport for us: the visible
+        # one, else the first that exists (offscreen/test sessions have no
+        # "active" viewport).
+        if not vp:
+            try:
+                vp = conn.request_receive(gphev, active_viewport_atom())[0]
+            except Exception:
+                pass
+        if not vp:
+            vps = conn.request_receive(gphev, viewport_atom())[0]
+            vp = vps[0] if vps else None
+        if not vp:
+            return None
+        ph_actor = conn.request_receive(vp, viewport_playhead_atom())[0]
+        return Playhead(conn, ph_actor) if ph_actor else None
+
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def check_and_update_active_playhead(self) -> None:
-        """Query the active playhead from xStudio and cache its reference if changed."""
+        """Query the active playhead from xStudio and cache its reference if changed.
+
+        Adopts only a reading seen on two consecutive calls.  Adoption re-wires
+        ``attribute_changed``, and with one shared listener per connection that
+        churn can revoke the very subscription it is meant to maintain — so a
+        transient or disagreeing answer must never be acted on.  Real changes are
+        delivered promptly by the Form-2 event path; this is the safety net for
+        the changes xStudio does not announce, where one extra second costs
+        nothing.
+        """
         try:
-            ph = self.plugin.current_playhead()
+            ph = self._viewport_playhead()
         except Exception:
             return
+        if not ph:
+            return
 
-        if ph and self._adopt_playhead(ph):
+        key = self._remote_key(ph)
+        if key != self._last_scanned_playhead_key:
+            # First sighting — wait for the next scan to confirm it.
+            self._last_scanned_playhead_key = key
+            return
+
+        if self._adopt_playhead(ph):
             _log(f"[position_atom] active playhead updated: {ph.remote}")
 
     def _reacquire_active_playhead(self) -> None:
         """Re-acquire a live playhead after the previous reference went stale.
 
         Called from the poll thread when an actor call to ``active_playhead``
-        timed out.  ``current_playhead()`` queries the global-playhead-events
-        actor (not the dead playhead), so it is safe; it is still bounded by a
-        timeout in case that path is also slow.  On success the new playhead is
-        stored.
+        timed out.  ``_viewport_playhead()`` queries the viewport (not the dead
+        playhead), so it is safe; it is still bounded by a timeout in case that
+        path is also slow.  On success the new playhead is stored.
         """
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
-                ph = self.plugin.current_playhead()
+                ph = self._viewport_playhead()
                 if ph and self._adopt_playhead(ph):
                     _log(f"[position_atom] re-acquired live playhead: {ph.remote}")
         except Exception:
@@ -630,9 +830,9 @@ class PlaybackSyncController:
         # frame match handles the simple case; the rolling time window handles
         # rapid scrubbing, where async attribute_changed callbacks lag behind
         # _last_applied_frame and would otherwise echo stale frames back.
-        if frame == self.plugin._last_applied_frame:
+        if frame == self._last_applied_frame:
             return
-        if time.monotonic() < self.plugin._playback_apply_suppress_until:
+        if time.monotonic() < self._playback_apply_suppress_until:
             return
 
         # On first run there's no known baseline to diff against. Treat it as
@@ -644,10 +844,10 @@ class PlaybackSyncController:
         # an event afterward to "catch" it — only scrubbing did, because it
         # fires many events in a row and later ones compare against a real
         # baseline).
-        first_run = self.plugin._last_polled_playing is None
+        first_run = self._last_polled_playing is None
 
         # Check playing state change
-        playing_changed = first_run or (playing != self.plugin._last_polled_playing)
+        playing_changed = first_run or (playing != self._last_polled_playing)
 
         if not first_run:
             # Skip frame updates while playing if play state didn't change
@@ -656,12 +856,12 @@ class PlaybackSyncController:
 
             # If paused and frame hasn't changed, skip
             if not playing and not playing_changed:
-                if frame == self.plugin._last_polled_frame:
+                if frame == self._last_polled_frame:
                     return
 
         # Update cache to prevent redundant broadcasts
-        self.plugin._last_polled_playing = playing
-        self.plugin._last_polled_frame = frame
+        self._last_polled_playing = playing
+        self._last_polled_frame = frame
 
         # Construct the unified view-state payload (position + current view).
         # The view_mode/clip_guid describe what we are currently viewing so a
@@ -680,7 +880,7 @@ class PlaybackSyncController:
 
         # Mark local playback as active so an echoed selection from a following
         # peer doesn't seek our own playhead to a clip start mid-scrub.
-        self.plugin._local_scrub_active_until = time.monotonic() + 0.4
+        self._local_scrub_active_until = time.monotonic() + 0.4
 
         # Position-only updates while paused (scrubbing) are rate-limited:
         # xStudio fires one of these per rendered frame (~60 Hz) while dragging
@@ -783,8 +983,8 @@ class PlaybackSyncController:
 
             is_timeline = isinstance(container, Timeline)
             is_playlist = isinstance(container, Playlist)
-            self.plugin._viewport_container_is_playlist = is_playlist
-            self.plugin._viewport_container_is_timeline = is_timeline
+            self._viewport_container_is_playlist = is_playlist
+            self._viewport_container_is_timeline = is_timeline
 
             clip_name = None
             clip_uuid_str = None
@@ -843,7 +1043,7 @@ class PlaybackSyncController:
             # returned to sequence/timeline view without going through RV.
             if (
                 self.plugin.active_playhead
-                and not self.plugin._applying_pinned_mode
+                and not self._applying_pinned_mode
                 and self.plugin.manager
                 and self.plugin.manager.status == STATE_SYNCED
             ):
@@ -853,10 +1053,13 @@ class PlaybackSyncController:
                     # cached reference can point at a destroyed actor and the read
                     # hangs the poll thread for ~100s (below the request_receive
                     # timeout layer, so @bounded on this method does not catch it,
-                    # confirmed by the FREEZE-PROBE). current_playhead() queries
-                    # the persistent global-playhead actor and is bounded.
+                    # confirmed by the FREEZE-PROBE). _viewport_playhead() queries
+                    # live actors and is bounded — and unlike current_playhead()
+                    # it returns the playhead actually on screen rather than
+                    # global_active_playhead_, whose PSM may belong to a
+                    # different playhead entirely.
                     with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
-                        _psm_ph = self.plugin.current_playhead()
+                        _psm_ph = self._viewport_playhead()
                     psm_attr = _psm_ph.get_attribute("Pinned Source Mode") if _psm_ph else None
                     if psm_attr is not None:
                         with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
@@ -882,8 +1085,8 @@ class PlaybackSyncController:
                                 # mode.  The show_atom fired ~80 ms ago (suppressed or not);
                                 # use _last_show_atom_media to broadcast mode=source so RV
                                 # also switches to single-clip view for that clip.
-                                _atom_age = time.monotonic() - self.plugin._last_show_atom_at
-                                _media_h = self.plugin._last_show_atom_media if _atom_age < 2.0 else None
+                                _atom_age = time.monotonic() - self._last_show_atom_at
+                                _media_h = self._last_show_atom_media if _atom_age < 2.0 else None
                                 if not _media_h:
                                     _media_h = clip_name  # fallback: current poll value
                                 if _media_h:
@@ -1094,7 +1297,7 @@ class PlaybackSyncController:
         # (sent before the remote knew about this local change) overriding it.
         # Only set the guard when not inside a remote-apply echo suppression window
         # (i.e., this broadcast is genuinely local, not an echo of a remote apply).
-        if time.monotonic() >= self.plugin._selection_broadcast_suppress_until:
+        if time.monotonic() >= self._selection_broadcast_suppress_until:
             self._local_view_action_until = time.monotonic() + 1.0
         state = self.current_playback_state() or {
             "playing": False,
@@ -1237,17 +1440,17 @@ class PlaybackSyncController:
             return False
         self.plugin.manager.active_timeline_guid = tl_guid
         # Suppress the show_atom burst the switch fires from echoing back.
-        self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+        self._selection_broadcast_suppress_until = time.monotonic() + 0.5
         try:
             self.plugin.connection.api.session.viewed_container = target
             self.plugin.connection.api.session.set_on_screen_source(target)
             if self.plugin.active_playhead:
                 try:
-                    self.plugin._applying_pinned_mode = True
+                    self._applying_pinned_mode = True
                     self.plugin.active_playhead.set_attribute("Pinned Source Mode", True)
                     self._last_pinned_source_mode = True
                 finally:
-                    self.plugin._applying_pinned_mode = False
+                    self._applying_pinned_mode = False
             _log(
                 f"apply view-state: sequence → {getattr(target, 'name', '?')!r}"
                 f" ({tl_guid[:8]})"
@@ -1425,20 +1628,20 @@ class PlaybackSyncController:
                     # Update cache only when we actually change xStudio's play
                     # state so the poll does not mistake a no-op remote event
                     # for a local change.
-                    self.plugin._last_polled_playing = playing
+                    self._last_polled_playing = playing
                     if playing:
-                        self.plugin._playing_started_at = time.monotonic()
+                        self._playing_started_at = time.monotonic()
                     ph.playing = playing
                 # Apply position if we are paused, or the play/pause state changed,
                 # but NOT when the timeline guid mismatched (the view switch has not
                 # finished landing — seeking on the wrong timeline would be wrong).
                 if (not playing or playing_changed) and not _tl_mismatch:
-                    self.plugin._last_applied_frame = frame
-                    self.plugin._last_polled_frame = frame
+                    self._last_applied_frame = frame
+                    self._last_polled_frame = frame
                     # Suppress the echo: ph.position fires attribute_changed
                     # asynchronously; refresh a rolling window so those callbacks
                     # don't re-broadcast while a peer is driving playback.
-                    self.plugin._playback_apply_suppress_until = time.monotonic() + 0.4
+                    self._playback_apply_suppress_until = time.monotonic() + 0.4
                     ph.position = frame
         except Exception:
             # xStudio's UI uses the new live playhead; re-acquire it via the
@@ -1499,7 +1702,7 @@ class PlaybackSyncController:
         any highlight) and deliberately conservative — a dropped highlight is
         harmless, a segfault is not.
         """
-        return time.monotonic() < self.plugin._structural_mutation_suppress_until
+        return time.monotonic() < self.plugin.structure._structural_mutation_suppress_until
 
     def _highlight_timeline_item(self, clip_guid: str) -> None:
         """Select/highlight *clip_guid* in its sequence timeline, in place.
@@ -1587,7 +1790,7 @@ class PlaybackSyncController:
                 # Suppress our own outbound re-broadcast of the selection this
                 # send triggers, so applying a peer's highlight doesn't echo
                 # back (mirrors RV's _rv_updating echo guard; task 3.2).
-                self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                 self.plugin.connection.send(
                     playlist_xs_tl.remote, item_selection_atom(), ua_vec
                 )
@@ -1622,7 +1825,7 @@ class PlaybackSyncController:
         # sender.  When two peers start on different clips that produces an endless
         # swap (each applies the other's selection and re-broadcasts its own).
         # Suppress local selection broadcasts briefly while we apply this one.
-        self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+        self._selection_broadcast_suppress_until = time.monotonic() + 0.5
 
         if not clip_guid:
             # Clear / container switch.
@@ -1660,33 +1863,33 @@ class PlaybackSyncController:
                                 # to the full timeline rather than any single selected media item.
                                 if self.plugin.active_playhead:
                                     try:
-                                        self.plugin._applying_pinned_mode = True
+                                        self._applying_pinned_mode = True
                                         self.plugin.active_playhead.set_attribute("Pinned Source Mode", True)
                                         self._last_pinned_source_mode = True
                                         _log("RECV selection clear: set Pinned Source Mode = True")
                                     except Exception:
                                         _log_exc("RECV selection: failed to set Pinned Source Mode")
                                     finally:
-                                        self.plugin._applying_pinned_mode = False
+                                        self._applying_pinned_mode = False
                             else:
                                 self.plugin.connection.api.session.set_on_screen_source(pl)
                                 _log("RECV selection clear: set_on_screen_source to playlist (Source)")
                                 if self.plugin.active_playhead:
                                     try:
-                                        self.plugin._applying_pinned_mode = True
+                                        self._applying_pinned_mode = True
                                         self.plugin.active_playhead.set_attribute("Pinned Source Mode", False)
                                         self._last_pinned_source_mode = False
                                         _log("RECV selection clear: set Pinned Source Mode = False")
                                     except Exception:
                                         _log_exc("RECV selection: failed to set Pinned Source Mode")
                                     finally:
-                                        self.plugin._applying_pinned_mode = False
+                                        self._applying_pinned_mode = False
 
                             pl.playhead_selection.select_all()
                             # select_all() fires show_atom for every media item in the
                             # playlist.  Suppress those for 0.5 s — in practice all
                             # echo show_atoms arrive within 150 ms.
-                            self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                            self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container")
 
@@ -1853,7 +2056,7 @@ class PlaybackSyncController:
                     # Single-clip individual playlist: just show it.
                     # Suppress the show_atom burst set_on_screen_source fires so it
                     # doesn't echo back to the peer that sent us this selection.
-                    self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
                     self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
@@ -1889,7 +2092,7 @@ class PlaybackSyncController:
                                         if sr is not None:
                                             current_time += int(sr.duration.value)
 
-                    self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
                     self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
@@ -1909,7 +2112,7 @@ class PlaybackSyncController:
                     # Flat playlist: viewed_container + set_on_screen_source + set_selection.
                     # Suppress the show_atom that fires from set_selection so it doesn't
                     # echo back to the peer that just sent us this selection.
-                    self.plugin._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                    self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
                     self.plugin.connection.api.session.set_on_screen_source(playlist)
@@ -1927,7 +2130,7 @@ class PlaybackSyncController:
                 self.check_and_update_active_playhead()
                 if self.plugin.active_playhead:
                     try:
-                        self.plugin._applying_pinned_mode = True
+                        self._applying_pinned_mode = True
                         psm = (view_mode == "sequence")
                         self.plugin.active_playhead.set_attribute("Pinned Source Mode", psm)
                         self._last_pinned_source_mode = psm
@@ -1935,7 +2138,7 @@ class PlaybackSyncController:
                     except Exception:
                         _log_exc("RECV selection: failed to set Pinned Source Mode")
                     finally:
-                        self.plugin._applying_pinned_mode = False
+                        self._applying_pinned_mode = False
             except Exception:
                 _log_exc("RECV selection: container switch or selection failed")
 

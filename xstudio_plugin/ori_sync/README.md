@@ -72,9 +72,47 @@ sync. Two compounding causes, both documented in
 
 `PlaybackSyncController._adopt_playhead` now does the one thing the base call was
 wanted for — assigning `attribute_changed` — at every site that acquires a
-playhead, without issuing the fatal leave. Revisit if
-`pr/python-per-subscription-listeners` lands upstream, which fixes this
-structurally by giving each subscription its own listener actor.
+playhead, without issuing the fatal leave.
+
+#### Acquire the playhead from the viewport, never from `current_playhead()`
+
+`PluginBase.current_playhead()` sends a bare `viewport_playhead_atom` to
+`PlayheadGlobalEventsActor`, which answers with `global_active_playhead_`. **That
+is not the viewport's playhead.** It starts life as a spawned `"DummyPlayhead"`
+(`playhead_global_events_actor.cpp:31-33`) that emits no position events, and it
+is only reassigned by the explicit "set the global playhead" handler (`:182`) —
+the handler that runs when a *viewport* connects to a playhead (`:189-243`)
+updates `viewports_[name].playhead` and leaves `global_active_playhead_` alone.
+
+Symptom when this bites: build a sequence out of a bin and the plugin keeps the
+pre-sequence playhead for the rest of the session. `on_playhead_attribute_changed`
+never fires, so scrubbing and play/stop are silently never broadcast, while
+selection sync keeps working and masks it. The peer log shows the *same* playhead
+address before the sequence existed and after it is on screen, and zero
+`queuing playback state broadcast` lines.
+
+Use `PlaybackSyncController._viewport_playhead()` instead — it asks the viewport
+actor directly. Don't build a `Viewport` wrapper for this either: it is a
+`ModuleBase` (constructing one subscribes it to the viewport's attribute events)
+and it memoises `self.__playhead`, so it returns a stale playhead after the first
+call.
+
+Because not every playhead change is announced — creating a sequence fires no
+`viewport_playhead_atom` at all, since the C++ handler early-returns when the
+viewport's playhead is unchanged — `_poll_loop` also re-checks once a second.
+`_adopt_playhead` no-ops on an unchanged remote key, so that costs one bounded
+read per second and no re-subscription.
+
+**If `pr/python-per-subscription-listeners` lands upstream, redo all of this
+rather than assuming it still holds.** That branch gives each subscription its own
+listener actor, which changes the ground underneath in three ways: both reasons
+for avoiding `subscribe_to_playhead_events()` dissolve (a leave can only revoke
+its own membership), so the hand-rolled ownership may become unnecessary;
+`Playhead` construction stops being free, which makes the remote-key guards and
+the 1 Hz re-check load-bearing for resource use rather than just for churn; and
+the fix *removes* events that callbacks currently receive via crosstalk between a
+`PlayheadActor`'s groups, which is a silent-omission change. Diff an event trace,
+don't eyeball behaviour.
 
 ### Build (macOS, as used here)
 

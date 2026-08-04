@@ -235,19 +235,28 @@ def execute_xstudio_command(payload, port):
         elif action == "set_selection":
             name = payload.get("name")
             
-            # Check playlists
+            # Selecting a playlist here is a *bin* selection, not a sequence
+            # selection: an xStudio Playlist is a bin, and its playhead only
+            # spans whatever sits in the PlayheadSelection — one clip at a time.
+            # Do NOT try to widen it (playhead_selection.select_all() plus a
+            # "String" compare mode) to imitate RV's concatenated
+            # `Default Sequence`. That does string the clips, but select_all
+            # emits one show_atom per media, and the plugin broadcasts each as
+            # mode=source with a different clip_guid — every one of which trips
+            # broadcast_view_state's `_new_source_clip` reset (ph.position = 0).
+            # The burst can straggle past a following set_frame and rewind both
+            # peers, which made xstudio_selects fail ~50% of runs.
             for i, pl in enumerate(conn.api.session.playlists):
                 if pl.name == name or (name in ["Default Sequence", "Sequence", "Default"] and i == 0):
                     conn.api.session.set_on_screen_source(pl)
                     return {"action": action, "status": "success"}
-                    
+
                 # Check media (clip)
                 for m in pl.media:
-                    import os
                     if m.name == name or os.path.basename(m.name) == name:
                         conn.api.session.set_on_screen_source(m)
                         return {"action": action, "status": "success"}
-                        
+
             raise ValueError(f"Could not find sequence or media matching name: {name}")
 
         elif action == "set_frame":
@@ -278,7 +287,6 @@ def execute_xstudio_command(payload, port):
             name = payload.get("name")
             for pl in conn.api.session.playlists:
                 for m in pl.media:
-                    import os
                     if m.name == name or os.path.basename(m.name) == name:
                         pl.remove_media(m)
                         return {"action": action, "status": "success"}
