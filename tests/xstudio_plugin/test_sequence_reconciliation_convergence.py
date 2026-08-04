@@ -14,7 +14,13 @@ require a live xStudio session: xStudio's timeline/playlist objects are
 faked below. Run with the xStudio-bundled interpreter, e.g.::
 
     /path/to/xstudio/build/vcpkg_installed/arm-osx/tools/python3/python3 -m pytest \\
-        xstudio_plugin/tests/test_sequence_reconciliation_convergence.py -v
+        tests/xstudio_plugin/test_sequence_reconciliation_convergence.py -v
+
+Lives under the repo-root ``tests/`` tree, not inside ``xstudio_plugin/``
+itself — xStudio's plugin loader enumerates every subdirectory of
+``xstudio_plugin/`` as a plugin candidate, and a non-plugin package there
+(e.g. a ``tests/`` dir) makes it log a "Failed to load plugin" error on
+every launch.
 """
 import os
 import sys
@@ -22,8 +28,9 @@ import types
 
 import opentimelineio as otio
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python")))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_repo_root, "python"))
+sys.path.insert(0, os.path.join(_repo_root, "xstudio_plugin"))
 
 from otio_sync_core.manager import SyncManager, STATE_SYNCED  # noqa: E402
 
@@ -32,7 +39,7 @@ from otio_sync_core.manager import SyncManager, STATE_SYNCED  # noqa: E402
 # `pika` (RabbitMQ), not part of xStudio's bundled Python. structure_sync.py's
 # `from .utils import ...` only needs a valid package context to resolve, not
 # the real package init.
-_ori_sync_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ori_sync"))
+_ori_sync_dir = os.path.join(_repo_root, "xstudio_plugin", "ori_sync")
 _ori_sync_stub = types.ModuleType("ori_sync")
 _ori_sync_stub.__path__ = [_ori_sync_dir]
 sys.modules.setdefault("ori_sync", _ori_sync_stub)
