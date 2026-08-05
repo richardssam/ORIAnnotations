@@ -9,7 +9,7 @@ from utils import _log, _show_warning, _parse_ori_session, _media_path, _is_medi
 
 try:
     from otio_sync_core import SyncManager, RabbitMQNetwork
-    from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED
+    from otio_sync_core.manager import STATE_DISCOVERING
     from otio_sync_core.protocol_messages import timeline_origin, ORIGIN_OTIO_IMPORT
     from otio_sync_core.rabbitmq_network import resolve_host
     import opentimelineio as otio
@@ -354,9 +354,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         _log("Disconnected from session")
 
     def _init_as_master(self):
-        """Initialise the session as the first participant (Master)."""
-        self.sync_manager.is_master = True
-        self.sync_manager._set_status(STATE_SYNCED)
+        """Initialise the session as the first participant (Master).
+
+        Mastership is claimed synchronously but announced later: ``poll_network``
+        re-checks ``STATE_DISCOVERING`` every 33 ms tick and would re-enter here
+        for the whole of _deferred_master_init's expansion window, while a
+        joiner's snapshot is empty until that init has built the timelines.  The
+        matching ``broadcast_master_response()`` is at the end of
+        :meth:`_deferred_master_init`.
+        """
+        self.sync_manager.elect_self_as_master(broadcast=False)
         self._deferred_master_init()
 
     def _deferred_master_init(self, attempt=0):
@@ -403,6 +410,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         # timelines (whole-OTIO model), built via RV's native otio_writer.
         self.sequence.init_otio_timelines()
 
+        # Deferred half of the election started in _init_as_master (which claims
+        # mastership with broadcast=False).  Not a stray broadcast: announcing
+        # only now guarantees a joiner's STATE_REQUEST is answered with a
+        # populated snapshot rather than an empty one.
         self.sync_manager.broadcast_master_response()
         self.annotation._import_existing_rv_annotations()
         _log("Session Initialized as MASTER")

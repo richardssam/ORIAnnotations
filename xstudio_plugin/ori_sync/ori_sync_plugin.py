@@ -494,19 +494,18 @@ class ORISyncPlugin(PluginBase):
     # ── discovery ──────────────────────────────────────────────────────────────
 
     def _discovery_timeout_task(self) -> None:
-        """Self-elect as master when the discovery timeout expires."""
+        """Enqueue self-election when the discovery timeout expires.
+
+        Runs on its own short-lived daemon thread, so it does no manager work
+        itself — the poll thread is the manager's single writer.  The status
+        read here is only a cheap "is this timeout still relevant" filter; the
+        authoritative check happens at drain time in the ``self_elect`` command,
+        because a master can answer in the interval between the two.
+        """
         time.sleep(self.DISCOVERY_TIMEOUT)
         if self.manager and self.manager.status == STATE_DISCOVERING:
-            _log("No master found — self-electing")
-            # Register the current xStudio session as the initial timeline.
-            # Done here rather than at connect time because viewed_container
-            # fails at startup before any media is loaded.
-            for tl in self.builder.build_otio_timelines():
-                self.manager.register_timeline(tl)
-            self.manager.is_master = True
-            self.manager.master_guid = self.manager.self_guid
-            self.manager.broadcast_master_response()
-            self.manager._set_status(STATE_SYNCED)
+            _log("No master found — queuing self-election")
+            self._cmd_queue.put(("self_elect", {}))
 
     # ── poll loop ──────────────────────────────────────────────────────────────
 
@@ -644,6 +643,26 @@ class ORISyncPlugin(PluginBase):
         try:
             if cmd == "load_timelines":
                 self.builder.do_load_timelines()
+            elif cmd == "self_elect":
+                # Discovery timed out with no master.  Registration and election
+                # both run here rather than on the timeout thread: they mutate
+                # the manager, and build_otio_timelines() reads xStudio actors.
+                #
+                # Re-check the status — this is the authoritative one.  A peer's
+                # I_AM_MASTER processed by manager.tick() during the queue
+                # latency (or a leave_session drained ahead of us) leaves the
+                # session out of STATE_DISCOVERING, and electing then would make
+                # a second master.
+                if self.manager and self.manager.status == STATE_DISCOVERING:
+                    _log("No master found — self-electing")
+                    # Register the current xStudio session as the initial
+                    # timeline.  Done here rather than at connect time because
+                    # viewed_container fails at startup before any media loads.
+                    for tl in self.builder.build_otio_timelines():
+                        self.manager.register_timeline(tl)
+                    self.manager.elect_self_as_master()
+                else:
+                    _log("self_elect: no longer discovering — skipping election")
             elif cmd == "live_stroke":
                 self.annotation.broadcast_live_stroke_from_json(payload)
             elif cmd == "clear_live_stroke":
@@ -806,10 +825,7 @@ class ORISyncPlugin(PluginBase):
             _log("State request timed out. Electing self as master.")
             for tl in self.builder.build_otio_timelines():
                 self.manager.register_timeline(tl)
-            self.manager.is_master = True
-            self.manager.master_guid = self.manager.self_guid
-            self.manager.broadcast_master_response()
-            self.manager._set_status(STATE_SYNCED)
+            self.manager.elect_self_as_master()
 
     def _on_synced(self) -> None:
         _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")

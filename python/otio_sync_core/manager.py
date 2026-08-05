@@ -122,7 +122,9 @@ class SyncManager:
        before transitioning to ``STATE_SYNCED``.
 
     If no master responds within the discovery timeout (implemented in the caller),
-    the caller elects itself master and calls :meth:`broadcast_master_response`.
+    the caller elects itself master via :meth:`elect_self_as_master`, which owns
+    every state transition the election entails.  Callers MUST NOT elect by
+    assigning :attr:`is_master`, :attr:`master_guid`, or :attr:`status` directly.
 
     :param session_id: Logical session identifier; scopes all network messages.
     :param self_guid: Stable GUID for this peer; auto-generated when not provided.
@@ -790,6 +792,36 @@ class SyncManager:
         receives a ``WHO_IS_MASTER`` it should answer.
         """
         self._send_message(IAmMaster(master_guid=self.self_guid))
+
+    def elect_self_as_master(self, broadcast: bool = True) -> None:
+        """Elect this peer as the session master.
+
+        The single election operation: it owns every state transition that
+        becoming master entails, so no caller has to assemble the sequence
+        itself.  Used by all self-election paths — the hosts' discovery and
+        state-request timeouts, and the master-failover check in :meth:`tick`.
+
+        The order matters.  :attr:`is_master` and :attr:`master_guid` are set
+        *before* the status transition, because ``_set_status(STATE_SYNCED)``
+        fires the :meth:`on_synced` callbacks and those callbacks branch on
+        :attr:`is_master` (a client loads the master's timelines; a master does
+        not).  The broadcast precedes the status change to keep the wire order
+        the pre-encapsulation call sites produced.
+
+        :param broadcast: When ``False``, apply the local election state but do
+            not announce it; the caller MUST call
+            :meth:`broadcast_master_response` itself once it is ready to serve a
+            ``STATE_REQUEST``.  OpenRV needs this: it must claim mastership
+            synchronously (its 33 ms poll re-checks ``STATE_DISCOVERING`` and
+            would otherwise re-enter its master init on the next tick) but can
+            only announce after its deferred OTIO expansion has built the
+            timelines a joiner's snapshot needs.
+        """
+        self.is_master = True
+        self.master_guid = self.self_guid
+        if broadcast:
+            self.broadcast_master_response()
+        self._set_status(STATE_SYNCED)
 
     def request_state(self) -> None:
         """Send a ``STATE_REQUEST`` to the master and enter ``STATE_JOINING``.
@@ -1721,10 +1753,10 @@ class SyncManager:
                 and getattr(self, "_last_who_is_master_time", None) is not None):
             if time.time() - self._last_who_is_master_time > 2.0:
                 _log("Master did not respond to WHO_IS_MASTER. Promoting self to master.")
-                self.is_master = True
-                self.master_guid = self.self_guid
+                # Already STATE_SYNCED here, so the status transition inside
+                # elect_self_as_master is a no-op and on_synced does not re-fire.
                 self._last_who_is_master_time = None
-                self.broadcast_master_response()
+                self.elect_self_as_master()
 
         # Check for state snapshot timeout
         if (self.status == STATE_JOINING 
