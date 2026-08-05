@@ -40,6 +40,14 @@ tests:
       OpenRV peer receives the same insertion via the real sync broadcast
       path (not a JSONL replay).
     recording: "recordings/add_media_v2.jsonl"
+    status: "known_broken"
+    # Never passed: 23 runs, 0 passes as of 2026-08-05, failing on a position
+    # assertion (`expected frame ~137, got 100`) rather than anything
+    # structural. Tracked in that change's baseline table; its §3.1 (did this
+    # regress at the rebase or earlier?) and §3.4 are still open, and §3.2a
+    # re-recorded `add_media_notc.jsonl` while this test consumes
+    # `add_media_v2.jsonl` — so the re-record may not have covered it.
+    blocked_by: "fix-xs-playhead-attribute-subscription"
     script_driven: true
     frame_tolerance: 5
     checkpoint_validation_delay: 4.5
@@ -132,6 +140,13 @@ tests:
       than replayed as raw JSONL events).
     recording: "recordings/xstudio_selects_v2.jsonl"
     checkpoint_validation_delay: 4
+    status: "known_broken"
+    # Its premise — RV driving selection — is the behaviour being removed:
+    # under host-owned visibility a non-host RV follows the host's view rather
+    # than broadcasting its own. That change's §6.1 retires this test outright
+    # (`xstudio_selects_script_xstudio` already covers the intended topology),
+    # so this is expected to be deleted rather than fixed.
+    blocked_by: "host-owned-visibility"
     script_driven: true
     frame_tolerance: 5
     apps:
