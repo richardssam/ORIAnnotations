@@ -483,7 +483,19 @@ class TestRunner:
             # Annotation fields differ in representation per app (RV stroke
             # components vs xStudio bookmarks) and are checked separately by the
             # annotation-presence check, so exclude them from structural equality.
+            # `view_mode` is excluded deliberately, for the same reason
+            # `_verify_frame_sync` reports a sequence/isolated-clip split as a
+            # warning rather than failing on it: the split is real and worth
+            # seeing, but it is not by itself proof of desync, and /state does
+            # not expose enough (a clip's offset within its sequence) to tell
+            # the harmful case from the harmless one. It is reported in the
+            # observed line of every check instead. Omitting it here would make
+            # it a silent structural-equality criterion — which is exactly what
+            # happened when the field was first added, turning a known,
+            # tolerated split into `state_mismatch` failures on tests that had
+            # never failed.
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
+                           "view_mode",
                            "annotations", "annotation_count", "is_master"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
