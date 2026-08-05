@@ -42,6 +42,13 @@ def get_xstudio_state(port=14441):
         "playing": False,
         "annotations": [],
         "is_master": None,
+        # Seeded here rather than inside the container read below, so a failed
+        # container read cannot leave them absent entirely. media_exists
+        # defaults True because "unknown" is not "missing" — defaulting False
+        # made compare_states fail for 10s whenever the container was a
+        # Playlist with no single on-screen source.
+        "media_path": None,
+        "media_exists": True,
     }
 
     try:
@@ -81,48 +88,6 @@ def get_xstudio_state(port=14441):
                 state["clip"] = c.name
                 logging.info(f"Container name: {c.name}")
             
-            # Check if media exists via active playhead.
-            # Default True: "unknown" is not the same as "missing". We only set
-            # False when we have the path and can confirm the file is absent.
-            # In xs_flat_playlist mode the container is a Playlist and
-            # on_screen_media may not expose a single source, which previously
-            # left media_exists=False and caused compare_states to fail for 10s.
-            state["media_path"] = None
-            state["media_exists"] = True
-            try:
-                from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
-                from xstudio.api.session.playhead import Playhead
-                gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
-                ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
-                if ph_actor:
-                    ph = Playhead(conn, ph_actor)
-                    # Report the actual playhead frame so frame checkpoints can
-                    # validate xStudio too (was hard-coded None, which made every
-                    # frame check silently skip xStudio).
-                    try:
-                        state["frame"] = ph.position
-                    except Exception:
-                        pass
-                    ms = ph.on_screen_media
-                    if ms:
-                        ms_src = ms.media_source()
-                        if ms_src and ms_src.media_reference:
-                            uri_str = str(ms_src.media_reference.uri())
-                            state["media_path"] = uri_str
-                            if uri_str.startswith("file:/"):
-                                local_path = uri_str
-                                if local_path.startswith("file://localhost"):
-                                    local_path = local_path[16:]
-                                elif local_path.startswith("file://"):
-                                    local_path = local_path[7:]
-                                elif local_path.startswith("file:/"):
-                                    local_path = local_path[5:]
-                                state["media_exists"] = os.path.exists(local_path)
-                            else:
-                                state["media_exists"] = os.path.exists(uri_str)
-            except Exception as e:
-                logging.debug(f"Could not check playhead media: {e}")
-            
         except Exception as e:
             logging.debug(f"Could not read container: {e}")
             # Fallback: if the viewport has no active container (e.g. media was
@@ -134,6 +99,59 @@ def get_xstudio_state(port=14441):
                     state["clip"] = playlists[0].name
             except Exception:
                 pass
+
+        # 2b. Playhead position / play state.
+        # Deliberately a SIBLING of the container read above, not nested inside
+        # it. It used to live in that block, so a single "Could not read
+        # container: invalid_argument" left frame=None and playing=False — and
+        # because validate_checkpoint skips an app reporting frame=None, every
+        # xStudio frame assertion silently passed. A whole run of green seeks
+        # can mean xStudio was never checked at all. The playhead is reachable
+        # via the global-playhead-events actor and does not depend on the
+        # viewed container, so an unreadable container must not disable it.
+        try:
+            from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+            from xstudio.api.session.playhead import Playhead
+            gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+            ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+            if ph_actor:
+                ph = Playhead(conn, ph_actor)
+                # Report the actual playhead frame so frame checkpoints can
+                # validate xStudio too (was hard-coded None, which made every
+                # frame check silently skip xStudio).
+                try:
+                    state["frame"] = ph.position
+                except Exception:
+                    pass
+                # Likewise report real playback status. This was hard-coded
+                # False, so a frame assertion could never tell "xStudio is
+                # parked on the wrong frame" from "xStudio is playing and
+                # the frame is meaningless" — the runner skips frame
+                # comparisons for a moving playhead, and it can only do
+                # that if the playhead admits it is moving.
+                try:
+                    state["playing"] = bool(ph.playing)
+                except Exception:
+                    pass
+                ms = ph.on_screen_media
+                if ms:
+                    ms_src = ms.media_source()
+                    if ms_src and ms_src.media_reference:
+                        uri_str = str(ms_src.media_reference.uri())
+                        state["media_path"] = uri_str
+                        if uri_str.startswith("file:/"):
+                            local_path = uri_str
+                            if local_path.startswith("file://localhost"):
+                                local_path = local_path[16:]
+                            elif local_path.startswith("file://"):
+                                local_path = local_path[7:]
+                            elif local_path.startswith("file:/"):
+                                local_path = local_path[5:]
+                            state["media_exists"] = os.path.exists(local_path)
+                        else:
+                            state["media_exists"] = os.path.exists(uri_str)
+        except Exception as e:
+            logging.debug(f"Could not check playhead media: {e}")
 
         # 3. Annotations — enumerate ALL session bookmarks globally instead of
         # filtering media by the viewed container's name.  When a Timeline is on

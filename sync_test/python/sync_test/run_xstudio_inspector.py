@@ -18,7 +18,13 @@ def main():
         
     from sync_test.xstudio_hook import start_xstudio_inspector
     import logging
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+    logging.basicConfig(
+        level=logging.DEBUG,
+        # Millisecond resolution, matching cli.py and the runner log, so
+        # inspector reads can be interleaved with them when correlating.
+        format='%(asctime)s.%(msecs)03d %(levelname)s %(message)s',
+        datefmt='%H:%M:%S',
+    )
     
     print(f"Starting XStudio Inspector Server on HTTP port {http_port}, bridging to XStudio port {xstudio_port}...")
     server = start_xstudio_inspector(http_port, xstudio_port)

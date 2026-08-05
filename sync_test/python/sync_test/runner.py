@@ -8,7 +8,10 @@ import os
 import socket
 import bisect
 import uuid
+import subprocess
+import contextlib
 from collections import Counter
+from datetime import datetime, timezone
 
 from .spawner import AppSpawner
 from .config import SyncTestConfig
@@ -56,10 +59,268 @@ def _normalize_clip_name(name):
     return normalize_clip_name(name)
 
 
+def _playhead_is_playing(state):
+    """True if *state* reports an actively playing playhead.
+
+    Tolerates both shapes the inspectors emit: a flat ``playing`` key and the
+    nested ``playback_state.playing`` of a StateSnapshot. Returns False when
+    the field is absent — an app that does not report playback status is
+    treated as parked, since assuming otherwise would silently disable frame
+    assertions for that app entirely.
+    """
+    if not isinstance(state, dict):
+        return False
+    playing = state.get("playing")
+    if playing is None:
+        playback = state.get("playback_state")
+        if isinstance(playback, dict):
+            playing = playback.get("playing")
+    return bool(playing)
+
+
+def _any_playing(states):
+    """Names-free check: is any app's playhead currently running?"""
+    return any(_playhead_is_playing(st) for st in states)
+
+
+def _format_observed(states, app_names):
+    """Render what every app actually reports, for logging beside an expectation.
+
+    Both the pass and fail paths use this. A pass that says only "frame ~29"
+    cannot be distinguished from a pass where every app sat at a coincidentally
+    tolerable frame on the wrong clip, and a frame-mismatch message that omits
+    the clip sends you digging through the recording to find out whether the
+    playhead or the selection was the thing that went wrong. Print the observed
+    values and the question answers itself.
+    """
+    parts = []
+    for state, name in zip(states, app_names):
+        if not isinstance(state, dict):
+            parts.append(f"{name}=<no state>")
+        elif "error" in state:
+            parts.append(f"{name}=<error: {state['error']}>")
+        else:
+            # Labelled "timeline", not "clip": the state key is named `clip`
+            # but both hooks populate it with the active *timeline* name
+            # (see openrv_hook "first non-empty sequence" and xstudio_hook's
+            # note that it is the timeline name when a timeline is on screen),
+            # and validate_checkpoint compares it against the checkpoint's
+            # `timeline_name`. Printing it as "clip" makes a `set_selection
+            # car_ACES_sRGB.mov` look like it silently failed when the field
+            # was never tracking clip selection in the first place.
+            desc = f"{name}: frame={state.get('frame')} timeline={state.get('clip')!r}"
+            # A seek assertion against a *playing* playhead can never converge:
+            # both peers keep advancing and sample at different instants. When
+            # the endpoint reports it, say so — it distinguishes "the seek did
+            # not propagate" from "the seek propagated and then playback ran
+            # away with it", which look identical as bare frame numbers.
+            playing = state.get("playing")
+            if playing is None:
+                playback = state.get("playback_state")
+                if isinstance(playback, dict):
+                    playing = playback.get("playing")
+            if playing is not None:
+                desc += f" playing={playing}"
+            parts.append(desc)
+    return " | ".join(parts) if parts else "<no apps>"
+
+
+class FailKind:
+    """Closed set of reasons a test can fail. Attached at the point a failure
+    is raised (not inferred from message text later) so retry eligibility and
+    run-history classification are always accurate — see the
+    sync-tests-tracking change design doc, "fail_kind as a small closed enum".
+    """
+    STATE_MISMATCH = "state_mismatch"
+    CHECKPOINT_TIMEOUT = "checkpoint_timeout"
+    MISSING_MEDIA = "missing_media"
+    LOG_ERROR_SIGNATURE = "log_error_signature"
+    ANNOTATION_MISSING = "annotation_missing"
+    STRUCTURAL_CONSENSUS = "structural_consensus"
+    OTIO_EXPORT = "otio_export"
+
+
+#: fail_kinds for which waiting longer can plausibly change the outcome —
+#: eligible for the bounded one-retry-at-2x described in design.md. The rest
+#: (missing media, a known-bad log signature, an annotation that never
+#: arrived even after the test's own settle time, an OTIO export mismatch)
+#: cannot be fixed by waiting, so they fail immediately.
+TIMING_ELIGIBLE_FAIL_KINDS = frozenset({
+    FailKind.STATE_MISMATCH,
+    FailKind.CHECKPOINT_TIMEOUT,
+    FailKind.STRUCTURAL_CONSENSUS,
+})
+
+
+class TestResult:
+    """Structured outcome of ``TestRunner.run_test`` — replaces the old bare
+    ``bool`` return so failure kind, retry outcome, and convergence timing
+    survive past the function instead of being logged and discarded.
+    """
+    def __init__(self, test_name, passed, fail_kind=None, message="",
+                 converged_late=False, time_to_converge=0.0, recording=None,
+                 duration=0.0):
+        self.test_name = test_name
+        self.passed = passed
+        self.fail_kind = fail_kind
+        self.message = message
+        self.converged_late = converged_late
+        self.time_to_converge = time_to_converge
+        #: Wall-clock seconds for the entire run_test() call — app launch,
+        #: teardown, and everything in between — not to be confused with
+        #: time_to_converge (which measures a single check against its own
+        #: deadline, not the whole test's runtime).
+        self.duration = duration
+        #: The `recording:` path from the test's yaml entry, or None for a
+        #: script-driven test with no recording at all (pure `commands:` /
+        #: fixture-only). Script-driven tests *with* a recording still derive
+        #: their commands from it (see derive_commands_from_recording), so
+        #: this is populated for those too.
+        self.recording = recording
+
+
+@contextlib.contextmanager
+def _freeze_playback(player):
+    """Freeze recording playback for the duration of a checkpoint validation.
+
+    A checkpoint's expected value is only true for as long as the recording
+    holds that point in its timeline; freezing stops the player thread's
+    event dispatch so validation (which can itself take time — RPCs, a
+    convergence poll) cannot race the recording forward past that window.
+    See the freeze-recording-during-validation change proposal for the two
+    traced failures this fixes.
+
+    A context manager rather than paired pause()/resume() calls so resume is
+    guaranteed on every exit path — normal, early ``break``, or exception —
+    since a leaked freeze would hang the whole test run. No-op when *player*
+    is ``None`` (script-driven tests have no recording playing during their
+    assertions, so there is nothing to freeze).
+    """
+    if player is None:
+        yield
+        return
+    freeze_start = time.time()
+    player.pause()
+    try:
+        yield
+    finally:
+        player.resume()
+        logging.info(
+            f"⏸  Playback frozen {time.time() - freeze_start:.1f}s for checkpoint validation"
+        )
+
+
+def _poll_until(check_fn, deadline_seconds, poll_interval=0.5, label=None):
+    """Poll ``check_fn() -> (ok, msg)`` until it passes or *deadline_seconds*
+    elapses. Returns ``(ok, msg, elapsed_seconds)``.
+
+    Pass *label* to have the waiting reported. Without it this polls in
+    silence, so a check that quietly retried for seconds is indistinguishable
+    in the log from one that passed or failed outright — the elapsed time only
+    shows up afterwards, in a trailing ``[waited N.Ns]``. Frame checkpoints
+    announce their retries; anything using this should too.
+    """
+    start = time.time()
+    ok, msg = check_fn()
+    if ok or deadline_seconds <= 0:
+        return ok, msg, time.time() - start
+
+    if label:
+        logging.warning(
+            f"{label} did not match on first check — polling up to "
+            f"{deadline_seconds:.1f}s for convergence before failing."
+        )
+    while not ok and (time.time() - start) < deadline_seconds:
+        time.sleep(poll_interval)
+        ok, msg = check_fn()
+    elapsed = time.time() - start
+    if label:
+        logging.info(
+            f"{label} {'converged' if ok else 'did NOT converge'} "
+            f"after {elapsed:.1f}s of polling."
+        )
+    return ok, msg, elapsed
+
+
 class TestRunner:
     def __init__(self, config_path="sync_tests.yaml"):
         self.config_path = config_path
         self.config = SyncTestConfig.from_file(config_path)
+
+    def _resolve_git_sha(self):
+        """Current repo HEAD, or None if unavailable — tolerates a dirty or
+
+        detached worktree (``git rev-parse HEAD`` works in both) and a
+        missing git binary alike, since a run-history entry is still worth
+        recording without it.
+        """
+        try:
+            repo_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..")
+            )
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo_root,
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def _history_path(self):
+        return os.path.join(
+            os.path.dirname(os.path.abspath(self.config_path)), "run_history.jsonl"
+        )
+
+    def load_history(self):
+        """Read ``run_history.jsonl`` (if it exists) into ``{test_name: [entries...]}``,
+
+        each test's entries ordered oldest-to-newest. Used to show prior
+        results in the run summary — call this *before* running new tests
+        so it reflects only prior runs, not ones about to be appended.
+        """
+        by_test = {}
+        path = self._history_path()
+        if not os.path.exists(path):
+            return by_test
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    by_test.setdefault(entry.get("test"), []).append(entry)
+        except OSError:
+            pass
+        return by_test
+
+    def _write_history_entry(self, result):
+        """Append one entry to ``sync_test/run_history.jsonl`` for every
+        completed run, pass or fail — see the sync-tests-tracking change
+        design doc, "Run-history format: git-tracked JSON Lines, one file".
+        """
+        history_path = self._history_path()
+        entry = {
+            "test": result.test_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "git_sha": self._resolve_git_sha(),
+            "result": "pass" if result.passed else "fail",
+            "fail_kind": result.fail_kind,
+            "converged_late": result.converged_late,
+            "time_to_converge": round(result.time_to_converge, 3),
+            "recording": result.recording,
+            "duration": round(result.duration, 3),
+        }
+        try:
+            with open(history_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            logging.warning(f"Could not write run history entry: {e}")
 
     def fetch_state(self, port):
         url = f"http://127.0.0.1:{port}/state"
@@ -106,23 +367,31 @@ class TestRunner:
             return {"error": str(e)}
 
     def compare_states(self, states, app_names):
+        """Returns ``(passed, message, fail_kind)``. ``fail_kind`` is only
+
+        meaningful when ``passed`` is False: ``FailKind.MISSING_MEDIA`` for a
+        confirmed-absent media file (never resolved by waiting longer), or
+        ``FailKind.STATE_MISMATCH`` for a transient app error or a live
+        structural/clip mismatch (both retry-eligible — an app error can be a
+        momentary RPC hiccup, and a live mismatch may still converge).
+        """
         if len(states) < 2:
-            return True, ""
+            return True, "", None
 
         base_state = states[0]
         if "error" in base_state:
-            return False, f"{app_names[0]} returned error: {base_state['error']}"
+            return False, f"{app_names[0]} returned error: {base_state['error']}", FailKind.STATE_MISMATCH
 
         if "media_exists" in base_state and not base_state["media_exists"]:
-            return False, f"{app_names[0]} reports missing media: {base_state.get('media_path')}"
+            return False, f"{app_names[0]} reports missing media: {base_state.get('media_path')}", FailKind.MISSING_MEDIA
 
         for i in range(1, len(states)):
             st = states[i]
             if "error" in st:
-                return False, f"{app_names[i]} returned error: {st['error']}"
+                return False, f"{app_names[i]} returned error: {st['error']}", FailKind.STATE_MISMATCH
 
             if "media_exists" in st and not st["media_exists"]:
-                return False, f"{app_names[i]} reports missing media: {st.get('media_path')}"
+                return False, f"{app_names[i]} reports missing media: {st.get('media_path')}", FailKind.MISSING_MEDIA
 
             # Ignore transient states like playing or absolute path strings.
             # Annotation fields differ in representation per app (RV stroke
@@ -143,14 +412,23 @@ class TestRunner:
                 diff_msg = f"Mismatch between {app_names[0]} and {app_names[i]}:\n"
                 diff_msg += f"{app_names[0]}: {json.dumps(s1)}\n"
                 diff_msg += f"{app_names[i]}: {json.dumps(s2)}\n"
-                return False, diff_msg
+                return False, diff_msg, FailKind.STATE_MISMATCH
 
-        return True, ""
+        return True, "", None
 
     def validate_checkpoint(self, states, app_names, checkpoint):
         """Check each app's reported state against a recording checkpoint.
 
         Only validates fields the app exposes (frame may be None for some apps).
+
+        A frame is only comparable when the playhead is parked. If an app
+        reports that it is playing, its frame is changing continuously and no
+        single value is the "right" one — comparing anyway produces a mismatch
+        that says nothing about sync, and polling for convergence cannot help
+        because both peers keep moving. Such apps are excluded from the frame
+        comparison; callers detect the situation with :func:`_any_playing` and
+        report it rather than treating the result as a clean pass.
+
         Returns (passed, reason_string).
         """
         expected_frame = checkpoint.get("frame")
@@ -163,25 +441,83 @@ class TestRunner:
                 return False, f"{name} returned error at checkpoint: {state['error']}"
 
             actual_frame = state.get("frame")
-            if expected_frame is not None and actual_frame is not None:
+            actual_clip = state.get("clip")
+            if _playhead_is_playing(state):
+                # Playing: the frame is a moving target, so there is nothing
+                # meaningful to assert. Skip it rather than diff against a
+                # value that was already stale when it was sampled.
+                pass
+            elif expected_frame is not None and actual_frame is not None:
                 # RV frame() is 1-indexed; PLAYBACK_SETTINGS value is 0-indexed
                 adjusted = int(expected_frame) + 1
                 if abs(actual_frame - adjusted) > frame_tolerance:
+                    # Name the timeline the wrong frame was read on. A playhead
+                    # sitting on the wrong timeline and a playhead that failed
+                    # to follow a seek produce the same bare frame number, and
+                    # they are entirely different faults.
                     messages.append(
                         f"{name}: expected frame ~{adjusted}, got {actual_frame}"
+                        f" (on timeline {actual_clip!r})"
                     )
 
-            actual_clip = state.get("clip")
             if expected_clip and actual_clip is not None:
                 if _normalize_clip_name(actual_clip) != _normalize_clip_name(expected_clip):
                     messages.append(
-                        f"{name}: expected clip '{expected_clip}', got '{actual_clip}'"
+                        f"{name}: expected timeline '{expected_clip}', "
+                        f"got '{actual_clip}'"
                     )
 
         if messages:
             t = checkpoint.get("time_offset", 0)
-            return False, f"Checkpoint at t={t:.1f}s failed:\n" + "\n".join(messages)
+            # Always show every app, not just the mismatching one: whether the
+            # peers agree with each other separates "one app is wrong" from
+            # "the expectation is wrong".
+            return False, (
+                f"Checkpoint at t={t:.1f}s failed:\n" + "\n".join(messages)
+                + f"\n  observed: {_format_observed(states, app_names)}"
+            )
         return True, ""
+
+    def _verify_frame_sync(self, app_ports, frame, frame_tolerance, deadline, label):
+        """Poll until every app's playhead reports *frame*, or *deadline* elapses.
+
+        A ``set_frame`` is a discrete seek, not playback: once every app has
+        applied it the value is parked and cannot drift, so a mismatch here is
+        a real convergence failure rather than a sampling artefact. That makes
+        each seek independently checkable, which is why this is factored out
+        of the single trailing shuttle check.
+
+        :returns: ``(ok, message, elapsed_seconds, last_observed_states)``
+        """
+        checkpoint = {
+            "time_offset": 0.0,
+            "frame": frame,
+            "timeline_name": None,
+            "frame_tolerance": frame_tolerance,
+        }
+        names = [a[0] for a in app_ports]
+        seen = {}
+
+        def _check():
+            states = [self.fetch_state(port) for _, port in app_ports]
+            seen["states"] = states
+            # A seek is supposed to park the playhead. If an app is still
+            # playing, the frame is unassertable — and because
+            # validate_checkpoint skips playing apps, letting this through
+            # would report a clean pass having compared nothing. Keep polling
+            # (playback may be about to stop) and, if it never parks, say so
+            # instead of emitting a frame mismatch that misdescribes the fault.
+            playing = [n for st, n in zip(states, names) if _playhead_is_playing(st)]
+            if playing:
+                return False, (
+                    f"playback still active on {', '.join(playing)} — a seek must "
+                    "park the playhead, so no frame assertion is possible\n"
+                    f"  observed: {_format_observed(states, names)}"
+                )
+            return self.validate_checkpoint(states, names, checkpoint)
+
+        ok, msg, elapsed = _poll_until(_check, deadline, label=label)
+        return ok, msg, elapsed, seen.get("states", [])
 
     def compare_full_states(self, full_states, app_names, frame_tolerance=5,
                             compare_frame=False):
@@ -508,14 +844,21 @@ class TestRunner:
     def run_test(self, test_name, script_driven=False,
                  checkpoint_validation_delay=1.5,
                  checkpoint_min_spacing=2.0,
-                 frame_tolerance=5):
+                 frame_tolerance=5,
+                 test_index=None, test_total=None):
+        test_start_time = time.time()
         if SyncPlayer is None:
             raise RuntimeError("Cannot import sync_recorder.player.SyncPlayer")
 
         test_data = self.config.get_test(test_name)
         if not test_data:
             logging.error(f"Test '{test_name}' not found in configuration.")
-            return False
+            result = TestResult(
+                test_name, False, message="test not found in configuration",
+                duration=time.time() - test_start_time,
+            )
+            self._write_history_entry(result)
+            return result
 
         apps = test_data['apps']
         script_driven = script_driven or test_data.get('script_driven', False)
@@ -539,10 +882,15 @@ class TestRunner:
         checkpoint_min_spacing = test_data.get('checkpoint_min_spacing', checkpoint_min_spacing)
         frame_tolerance = test_data.get('frame_tolerance', frame_tolerance)
 
+        progress = f"  [{test_index}/{test_total}]" if test_index and test_total else ""
         print(f"\n{'='*70}")
-        print(f"  ▶ RUNNING TEST: {test_name}")
+        print(f"  ▶ RUNNING TEST: {test_name}{progress}")
         print(f"{'='*70}")
         logging.info(f"Starting test '{test_name}' with apps: {apps}")
+        if recording:
+            logging.info(f"Reading from recording: {recording}")
+        else:
+            logging.info("No recording — script-driven via explicit commands/fixtures.")
 
         executables = self.config.settings.get('executables', {})
         openrv_args = self.config.settings.get('openrv_args', [])
@@ -555,8 +903,12 @@ class TestRunner:
             # CI failures are diagnosable without live stdout capture.
             runner_log_path = os.path.join(spawner.logs_dir, "runner.log")
             _runner_fh = logging.FileHandler(runner_log_path, mode="w")
+            # Millisecond resolution, matching the console format in cli.py —
+            # this file is what gets read alongside the plugin logs, so it is
+            # the one that most needs to line up with them.
             _runner_fh.setFormatter(logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+                "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+                datefmt="%H:%M:%S"
             ))
             logging.getLogger().addHandler(_runner_fh)
             player = None
@@ -665,19 +1017,49 @@ class TestRunner:
             logging.info("Apps launched. Waiting for all apps to connect...")
             if not self._wait_for_all_apps(app_ports, timeout=90.0):
                 logging.error("Timed out waiting for apps to become ready.")
-                return False
+                result = TestResult(
+                    test_name, False, message="apps did not connect in time",
+                    recording=recording, duration=time.time() - test_start_time,
+                )
+                self._write_history_entry(result)
+                return result
             logging.info("All apps connected.")
 
             if not script_driven:
                 logging.info("Waiting for all apps to receive the initial snapshot...")
                 if not self._wait_for_snapshot(app_ports, timeout=30.0):
                     logging.warning("Apps did not all report a clip within 30s — proceeding anyway.")
+                # Only now is the recording's t=0 defined. The player's own
+                # peer-join gate sees a snapshot leave over RabbitMQ, which can
+                # happen while we are still inside _wait_for_all_apps; it cannot
+                # see an app finish applying that state and become queryable.
+                # Arming here anchors the recording to the same readiness signal
+                # this runner validates against, so checkpoint hold windows
+                # cannot start elapsing before we are able to check them.
+                # Unconditional, matching the "proceed anyway" tolerance above:
+                # a degraded run proceeds exactly as it did before, just via the
+                # explicit path rather than an implicit one.
+                player.arm_clock()
 
             failed = False
             fail_reason = ""
+            fail_kind = None
+            converged_late = False
+            time_to_converge = 0.0
+            # Applies ONLY to checks with no moving target: the live
+            # apps-vs-apps mismatch watch and the terminal structural-consensus
+            # check (both compare peers to each other, and the latter runs after
+            # the recording has stopped). Point-in-time checkpoints validated
+            # against a recorded oracle mid-playback are deliberately excluded —
+            # their expected value is only true inside the window the recording
+            # holds it, so "wait longer" cannot help and the extra blocking
+            # delays every subsequent checkpoint. See the two checkpoint sites
+            # below for the full rationale.
+            RETRY_MULTIPLIER = 2
 
             last_check_time = time.time()
             mismatch_start_time = None
+            mismatch_retry_triggered = False
             MAX_DIVERGENCE_TIME = 10.0
 
             checkpoint_idx = 0
@@ -714,9 +1096,37 @@ class TestRunner:
                         logging.error(f"Command execution failed: {res['error']}")
                         failed = True
                         break
+                    time.sleep(1.0)
+
+                    # Verify *every* seek, not just the last one. Only checking
+                    # the final set_frame lets an earlier seek fail to
+                    # propagate and then be masked by a later one that happens
+                    # to land — the peer looks synced at the end while having
+                    # missed a seek in the middle. Each seek parks the playhead
+                    # at a known value, so each is independently checkable.
                     if cmd.get("action") == "set_frame":
                         last_frame_cmd = cmd
-                    time.sleep(1.0)
+                        ok, msg, elapsed, states = self._verify_frame_sync(
+                            app_ports, cmd["frame"], frame_tolerance,
+                            checkpoint_validation_delay,
+                            label=f"set_frame({cmd['frame']})",
+                        )
+                        time_to_converge = max(time_to_converge, elapsed)
+                        observed = _format_observed(states, [a[0] for a in app_ports])
+                        if ok:
+                            if elapsed > 0:
+                                converged_late = True
+                            logging.info(
+                                f"✅ set_frame {cmd['frame']} synced "
+                                f"(expected frame ~{int(cmd['frame']) + 1}) "
+                                f"[valid after {elapsed:.1f}s] — observed: {observed}"
+                            )
+                        else:
+                            logging.error(f"❌ FAIL: {msg} [waited {elapsed:.1f}s]")
+                            failed = True
+                            fail_kind = FailKind.CHECKPOINT_TIMEOUT
+                            fail_reason = msg
+                            break
 
                 convergence_wait = float(test_data.get("convergence_wait", 3.0))
                 logging.info(f"Command sequence completed. Waiting {convergence_wait}s for convergence...")
@@ -731,21 +1141,24 @@ class TestRunner:
                 # via the same tolerance logic as recording-mode frame
                 # checkpoints.
                 if not failed and last_frame_cmd is not None:
-                    states = [self.fetch_state(port) for _, port in app_ports]
-                    shuttle_cp = {
-                        "time_offset": 0.0,
-                        "frame": last_frame_cmd["frame"],
-                        "timeline_name": None,
-                        "frame_tolerance": frame_tolerance,
-                    }
-                    ok, msg = self.validate_checkpoint(states, [a[0] for a in app_ports], shuttle_cp)
+                    ok, msg, elapsed, states = self._verify_frame_sync(
+                        app_ports, last_frame_cmd["frame"], frame_tolerance,
+                        checkpoint_validation_delay, label="Shuttle check",
+                    )
+                    time_to_converge = max(time_to_converge, elapsed)
+                    observed = _format_observed(states, [a[0] for a in app_ports])
                     if ok:
+                        if elapsed > 0:
+                            converged_late = True
                         logging.info(
-                            f"✅ Shuttle check passed: frame ~{int(last_frame_cmd['frame']) + 1}"
+                            f"✅ Shuttle check passed: expected frame "
+                            f"~{int(last_frame_cmd['frame']) + 1} "
+                            f"[valid after {elapsed:.1f}s] — observed: {observed}"
                         )
                     else:
-                        logging.error(f"❌ FAIL: {msg}")
+                        logging.error(f"❌ FAIL: {msg} [waited {elapsed:.1f}s]")
                         failed = True
+                        fail_kind = FailKind.CHECKPOINT_TIMEOUT
                         fail_reason = msg
 
             while playing_state["playing"]:
@@ -757,24 +1170,51 @@ class TestRunner:
                         st = self.fetch_state(port)
                         states.append(st)
 
-                    match, diff = self.compare_states(states, [a[0] for a in app_ports])
+                    match, diff, diff_kind = self.compare_states(states, [a[0] for a in app_ports])
                     if not match:
-                        if mismatch_start_time is None:
-                            mismatch_start_time = time.time()
-                            logging.warning(f"Transient mismatch detected, waiting for convergence...\n{diff}")
-                        elif time.time() - mismatch_start_time > MAX_DIVERGENCE_TIME:
-                            logging.error(f"❌ FAIL: State mismatch persisted for >{MAX_DIVERGENCE_TIME}s in test '{test_name}'!\n{diff}")
-                            logging.error("Check application logs for details:")
-                            for name, port in app_ports:
-                                logging.error(f"  {os.path.join(spawner.logs_dir, f'{name}_{port}.log')}")
+                        if diff_kind == FailKind.MISSING_MEDIA:
+                            # Never resolved by waiting longer — fail immediately,
+                            # no retry (see FailKind / TIMING_ELIGIBLE_FAIL_KINDS).
+                            logging.error(f"❌ FAIL: {diff}")
                             failed = True
+                            fail_kind = diff_kind
                             fail_reason = diff
                             playing_state["playing"] = False
                             break
+                        if mismatch_start_time is None:
+                            mismatch_start_time = time.time()
+                            mismatch_retry_triggered = False
+                            logging.warning(f"Transient mismatch detected, waiting for convergence...\n{diff}")
+                        else:
+                            elapsed = time.time() - mismatch_start_time
+                            if elapsed > MAX_DIVERGENCE_TIME and not mismatch_retry_triggered:
+                                mismatch_retry_triggered = True
+                                logging.warning(
+                                    f"State mismatch persisted past {MAX_DIVERGENCE_TIME}s — "
+                                    f"retrying once up to {MAX_DIVERGENCE_TIME * RETRY_MULTIPLIER}s "
+                                    "before failing."
+                                )
+                            if elapsed > MAX_DIVERGENCE_TIME * RETRY_MULTIPLIER:
+                                logging.error(f"❌ FAIL: State mismatch persisted for >{MAX_DIVERGENCE_TIME * RETRY_MULTIPLIER}s in test '{test_name}'!\n{diff}")
+                                logging.error("Check application logs for details:")
+                                for name, port in app_ports:
+                                    logging.error(f"  {os.path.join(spawner.logs_dir, f'{name}_{port}.log')}")
+                                failed = True
+                                fail_kind = diff_kind
+                                fail_reason = diff
+                                playing_state["playing"] = False
+                                break
                     else:
                         if mismatch_start_time is not None:
-                            logging.info("✅ States have converged again.")
+                            elapsed = time.time() - mismatch_start_time
+                            time_to_converge = max(time_to_converge, elapsed)
+                            if mismatch_retry_triggered:
+                                converged_late = True
+                                logging.info(f"✅ States converged late (after {elapsed:.1f}s, within retry window).")
+                            else:
+                                logging.info(f"✅ States have converged again (after {elapsed:.1f}s).")
                             mismatch_start_time = None
+                            mismatch_retry_triggered = False
 
                     # Checkpoint validation: once enough time has passed after a checkpoint
                     # event was dispatched, check that apps reflect the expected state.
@@ -784,18 +1224,81 @@ class TestRunner:
                             cp = checkpoints[checkpoint_idx]
                             if current_offset < cp["time_offset"] + checkpoint_validation_delay:
                                 break
-                            ok, msg = self.validate_checkpoint(states, [a[0] for a in app_ports], cp)
+                            # Playback is frozen before state is sampled (not
+                            # just around validate_checkpoint) so the app
+                            # state checked is not itself racing an advancing
+                            # recording. With the target no longer able to go
+                            # stale mid-check, a first-attempt mismatch is
+                            # retry-eligible again — poll up to
+                            # FRAME_CP_BASE_DEADLINE, then once more at 2x,
+                            # mirroring the bounded-retry pattern used for the
+                            # live mismatch watch and terminal consensus check
+                            # below. See freeze-recording-during-validation
+                            # change.
+                            FRAME_CP_BASE_DEADLINE = 5.0
+                            cp_start = time.time()
+                            cp_deadline = cp_start + FRAME_CP_BASE_DEADLINE
+                            cp_retried = False
+                            cp_names = [a[0] for a in app_ports]
+                            with _freeze_playback(player):
+                                while True:
+                                    cp_states = [self.fetch_state(port) for _, port in app_ports]
+                                    ok, msg = self.validate_checkpoint(cp_states, cp_names, cp)
+                                    if ok and _any_playing(cp_states):
+                                        # validate_checkpoint skips the frame
+                                        # comparison for a playing app, so this
+                                        # "pass" may have asserted nothing.
+                                        # Keep waiting for the playhead to park
+                                        # rather than bank a vacuous result.
+                                        if time.time() < cp_deadline:
+                                            time.sleep(0.5)
+                                            continue
+                                        ok = False
+                                        msg = (
+                                            f"Checkpoint at t={cp['time_offset']:.1f}s: playback "
+                                            "still active at deadline — frame never became "
+                                            "assertable\n  observed: "
+                                            f"{_format_observed(cp_states, cp_names)}"
+                                        )
+                                    if ok or time.time() >= cp_deadline:
+                                        if not ok and not cp_retried:
+                                            cp_retried = True
+                                            cp_deadline = cp_start + FRAME_CP_BASE_DEADLINE * RETRY_MULTIPLIER
+                                            logging.warning(
+                                                f"Checkpoint t={cp['time_offset']:.1f}s not yet matching after "
+                                                f"{FRAME_CP_BASE_DEADLINE:.1f}s — retrying up to "
+                                                f"{FRAME_CP_BASE_DEADLINE * RETRY_MULTIPLIER:.1f}s "
+                                                "(playback stays frozen) before failing."
+                                            )
+                                            continue
+                                        break
+                                    time.sleep(0.5)
+                            cp_elapsed = time.time() - cp_start
+                            time_to_converge = max(time_to_converge, cp_elapsed)
+                            # Real wall-clock time from the recording event to the
+                            # moment it was validated — directly comparable to
+                            # checkpoint_validation_delay, so this is the number to
+                            # read when tuning that setting.
+                            validated_after = (time.time() - player._play_start_time) - cp["time_offset"]
+                            timing_note = (
+                                f" [checked {validated_after:.1f}s after event, took {cp_elapsed:.1f}s; "
+                                f"checkpoint_validation_delay={checkpoint_validation_delay:.1f}s]"
+                            )
                             if ok:
+                                if cp_retried:
+                                    converged_late = True
                                 logging.info(
                                     f"✅ Checkpoint t={cp['time_offset']:.1f}s passed "
                                     f"(frame={cp.get('frame')}, clip={cp.get('timeline_name')})"
+                                    f"{timing_note}"
                                 )
                             else:
-                                logging.error(f"❌ FAIL: {msg}")
+                                logging.error(f"❌ FAIL: {msg}{timing_note}")
                                 logging.error("Check application logs for details:")
                                 for name, port in app_ports:
                                     logging.error(f"  {os.path.join(spawner.logs_dir, f'{name}_{port}.log')}")
                                 failed = True
+                                fail_kind = FailKind.CHECKPOINT_TIMEOUT
                                 fail_reason = msg
                                 playing_state["playing"] = False
                             checkpoint_idx += 1
@@ -815,34 +1318,65 @@ class TestRunner:
                             # fixed replay offset is flaky — it can land mid-burst.
                             # The apps are eventually-consistent; a genuine desync
                             # never converges and still fails after the timeout.
+                            # Bounded by SCP_BASE_DEADLINE, now extended by the
+                            # same 2x retry that terminal checks get: playback
+                            # is frozen for the entire poll below (including
+                            # the retry extension), so the recording cannot
+                            # advance while it runs and the target cannot go
+                            # stale — see freeze-recording-during-validation
+                            # change.
                             ok, msg = False, ""
-                            scp_deadline = time.time() + 10.0
-                            while True:
-                                full_states = [self.fetch_full_state(port) for _, port in app_ports]
-                                ok, msg = self.validate_state_checkpoint(
-                                    full_states, names, scp, frame_tolerance=frame_tolerance,
-                                )
-                                if ok:
-                                    # Oracle passed; also require client-vs-client
-                                    # consensus (frame only when playhead parked).
-                                    ok, msg = self.compare_full_states(
-                                        full_states, names, frame_tolerance=frame_tolerance,
-                                        compare_frame=scp.get("frame_held", False),
+                            SCP_BASE_DEADLINE = 10.0
+                            scp_start = time.time()
+                            scp_deadline = scp_start + SCP_BASE_DEADLINE
+                            scp_retried = False
+                            with _freeze_playback(player):
+                                while True:
+                                    full_states = [self.fetch_full_state(port) for _, port in app_ports]
+                                    ok, msg = self.validate_state_checkpoint(
+                                        full_states, names, scp, frame_tolerance=frame_tolerance,
                                     )
-                                if ok or time.time() >= scp_deadline:
-                                    break
-                                time.sleep(0.5)
+                                    if ok:
+                                        # Oracle passed; also require client-vs-client
+                                        # consensus (frame only when playhead parked).
+                                        ok, msg = self.compare_full_states(
+                                            full_states, names, frame_tolerance=frame_tolerance,
+                                            compare_frame=scp.get("frame_held", False),
+                                        )
+                                    if ok or time.time() >= scp_deadline:
+                                        if not ok and not scp_retried:
+                                            scp_retried = True
+                                            scp_deadline = scp_start + SCP_BASE_DEADLINE * RETRY_MULTIPLIER
+                                            logging.warning(
+                                                f"State checkpoint t={scp['time_offset']:.1f}s not yet "
+                                                f"matching after {SCP_BASE_DEADLINE:.1f}s — retrying up to "
+                                                f"{SCP_BASE_DEADLINE * RETRY_MULTIPLIER:.1f}s "
+                                                "(playback stays frozen) before failing."
+                                            )
+                                            continue
+                                        break
+                                    time.sleep(0.5)
+                            scp_elapsed = time.time() - scp_start
+                            time_to_converge = max(time_to_converge, scp_elapsed)
+                            validated_after = (time.time() - player._play_start_time) - scp["time_offset"]
+                            timing_note = (
+                                f" [valid {validated_after:.1f}s after event, took {scp_elapsed:.1f}s; "
+                                f"checkpoint_validation_delay={checkpoint_validation_delay:.1f}s]"
+                            )
                             if ok:
+                                if scp_retried:
+                                    converged_late = True
                                 logging.info(
                                     f"✅ State checkpoint t={scp['time_offset']:.1f}s passed"
-                                    + (f" ({msg})" if msg else "")
+                                    + (f" ({msg})" if msg else "") + timing_note
                                 )
                             else:
-                                logging.error(f"❌ FAIL: {msg}")
+                                logging.error(f"❌ FAIL: {msg}{timing_note}")
                                 logging.error("Check application logs for details:")
                                 for name, port in app_ports:
                                     logging.error(f"  {os.path.join(spawner.logs_dir, f'{name}_{port}.log')}")
                                 failed = True
+                                fail_kind = FailKind.STRUCTURAL_CONSENSUS
                                 fail_reason = msg
                                 playing_state["playing"] = False
                             state_checkpoint_idx += 1
@@ -854,14 +1388,37 @@ class TestRunner:
                 player_thread.join(timeout=1.0)
             else:
                 # Script-driven: final coherence check
-                states = []
-                for name, port in app_ports:
-                    st = self.fetch_state(port)
-                    states.append(st)
-                match, diff = self.compare_states(states, [a[0] for a in app_ports])
+                states = [self.fetch_state(port) for _, port in app_ports]
+                match, diff, diff_kind = self.compare_states(states, [a[0] for a in app_ports])
+                elapsed = 0.0
+                if not match and diff_kind in TIMING_ELIGIBLE_FAIL_KINDS:
+                    logging.warning(
+                        f"Final coherence check failed on first try ({diff_kind}) — "
+                        f"retrying for up to {checkpoint_validation_delay:.1f}s more before failing."
+                    )
+                    _kind_box = {"kind": diff_kind}
+
+                    def _recheck_final_coherence():
+                        fresh_states = [self.fetch_state(port) for _, port in app_ports]
+                        m, d, k = self.compare_states(fresh_states, [a[0] for a in app_ports])
+                        _kind_box["kind"] = k
+                        return m, d
+
+                    match, diff, elapsed = _poll_until(_recheck_final_coherence, checkpoint_validation_delay)
+                    diff_kind = _kind_box["kind"]
+                time_to_converge = max(time_to_converge, elapsed)
                 if not match:
-                    logging.error(f"❌ FAIL: Final state mismatch in test '{test_name}'!\n{diff}")
+                    logging.error(
+                        f"❌ FAIL: Final state mismatch in test '{test_name}' "
+                        f"[waited {elapsed:.1f}s]!\n{diff}"
+                    )
                     failed = True
+                    fail_kind = diff_kind
+                    fail_reason = diff
+                else:
+                    if elapsed > 0:
+                        converged_late = True
+                    logging.info(f"✅ Final coherence check passed [valid after {elapsed:.1f}s]")
 
             # Annotation geometry round-trip check (script-driven `draw_annotation`
             # tests only): verify the peer's native readback matches the value
@@ -920,6 +1477,7 @@ class TestRunner:
                             f"recording for '{test_name}' contains annotations."
                         )
                         failed = True
+                        fail_kind = FailKind.ANNOTATION_MISSING
                         fail_reason = f"{name} created no annotations"
                     else:
                         logging.info(f"✅ {name} created {cnt} annotation stroke(s)")
@@ -964,21 +1522,48 @@ class TestRunner:
                 # (the slower peer may not have applied the last events yet). A
                 # genuine desync never converges and still fails after the timeout.
                 ok, msg = False, ""
-                deadline = time.time() + 15.0
+                CONSENSUS_BASE_DEADLINE = 15.0
+                consensus_start = time.time()
+                deadline = consensus_start + CONSENSUS_BASE_DEADLINE
+                consensus_retried = False
                 while True:
                     full_states = [self.fetch_full_state(port) for _, port in app_ports]
                     ok, msg = self.compare_full_states(
                         full_states, [a[0] for a in app_ports], frame_tolerance=frame_tolerance
                     )
-                    if ok or time.time() >= deadline:
+                    if ok:
+                        break
+                    if time.time() >= deadline:
+                        if not consensus_retried:
+                            # One bounded retry at 2x — structural consensus is
+                            # convergence-timing-eligible.
+                            consensus_retried = True
+                            deadline = consensus_start + CONSENSUS_BASE_DEADLINE * RETRY_MULTIPLIER
+                            logging.warning(
+                                f"Structural consensus not yet reached after "
+                                f"{CONSENSUS_BASE_DEADLINE:.1f}s — retrying up to "
+                                f"{CONSENSUS_BASE_DEADLINE * RETRY_MULTIPLIER:.1f}s before failing."
+                            )
+                            continue
                         break
                     time.sleep(1.0)
+                consensus_elapsed = time.time() - consensus_start
+                time_to_converge = max(time_to_converge, consensus_elapsed)
                 if not ok:
-                    logging.error(f"❌ FAIL: structural consensus in '{test_name}':\n{msg}")
+                    logging.error(
+                        f"❌ FAIL: structural consensus in '{test_name}' "
+                        f"[took {consensus_elapsed:.1f}s]:\n{msg}"
+                    )
                     failed = True
+                    fail_kind = FailKind.STRUCTURAL_CONSENSUS
                     fail_reason = msg
                 else:
-                    logging.info("✅ Apps agree on timeline structure (full-state consensus)")
+                    if consensus_retried:
+                        converged_late = True
+                    logging.info(
+                        "✅ Apps agree on timeline structure (full-state consensus) "
+                        f"[took {consensus_elapsed:.1f}s]"
+                    )
 
             # OTIO structural comparison (§9.5): export the timeline from every
             # app and compare it against a reference .otio file.  Triggered when
@@ -1013,6 +1598,8 @@ class TestRunner:
                                 f"{res['error']}"
                             )
                             failed = True
+                            fail_kind = FailKind.OTIO_EXPORT
+                            fail_reason = f"{app_name} export_otio failed: {res['error']}"
                             continue
                         import opentimelineio as otio
                         candidate = otio.adapters.read_from_file(export_path)
@@ -1029,9 +1616,16 @@ class TestRunner:
                                 + "\n".join(f"  {d}" for d in diffs)
                             )
                             failed = True
+                            fail_kind = FailKind.OTIO_EXPORT
+                            fail_reason = (
+                                f"{app_name} OTIO export differs from reference "
+                                f"'{os.path.basename(ref_path)}': " + "; ".join(diffs)
+                            )
                 except Exception as e:
                     logging.error(f"❌ FAIL: otio_compare block raised: {e}", exc_info=True)
                     failed = True
+                    fail_kind = FailKind.OTIO_EXPORT
+                    fail_reason = f"otio_compare block raised: {e}"
 
             # Save session states
             for name, port in app_ports:
@@ -1049,6 +1643,7 @@ class TestRunner:
 
             if self._report_log_errors(app_ports, spawner.logs_dir):
                 failed = True
+                fail_kind = fail_kind or FailKind.LOG_ERROR_SIGNATURE
                 fail_reason = fail_reason or "known-bad signature found in a plugin log"
 
             if failed:
@@ -1059,9 +1654,17 @@ class TestRunner:
             logging.getLogger().removeHandler(_runner_fh)
             _runner_fh.close()
 
-            if failed:
-                return False
-            return True
+            result = TestResult(
+                test_name, not failed,
+                fail_kind=fail_kind if failed else None,
+                message=fail_reason,
+                converged_late=converged_late,
+                time_to_converge=time_to_converge,
+                recording=recording,
+                duration=time.time() - test_start_time,
+            )
+            self._write_history_entry(result)
+            return result
 
     def _scan_log_for_errors(self, log_path):
         """Return a Counter of {error_summary: count} found in a log file.
@@ -1171,22 +1774,92 @@ class TestRunner:
                 logging.error(f"    {n:3}x  {msg!r}")
         return found_known_bad
 
+    def _test_status(self, test_name):
+        """``(status, blocked_by)`` for a configured test, defaulting to
+
+        ``("stable", None)`` when unset.
+        """
+        test_data = self.config.get_test(test_name) or {}
+        return test_data.get('status', 'stable'), test_data.get('blocked_by')
+
+    def counts_as_suite_pass(self, test_name, result):
+        """Whether *result* should count toward the overall suite pass/fail.
+
+        A ``known_broken`` test failing as expected is still reported (see
+        ``run_all``'s summary), but does not fail the suite — that's the
+        entire point of declaring it known_broken rather than leaving it to
+        redden the suite like an undiagnosed regression. Everything else
+        must pass normally.
+        """
+        status, _ = self._test_status(test_name)
+        if status == 'known_broken':
+            return True
+        return result.passed
+
+    def _format_prev_result(self, entries):
+        """Compact "what happened last time" string from prior history
+
+        entries (oldest-to-newest, *not* including the run currently in
+        progress). Shows the immediately-previous result plus a short
+        pass/fail trend strip so flakiness is visible without cross-checking
+        `run_history.jsonl` by hand.
+        """
+        if not entries:
+            return "no prior runs"
+        recent = entries[-5:]
+        trend = "".join("✅" if e.get("result") == "pass" else "❌" for e in recent)
+        last = entries[-1]
+        last_desc = "pass" if last.get("result") == "pass" else f"fail({last.get('fail_kind')})"
+        return f"prev: {last_desc}, last {len(recent)}: {trend}"
+
     def run_all(self, script_driven=False):
+        # Snapshot history *before* this run's own entries are appended, so
+        # "previous results" in the summary reflects prior invocations only.
+        previous_history = self.load_history()
+
+        suite_start_time = time.time()
         results = {}
-        for t in self.config.tests:
+        total = len(self.config.tests)
+        for i, t in enumerate(self.config.tests, start=1):
             test_name = t['name']
-            success = self.run_test(test_name, script_driven=script_driven)
-            results[test_name] = success
+            results[test_name] = self.run_test(
+                test_name, script_driven=script_driven,
+                test_index=i, test_total=total,
+            )
+        suite_duration = time.time() - suite_start_time
 
         print("\n" + "="*70)
         print("  SYNC TEST SUMMARY")
         print("="*70)
         all_passed = True
-        for test_name, success in results.items():
-            status = "✅ PASSED" if success else "❌ FAILED"
-            print(f"  {status}  |  {test_name}")
-            if not success:
+        for test_name, result in results.items():
+            status, blocked_by = self._test_status(test_name)
+            duration_str = f"[{result.duration:.1f}s]"
+            prev = self._format_prev_result(previous_history.get(test_name, []))
+
+            if result.passed and status == 'known_broken':
+                print(
+                    f"  ⚠️  XPASS         |  {test_name}  {duration_str}  (status: known_broken "
+                    f"but passed — check whether blocked_by '{blocked_by}' can be closed out)  ({prev})"
+                )
+            elif result.passed:
+                suffix = (
+                    f"  (converged late, {result.time_to_converge:.1f}s)"
+                    if result.converged_late else ""
+                )
+                print(f"  ✅ PASSED        |  {test_name}  {duration_str}{suffix}  ({prev})")
+            elif status == 'known_broken':
+                print(
+                    f"  ⚪ KNOWN_BROKEN  |  {test_name}  {duration_str}  "
+                    f"({result.fail_kind}; blocked_by: {blocked_by})  ({prev})"
+                )
+            else:
+                print(f"  ❌ FAILED        |  {test_name}  {duration_str}  ({result.fail_kind})  ({prev})")
+
+            if not self.counts_as_suite_pass(test_name, result):
                 all_passed = False
+        print("="*70)
+        print(f"  Total run time: {suite_duration:.1f}s across {len(results)} test(s)")
         print("="*70 + "\n")
 
         return all_passed

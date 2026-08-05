@@ -18,6 +18,22 @@ Instead of testing only the `SyncManager` library in isolation, this framework p
 3. **Playback Automation:** Uses the existing `sync_recorder.player.SyncPlayer` to stream a `.jsonl` recording of OTIO sync events into the RabbitMQ exchange, simulating a remote master peer driving the session.
 4. **State Assertion:** The Test Runner (`runner.py`) continuously polls the `/state` endpoint of all spawned apps and asserts that they match the expected synchronized state.
 
+## Checkpoint Validation
+
+For recording-driven tests (`script_driven: false`), the runner derives two kinds of point-in-time checkpoints from the `.jsonl` recording: **frame checkpoints** (an app's playhead should read a specific frame) and **structural state checkpoints** (an app's full timeline structure should match a recorded `STATE_SNAPSHOT`). Each checkpoint becomes due `checkpoint_validation_delay` seconds after its recorded event.
+
+While a checkpoint is being validated, the runner **freezes recording playback** — pausing `SyncPlayer` for the duration of the check and resuming once it reaches a verdict (pass, fail, or retry-exhausted). This means `checkpoint_validation_delay` is no longer a race against the recording: it's simply how long after the event to *start* checking. Once validation begins, the recording cannot advance further out from under it, however long the check itself takes (an inspector RPC, a multi-second convergence poll). Because the target can no longer go stale mid-check, both checkpoint types are retry-eligible: a first-attempt mismatch is retried once at 2x the original deadline (still frozen) before failing, the same bounded-retry pattern used elsewhere in the runner.
+
+Every freeze/resume is logged with its duration (`⏸ Playback frozen N.Ns for checkpoint validation`), so time removed from real-time replay pacing is visible rather than silently distorting it. Total suite runtime grows by the sum of these freezes — expected, and bounded by each checkpoint's own retry deadline.
+
+Freezing protects the evaluation window; it cannot protect a window that started elapsing before evaluation was possible at all. So the recording's t=0 is no longer set by `SyncPlayer`'s own peer-join gate. That gate sees a `STATE_SNAPSHOT` leave over RabbitMQ — which can happen while the runner is still waiting for apps to finish booting — but it cannot see an app finish *applying* that state and become queryable over HTTP. The two signals can be far apart, and the whole gap used to be charged against the recording's timeline before the validation loop ever ran.
+
+The gate now tracks peer-snapshot delivery only. The runner calls `player.arm_clock()` after its own `_wait_for_snapshot()` confirms every app reports a clip, and the clock starts once the gate's conditions *and* that arming have both happened — whichever comes last. Arming never bypasses the gate: dispatching before peers hold the initial snapshot would be a worse race than the one this closes. Checkpoint hold windows therefore start from a moment the runner has itself confirmed.
+
+The interval between the two is logged (`[player] Clock armed N.Ns after the peer-join gate cleared`), so the gap is a number you can read rather than an inference. Its companion line — `[player] Peer-join gate cleared; holding the recording's clock until arm_clock() is called` — is also the first thing to look for if a recording-driven test appears to hang: there is deliberately no auto-arm fallback, so a `wait_for_peer=True` caller that never arms services the network forever and dispatches nothing.
+
+`frame_held` / `_FRAME_HOLD_SAFETY_MARGIN` and the `validation_delay`-based silence filters in `derive_checkpoints`/`derive_state_checkpoints` remain in place. Their original purpose — buying enough window to survive a still-advancing recording — is now largely redundant now that playback freezes during validation, but they still guard against sampling mid-burst, so they're left as belt-and-braces rather than load-bearing. Narrowing them is a separate, independently-verifiable follow-on.
+
 ## Test Configuration
 
 Tests are defined in a YAML configuration file (`sync_tests.yaml` at the project root).
@@ -27,11 +43,24 @@ Example `sync_tests.yaml`:
 ```yaml
 tests:
   - name: "xstudio_vs_openrv_demo"
+    description: >
+      Replays a basic two-app session (xStudio + OpenRV) from a recorded
+      .jsonl and asserts both apps converge on the same clip/frame/state.
+      Baseline smoke test for the sync pipeline.
     recording: "demo.jsonl"
     apps:
       - "xstudio"
       - "openrv"
 ```
+
+`description` is **required** for every test in `sync_tests.yaml` — it's the canonical suite definition, and the runner rejects loading it if any entry is missing one. Explain what scenario the test exercises and why it exists, so a future reader (or a future you) can reconstruct it without archaeology.
+
+Two optional fields track known issues:
+
+- `status: known_broken` — the test is expected to fail right now for a known, already-tracked reason. It still runs and is still reported, but a `known_broken` failure does not fail the overall suite.
+- `blocked_by: "<openspec-change-name>"` — required alongside `status: known_broken`, naming the OpenSpec change expected to fix it. If a `known_broken` test unexpectedly passes, the summary flags it (XPASS-style) as a signal to check whether the status can be reverted to `stable`.
+
+`sync_tests_xstudio.yaml` and `sync_demos.yaml` duplicate a subset of `sync_tests.yaml`'s entries for convenience and are **not** required to carry `description`/`status`/`blocked_by` — `sync_tests.yaml` is the single source of truth for a test's intent.
 
 ## Running Tests
 

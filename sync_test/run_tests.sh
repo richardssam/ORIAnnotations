@@ -10,4 +10,6 @@ export PYTHONPATH="${PYTHON_DIR}:${PYTHONPATH}"
 
 # Run the python CLI module from the script directory
 cd "${SCRIPT_DIR}"
+echo "SCRIPTDIR: ${SCRIPT_DIR}"
+echo "PYTHONPATH: ${PYTHONPATH}"
 python -m sync_test.cli "$@"

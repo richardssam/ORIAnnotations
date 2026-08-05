@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -71,6 +72,27 @@ class SyncPlayer:
         self._peer_snapshot_sent_at: float | None = None
         self._peer_active_received: bool = False
         self._peers_snapshotted: set[str] = set()
+
+        # Explicit clock arming. The gate above tracks peer-snapshot delivery
+        # only; it no longer starts the logical clock by itself. The clock arms
+        # once the gate's conditions AND arm_clock() have both happened,
+        # whichever comes last, so the caller can anchor t=0 to its own
+        # readiness check rather than an earlier, transport-specific one.
+        # Deliberately not a replacement for the gate: arming alone must never
+        # start dispatch before peers have received their initial snapshot.
+        self._clock_arm_requested = False
+        # Instant the gate's own conditions first passed while still unarmed —
+        # the start of the interval this decoupling exists to stop losing.
+        self._gate_cleared_at: float | None = None
+
+        # Freeze support: suspends event dispatch (and the wait_for_peer gate)
+        # without losing timeline position. resume() shifts _play_start_time
+        # (and _drain_deadline, if a drain is in progress) forward by the
+        # elapsed pause duration, so current_offset — and anything computed
+        # from it, including the runner's own independent copy — is unchanged
+        # across the pause.
+        self._paused = False
+        self._pause_started_at: float | None = None
 
     def load_recording(self, filepath: str) -> None:
         """Load recorded events from a JSON Lines file.
@@ -202,17 +224,27 @@ class SyncPlayer:
 
         When *wait_for_peer* is ``True``, :meth:`tick` enters a waiting state
         and does not send any events until *min_peer_count* peers have each
-        requested and received a ``STATE_SNAPSHOT`` **and** *post_snapshot_delay*
-        seconds have elapsed after the last snapshot was sent.  During this phase
-        :meth:`tick` still returns ``True`` and continues to service incoming
-        network requests.
+        requested and received a ``STATE_SNAPSHOT``, *post_snapshot_delay*
+        seconds have elapsed after the last snapshot was sent, **and** the
+        caller has called :meth:`arm_clock`.  During this phase :meth:`tick`
+        still returns ``True`` and continues to service incoming network
+        requests.
+
+        .. important::
+           ``wait_for_peer=True`` callers **must** call :meth:`arm_clock`.
+           There is no auto-arm fallback: a caller that never arms services
+           the network forever and dispatches nothing.  This is deliberate —
+           it lets the caller anchor the recording's t=0 to its own readiness
+           check instead of the gate's, which is a different and usually much
+           later moment.  ``wait_for_peer=False`` is unaffected and arms the
+           clock synchronously here, as before.
 
         :param speed: Playback speed multiplier.
         :param loop: If True, loops playback indefinitely.
         :param replace_source_guid: If True, replaces payload source GUIDs with
             the player's own guid.
         :param wait_for_peer: If True, hold event dispatch until peers have
-            loaded the current state.
+            loaded the current state *and* :meth:`arm_clock` has been called.
         :param min_peer_count: Number of distinct peers that must each receive
             a STATE_SNAPSHOT before the gate clears.  Default 1.
         :param post_snapshot_delay: Seconds to wait after the last snapshot is
@@ -228,8 +260,14 @@ class SyncPlayer:
         self._min_peer_count = min_peer_count
         self._wait_for_peer = wait_for_peer
         self._post_snapshot_delay = post_snapshot_delay
+        # Reset so reusing a player instance for a second run cannot inherit a
+        # stale arm from the previous one. (Not about loop=True: internal
+        # looping restarts in place inside tick() with _wait_for_peer already
+        # False, so it never re-enters this method nor consults the flag.)
+        self._clock_arm_requested = False
+        self._gate_cleared_at = None
         # When waiting for a peer, defer setting _play_start_time until the
-        # gate clears; tick() will set it then.
+        # gate clears *and* arm_clock() has been called; tick() sets it then.
         self._play_start_time = None if wait_for_peer else time.time()
         self._play_index = 0
         self._play_speed = speed
@@ -246,9 +284,10 @@ class SyncPlayer:
         events whose scheduled time has passed.
 
         While the peer-join gate is active (``wait_for_peer=True`` was passed
-        to :meth:`start_playback` and no peer has loaded state yet) this
-        method services incoming network requests but does not send recorded
-        events; it still returns ``True`` so callers keep ticking.
+        to :meth:`start_playback` and either no peer has loaded state yet or
+        :meth:`arm_clock` has not been called) this method services incoming
+        network requests but does not send recorded events; it still returns
+        ``True`` so callers keep ticking.
 
         :returns: True if playback is still active, False if finished.
         :rtype: bool
@@ -263,6 +302,12 @@ class SyncPlayer:
 
         self._process_network_requests()
 
+        if self._paused:
+            # Network requests (above) are still serviced so a joining peer
+            # is answered, but dispatch — including arming the wait_for_peer
+            # gate below — is suspended until resume().
+            return True
+
         # Peer-join gate: wait until min_peer_count peers have each received a
         # snapshot and the post-snapshot delay has elapsed.
         if self._wait_for_peer:
@@ -273,7 +318,31 @@ class SyncPlayer:
             if not self._peer_active_received and elapsed < self._post_snapshot_delay:
                 # All peers snapshotted but cooling-off delay not yet elapsed.
                 return True
-            # Gate cleared — arm the event clock and drop into normal playback.
+
+            # The gate's own conditions are met. Note the instant once, so the
+            # interval from here to the caller's explicit arm is measurable —
+            # that interval is precisely the time this player used to burn off
+            # the recording's timeline before the caller was ready to watch it.
+            if self._gate_cleared_at is None:
+                self._gate_cleared_at = time.time()
+                if not self._clock_arm_requested:
+                    logging.info(
+                        "[player] Peer-join gate cleared; holding the "
+                        "recording's clock until arm_clock() is called."
+                    )
+            if not self._clock_arm_requested:
+                # Gate is satisfied but the caller has not declared itself
+                # ready. Keep servicing the network (above); dispatch nothing.
+                return True
+
+            # Gate cleared AND caller armed — start the clock. Report the
+            # interval between the two, mirroring the runner's freeze-duration
+            # log: time that does not count against the recording's timeline
+            # is stated, never silent.
+            logging.info(
+                f"[player] Clock armed {time.time() - self._gate_cleared_at:.1f}s "
+                "after the peer-join gate cleared; recording t=0 is now."
+            )
             self._wait_for_peer = False
             self._play_start_time = time.time()
 
@@ -315,6 +384,61 @@ class SyncPlayer:
             return False
 
         return True
+
+    def arm_clock(self) -> None:
+        """Declare the caller ready, permitting the logical clock to start.
+
+        Required for ``wait_for_peer=True`` playback, which will otherwise
+        service the network forever and dispatch nothing. The clock starts once
+        this **and** the peer-join gate's own conditions (snapshot delivered to
+        ``min_peer_count`` peers, ``post_snapshot_delay`` elapsed) have both
+        happened, whichever comes last — arming never bypasses the gate, since
+        dispatching before peers hold the initial snapshot is a worse race than
+        the one this call exists to close.
+
+        The point is that the caller usually knows something the gate does not.
+        The gate sees a snapshot leave over the message bus; it cannot see the
+        peer finish applying that state and become queryable. Arming from the
+        caller's own readiness check makes the recording's t=0 that later,
+        truer moment.
+
+        Safe at any time: before :meth:`start_playback`, after the clock is
+        already armed, or under ``wait_for_peer=False`` (a no-op there, since
+        that mode arms synchronously in :meth:`start_playback`). Note
+        :meth:`start_playback` clears the flag, so arming *before* it has no
+        effect on the run it starts.
+        """
+        self._clock_arm_requested = True
+
+    def pause(self) -> None:
+        """Suspend recorded-event dispatch without losing timeline position.
+
+        :meth:`tick` keeps servicing the network (peer joins, STATE_REQUEST)
+        while paused; it just stops dispatching recorded events. Idempotent —
+        pausing already-paused playback is a no-op.
+        """
+        if self._paused:
+            return
+        self._paused = True
+        self._pause_started_at = time.time()
+
+    def resume(self) -> None:
+        """Resume dispatch after :meth:`pause`, preserving the logical timeline.
+
+        Shifts ``_play_start_time`` (and an in-progress drain deadline, if
+        any) forward by the elapsed pause duration, so ``current_offset`` is
+        unchanged across the pause. Idempotent — resuming playback that is
+        not paused is a no-op.
+        """
+        if not self._paused:
+            return
+        self._paused = False
+        elapsed = time.time() - self._pause_started_at
+        self._pause_started_at = None
+        if self._play_start_time is not None:
+            self._play_start_time += elapsed
+        if self._drain_deadline is not None:
+            self._drain_deadline += elapsed
 
     def stop_playback(self) -> None:
         """Stop non-blocking procedural playback and clean up network resources."""

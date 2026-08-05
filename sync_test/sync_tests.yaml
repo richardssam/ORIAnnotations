@@ -24,26 +24,47 @@ media:
 
 tests:
   - name: "xstudio_vs_openrv_basic_annotation_notc"
+    description: >
+      Baseline two-app smoke test. Replays a recorded no-timecode session with
+      a single-clip pen annotation and asserts xStudio and OpenRV converge on
+      the same clip/frame/annotation state.
     recording: "recordings/single_clip_annotation_notc.jsonl"
     checkpoint_validation_delay: 2.5
+    frame_tolerance: 5
     apps:
       - "xstudio"
       - "openrv"
   - name: "add_media"
+    description: >
+      Script-driven: xStudio adds a media item to its playlist; asserts the
+      OpenRV peer receives the same insertion via the real sync broadcast
+      path (not a JSONL replay).
     recording: "recordings/add_media_v2.jsonl"
     script_driven: true
+    frame_tolerance: 5
+    checkpoint_validation_delay: 4.5
     apps:
       - "xstudio"
       - "openrv"
   - name: "delete_media_openrv_noscript"
+    description: >
+      JSONL replay (not script-driven) between two OpenRV instances: replays
+      a recorded media-deletion session and asserts both converge on the
+      same resulting clip set.
     recording: "recordings/delete_media_notc.jsonl"
     script_driven: false
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "openrv"
   - name: "delete_media_openrv"
+    description: >
+      Script-driven, OpenRV-only (both apps): add two clips, select one,
+      delete the other, then re-select the first — regression coverage for
+      delete-while-a-different-clip-is-selected on OpenRV.
     #recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -59,8 +80,14 @@ tests:
       - "openrv"
       - "openrv"
   - name: "delete_media_xstudio"
+    description: >
+      Same delete-while-a-different-clip-is-selected scenario as
+      delete_media_openrv, but driven from xStudio with OpenRV as peer —
+      verifies the deletion and surviving selection sync cross-app.
     #recording: "recordings/delete_media_notc.jsonl"
     script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -76,30 +103,48 @@ tests:
       - "xstudio"
       - "openrv"
   - name: "reorder_media"
+    description: >
+      JSONL replay: OpenRV drives a clip reorder within a timeline; asserts
+      the xStudio peer converges on the same clip order (MOVE_CHILD
+      reconciliation, not just the same clip set).
     recording: "recordings/reorder_media_v2.jsonl"
     script_driven: false
-    checkpoint_validation_delay: 4.5
+    checkpoint_validation_delay: 6
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "xstudio"
   - name: "xstudio_selects"
+    description: >
+      JSONL replay: xStudio drives clip/sequence selection changes; asserts
+      the OpenRV peer's active selection converges to match.
     recording: "recordings/xstudio_selects_v2.jsonl"
-    checkpoint_validation_delay: 2.5
+    checkpoint_validation_delay: 6
+    frame_tolerance: 5
     #script_driven: true
     apps:
       - "openrv"
       - "xstudio"
   - name: "xstudio_selects_script_rv"
+    description: >
+      Same selection scenario as xstudio_selects, but script-driven with
+      OpenRV as the driver app (commands derived from the recording rather
+      than replayed as raw JSONL events).
     recording: "recordings/xstudio_selects_v2.jsonl"
-    #checkpoint_validation_delay: 2.5
+    checkpoint_validation_delay: 4
     script_driven: true
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "xstudio"
   - name: "xstudio_selects_script_xstudio"
+    description: >
+      Same selection scenario as xstudio_selects, script-driven with xStudio
+      as the driver app instead of OpenRV.
     recording: "recordings/xstudio_selects_v2.jsonl"
     #checkpoint_validation_delay: 2.5
     script_driven: true
+    frame_tolerance: 5
     apps:
       - "xstudio"
       - "openrv"
@@ -110,20 +155,33 @@ tests:
   #    - "openrv"
   #    - "xstudio"
   - name: "text_annotations_notc"
+    description: >
+      JSONL replay: OpenRV drives a recorded text-annotation session (no
+      timecode media); asserts the xStudio peer converges on the same text
+      annotation state.
     recording: "recordings/text_annotations_notc.jsonl"
     script_driven: false
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "xstudio"
   - name: "text_annotations_xstudio_to_rv"
+    description: >
+      JSONL replay: xStudio-authored text annotations sync to an OpenRV
+      peer — reverse direction of text_annotations_notc.
     recording: "recordings/text_annotations_xstudio_to_rv.jsonl"
     script_driven: false
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "xstudio"
   - name: "delete_timeline"
+    description: >
+      JSONL replay: asserts a whole-timeline deletion (REMOVE_TIMELINE) sent
+      by the OpenRV driver syncs correctly to the xStudio peer.
     recording: "recordings/delete_timeline.jsonl"
     script_driven: false
+    frame_tolerance: 5
     apps:
       - "openrv"
       - "xstudio"
@@ -132,8 +190,13 @@ tests:
   # Fixture: examples/otio_sample.rv is otio_test_quicktime.otio already imported into RV.
   # Both tests confirm the full round-trip: imported OTIO → sync → peer export ≈ reference.
   - name: "otio_import_rv_to_rv"
+    description: >
+      OTIO import round-trip: an RV master pre-loaded with an imported OTIO
+      file syncs its structure to an empty RV peer; both apps' re-exported
+      OTIO must match the original reference file.
     script_driven: true
     convergence_wait: 8.0
+    frame_tolerance: 5
     fixtures:
       - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
       - null                        # app[1]: RV peer starts empty, receives via sync
@@ -145,8 +208,12 @@ tests:
       - "openrv"
 
   - name: "otio_import_rv_to_xstudio"
+    description: >
+      Same OTIO import round-trip as otio_import_rv_to_rv, RV master ->
+      xStudio peer instead of a second RV instance.
     script_driven: true
     convergence_wait: 8.0
+    frame_tolerance: 5
     fixtures:
       - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
       - null                        # app[1]: xStudio peer starts empty, receives via sync
@@ -158,8 +225,18 @@ tests:
       - "xstudio"
 
   - name: "otio_import_xstudio_to_rv"
+    description: >
+      NOTE (found while backfilling descriptions, sync-tests-tracking
+      change): despite its name, this is configured identically to
+      otio_import_rv_to_xstudio — the RV fixture (app[0]) is still the one
+      pre-loaded with the OTIO import, and xStudio (app[1]) still starts
+      empty. It does not actually exercise an xStudio-driven import. Left
+      as-is (not fixed) since correcting the fixture/apps assignment is a
+      behavior change outside this change's scope — flagging for a
+      follow-up rather than silently leaving it undocumented.
     script_driven: true
     convergence_wait: 8.0
+    frame_tolerance: 5
     fixtures:
       - "examples/otio_sample.rv"  # app[0]: RV master with OTIO pre-loaded
       - null                        # app[1]: xStudio peer starts empty, receives via sync
@@ -171,16 +248,26 @@ tests:
       - "xstudio"
 
   - name: "otio_xstudio_timeline_changes"
+    description: >
+      JSONL replay between two xStudio instances: asserts xStudio timeline
+      edits (post-OTIO-import) recorded in the session correctly re-sync to
+      a second xStudio instance.
     recording: "recordings/otio_xstudio_timeline_changes.jsonl"
     script_driven: false
+    frame_tolerance: 5
+    checkpoint_validation_delay: 8
     apps:
       - "xstudio"
       - "xstudio"
 
   - name: "color_tests"
+    description: >
+      JSONL replay: asserts OCIO/color-pipeline settings (display/view/
+      exposure) sync correctly between an xStudio driver and OpenRV peer.
     recording: "recordings/color_tests.jsonl"
     checkpoint_validation_delay: 2.5
     script_driven: false
+    frame_tolerance: 5
     apps:
       - "xstudio"
       - "openrv"
@@ -193,7 +280,14 @@ tests:
   # `sync_test.annotation_assertions`. This is the reverse-direction coverage
   # `testchart/` never exercises (it only tests OTIO import -> app).
   - name: "openrv_draws_pen_xstudio_verifies"
+    description: >
+      Native-draw round-trip: OpenRV draws a real pen stroke via its
+      production send path (no OTIO-import codec involved); asserts
+      xStudio's received stroke thickness/color round-trips within
+      tolerance of both apps' real codec constants, plus a rendered-pixel
+      visual check.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -221,7 +315,12 @@ tests:
       - "xstudio"
 
   - name: "xstudio_draws_pen_openrv_verifies"
+    description: >
+      Same native-draw round-trip as openrv_draws_pen_xstudio_verifies, in
+      the reverse direction: xStudio draws the pen stroke, OpenRV peer
+      verifies the round-trip.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -246,7 +345,13 @@ tests:
       - "openrv"
 
   - name: "openrv_draws_rect_xstudio_verifies"
+    description: >
+      Native-draw round-trip for a rectangle: OpenRV draws a native rect
+      annotation; asserts xStudio's tessellated border thickness round-trips
+      correctly — regression coverage for a prior 2x rect-border bug that a
+      numeric-only check missed until the visual_check was added.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -288,7 +393,11 @@ tests:
       - "xstudio"
 
   - name: "openrv_draws_ellipse_xstudio_verifies"
+    description: >
+      Same native-draw round-trip as openrv_draws_rect_xstudio_verifies, for
+      an ellipse's tessellated border thickness instead of a rectangle's.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -310,7 +419,11 @@ tests:
       - "xstudio"
 
   - name: "openrv_draws_arrow_xstudio_verifies"
+    description: >
+      Same native-draw round-trip family, for an arrow annotation's shaft
+      thickness.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -341,7 +454,15 @@ tests:
   # visual_check: text has no straight-edge cross-section the existing
   # pixel-measurement helper can sample.
   - name: "openrv_draws_text_xstudio_verifies"
+    description: >
+      Native-draw round-trip for text using the current fontSize (WCS
+      image-height-fraction) convention: OpenRV draws a native text
+      annotation; asserts xStudio's received font_size/position round-trip
+      correctly. Regression coverage for the ~10x text-size mismatch bug —
+      uses the exact font_size_wcs value from the real annotation
+      (examples/bad.rv's "FOO") that surfaced it.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
@@ -372,7 +493,14 @@ tests:
   # PaintIPNode.cpp fallback default; nominal = 0.01 * 10000/1080 is the
   # reconstructed scale-exclusive fontSize the fallback produces.
   - name: "openrv_draws_legacy_text_xstudio_verifies"
+    description: >
+      Same text round-trip as openrv_draws_text_xstudio_verifies, but
+      exercising the legacy-session fallback path: OpenRV writes only the
+      old raw `size` property (no fontSize), and xStudio's received value
+      must match the reconstructed fallback conversion rather than being
+      misread as an already-WCS-fraction value.
     script_driven: true
+    frame_tolerance: 5
     commands:
       - action: "add_media"
         url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"

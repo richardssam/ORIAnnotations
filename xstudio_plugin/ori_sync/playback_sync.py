@@ -40,6 +40,13 @@ _WIRE_TO_LOOP_MODE = {v: k for k, v in _LOOP_MODE_TO_WIRE.items()}
 # up the single poll thread on the receiving end.  ~20 Hz stays visually smooth.
 _SCRUB_BROADCAST_INTERVAL = 0.05
 
+# How long after receiving a peer's playback message this peer treats itself as
+# "being driven" and refuses to broadcast its own playhead position.  ph.position
+# fires attribute_changed asynchronously, so the exact-frame guard alone loses
+# the race during rapid scrubbing; this rolling window covers the lag.  Refreshed
+# on every received message, so it only expires once the peer stops driving.
+_PLAYBACK_ECHO_GUARD_S = 0.4
+
 # Programmatically highlighting the selected clip inside a sequence track (via a
 # raw item_selection_atom send) can crash xStudio: the send into a recently-rebuilt
 # timeline races with that timeline's clip actors being torn down, and the
@@ -146,13 +153,23 @@ class PlaybackSyncController:
         self._last_applied_frame: int | None = None
         self._last_polled_playing: bool | None = None
         # Monotonic deadline until which local playhead attribute_changed events
-        # are NOT re-broadcast.  Set on every remote playback apply: ph.position
-        # fires attribute_changed asynchronously, and during rapid scrubbing the
-        # single _last_applied_frame guard loses the race (a lagging callback for
-        # an older frame no longer matches), echoing positions back and creating
-        # a feedback loop.  A short rolling window suppresses those echoes while a
-        # peer is driving playback, without blocking genuine local scrubs once it
-        # stops (the window simply expires).
+        # are NOT re-broadcast.  Armed on *receipt* of every remote playback
+        # message (and re-armed around the position apply itself), because what
+        # it really tracks is "a peer is currently driving playback" — which is
+        # true even for messages we deliberately drop.
+        #
+        # Two failure modes it covers.  First, ph.position fires
+        # attribute_changed asynchronously, so during rapid scrubbing the exact
+        # _last_applied_frame match loses the race (a lagging callback carries an
+        # older frame that no longer matches) and echoes positions back.  Second,
+        # when an incoming message is dropped — mismatched timeline_guid while
+        # paused, a play-state-only update — the local playhead may still move on
+        # its own (a selection change resetting it to the clip start), and that
+        # position would otherwise be broadcast to the driver as if it were a
+        # deliberate local seek, overriding the one the user asked for.
+        #
+        # Rolling rather than fixed: refreshed per message, so it expires only
+        # once the peer stops driving and genuine local scrubs go out again.
         self._playback_apply_suppress_until: float = 0.0
         # Monotonic deadline refreshed whenever we broadcast a *local* playhead
         # move (scrubbing).  Used only to suppress selection-driven clip-start
@@ -917,6 +934,21 @@ class PlaybackSyncController:
             return
         if time.monotonic() < self._pending_scrub_due:
             return
+        # Re-check the echo guard at FLUSH time, not just at capture time.
+        # This state was sampled when no peer was driving; if one has started
+        # since (the guard is armed), the queued position is stale by
+        # definition and sending it would override the seek that peer just
+        # told us about — the exact "driver snaps back to our old frame"
+        # failure the guard exists to prevent. Drop it: the remote apply is
+        # now the authority on where the playhead belongs.
+        if time.monotonic() < self._playback_apply_suppress_until:
+            stale_frame = self._pending_scrub_state["current_time"]["value"]
+            self._pending_scrub_state = None
+            _log(
+                f"Event: dropping throttled scrub broadcast frame={stale_frame:.0f}"
+                " — a peer is driving playback"
+            )
+            return
         state = self._pending_scrub_state
         self._pending_scrub_state = None
         self._last_scrub_broadcast_at = time.monotonic()
@@ -1103,9 +1135,36 @@ class PlaybackSyncController:
                                         if _ctg:
                                             self.plugin.manager.active_timeline_guid = _ctg
                                         # xStudio auto-plays on double-click, so tell remote
-                                        # peers to also start playing immediately.
-                                        self.broadcast_view_state(_cg, "source", playing_override=True)
-                                        _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} mode=source playing=True")
+                                        # peers to also start playing immediately — but only
+                                        # when this transition really came from a local
+                                        # double-click.  A peer-driven view switch produces
+                                        # the identical PSM True→False transition (an
+                                        # incoming message → apply_selection → pinned mode
+                                        # drops), and asserting playing=True there starts
+                                        # playback on every peer when no user asked for it,
+                                        # which then echoes back around as a genuine-looking
+                                        # play command.  The echo guard is armed for
+                                        # _PLAYBACK_ECHO_GUARD_S after any received playback
+                                        # message, so an armed guard means "a peer is
+                                        # driving": claim the auto-play only when it is not.
+                                        # override=None falls back to broadcast_view_state's
+                                        # own default of playing=False — i.e. "do not assert
+                                        # play", leaving the peer's existing play state to be
+                                        # governed by whoever is actually driving.
+                                        _peer_driven = (
+                                            time.monotonic()
+                                            < self._playback_apply_suppress_until
+                                        )
+                                        self.broadcast_view_state(
+                                            _cg, "source",
+                                            playing_override=None if _peer_driven else True,
+                                        )
+                                        _log(
+                                            f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} "
+                                            "mode=source playing="
+                                            + ("(unforced — peer-driven view switch)"
+                                               if _peer_driven else "True")
+                                        )
                                     else:
                                         _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
                                 else:
@@ -1299,11 +1358,25 @@ class PlaybackSyncController:
         # (i.e., this broadcast is genuinely local, not an echo of a remote apply).
         if time.monotonic() >= self._selection_broadcast_suppress_until:
             self._local_view_action_until = time.monotonic() + 1.0
-        state = self.current_playback_state() or {
-            "playing": False,
-            "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
-            "playback_mode": self._get_playback_mode(),
-        }
+        state = self.current_playback_state()
+        if state is None:
+            # Could not read the local playhead — it is missing, or a bounded
+            # read timed out against an actor torn down by a view switch. The
+            # fallback below does not say "unknown"; it fabricates frame 0 and
+            # broadcasts it as fact, and peers seek there. An unreadable
+            # position thus becomes a confident wrong one, indistinguishable
+            # downstream from a genuine seek to the clip start — so say so
+            # here, where the distinction still exists.
+            _log(
+                "[SEL] broadcast_view_state: current_playback_state() unavailable"
+                " — broadcasting FABRICATED frame=0"
+                f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
+            )
+            state = {
+                "playing": False,
+                "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
+                "playback_mode": self._get_playback_mode(),
+            }
         state["view_mode"] = view_mode
         state["clip_guid"] = clip_guid or None
         if playing_override is not None:
@@ -1315,6 +1388,17 @@ class PlaybackSyncController:
             # under a second (and RV with them); Loop keeps the shot playing so it
             # is actually reviewable on both peers.  Broadcast frame 0 + loop, and
             # apply both to our own playhead so xStudio matches.
+            #
+            # Logged to separate this DELIBERATE frame-0 from the fabricated one
+            # above: both leave as `value: 0.0` on the wire and are otherwise
+            # indistinguishable, but this one is correct behaviour while that one
+            # is a failed read. Also reports the position being discarded, since
+            # overwriting a seek that just landed is the way this goes wrong.
+            _log(
+                "[SEL] broadcast_view_state: new source-clip isolation"
+                f" {(clip_guid or '-')[:8]} — forcing frame=0"
+                f" (discarding position {state['current_time']['value']:.0f}) + loop"
+            )
             state["current_time"]["value"] = 0.0
             state["playback_mode"] = "loop"
             # Make Loop the *remembered* mode.  Every time a clip playhead is
@@ -1481,6 +1565,28 @@ class PlaybackSyncController:
         if not self.plugin.active_playhead:
             return
 
+        # Arm the echo guard on RECEIPT, ahead of every early return below —
+        # not only where a seek is actually applied.
+        #
+        # Receiving this message means a peer is driving playback, and that is
+        # true whether or not we go on to apply it.  Several paths deliberately
+        # drop it (mismatched timeline_guid while paused, a play-state-only
+        # update, a view switch that supersedes the seek), and each of those
+        # used to leave no guard armed at all.  Meanwhile the local playhead
+        # can still move for reasons of its own during that window — most
+        # often a selection change resetting it to the clip start.
+        # on_playhead_attribute_changed then sees a frame matching neither
+        # _last_applied_frame nor an active window, and broadcasts that stale
+        # position back to the driver, which applies it and loses the seek the
+        # user actually asked for.
+        #
+        # Observed as: peer seeks to 63 -> we drop the message on a timeline
+        # mismatch -> we broadcast our stale 0 twelve times over ~800 ms ->
+        # the driver snaps back to 0.
+        self._playback_apply_suppress_until = (
+            time.monotonic() + _PLAYBACK_ECHO_GUARD_S
+        )
+
         # 1. View switch (mode / active clip).  Switch the on-screen source only
         #    when it actually changes:
         #      * mode changed (sequence↔source), or
@@ -1638,10 +1744,15 @@ class PlaybackSyncController:
                 if (not playing or playing_changed) and not _tl_mismatch:
                     self._last_applied_frame = frame
                     self._last_polled_frame = frame
-                    # Suppress the echo: ph.position fires attribute_changed
-                    # asynchronously; refresh a rolling window so those callbacks
-                    # don't re-broadcast while a peer is driving playback.
-                    self._playback_apply_suppress_until = time.monotonic() + 0.4
+                    # Re-arm from *here* as well as on receipt above: everything
+                    # between the two (the view switch, a Loop Mode set, the
+                    # bounded playhead reads) can take a while, and ph.position's
+                    # attribute_changed fires asynchronously after this point.
+                    # Restarting the window keeps it covering that callback
+                    # rather than letting it expire mid-apply.
+                    self._playback_apply_suppress_until = (
+                        time.monotonic() + _PLAYBACK_ECHO_GUARD_S
+                    )
                     ph.position = frame
         except Exception:
             # xStudio's UI uses the new live playhead; re-acquire it via the

@@ -348,6 +348,194 @@ class TestSyncRecorderPlayer(unittest.TestCase):
             player_net.stop()
             peer_net.stop()
 
+    def test_pause_freezes_offset_and_resume_restores_it(self):
+        """The reported playback offset must be the same immediately before a
+        pause and immediately after the corresponding resume (proposal.md
+        §Verify offset frozen)."""
+        port = 9989
+        player_net = UDPNetwork(port=port, self_guid="pause_offset_player")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+                {"time_offset": 60.0, "payload": {"command": "B", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True)
+            player.tick()  # dispatch event A at offset 0.0
+
+            offset_before = time.time() - player._play_start_time
+            player.pause()
+            time.sleep(0.3)
+            for _ in range(3):
+                self.assertTrue(player.tick())
+            player.resume()
+            offset_after = time.time() - player._play_start_time
+
+            self.assertAlmostEqual(offset_before, offset_after, delta=0.05)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_paused_playback_dispatches_no_events(self):
+        """No event may be dispatched while paused, however long the pause
+        lasts (spec: sync-recorder-state-capture, "Paused playback dispatches
+        no events")."""
+        port = 9988
+        player_net = UDPNetwork(port=port, self_guid="pause_dispatch_player")
+        receiver_net = UDPNetwork(port=port, self_guid="pause_dispatch_receiver")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+                {"time_offset": 0.05, "payload": {"command": "B", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True)
+            player.tick()  # dispatch A
+            player.pause()
+
+            # Long enough that, unpaused, event B would have been dispatched
+            # many times over.
+            for _ in range(10):
+                player.tick()
+                time.sleep(0.03)
+
+            received = receiver_net.receive_payloads()
+            self.assertEqual(len(received), 1, "no event should dispatch while paused")
+            self.assertEqual(received[0]["command"], "A")
+        finally:
+            player.stop_playback()
+            player_net.stop()
+            receiver_net.stop()
+
+    def test_resume_preserves_event_spacing(self):
+        """After resume, the next event dispatched is the one that was next
+        before the pause, and inter-event spacing matches the recording,
+        unaffected by how long the pause lasted."""
+        port = 9987
+        player_net = UDPNetwork(port=port, self_guid="pause_spacing_player")
+        receiver_net = UDPNetwork(port=port, self_guid="pause_spacing_receiver")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+                {"time_offset": 0.1, "payload": {"command": "B", "payload": {}}},
+                {"time_offset": 0.2, "payload": {"command": "C", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True)
+            player.tick()  # dispatch A at offset 0.0
+            player.pause()
+            time.sleep(0.5)  # pause well past B and C's recorded offsets
+            player.resume()
+
+            # B should not be dispatched immediately on resume — its recorded
+            # spacing (0.1s after A) must still be honored.
+            player.tick()
+            received = receiver_net.receive_payloads()
+            self.assertEqual(
+                [p["command"] for p in received], ["A"],
+                "B dispatched before its recorded spacing elapsed post-resume",
+            )
+
+            time.sleep(0.15)
+            player.tick()
+            time.sleep(0.15)
+            player.tick()
+            received = receiver_net.receive_payloads()
+            self.assertEqual([p["command"] for p in received], ["B", "C"])
+        finally:
+            player.stop_playback()
+            player_net.stop()
+            receiver_net.stop()
+
+    def test_pause_idempotent(self):
+        """Pausing already-paused playback, or resuming playback that is not
+        paused, is a no-op."""
+        port = 9986
+        player_net = UDPNetwork(port=port, self_guid="pause_idempotent_player")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+            ]
+            player.start_playback(speed=1.0, replace_source_guid=True)
+
+            player.resume()  # not paused: no-op
+            self.assertFalse(player._paused)
+
+            player.pause()
+            paused_at_first = player._pause_started_at
+            time.sleep(0.05)
+            player.pause()  # already paused: no-op, must not reset the pause clock
+            self.assertEqual(player._pause_started_at, paused_at_first)
+
+            player.resume()
+            self.assertFalse(player._paused)
+            play_start_before = player._play_start_time
+
+            player.resume()  # already resumed: no-op
+            self.assertEqual(player._play_start_time, play_start_before)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_paused_player_still_answers_peer_state_request(self):
+        """A peer requesting state while playback is paused must still be
+        answered, exactly as during normal playback."""
+        port = 9985
+        player_net = UDPNetwork(port=port, self_guid="pause_peer_player")
+        peer_net = UDPNetwork(port=port, self_guid="pause_peer_peer")
+        try:
+            player = SyncPlayer(network=player_net)
+            player.events = [
+                {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+            ]
+            player._recorded_snapshot = {
+                "payload": {
+                    "command_schema": "LiveSession.1",
+                    "command": {
+                        "event": "STATE_SNAPSHOT",
+                        "payload": {
+                            "target_guid": None,
+                            "timelines": {},
+                            "snapshot_timestamp": 50.0,
+                        },
+                    },
+                }
+            }
+            player.start_playback(speed=1.0, replace_source_guid=True)
+            player.pause()
+
+            peer_net.send_payload({
+                "session": "otio-sync-demo",
+                "source_guid": "pause_peer_peer",
+                "payload": {
+                    "command_schema": "LiveSession.1",
+                    "command": {
+                        "event": "STATE_REQUEST",
+                        "payload": {
+                            "target_guid": "pause_peer_player",
+                            "requester_guid": "pause_peer_peer",
+                        },
+                    },
+                },
+            })
+
+            time.sleep(0.15)
+            self.assertTrue(player.tick(), "paused player must keep ticking")
+            time.sleep(0.15)
+
+            received = peer_net.receive_payloads()
+            snapshot_evt = next(
+                (p for p in received
+                 if p.get("payload", {}).get("command", {}).get("event") == "STATE_SNAPSHOT"),
+                None,
+            )
+            self.assertIsNotNone(snapshot_evt, "peer must be answered even while paused")
+        finally:
+            player.stop_playback()
+            player_net.stop()
+            peer_net.stop()
+
     def test_delayed_master_startup_handshake_capture(self):
         port = 9991
 
@@ -446,6 +634,228 @@ class TestSyncRecorderPlayer(unittest.TestCase):
         snapshot_recorded = next((e for e in events if e["payload"].get("payload", {}).get("command", {}).get("event") == "STATE_SNAPSHOT"), None)
         self.assertIsNotNone(snapshot_recorded)
         self.assertTrue(recorder._snapshot_captured)
+
+
+class TestExplicitClockArming(unittest.TestCase):
+    """The peer-join gate tracks peer-snapshot delivery; it no longer starts
+    the recording's logical clock by itself. The clock arms once the gate's
+    conditions AND arm_clock() have both happened, whichever comes last
+    (spec: sync-recorder-state-capture, "Explicit Clock Arming Decoupled From
+    Peer-Join Gate").
+    """
+
+    def _make_player(self, net, guid_prefix="arm"):
+        player = SyncPlayer(network=net)
+        player.events = [
+            {"time_offset": 0.0, "payload": {"command": "A", "payload": {}}},
+            {"time_offset": 0.05, "payload": {"command": "B", "payload": {}}},
+        ]
+        return player
+
+    def _satisfy_gate(self, player):
+        """Drive the gate's own conditions to satisfied, as a joining peer
+        receiving its snapshot would. Backdates the snapshot instant so the
+        post-snapshot cooling-off delay is already elapsed, keeping the test
+        about arming rather than about waiting out a timer."""
+        player._peers_snapshotted.add("peer-1")
+        player._peer_snapshot_sent_at = time.time() - 10.0
+
+    def test_gate_cleared_but_never_armed_dispatches_nothing(self):
+        """Gate conditions satisfied but arm_clock() never called: no event
+        dispatched however long we tick, and the network is still serviced
+        (spec: "A caller that never arms the clock sees no dispatch")."""
+        port = 9984
+        player_net = UDPNetwork(port=port, self_guid="arm_none_player")
+        receiver_net = UDPNetwork(port=port, self_guid="arm_none_receiver")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self._satisfy_gate(player)
+
+            for _ in range(15):
+                self.assertTrue(player.tick(), "unarmed player must keep ticking")
+                time.sleep(0.02)
+
+            self.assertEqual(
+                len(receiver_net.receive_payloads()), 0,
+                "no event may dispatch before the clock is armed",
+            )
+            self.assertIsNone(player._play_start_time, "clock must remain unarmed")
+            self.assertTrue(player._wait_for_peer, "gate must stay engaged until armed")
+        finally:
+            player.stop_playback()
+            player_net.stop()
+            receiver_net.stop()
+
+    def test_arming_before_gate_clears_does_not_start_clock_early(self):
+        """arm_clock() ahead of the gate must not bypass it — the clock starts
+        when the gate's conditions are later satisfied, not at the moment of
+        the arm request (spec: "Arming before the gate clears does not start
+        the clock early")."""
+        port = 9983
+        player_net = UDPNetwork(port=port, self_guid="arm_early_player")
+        receiver_net = UDPNetwork(port=port, self_guid="arm_early_receiver")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            player.arm_clock()
+
+            # No peer has been snapshotted yet: arming alone must not dispatch.
+            for _ in range(5):
+                self.assertTrue(player.tick())
+                time.sleep(0.02)
+            self.assertIsNone(
+                player._play_start_time,
+                "arming must not bypass the peer-join gate",
+            )
+            self.assertEqual(len(receiver_net.receive_payloads()), 0)
+
+            # Now satisfy the gate; the clock arms on the next tick.
+            self._satisfy_gate(player)
+            player.tick()
+            self.assertIsNotNone(player._play_start_time)
+            self.assertAlmostEqual(player._play_start_time, time.time(), delta=0.2)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+            receiver_net.stop()
+
+    def test_arming_after_gate_cleared_arms_on_next_tick(self):
+        """arm_clock() when the gate is already satisfied arms the clock on the
+        very next tick (spec: "Explicit arming starts the clock")."""
+        port = 9982
+        player_net = UDPNetwork(port=port, self_guid="arm_late_player")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self._satisfy_gate(player)
+            player.tick()
+            self.assertIsNone(player._play_start_time)
+
+            time.sleep(0.2)
+            player.arm_clock()
+            player.tick()
+
+            self.assertIsNotNone(player._play_start_time, "clock must arm on the next tick")
+            self.assertFalse(player._wait_for_peer, "gate must release once armed")
+            # t=0 is the arm, not the earlier gate-clear: a recording event at
+            # offset 0.05 must not already be considered overdue by 0.2s.
+            self.assertLess(time.time() - player._play_start_time, 0.1)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_wait_for_peer_false_is_unchanged(self):
+        """The default mode still arms synchronously in start_playback(),
+        whether or not arm_clock() is ever called."""
+        port = 9981
+        player_net = UDPNetwork(port=port, self_guid="arm_default_player")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0)
+            self.assertIsNotNone(
+                player._play_start_time,
+                "wait_for_peer=False must arm synchronously, as before",
+            )
+            armed_at = player._play_start_time
+
+            # arm_clock() is a harmless no-op in this mode.
+            player.arm_clock()
+            player.tick()
+            self.assertEqual(player._play_start_time, armed_at)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_pause_while_unarmed_then_arm_and_resume(self):
+        """Pausing before the clock has ever been armed must not corrupt
+        _play_start_time or cause a premature or duplicate arm."""
+        port = 9980
+        player_net = UDPNetwork(port=port, self_guid="arm_pause_player")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self._satisfy_gate(player)
+
+            player.pause()
+            for _ in range(5):
+                self.assertTrue(player.tick(), "paused unarmed player keeps ticking")
+                time.sleep(0.02)
+            self.assertIsNone(player._play_start_time, "pause must not arm the clock")
+
+            player.arm_clock()
+            player.tick()  # still paused: the paused check precedes the gate
+            self.assertIsNone(
+                player._play_start_time,
+                "arming while paused must not arm until resumed",
+            )
+
+            player.resume()  # must not corrupt a None anchor
+            self.assertIsNone(player._play_start_time)
+            player.tick()
+            self.assertIsNotNone(player._play_start_time, "clock arms after resume")
+            self.assertAlmostEqual(player._play_start_time, time.time(), delta=0.2)
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_gate_to_arm_interval_is_logged(self):
+        """Both ends of the gate-to-arm interval are logged, and the reported
+        interval matches the delay actually injected — this is the measurement
+        the change is justified by, so it must be trustworthy."""
+        port = 9979
+        player_net = UDPNetwork(port=port, self_guid="arm_log_player")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self._satisfy_gate(player)
+
+            with self.assertLogs(level="INFO") as captured:
+                player.tick()  # gate clears, unarmed -> "holding" line
+                time.sleep(0.5)
+                player.arm_clock()
+                player.tick()  # arms -> interval line
+
+            messages = "\n".join(captured.output)
+            self.assertIn("gate cleared", messages.lower())
+            self.assertIn("clock armed", messages.lower())
+            armed_line = next(l for l in captured.output if "Clock armed" in l)
+            reported = float(armed_line.split("Clock armed ")[1].split("s after")[0])
+            self.assertAlmostEqual(
+                reported, 0.5, delta=0.2,
+                msg=f"reported interval {reported}s should match the ~0.5s injected",
+            )
+        finally:
+            player.stop_playback()
+            player_net.stop()
+
+    def test_arm_from_previous_run_is_not_inherited(self):
+        """start_playback() clears the arm flag, so reusing a player instance
+        for a second run cannot inherit a stale arm from the first."""
+        port = 9978
+        player_net = UDPNetwork(port=port, self_guid="arm_reuse_player")
+        try:
+            player = self._make_player(player_net)
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self._satisfy_gate(player)
+            player.arm_clock()
+            player.tick()
+            self.assertIsNotNone(player._play_start_time, "first run arms normally")
+
+            # Second run on the same instance: the previous arm must not carry.
+            player.start_playback(speed=1.0, wait_for_peer=True, post_snapshot_delay=0.0)
+            self.assertFalse(player._clock_arm_requested)
+            self._satisfy_gate(player)
+            for _ in range(5):
+                player.tick()
+                time.sleep(0.02)
+            self.assertIsNone(
+                player._play_start_time,
+                "second run must wait for its own arm_clock()",
+            )
+        finally:
+            player.stop_playback()
+            player_net.stop()
 
 
 if __name__ == "__main__":
