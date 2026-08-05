@@ -59,6 +59,83 @@ def _normalize_clip_name(name):
     return normalize_clip_name(name)
 
 
+def _media_identity(state):
+    """Normalised on-screen media path, or None if the app did not report one.
+
+    This is the only per-clip identity the harness gets. ``state["clip"]`` is
+    the active *timeline* name — identical for both apps whichever clip they
+    are actually showing — so without this, a frame comparison cannot tell
+    "both apps at frame 61 of the same shot" from "each at frame 61 of a
+    different shot". The two are not the same thing and only one is sync.
+
+    Both hooks store the raw value, which may be a ``file://`` URI (xStudio's
+    media_reference) or a plain path (OpenRV's sourceMedia), so the strings do
+    not compare directly — the reason ``media_path`` sits in compare_states'
+    ignore_keys. Normalise here rather than leave the field unusable.
+    """
+    if not isinstance(state, dict):
+        return None
+    path = state.get("media_path")
+    if not path:
+        return None
+    if path.startswith("file://localhost"):
+        path = path[16:]
+    elif path.startswith("file://"):
+        path = path[7:]
+    elif path.startswith("file:/"):
+        path = path[5:]
+    path = os.path.normpath(path)
+    # normpath deliberately PRESERVES exactly two leading slashes (POSIX leaves
+    # "//" implementation-defined), so a "file:////Users/x" URI normalises to
+    # "//Users/x" and compares unequal to "/Users/x" — the same file, reported
+    # as a clip mismatch. Collapse any leading run of slashes to one.
+    return re.sub(r"^/+", "/", path)
+
+
+def _media_disagreement(states, app_names):
+    """Names of apps showing different media, or None when they agree.
+
+    Apps that report no media at all are excluded rather than treated as a
+    mismatch — "unknown" is not "different" (the same reasoning that makes
+    media_exists default True).
+    """
+    known = [
+        (name, _media_identity(st))
+        for st, name in zip(states, app_names)
+        if _media_identity(st) is not None
+    ]
+    if len(known) < 2:
+        return None
+    first = known[0][1]
+    if all(ident == first for _, ident in known):
+        return None
+    # Full paths, not basenames: two apps can report the same filename from
+    # different directories (or one resolving a symlink the other does not),
+    # and a message showing only "car.mov vs car.mov" is unreadable.
+    return ", ".join(f"{name}={ident}" for name, ident in known)
+
+
+def _view_mode_disagreement(states, app_names):
+    """Report a sequence-vs-isolated-clip split, or None when the apps agree.
+
+    A frame index means a different thing in each mode — an offset into the
+    whole sequence versus an offset into one isolated clip — so comparing
+    across a split compares unlike quantities. Apps not reporting a view mode
+    are excluded: unknown is not disagreement.
+    """
+    known = [
+        (name, st.get("view_mode"))
+        for st, name in zip(states, app_names)
+        if isinstance(st, dict) and st.get("view_mode") is not None
+    ]
+    if len(known) < 2:
+        return None
+    first = known[0][1]
+    if all(mode == first for _, mode in known):
+        return None
+    return ", ".join(f"{name}={mode}" for name, mode in known)
+
+
 def _playhead_is_playing(state):
     """True if *state* reports an actively playing playhead.
 
@@ -121,6 +198,15 @@ def _format_observed(states, app_names):
                     playing = playback.get("playing")
             if playing is not None:
                 desc += f" playing={playing}"
+            # The clip actually on screen. Without it a matching frame across
+            # two different shots is indistinguishable from real sync.
+            media = _media_identity(state)
+            desc += f" media={os.path.basename(media) if media else None!r}"
+            # Sequence vs isolated-clip view. Frame numbers mean different
+            # things in each, so a comparison across a view-mode split is not
+            # comparing like with like.
+            if state.get("view_mode") is not None:
+                desc += f" view={state['view_mode']}"
             parts.append(desc)
     return " | ".join(parts) if parts else "<no apps>"
 
@@ -513,6 +599,37 @@ class TestRunner:
                     f"playback still active on {', '.join(playing)} — a seek must "
                     "park the playhead, so no frame assertion is possible\n"
                     f"  observed: {_format_observed(states, names)}"
+                )
+            # Same frame on different clips is not sync. Establish that the
+            # apps are looking at the same media before believing any frame
+            # comparison between them — otherwise a "passing" seek check can
+            # be comparing frame 61 of one shot against frame 61 of another.
+            disagreement = _media_disagreement(states, names)
+            if disagreement:
+                return False, (
+                    f"apps are showing different media ({disagreement}) — a frame "
+                    "comparison between them is meaningless until they agree\n"
+                    f"  observed: {_format_observed(states, names)}"
+                )
+            # A sequence/isolated-clip split is reported but NOT failed on.
+            # In principle frame indices are incomparable across it — one
+            # counts from the start of the sequence, the other from the start
+            # of the clip. In practice they coincide whenever the isolated clip
+            # is the sequence's first, and /state does not expose the clip's
+            # offset within the sequence, so we cannot tell the harmful case
+            # from the harmless one here. The media check above already blocks
+            # the genuinely dangerous comparison (different clips entirely).
+            # Surfaced as a warning because the split may still be a real view
+            # desync worth chasing on its own.
+            view_split = _view_mode_disagreement(states, names)
+            # Once per check, not once per poll: this is a standing condition,
+            # so re-reporting it every 0.5s buries the actual result.
+            if view_split and view_split != seen.get("warned_split"):
+                seen["warned_split"] = view_split
+                logging.warning(
+                    f"View-mode split during {label}: {view_split} — frame "
+                    "comparison proceeding (same media), but the apps are not "
+                    "showing the same thing."
                 )
             return self.validate_checkpoint(states, names, checkpoint)
 

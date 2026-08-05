@@ -16,6 +16,7 @@ def get_openrv_state():
         "clip": None,
         "frame": None,
         "playing": False,
+        "view_mode": None,
         "annotations": [],
         "is_master": None,
     }
@@ -48,6 +49,22 @@ def get_openrv_state():
         # but xStudio always reports its playlist/timeline name ("Default").
         # Anchoring both sides to the sequence level makes the comparison robust.
         view_node = rv.commands.viewNode()
+
+        # Whether we are viewing the whole sequence or a single isolated clip.
+        # Without this the harness cannot tell "both apps at frame 61 of the
+        # sequence" from "one at frame 61 of the sequence, the other at frame 61
+        # of an isolated clip" — the states look identical because state["clip"]
+        # reports the timeline name in both cases. Same rule the RV controller
+        # itself uses in on_view_changed: an RVSourceGroup view is single-clip.
+        try:
+            state["view_mode"] = (
+                "source"
+                if rv.commands.nodeType(view_node) == "RVSourceGroup"
+                else "sequence"
+            )
+        except Exception:
+            state["view_mode"] = None
+
         clip_name = None
         try:
             seq_groups = rv.commands.nodesOfType("RVSequenceGroup")

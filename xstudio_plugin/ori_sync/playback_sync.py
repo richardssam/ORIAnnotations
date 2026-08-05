@@ -151,6 +151,11 @@ class PlaybackSyncController:
         # change came from a remote apply, so we skip re-broadcasting (echo guard).
         self._last_polled_frame: int | None = None
         self._last_applied_frame: int | None = None
+        # Last position a peer sent us, recorded on RECEIPT whether or not we
+        # applied it — unlike _last_applied_frame, which only tracks applies.
+        # While a peer is driving, this is what that peer believes the position
+        # to be, and so the only safe value for us to put on the wire.
+        self._last_received_frame: int | None = None
         self._last_polled_playing: bool | None = None
         # Monotonic deadline until which local playhead attribute_changed events
         # are NOT re-broadcast.  Armed on *receipt* of every remote playback
@@ -243,6 +248,7 @@ class PlaybackSyncController:
         self._last_scanned_playhead_key = None
         self._last_polled_frame = None
         self._last_applied_frame = None
+        self._last_received_frame = None
         self._last_polled_playing = None
         self._playback_apply_suppress_until = 0.0
         self._local_scrub_active_until = 0.0
@@ -1381,6 +1387,37 @@ class PlaybackSyncController:
         state["clip_guid"] = clip_guid or None
         if playing_override is not None:
             state["playing"] = playing_override
+
+        # Withhold OUR position while a peer is driving playback.
+        #
+        # This message exists to announce a view change; the position it
+        # carries is incidental. But a view switch tears down and re-acquires
+        # the playhead, and a freshly acquired playhead reads 0 — so this path
+        # would broadcast a genuine-but-meaningless 0 shortly after a peer's
+        # seek landed, and the driver would apply it and lose the seek.
+        # Observed: RECV frame=61 -> playhead re-acquired 119ms later ->
+        # SEND frame=0 at 182ms, while a sibling path logged "suppressed
+        # (echo guard)" in the same millisecond. This was the last broadcast
+        # path not consulting the guard.
+        #
+        # "Withhold" cannot mean omitting current_time: a receiver reads it as
+        # `current_time.get("value", 0)`, so an absent field IS frame 0 — the
+        # very bug. Instead send back the position the driver last told us,
+        # which is a no-op for them and leaves the message well-formed. With
+        # nothing received yet there is nothing to defer to, so fall through
+        # to our own reading.
+        if (
+            time.monotonic() < self._playback_apply_suppress_until
+            and self._last_received_frame is not None
+        ):
+            _own = state["current_time"]["value"]
+            if int(_own) != self._last_received_frame:
+                _log(
+                    "[SEL] broadcast_view_state: withholding own position"
+                    f" {_own:.0f} while a peer is driving — deferring to"
+                    f" driver's frame={self._last_received_frame}"
+                )
+            state["current_time"]["value"] = float(self._last_received_frame)
         if _new_source_clip:
             # A new single-clip isolation: start at the clip's first frame AND
             # loop it.  Isolated clips are typically short shots being reviewed —
@@ -1389,17 +1426,33 @@ class PlaybackSyncController:
             # is actually reviewable on both peers.  Broadcast frame 0 + loop, and
             # apply both to our own playhead so xStudio matches.
             #
-            # Logged to separate this DELIBERATE frame-0 from the fabricated one
-            # above: both leave as `value: 0.0` on the wire and are otherwise
-            # indistinguishable, but this one is correct behaviour while that one
-            # is a failed read. Also reports the position being discarded, since
-            # overwriting a seek that just landed is the way this goes wrong.
-            _log(
-                "[SEL] broadcast_view_state: new source-clip isolation"
-                f" {(clip_guid or '-')[:8]} — forcing frame=0"
-                f" (discarding position {state['current_time']['value']:.0f}) + loop"
+            # The frame-0 reset is right only for a LOCAL isolation. When this
+            # isolation came from applying a peer's message, that peer has
+            # already said where the playhead belongs — forcing 0 discards
+            # their seek, the same "treat a peer-driven transition as a local
+            # user action" error as the auto-play inference above. Loop mode
+            # applies either way: an isolated clip should loop for review no
+            # matter who isolated it.
+            _peer_driven_isolation = (
+                time.monotonic() < self._playback_apply_suppress_until
             )
-            state["current_time"]["value"] = 0.0
+            if _peer_driven_isolation:
+                _log(
+                    "[SEL] broadcast_view_state: new source-clip isolation"
+                    f" {(clip_guid or '-')[:8]} — peer-driven, keeping frame"
+                    f" {state['current_time']['value']:.0f} (loop still applied)"
+                )
+            else:
+                # Logged to separate this DELIBERATE frame-0 from the fabricated
+                # one above: both leave as `value: 0.0` on the wire and are
+                # otherwise indistinguishable, but this one is correct behaviour
+                # while that one is a failed read.
+                _log(
+                    "[SEL] broadcast_view_state: new source-clip isolation"
+                    f" {(clip_guid or '-')[:8]} — forcing frame=0"
+                    f" (discarding position {state['current_time']['value']:.0f}) + loop"
+                )
+                state["current_time"]["value"] = 0.0
             state["playback_mode"] = "loop"
             # Make Loop the *remembered* mode.  Every time a clip playhead is
             # (re-)acquired — including at the loop boundary when the clip
@@ -1586,6 +1639,16 @@ class PlaybackSyncController:
         self._playback_apply_suppress_until = (
             time.monotonic() + _PLAYBACK_ECHO_GUARD_S
         )
+        # Record the driver's position here too, ahead of the same early
+        # returns — broadcast_view_state needs it to avoid putting our own
+        # position on the wire while being driven, and by the time `frame` is
+        # parsed further down we may already have returned.
+        _incoming_ct = state.get("current_time") or {}
+        if "value" in _incoming_ct:
+            try:
+                self._last_received_frame = max(0, int(_incoming_ct["value"]))
+            except (TypeError, ValueError):
+                pass
 
         # 1. View switch (mode / active clip).  Switch the on-screen source only
         #    when it actually changes:

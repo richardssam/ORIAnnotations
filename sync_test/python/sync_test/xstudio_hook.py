@@ -40,6 +40,7 @@ def get_xstudio_state(port=14441):
         "clip": None,
         "frame": None,
         "playing": False,
+        "view_mode": None,
         "annotations": [],
         "is_master": None,
         # Seeded here rather than inside the container read below, so a failed
@@ -131,6 +132,18 @@ def get_xstudio_state(port=14441):
                 # that if the playhead admits it is moving.
                 try:
                     state["playing"] = bool(ph.playing)
+                except Exception:
+                    pass
+                # Sequence view vs a single isolated clip. Needed because
+                # state["clip"] reports the timeline name either way, so
+                # without it "frame 61 of the sequence" and "frame 61 of an
+                # isolated clip" are indistinguishable in the harness.
+                # Mapping follows the plugin's own use of this attribute
+                # (playback_sync PSM handler): pinned True means we are back on
+                # the timeline, False means a clip has been isolated.
+                try:
+                    _psm = ph.get_attribute("Pinned Source Mode").value()
+                    state["view_mode"] = "sequence" if _psm else "source"
                 except Exception:
                     pass
                 ms = ph.on_screen_media
