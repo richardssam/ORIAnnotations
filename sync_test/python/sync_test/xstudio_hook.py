@@ -60,10 +60,25 @@ def get_xstudio_state(port=14441):
         # reach the plugin's SyncManager directly, but export_state() already
         # writes is_master into that file (see manager.py) for exactly this
         # kind of harness visibility.
+        synced_timeline_name = None
         try:
             full = get_xstudio_full_state(port)
             if isinstance(full, dict) and "is_master" in full:
                 state["is_master"] = full["is_master"]
+            # The synced timeline's name, resolved through the shared sync GUID.
+            # This is the only container name that means the same thing on every
+            # peer: the viewed-container name below reports the *timeline* when a
+            # timeline is focused and the *playlist* when a bin is, so two peers
+            # in perfect sync can report different strings purely because their
+            # UI focus differs. Observed in otio_xstudio_timeline_changes, where
+            # one instance reported 'Sequence 1' (the timeline) and the other
+            # 'Added Media' (the bin containing it) — both correct, neither
+            # comparable. Keyed by GUID, this agrees by construction.
+            if isinstance(full, dict):
+                _atg = full.get("active_timeline_guid")
+                _tl = (full.get("timelines") or {}).get(_atg)
+                if isinstance(_tl, dict) and _tl.get("name"):
+                    synced_timeline_name = _tl["name"]
         except Exception:
             pass
         
@@ -100,6 +115,18 @@ def get_xstudio_state(port=14441):
                     state["clip"] = playlists[0].name
             except Exception:
                 pass
+
+        # Prefer the synced timeline name over whatever container happens to be
+        # focused. Applied last so it overrides both branches above and the
+        # fallback: those answer "what is this instance looking at", which is a
+        # per-peer UI question, while comparisons need "which synced timeline is
+        # active", which is a session-wide one. OpenRV's hook already anchors at
+        # sequence level for the same reason ("Anchoring both sides to the
+        # sequence level makes the comparison robust"), so this brings xStudio
+        # into line rather than inventing a new convention. Falls through to the
+        # focus-dependent value when the plugin has no active timeline yet.
+        if synced_timeline_name:
+            state["clip"] = synced_timeline_name
 
         # 2b. Playhead position / play state.
         # Deliberately a SIBLING of the container read above, not nested inside
