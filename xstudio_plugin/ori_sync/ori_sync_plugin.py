@@ -900,6 +900,22 @@ class ORISyncPlugin(PluginBase):
             _log_exc(f"join_event_group failed for {label}")
             return None
         self._event_group_subs[key] = {"sub_id": sub_id, "callbacks": [(label, cb)]}
+        # Report the registry size on every NEW group join. Entries are keyed by
+        # actor address and are deliberately never left while connected (a stale
+        # join costs one no-op dispatch), so this dict grows by one for every
+        # distinct actor we ever subscribe to — most visibly, once per playhead
+        # replacement. One stale entry is the accepted trade; an unbounded run of
+        # them is not, because every group event then fans out across all of
+        # them. Counting here makes that observable without waiting out a long
+        # session: the driver is adoption count, not elapsed time, so repeating
+        # the actions that replace a playhead (viewport switch, on-screen source
+        # change, entering/leaving single-clip isolation) exercises it directly.
+        _log(
+            f"[event-group] joined {label} on new group {key} — "
+            f"{len(self._event_group_subs)} group(s) joined, "
+            f"{sum(len(e['callbacks']) for e in self._event_group_subs.values())} "
+            "handler(s) total"
+        )
         return key
 
     def detach_event_group_handler(self, key: "str | None", label: str) -> None:

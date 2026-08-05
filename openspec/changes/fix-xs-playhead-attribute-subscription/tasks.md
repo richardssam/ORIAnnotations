@@ -113,19 +113,36 @@ the exact moment delivery stops. Treat that call as unusable on this build.
 ## 2. Verify
 
 - [x] 2.1 Scrub in one xStudio and confirm the peer follows — **confirmed working by the user**
-- [ ] 2.2 Confirm `queuing playback state broadcast` now appears in the plugin log, and that `PLAYBACK_SETTINGS_1.0` messages carry real frame values rather than `frame=0.0`
-- [ ] 2.3 Confirm `[position_atom] active playhead updated` now fires a small number of times per session, not ~21 for a single unchanged playhead
-- [ ] 2.4 Confirm position sync survives playhead replacement: switch viewport, change on-screen source, enter and leave single-clip isolation, then scrub again after each
-- [ ] 2.5 Confirm play/stop (not just scrub) propagates, since `playing` rides the same callback
-- [ ] 2.6 Check for an `on_screen_media_changed` regression — `PluginBase` no longer maintains a playhead, so that hook is dead. Nothing overrides it, but confirm rather than assume (design.md Risks)
-- [ ] 2.7 Long-session check: adoption should now be rare, but confirm playhead wrappers are not accumulating subscriptions over an extended session
+- [x] 2.2 Confirm `queuing playback state broadcast` now appears in the plugin log, and that `PLAYBACK_SETTINGS_1.0` messages carry real frame values rather than `frame=0.0`
+- [x] 2.3 Confirm `[position_atom] active playhead updated` now fires a small number of times per session, not ~21 for a single unchanged playhead
+- [x] 2.4 Confirm position sync survives playhead replacement: switch viewport, change on-screen source, enter and leave single-clip isolation, then scrub again after each
+- [x] 2.5 Confirm play/stop (not just scrub) propagates, since `playing` rides the same callback
+- [x] 2.6 Check for an `on_screen_media_changed` regression — `PluginBase` no longer maintains a playhead, so that hook is dead. Nothing overrides it, but confirm rather than assume (design.md Risks)
+- [ ] 2.7 Confirm event-group subscriptions are not accumulating. **The driver is playhead-adoption count, not elapsed time** — `_event_group_subs` is keyed by actor address and (per 2.4) is never left while connected, so it gains a permanent entry for every distinct actor subscribed to, i.e. one per playhead replacement. A long idle session proves nothing; many adoptions in a short one proves it directly.
+
+  Procedure: watch the new `[event-group] joined … N group(s) joined, M handler(s) total` line, then repeat the 2.4 actions ~10–20 times — switch viewport, change on-screen source, enter and leave single-clip isolation — each of which replaces the playhead.
+
+  - Expected if healthy: N plateaus (the same actors are re-encountered, `join_event_group` finds the existing entry and only swaps the labelled callback).
+  - Expected if leaking: N climbs with each new actor. (Note this is *not* a per-event cost: each subscription is a `functools.partial` bound to its own key, so dispatch only ever touches that key's callbacks. An orphaned entry costs a retained subscription, not fan-out work.)
+
+  **Measured 2026-08-05 — it leaks.** Groups climbed 5→11 monotonically while handlers oscillated 5,6,6,7,6,6,5 — so detach works, but entries are never removed and ~6 of 11 held no callbacks at all. Growth occurs on playlist creation, which mints new container and item actors: `container-selection` re-joined three times under three different keys (`16414`, `19988`, `21418`). `join_event_group` dedupes by label only *within* a key, so when the viewed container changes the label migrates to a new key and the old entry is orphaned.
+
+  Note `_event_group_subs` is written in exactly one place and **never pruned or cleared** — not on disconnect, and there is no plugin-level `reset()`. So N climbs for the life of the plugin instance and across reconnects. One stale join is the accepted trade in 2.4; an unbounded run of them is a different thing and would need a prune-on-adoption or a plugin `reset()` (see `xstudio-controller-encapsulation`, which adds per-controller `reset()` but does not cover this dict).
+
+- [ ] 2.8 **Low priority — the recycling question, kept open only because we stay on `develop` meanwhile.** `event_group_key` is `str(obj.remote)`. If xStudio ever reuses an actor address, a new actor maps onto an orphaned entry and `join_event_group` takes its `entry is not None` branch: it appends the callback but **never subscribes to the new actor**, so its events are silently dropped — the same silent-deafness class as the `19:23:38` failure, and invisible, since only *new* keys log.
+
+  Partial evidence already in hand: the keys observed on 2026-08-05 (`16414`, `19983`, `19988`, `21164`, `21413`, `21418`, `21755`) are distinct and monotonically increasing within a session, which is what an allocating counter looks like rather than a recycling pool. Not proof, but enough to treat the hazard as unlikely rather than pressing. Revisit only if events go silent with no corresponding join line.
+
+- [ ] 2.9 **Parked — superseded by `pr/python-per-subscription-listeners`, do not build a workaround for this.** The accumulation in 2.7 is a symptom of the shared-listener design, and the upstream branch fixes the cause: one listener actor per subscription, so memberships are independent (`BroadcastActor::subscribers_` no longer collapses every Python subscription onto one entry) and `unsubscribe` stops revoking other subscribers. That removes the reasons `_event_group_subs` exists at all — join-once (2.3), never-leave (2.4) and the dedupe registry all become unnecessary, and 2.7/2.8 dissolve with them.
+
+  Investing in a prune-on-adoption, a threshold warning, or an actor-death hook now would be building maintenance for code scheduled for deletion. The measured leak is bounded by distinct-actor count with **no per-event cost** (dispatch is per-key), so living with it while the PR is pending is cheap. Options recorded for the record, should the PR be rejected outright: warn above a threshold; subscribe to fewer groups (4 of 7 observed new entries were `item:*`); invalidate on actor death if a signal exists without unsubscribing.
 
 ## 3. Re-establish a trustworthy baseline
 
 - [ ] 3.1 Answer design.md's open question: did this regress with the rebase onto `develop`, or earlier? Determines whether pre-rebase recordings and test results are still usable
 - [x] 3.2 Re-record `sync_test/recordings/xstudio_selects.jsonl`. It is stale for an unrelated reason (predates `d18ec21`, which retired `SELECTION_1.0` — see the `sync-source-view-playback` change), and re-recording was not viable while position events were never emitted — done 2026-08-02 as `xstudio_selects_v2.jsonl`; `xstudio_selects` now passes
-- [ ] 3.2a Re-record the three remaining position-dependent recordings, all still dated 2026-07-06 and therefore captured inside the broken window: `add_media_notc.jsonl`, `delete_media_notc.jsonl`, `reorder_media_v2.jsonl`
-- [ ] 3.3 Re-run the `sync_test` suite and record the result as the new baseline. Any run made during the broken window is void for position-dependent assertions
+- [x] 3.2a Re-record the three remaining position-dependent recordings, all still dated 2026-07-06 and therefore captured inside the broken window: `add_media_notc.jsonl`, `delete_media_notc.jsonl`, `reorder_media_v2.jsonl`
+- [x] 3.3 Re-run the `sync_test` suite and record the result as the new baseline. Any run made during the broken window is void for position-dependent assertions
 - [ ] 3.4 Revisit `sync-source-view-playback` against that baseline — its remaining scope may reduce to the recording refresh
 
 ### Measured 2026-08-03 (run during `xstudio-controller-encapsulation`)
@@ -152,5 +169,10 @@ stashed — identical failures.
 
 ## 4. Upstream follow-up
 
-- [ ] 4.1 Feed this back to the xStudio developer as a concrete consequence of the shared-listener design: an ordinary plugin following the documented API loses playhead events entirely. It is a stronger argument for `pr/python-per-subscription-listeners` than the synthetic repro
-- [ ] 4.2 If that branch lands, re-verify whether `subscribe_to_playhead_events()` becomes safe — re-verify, do not assume — and decide whether to keep this workaround
+- [ ] 4.1 Feed this back to the xStudio developer as a concrete consequence of the shared-listener design: an ordinary plugin following the documented API loses playhead events entirely. It is a stronger argument for `pr/python-per-subscription-listeners` than the synthetic repro.
+
+  Add the 2026-08-05 measurement as second evidence: on `develop`, `_event_group_subs` grew 5→11 groups in ~3 minutes of ordinary playlist creation, each entry a permanently retained subscription, ~6 of them with no callbacks left. This is not a plugin bug being worked around — it is the shared listener forcing every Python subscriber to maintain a de-duplication registry it should not need.
+
+- [ ] 4.2 **This is the real fix for 2.7/2.8/2.9 — track it, do not re-solve it locally.** Staying on `develop` in the meantime is a deliberate choice (acceptance may take weeks); the workaround is correct there and the leak it carries is bounded and cheap.
+
+  When the branch lands: re-verify — do not assume — whether `subscribe_to_playhead_events()` becomes safe, then remove the workaround stack in order (dedupe registry, never-leave rule, join-once rule) rather than piecemeal, since they exist as one mechanism. Note the branch was cut 2026-07-31 and `develop` has moved since, so confirm it still applies before rebuilding.
