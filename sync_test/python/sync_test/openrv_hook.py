@@ -32,6 +32,9 @@ def get_openrv_state():
         # healthy session; non-empty means some peer broadcast against an object
         # this one was never given, which used to produce no signal at all.
         "unresolved_patches": [],
+        # The sender-side counterpart. Unlike the above, any entry here IS a
+        # defect: a peer always knows what it published.
+        "unpublished_parents": [],
     }
 
     try:
@@ -44,6 +47,9 @@ def get_openrv_state():
                 state["host_guid"] = getattr(_mgr_for_master, "host_guid", None)
                 state["unresolved_patches"] = list(
                     getattr(_mgr_for_master, "unresolved_patches", []) or []
+                )
+                state["unpublished_parents"] = list(
+                    getattr(_mgr_for_master, "unpublished_parents", []) or []
                 )
             _pb = otio_sync_core.get_registered_playback_controller()
             if _pb is not None:

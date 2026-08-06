@@ -216,6 +216,8 @@ def _format_observed(states, app_names):
                 desc += f" MIRROR-FAILED({state['view_mirror_error']})"
             if state.get("unresolved_patches"):
                 desc += f" UNRESOLVED-PATCHES({len(state['unresolved_patches'])})"
+            if state.get("unpublished_parents"):
+                desc += f" UNPUBLISHED-PARENTS({len(state['unpublished_parents'])})"
             parts.append(desc)
     return " | ".join(parts) if parts else "<no apps>"
 
@@ -549,7 +551,7 @@ class TestRunner:
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
                            "is_host", "host_guid", "view_mirror_error",
-                           "unresolved_patches"}
+                           "unresolved_patches", "unpublished_parents"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 

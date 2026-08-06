@@ -38,8 +38,15 @@
 
 ## 5. Send-side guard
 
-- [ ] 5.1 Refuse, or at minimum report, a broadcast patch whose parent this peer has never published (design.md D2). Report-only first.
+- [x] 5.1 Refuse, or at minimum report, a broadcast patch whose parent this peer has never published (design.md D2). Report-only first.
+  - `SyncManager._check_parent_published`, reporting into `unpublished_parents` / `unpublished_parent_count` — bounded to 10 details with a full count, like §4, and into `export_state()` and both hooks.
+  - The test is *what crossed the wire*, tracked in `_session_guids`, deliberately **not** `_object_map`: in the defect the parent was firmly in the local map and had simply never been announced, so only a record of what was sent distinguishes the two. Populated on both sides — `broadcast_add_timeline`, `insert_child`, `send_state_snapshot` when sending; `_h_add_timeline`, `apply_snapshot`, a received `INSERT_CHILD` when receiving — because a peer may legitimately address structure *another* peer published.
+  - `reset_timelines` deliberately does not clear it. Rebuilding local state does not un-send messages, and clearing there would fire on precisely the master re-initialisation this change was chasing. Pinned by a test.
+  - This is the check §4.2 could not be: a sender always knows what it published, so unlike `unresolved_patches` a non-zero count here is unambiguously a defect.
+  - 10 tests in `tests/otio_sync/test_send_side_guard.py`, including that the message still goes out.
 - [ ] 5.2 Escalate to refusal only once the full suite is green with reporting in place — a guard that is wrong in the conservative direction would suppress legitimate patches.
+  - Not yet done, and the spec requirement above ("report it rather than emit it") is therefore only half-satisfied: it currently reports *and* emits.
+  - Blocked on evidence, not effort. §4.2 is the cautionary case — a check that looked clean on one run cost four green tests on the next two. The question this needs answered is whether legitimate broadcasts trip it, which needs several suite runs' worth of `UNPUBLISHED-PARENTS` counts, not one.
 
 ## 6. Delta-buffer replay comparison
 

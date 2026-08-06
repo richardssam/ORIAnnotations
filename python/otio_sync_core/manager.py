@@ -223,6 +223,18 @@ class SyncManager:
         #: they are applied rather than buffered straight back onto the list
         #: being iterated.
         self._replaying: bool = False
+
+        #: Sync GUIDs the session has actually seen — carried in a structural
+        #: message this peer sent, or in one it received.  Deliberately *not*
+        #: ``_object_map``: the defect this guards against had the parent
+        #: firmly in the local map and simply never announced, because the
+        #: track was rebuilt with a fresh GUID after ``ADD_TIMELINE`` had gone
+        #: out carrying the old one.  Only a record of what crossed the wire
+        #: can tell those apart.
+        self._session_guids: set[str] = set()
+        #: Broadcasts whose parent this peer never published, most recent last.
+        self._unpublished_parents: list[str] = []
+        self._unpublished_parent_count: int = 0
         self._last_snapshot_time: float = 0
         self._last_who_is_master_time: float | None = None
         self._state_request_time: float | None = None
@@ -301,6 +313,22 @@ class SyncManager:
     def unresolved_patch_count(self) -> int:
         """Total unresolved patches seen, including those aged out of the list."""
         return self.patcher.unresolved_patch_count
+
+    @property
+    def unpublished_parents(self) -> list[str]:
+        """Structural broadcasts whose parent this peer never published.
+
+        The sender-side counterpart to :attr:`unresolved_patches`, and the one
+        that can actually be trusted: a peer always knows what it published,
+        whereas a receiver cannot tell a genuinely orphaned patch from one that
+        merely arrived before it caught up.
+        """
+        return list(self._unpublished_parents)
+
+    @property
+    def unpublished_parent_count(self) -> int:
+        """Total unpublished-parent broadcasts, including those aged out."""
+        return self._unpublished_parent_count
 
     @property
     def _property_callbacks(self) -> list[Callable[[str, str, Any], None]]:
@@ -480,6 +508,9 @@ class SyncManager:
                 sync_timestamp=time.time(),
             )
         )
+        # Everything in this timeline is now common knowledge, so later patches
+        # may legitimately address any of it.
+        self._note_session_guids(tl)
         return authority.SENT
 
     def broadcast_clip_timeline(self, tl_guid: str) -> str:
@@ -626,6 +657,42 @@ class SyncManager:
             if guid:
                 guids.add(guid)
         return guids
+
+    #: Detail entries retained for :attr:`unpublished_parents`.
+    _UNPUBLISHED_HISTORY = 10
+
+    def _note_session_guids(self, item: otio.core.SerializableObject) -> None:
+        """Record that *item*'s subtree has crossed the wire.
+
+        Called on both sides — after this peer broadcasts structure, and after
+        it accepts structure from a peer — because either one makes the GUIDs
+        common knowledge in the session.
+        """
+        self._session_guids |= self._subtree_guids(item)
+
+    def _check_parent_published(self, kind: str, parent_uuid: str) -> bool:
+        """Report a structural broadcast addressing an unpublished parent.
+
+        Report-only by design (tasks.md 5.1): the guard is new and refusing a
+        legitimate patch would be a worse failure than the one it detects, so
+        it records and lets the message go.  Escalating to refusal is 5.2, and
+        is gated on the suite staying green with this in place.
+
+        :param kind: Message kind, for the record.
+        :param parent_uuid: GUID the outgoing patch addresses as its parent.
+        :returns: ``True`` when the parent is known to the session.
+        """
+        if not parent_uuid or parent_uuid in self._session_guids:
+            return True
+        self._unpublished_parent_count += 1
+        detail = (
+            f"{kind}: parent {str(parent_uuid)[:8]} never published by this peer "
+            f"({len(self._session_guids)} guids announced)"
+        )
+        self._unpublished_parents.append(detail)
+        del self._unpublished_parents[:-self._UNPUBLISHED_HISTORY]
+        _log(f"UNPUBLISHED PARENT {detail}")
+        return False
 
     def _purge_timeline_state(self, tl_guid: str) -> None:
         """Remove one timeline's own state without touching other timelines.
@@ -1113,6 +1180,10 @@ class SyncManager:
             display_state=self.display_state or None,
             host_guid=self.host_guid,
         ))
+        # A snapshot publishes every timeline it carries, as surely as an
+        # ADD_TIMELINE does for one.
+        for tl in self._timelines.values():
+            self._note_session_guids(tl)
 
     def export_state(self) -> dict[str, Any]:
         """Return this peer's current reduced state as a ``StateSnapshot`` payload.
@@ -1154,6 +1225,10 @@ class SyncManager:
         # be trusted as "synced with the sender".
         payload["unresolved_patches"] = list(self.unresolved_patches)
         payload["unresolved_patch_count"] = self.unresolved_patch_count
+        # The sender-side counterpart. Unlike the above this one *is* a defect
+        # wherever it is non-zero, since a peer always knows what it published.
+        payload["unpublished_parents"] = self.unpublished_parents
+        payload["unpublished_parent_count"] = self.unpublished_parent_count
         return payload
 
     def _send_message(self, msg: ProtocolMessage) -> None:
@@ -1220,7 +1295,9 @@ class SyncManager:
                 f"insert_child broadcasting: parent={parent_uuid} index={index} "
                 f"child={getattr(child_obj, 'name', '?')}"
             )
+            self._check_parent_published(InsertChild.EVENT, parent_uuid)
             self._send_message(msg)
+            self._note_session_guids(child_obj)
 
     def _enforce_visibility(self, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
         """Strip visibility fields when this peer is not the host.
@@ -1975,6 +2052,9 @@ class SyncManager:
         if tl_guid and msg.timeline and tl_guid not in self._timelines:
             tl = msg.as_otio()
             self._timelines[tl_guid] = tl
+            # A peer announced this subtree, so it is session-visible here too
+            # and this peer may address it without having published it itself.
+            self._note_session_guids(tl)
             seq_clip_guid = tl.metadata.get("clip_timeline_for")
             if seq_clip_guid:
                 # Single-clip annotation timeline — preserve canonical
@@ -2039,7 +2119,13 @@ class SyncManager:
     def _h_otio_session(
         self, msg: ProtocolMessage, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
-        return self.patcher.apply_patch(msg)
+        result = self.patcher.apply_patch(msg)
+        if result and result[0] == "insert_child":
+            # A peer published this child, so addressing it later is legitimate
+            # even though this peer never announced it.
+            if isinstance(result[1], otio.core.SerializableObject):
+                self._note_session_guids(result[1])
+        return result
 
     def tick(self) -> list[tuple[str, Any]]:
         """Poll the network and auto-advance the session handshake.
@@ -2252,6 +2338,7 @@ class SyncManager:
             for guid, tl_dict in tl_items:
                 tl = _dict_to_otio(tl_dict)
                 self._timelines[guid] = tl
+                self._note_session_guids(tl)
                 is_clip_tl = bool(tl.metadata.get("clip_timeline_for"))
                 if is_clip_tl:
                     self._traverse_and_map_preserve(tl)
