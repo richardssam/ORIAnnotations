@@ -51,8 +51,8 @@ def get_xstudio_state(port=14441):
         # healthy session; non-empty means some peer broadcast against an object
         # this one was never given, which used to produce no signal at all.
         "unresolved_patches": [],
-        # The sender-side counterpart. Unlike the above, any entry here IS a
-        # defect: a peer always knows what it published.
+        # The sender-side counterpart: sharper than the above, but not a
+        # verdict — derived parents and insert-then-announce are both benign.
         "unpublished_parents": [],
         # Seeded here rather than inside the container read below, so a failed
         # container read cannot leave them absent entirely. media_exists

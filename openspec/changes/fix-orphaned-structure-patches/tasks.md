@@ -44,9 +44,14 @@
   - `reset_timelines` deliberately does not clear it. Rebuilding local state does not un-send messages, and clearing there would fire on precisely the master re-initialisation this change was chasing. Pinned by a test.
   - This is the check §4.2 could not be: a sender always knows what it published, so unlike `unresolved_patches` a non-zero count here is unambiguously a defect.
   - 10 tests in `tests/otio_sync/test_send_side_guard.py`, including that the message still goes out.
-- [ ] 5.2 Escalate to refusal only once the full suite is green with reporting in place — a guard that is wrong in the conservative direction would suppress legitimate patches.
-  - Not yet done, and the spec requirement above ("report it rather than emit it") is therefore only half-satisfied: it currently reports *and* emits.
-  - Blocked on evidence, not effort. §4.2 is the cautionary case — a check that looked clean on one run cost four green tests on the next two. The question this needs answered is whether legitimate broadcasts trip it, which needs several suite runs' worth of `UNPUBLISHED-PARENTS` counts, not one.
+- [x] 5.2 Escalate to refusal only once the full suite is green with reporting in place — a guard that is wrong in the conservative direction would suppress legitimate patches.
+  - **Decision: do not escalate.** The suite was green (23/24, only `add_media` known-broken) *and* the guard fired 4 times, which is the combination that settles it: those broadcasts were legitimate. Refusing them would have broken working behaviour.
+  - This also corrects §5.1's claim that a non-zero count is unambiguously a defect. It is not. Two benign patterns, both observed:
+    - **Deterministically derived parents.** xStudio broadcast `INSERT_CHILD` into annotation track `3d793a7d`, which it never announced and which appears nowhere else in its log — and OpenRV applied it with **zero** unresolved patches, having derived the same clip-timeline GUID independently. A peer can hold an object nobody sent it, so "never announced" does not imply "peers cannot resolve it".
+    - **Insert-then-announce.** OpenRV broadcast `INSERT_CHILD` for parent `c7b6b324` at 18:02:22.134 with 0 GUIDs announced, then sent the `ADD_TIMELINE` carrying that same parent *and* child immediately after. The insert is genuinely unappliable on arrival, but the announcement that follows supersedes it, so state still converges.
+  - So the sender-side check is sharper than the receiver's — it excludes "I have not caught up yet" — but it is still a signal, not a verdict. Spec corrected to say so and to forbid refusing on this basis alone.
+  - Refusal remains possible but needs a test that excludes both patterns: something like "the parent is neither announced, nor deterministically derivable, nor about to be announced in this batch". That is a larger change than this one, and belongs to whoever needs it.
+  - Worth keeping: the report is now the only place the insert-then-announce waste is visible. It is not a correctness bug, but it is a message broadcast that no peer can apply.
 
 ## 6. Delta-buffer replay comparison
 

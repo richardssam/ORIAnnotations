@@ -318,10 +318,23 @@ class SyncManager:
     def unpublished_parents(self) -> list[str]:
         """Structural broadcasts whose parent this peer never published.
 
-        The sender-side counterpart to :attr:`unresolved_patches`, and the one
-        that can actually be trusted: a peer always knows what it published,
-        whereas a receiver cannot tell a genuinely orphaned patch from one that
-        merely arrived before it caught up.
+        The sender-side counterpart to :attr:`unresolved_patches`, and sharper
+        than it — a sender knows what it announced, so this excludes "I have
+        not caught up yet", which a receiver can never rule out.
+
+        Sharper is not the same as conclusive, and this is **not** a verdict.
+        Two benign patterns produce entries, both seen in a green suite:
+
+        * **Deterministically derived parents.**  Clip-timeline GUIDs are
+          computed from shared inputs, so a peer holds the parent without
+          anyone having sent it.  Observed: xStudio broadcast an annotation
+          into a track it never announced and OpenRV applied it with zero
+          unresolved patches.
+        * **Insert-then-announce.**  A peer inserts into a timeline it is still
+          building, then announces the whole timeline — parent and child
+          together — immediately afterwards.
+
+        So do not refuse a broadcast on this signal alone; see tasks.md 5.2.
         """
         return list(self._unpublished_parents)
 
@@ -1225,8 +1238,9 @@ class SyncManager:
         # be trusted as "synced with the sender".
         payload["unresolved_patches"] = list(self.unresolved_patches)
         payload["unresolved_patch_count"] = self.unresolved_patch_count
-        # The sender-side counterpart. Unlike the above this one *is* a defect
-        # wherever it is non-zero, since a peer always knows what it published.
+        # The sender-side counterpart: sharper than the above, since it
+        # excludes "not caught up yet", but still not a verdict — derived
+        # parents and insert-then-announce both produce benign entries.
         payload["unpublished_parents"] = self.unpublished_parents
         payload["unpublished_parent_count"] = self.unpublished_parent_count
         return payload

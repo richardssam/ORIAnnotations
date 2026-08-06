@@ -194,3 +194,47 @@ def test_rebuilding_local_state_does_not_unpublish_what_was_announced():
     mgr.insert_child(_guid(_media_track(tl)), otio.schema.Clip(name="car.mov"))
 
     assert mgr.unpublished_parents == []
+
+
+def test_a_derived_parent_resolves_on_a_peer_that_was_never_sent_it():
+    """Why this report is not a verdict, pinned.
+
+    Clip-timeline GUIDs are derived from shared inputs, so both peers compute
+    the same name without either announcing it. Observed live: xStudio
+    broadcast an annotation into track ``3d793a7d``, which appears nowhere else
+    in its log, and OpenRV applied it with zero unresolved patches. The sender
+    is reported, and is right to have sent it.
+    """
+    sender, receiver = _manager("a"), _manager("b")
+    sender_tl, receiver_tl = _timeline(sender), _timeline(receiver)
+    parent = _guid(_media_track(sender_tl))
+    assert parent == _guid(_media_track(receiver_tl)), "derivation must agree"
+
+    sender.insert_child(parent, otio.schema.Clip(name="car.mov"))
+
+    assert sender.unpublished_parent_count == 1, "sender reports it"
+    assert receiver.apply_patch(_inserts(sender)[0]) is not None, (
+        "receiver resolves it anyway — which is why refusing on this signal "
+        "alone would break working behaviour"
+    )
+    assert receiver.unresolved_patch_count == 0
+
+
+def test_insert_then_announce_is_superseded_by_the_announcement():
+    """The other benign pattern: OpenRV inserts into a timeline it is still
+    building, then announces the whole thing, parent and child together."""
+    sender, receiver = _manager("a"), _manager("b")
+    tl = _timeline(sender)
+    clip = otio.schema.Clip(name="car.mov")
+
+    sender.insert_child(_guid(_media_track(tl)), clip)
+    sender.broadcast_add_timeline(_guid(tl))
+
+    assert sender.unpublished_parent_count == 1
+    announce = next(
+        e for e in sender.network.sent
+        if e["payload"]["command"]["event"] == pm.AddTimeline.EVENT
+    )
+    receiver.apply_patch(announce)
+    names = [c.name for t in receiver._timelines[_guid(tl)].tracks for c in t]
+    assert "car.mov" in names, "the announcement carries what the insert could not"
