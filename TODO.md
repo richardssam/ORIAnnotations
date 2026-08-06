@@ -291,3 +291,20 @@ Task	What to verify
 ORI_SESSION="amqps://aswf:29a5953658144449ac73385b9e3144eedb76@146.235.219.100:5671/aswf?cacertfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/ca.pem&certfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.crt&keyfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.key:samtest"  ORI_SYNC_LOG_FILE=/Users/sam/git/ORIAnnotations/rvplugin/ori_sync/xstudio_host2.log xstudio test_media/source/encoded/*.mov
 
 ORI_SESSION="amqps://aswf:29a5953658144449ac73385b9e3144eedb76@146.235.219.100:5671/aswf?cacertfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/ca.pem&certfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.crt&keyfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.key:samtest"  ORI_SYNC_LOG_FILE=/Users/sam/git/ORIAnnotations/rvplugin/ori_sync/xstudio_client2.log xstudio -n
+
+# Openspec changes
+
+* fix-visibility-authority-bypass - Fixing some issues where a client is still affecting the host, and/or ignoring the host.
+* fix-playback-position-echo-loop - NEARLY DONE - Need to do some manual verification, should address SOON.
+* fix-xs-playhead-attribute-subscription - NEARLY DONE - Need some manual verification.
+* xs-detect-deleted-bookmarks - NEED TO VERIFY.
+* xstudio-controller-encapsulation - NEED TO VERIFY.
+
+Later:
+* define-neutral-viewport-coordinates - Long term future task - need to define proper viewport coordinates that correctly work across OTIO.
+* network-send-robustness - suspected RV network blocking.
+* rv-plugin-encapsulation - Need some cleanup of rv-plugin, might be fairly straightfoward.
+* session-roles - THE BIG ONE - definately started with host-owned-visibility - not clear what we should do before this.
+* structure-events - xstudio - currently relies on a 1-second periodic poll loop for changes - possibly revamp when we get better playlist listeners.
+
+* 

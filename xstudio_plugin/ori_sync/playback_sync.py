@@ -1370,22 +1370,45 @@ class PlaybackSyncController:
         state = self.current_playback_state()
         if state is None:
             # Could not read the local playhead — it is missing, or a bounded
-            # read timed out against an actor torn down by a view switch. The
-            # fallback below does not say "unknown"; it fabricates frame 0 and
-            # broadcasts it as fact, and peers seek there. An unreadable
-            # position thus becomes a confident wrong one, indistinguishable
-            # downstream from a genuine seek to the clip start — so say so
-            # here, where the distinction still exists.
-            _log(
-                "[SEL] broadcast_view_state: current_playback_state() unavailable"
-                " — broadcasting FABRICATED frame=0"
-                f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
+            # read timed out against an actor torn down by a view switch. This
+            # message cannot omit current_time (a receiver reads it as
+            # current_time.get("value", 0), so an absent field IS frame 0) —
+            # the same constraint as the withhold-while-driven case below —
+            # so withhold to the best position we actually know rather than
+            # fabricating one: the driver's last-told position if a peer is
+            # driving, else our own last observed frame, and only 0 (with a
+            # distinct log) when neither is known.
+            _fallback_frame = (
+                self._last_received_frame
+                if self._last_received_frame is not None
+                else self._last_polled_frame
             )
-            state = {
-                "playing": False,
-                "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
-                "playback_mode": self._get_playback_mode(),
-            }
+            if _fallback_frame is not None:
+                _log(
+                    "[SEL] broadcast_view_state: current_playback_state() unavailable"
+                    f" — withholding to last known frame={_fallback_frame}"
+                    f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
+                )
+                state = {
+                    "playing": False,
+                    "current_time": {
+                        "OTIO_SCHEMA": "RationalTime.1",
+                        "value": float(_fallback_frame),
+                        "rate": 24.0,
+                    },
+                    "playback_mode": self._get_playback_mode(),
+                }
+            else:
+                _log(
+                    "[SEL] broadcast_view_state: current_playback_state() unavailable"
+                    " and no known frame to withhold to — broadcasting FABRICATED frame=0"
+                    f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
+                )
+                state = {
+                    "playing": False,
+                    "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
+                    "playback_mode": self._get_playback_mode(),
+                }
         state["view_mode"] = view_mode
         state["clip_guid"] = clip_guid or None
         if playing_override is not None:
