@@ -51,5 +51,13 @@
 ## 7. Close out
 
 - [x] 7.1 Remove `status: known_broken` / `blocked_by` from `openrv_hosts_selection`.
-- [ ] 7.2 Run the full sync suite and confirm no regression in the RV↔RV structural tests (`delete_media_openrv`, `delete_media_openrv_noscript`, `otio_import_rv_to_rv`).
-- [ ] 7.3 Record whether the master/host split noted in `host-owned-visibility` recurred during this work, so that change inherits evidence rather than a rumour.
+- [x] 7.2 Run the full sync suite and confirm no regression in the RV↔RV structural tests (`delete_media_openrv`, `delete_media_openrv_noscript`, `otio_import_rv_to_rv`).
+  - All three pass, as does `openrv_hosts_selection` — the test this change exists for. `add_media` remains the only `known_broken` entry.
+  - Four other tests failed, and none survives contact with the evidence:
+    - `reorder_media` — already failing before this change (suite 6), same `checkpoint_timeout`.
+    - `delete_timeline` — xStudio's plugin logged nothing for the final 42s, stopping mid-test; a passing run logs 132 further lines over the same window. An xStudio poll-thread stall, not a state mismatch. **3/3 pass on re-run**, all at 61–62s against the failing run's truncated 47.6s.
+    - `openrv_draws_rect_xstudio_verifies`, `openrv_draws_text_xstudio_verifies` — both end on the same clip (`53834475`) with `no xStudio media for clip` / `no tracked bookmark`. xStudio applied **zero** snapshots in both, so §6's replay path never executed and cannot be implicated. This is the media-materialisation fault this change was originally (mis)named after, still open.
+  - Worth stating plainly: this suite is flaky enough that a single run cannot distinguish a regression from noise. Every failure above was attributed by evidence — prior-run history, log liveness, or proof the changed code never ran — not by re-running until green.
+- [x] 7.3 Record whether the master/host split noted in `host-owned-visibility` recurred during this work, so that change inherits evidence rather than a rumour.
+  - It behaved correctly wherever it was observable. In `delete_timeline`, OpenRV self-elected host while alone, then stood down on xStudio's `PEER_ANNOUNCE` (`elect_host: e59cd47e → f0ffde3d (self=follower, peers=2)`), matching the `xstudio` > `openrv` preference; xStudio held host with `master=False, host=True`, the split roles working as intended rather than colliding.
+  - The split did have one real cost here, already fixed: a peer that self-elects master reaches `STATE_SYNCED` holding no timelines, which is why "has this peer joined?" could not gate §4.2's reporting.
