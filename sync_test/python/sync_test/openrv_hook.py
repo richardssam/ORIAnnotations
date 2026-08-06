@@ -150,7 +150,15 @@ def get_openrv_state():
 
         state["media_path"] = None
         state["media_exists"] = False
-        
+
+        # Media loaded in the session, independent of the playhead — the
+        # counterpart to xStudio's media_count, so the harness can ask both
+        # peers "do you have the media yet?" in the same terms.
+        try:
+            state["media_count"] = len(rv.commands.nodesOfType("RVFileSource"))
+        except Exception:
+            state["media_count"] = 0
+
         # Check if media actually exists on disk
         import os
         sources = rv.commands.sourcesAtFrame(rv.commands.frame())

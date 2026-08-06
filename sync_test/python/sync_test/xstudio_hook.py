@@ -61,6 +61,14 @@ def get_xstudio_state(port=14441):
         # Playlist with no single on-screen source.
         "media_path": None,
         "media_exists": True,
+        # Count of media actually in the session, independent of the playhead.
+        # `media_path` above cannot answer "is media loaded?" — it reads
+        # `ph.on_screen_media`, which is None for a flat playlist even when the
+        # media is fully loaded, so it stays null for the whole of a passing
+        # annotation test. This counts what the sync plugin's own lookup
+        # consults, and is the quantity observed empty during the window where
+        # an arriving annotation gets dropped.
+        "media_count": 0,
     }
 
     try:
@@ -156,6 +164,13 @@ def get_xstudio_state(port=14441):
                     state["clip"] = playlists[0].name
             except Exception:
                 pass
+
+        try:
+            state["media_count"] = sum(
+                len(pl.media) for pl in session.playlists
+            )
+        except Exception as e:
+            logging.debug(f"Could not count session media: {e}")
 
         # Prefer the synced timeline name over whatever container happens to be
         # focused. Applied last so it overrides both branches above and the

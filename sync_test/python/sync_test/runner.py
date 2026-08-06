@@ -551,7 +551,8 @@ class TestRunner:
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
                            "is_host", "host_guid", "view_mirror_error",
-                           "unresolved_patches", "unpublished_parents"}
+                           "unresolved_patches", "unpublished_parents",
+                           "media_count"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 
@@ -812,6 +813,53 @@ class TestRunner:
             if "error" not in st and st.get("is_master") is True:
                 return True
             time.sleep(0.5)
+        return False
+
+    def _wait_for_media(self, app_ports, timeout=20.0):
+        """Poll every app's ``/state`` until all of them report loaded media.
+
+        An annotation names the clip it belongs to, and a peer that has not yet
+        materialised that clip **drops it permanently** — xStudio's
+        ``apply_remote_annotation`` returns early when
+        ``media_for_sync_guid`` misses, and nothing re-delivers it (the retry
+        machinery in that module is for outgoing broadcasts only).
+
+        Nothing about that is a race the *product* loses in practice: a person
+        cannot annotate media they cannot see. It is the script that annotates
+        1.4s after adding media. The harness used to cover the gap with the
+        flat ``time.sleep(1.0)`` between commands, which is a fixed budget for
+        work whose measured cost varies far more than that — ``load_otio``
+        alone ranged 0.04s→1.23s across one suite — so the margin held in
+        isolation and vanished under full-suite load. That is why the
+        annotation tests failed only in the suite and never on their own.
+
+        Waits on *every* peer, not just the driver: the driver is the one app
+        guaranteed to have the media already, so asking it alone would answer
+        the wrong question.
+
+        Returns False rather than raising so the caller can log a specific
+        diagnostic instead of failing later as a generic state mismatch —
+        same contract as :meth:`_wait_for_master`.
+
+        :param app_ports: ``(name, port)`` tuples for every app in the test.
+        :param timeout: Seconds to wait before giving up.
+        :returns: True once all apps report media, False on timeout.
+        """
+        deadline = time.time() + timeout
+        pending = []
+        while time.time() < deadline:
+            pending = []
+            for name, port in app_ports:
+                st = self.fetch_state(port)
+                if "error" in st or not st.get("media_count"):
+                    pending.append(name)
+            if not pending:
+                return True
+            time.sleep(0.25)
+        logging.warning(
+            f"_wait_for_media: {', '.join(pending)} still report no media after "
+            f"{timeout:.0f}s — an annotation sent now would be dropped silently."
+        )
         return False
 
     def _select_host_driver(self, app_ports):
@@ -1338,6 +1386,26 @@ class TestRunner:
                 logging.info(f"Driving {driver_app[0]} via commands...")
                 last_frame_cmd = None
                 for cmd in commands:
+                    action = cmd.get("action")
+
+                    # An explicit gate a test can place wherever it needs one.
+                    # Handled here rather than forwarded to a hook: the
+                    # condition spans every peer, and no single app can answer
+                    # it about the others.
+                    if action == "wait_for_media":
+                        logging.info("  -> Waiting for media on all peers...")
+                        self._wait_for_media(
+                            app_ports, timeout=cmd.get("timeout", 20.0)
+                        )
+                        continue
+
+                    # Implicit gate. Deliberately automatic rather than left to
+                    # each test to remember: omitting it costs a silently
+                    # dropped annotation and an intermittent failure elsewhere,
+                    # which is exactly the class of bug this removes.
+                    if action == "draw_annotation":
+                        self._wait_for_media(app_ports)
+
                     logging.info(f"  -> Sending command: {cmd}")
                     res = self.send_command(driver_app[1], cmd)
                     if "error" in res:

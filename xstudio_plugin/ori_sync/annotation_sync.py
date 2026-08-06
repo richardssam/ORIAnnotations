@@ -1150,8 +1150,14 @@ class AnnotationSyncController:
 
         media, aspect_half = self.plugin.media.media_for_sync_guid(clip_guid)
         if media is None:
+            # This annotation is now lost: nothing re-delivers it. The retry
+            # machinery in this module (flush_pending_annotations) is for
+            # *outgoing* broadcasts only, and both callers of this method drop
+            # on return. Logged as DROPPED rather than a bare "no media" so the
+            # consequence is legible in the log, not just the cause.
             _log(
-                f"apply_remote_annotation: no xStudio media for clip {clip_guid[:8]}"
+                f"apply_remote_annotation: DROPPED annotation for clip "
+                f"{clip_guid[:8]} frame={frame} — no xStudio media"
             )
             return
 
