@@ -77,3 +77,10 @@
 - [x] 7.3 Record whether the master/host split noted in `host-owned-visibility` recurred during this work, so that change inherits evidence rather than a rumour.
   - It behaved correctly wherever it was observable. In `delete_timeline`, OpenRV self-elected host while alone, then stood down on xStudio's `PEER_ANNOUNCE` (`elect_host: e59cd47e → f0ffde3d (self=follower, peers=2)`), matching the `xstudio` > `openrv` preference; xStudio held host with `master=False, host=True`, the split roles working as intended rather than colliding.
   - The split did have one real cost here, already fixed: a peer that self-elects master reaches `STATE_SYNCED` holding no timelines, which is why "has this peer joined?" could not gate §4.2's reporting.
+- [x] 7.4 Trim the `openrv-sync-plugin` delta to what this change actually built, before it is synced into the permanent spec.
+  - Two requirements were left over from the original `rv-follower-media-materialisation` framing that §2.1 renamed away from, and survived the §1.3 rewrite:
+    - *Media learned about after joining are materialised* — satisfied as a **consequence** of stable track GUIDs, but with no dedicated implementation, and its "already viewable are not duplicated" scenario is untested.
+    - *A peer reports media it cannot make viewable* — **nothing implements this.** The nearest thing in the code, `playback_sync.mirror_failure`, reports an unmirrorable *view* and belongs to `host-owned-visibility` D4.
+  - Removed rather than synced. A spec is the artefact a later session trusts over the code; recording an unimplemented reporting requirement as accepted is precisely the "silent disagreement between belief and behaviour" this change exists to remove — it would have been the same fault in a different medium.
+  - The proposal's own Capabilities section already scoped `openrv-sync-plugin` to track identity alone, so the delta was the outlier, not the scope.
+  - The trimmed requirements are not lost: they describe the media-materialisation work that remains genuinely open, and belong to whichever change builds it.

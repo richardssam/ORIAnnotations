@@ -81,8 +81,8 @@ equally empty on both sides and therefore agrees.
 
 ## Naming
 
-This was opened as `fix-orphaned-structure-patches`, when the working theory
+This was opened as `rv-follower-media-materialisation`, when the working theory
 was that OpenRV failed to materialise media it had been told about. The evidence
-moved the fault to the *sending* peer and into shared core, so the name now
-describes neither the cause nor the fix. Rename before implementing —
+moved the fault to the *sending* peer and into shared core, so that name
+described neither the cause nor the fix. Renamed before implementing —
 `fix-orphaned-structure-patches` fits what this actually does.
