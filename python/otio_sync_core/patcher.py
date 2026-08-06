@@ -402,6 +402,12 @@ class OTIOPatcher:
 
             elif isinstance(msg, InsertChild):
                 parent_uuid = msg.parent_uuid
+                if parent_uuid not in self.object_map:
+                    # DIAG(rv-follower-media-materialisation 1.1)
+                    _log(
+                        f"DIAG drop: INSERT_CHILD parent {str(parent_uuid)[:8]} "
+                        f"not in object_map ({len(self.object_map)} objects held)"
+                    )
                 if parent_uuid in self.object_map:
                     parent = self.object_map[parent_uuid]
                     index: int = msg.index

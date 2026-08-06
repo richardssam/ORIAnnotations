@@ -1823,6 +1823,8 @@ class SyncManager:
         _log(f"apply_patch: command_schema={command_schema} event={event} source={source[:8]}")
 
         if self.status == STATE_JOINING and command_schema != "LiveSession.1":
+            # DIAG(rv-follower-media-materialisation 1.1)
+            _log(f"DIAG buffer: {command_schema}/{event} held while JOINING")
             self._delta_buffer.append(payload)
             return None
 
@@ -1940,6 +1942,14 @@ class SyncManager:
         self, msg: AddTimeline, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
         tl_guid = msg.timeline_guid
+        # DIAG(rv-follower-media-materialisation 1.1)
+        if tl_guid and msg.timeline and tl_guid in self._timelines:
+            _existing = self._timelines[tl_guid]
+            _n_local = len(self._subtree_guids(_existing))
+            _log(
+                f"DIAG discard: ADD_TIMELINE {tl_guid[:8]} already held "
+                f"(local subtree has {_n_local} guids) — incoming copy dropped"
+            )
         # Check the GUID guard *before* deserializing: a timeline we already
         # hold must not pay the as_otio() cost.
         if tl_guid and msg.timeline and tl_guid not in self._timelines:
@@ -2233,6 +2243,12 @@ class SyncManager:
                     res = self.apply_patch(payload)
                     if res:
                         replay_results.append(res)
+                else:
+                    # DIAG(rv-follower-media-materialisation 1.1)
+                    _log(
+                        f"DIAG stale: buffered {p_data.get('command_schema')} dropped,"
+                        f" sync_timestamp {p_time} <= snapshot {timestamp}"
+                    )
 
             self._delta_buffer = []
             self._state_request_time = None
