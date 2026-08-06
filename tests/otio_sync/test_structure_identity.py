@@ -152,6 +152,75 @@ def test_a_peer_applies_inserts_addressed_to_a_rebuilt_track():
     )
 
 
+def test_an_unresolvable_insert_is_recorded():
+    """The drop used to be silent, which is what let eight of them pass unnoticed."""
+    receiver = _manager("receiver")
+    sender = _manager("sender")
+    rebuilt = _build_timeline(sender, "Default Sequence", derive=False)
+    sender.insert_child(_media_track_guid(rebuilt), otio.schema.Clip(name="car.mov"))
+    envelope = next(
+        e for e in sender.network.sent
+        if e["payload"]["command"]["event"] == pm.InsertChild.EVENT
+    )
+
+    receiver.apply_patch(envelope)
+
+    assert receiver.unresolved_patch_count == 1
+    assert "INSERT_CHILD" in receiver.unresolved_patches[-1]
+
+
+def test_a_healthy_apply_records_nothing():
+    sender, receiver = _manager("sender"), _manager("receiver")
+    _build_timeline(receiver, "Default Sequence")
+    tl = _build_timeline(sender, "Default Sequence")
+    sender.insert_child(_media_track_guid(tl), otio.schema.Clip(name="car.mov"))
+    envelope = next(
+        e for e in sender.network.sent
+        if e["payload"]["command"]["event"] == pm.InsertChild.EVENT
+    )
+
+    receiver.apply_patch(envelope)
+
+    assert receiver.unresolved_patches == []
+    assert receiver.unresolved_patch_count == 0
+
+
+def test_unresolved_record_is_bounded_but_counts_everything():
+    """A record, not a replay queue — it must not grow without limit."""
+    receiver = _manager("receiver")
+    sender = _manager("sender")
+    tl = _build_timeline(sender, "Default Sequence", derive=False)
+    track = _media_track_guid(tl)
+    for i in range(25):
+        sender.network.sent.clear()
+        sender.insert_child(track, otio.schema.Clip(name=f"clip{i}.mov"))
+        envelope = next(
+            e for e in sender.network.sent
+            if e["payload"]["command"]["event"] == pm.InsertChild.EVENT
+        )
+        receiver.apply_patch(envelope)
+
+    assert receiver.unresolved_patch_count == 25
+    assert len(receiver.unresolved_patches) == 10
+
+
+def test_unresolved_patches_reach_the_harness_via_export_state():
+    receiver = _manager("receiver")
+    sender = _manager("sender")
+    tl = _build_timeline(sender, "Default Sequence", derive=False)
+    sender.insert_child(_media_track_guid(tl), otio.schema.Clip(name="car.mov"))
+    envelope = next(
+        e for e in sender.network.sent
+        if e["payload"]["command"]["event"] == pm.InsertChild.EVENT
+    )
+    receiver.apply_patch(envelope)
+
+    payload = receiver.export_state()
+
+    assert payload["unresolved_patch_count"] == 1
+    assert len(payload["unresolved_patches"]) == 1
+
+
 def test_without_derivation_the_insert_is_orphaned():
     """Pins the failure mode, so a regression reads as this defect returning."""
     sender, receiver = _manager("sender"), _manager("receiver")

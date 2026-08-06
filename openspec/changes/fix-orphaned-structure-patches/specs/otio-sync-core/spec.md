@@ -30,16 +30,28 @@ sent, none applied, and no error raised at either end.
 
 ### Requirement: An unresolvable structural patch is reported
 When a structural patch cannot be applied because its target cannot be resolved,
-the receiving peer SHALL report it rather than discard it silently.
+the receiving peer SHALL record it and make the record observable, rather than
+discard it silently.
 
-A patch that cannot be applied is a fact the session needs to surface, whether
-or not the peer can recover from it automatically.
+The record is **diagnostic, not a health verdict**. A receiving peer cannot
+distinguish "the sender broadcast against an object it never published" from "I
+have not caught up yet" — both present as a parent GUID it does not hold — and
+sessions routinely produce a few of these while establishing. A peer that
+self-elects as master reaches its synchronised state holding no timelines at
+all, so even "has this peer joined?" does not separate the two cases. The
+enforceable check therefore belongs at the sender, which always knows whether it
+published a parent; it is specified separately above.
 
 #### Scenario: A patch naming an unknown parent is surfaced
 - **WHEN** a peer receives a structural patch whose parent object it does not hold
-- **THEN** the peer SHALL report that the patch could not be applied
-- **AND** the report SHALL be observable without reading application logs
-- **AND** the peer SHALL NOT report its state as synchronised with the sender
+- **THEN** the peer SHALL record that the patch could not be applied
+- **AND** the record SHALL be observable without reading application logs
+
+#### Scenario: The record does not grow without bound
+- **WHEN** many patches cannot be applied
+- **THEN** the retained detail SHALL be bounded
+- **AND** a count of all occurrences SHALL still be available
+- **AND** the record SHALL NOT be used to replay the patches later
 
 ### Requirement: Buffered deltas are replayed against the timestamp they carry
 Messages buffered while joining SHALL be compared against the snapshot using the

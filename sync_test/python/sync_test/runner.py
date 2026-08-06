@@ -214,6 +214,8 @@ def _format_observed(states, app_names):
                 desc += " host" if state["is_host"] else " follower"
             if state.get("view_mirror_error"):
                 desc += f" MIRROR-FAILED({state['view_mirror_error']})"
+            if state.get("unresolved_patches"):
+                desc += f" UNRESOLVED-PATCHES({len(state['unresolved_patches'])})"
             parts.append(desc)
     return " | ".join(parts) if parts else "<no apps>"
 
@@ -235,6 +237,11 @@ class FailKind:
     #: state_mismatch: the peers may still *report* matching state, because the
     #: follower kept whatever was on screen. Waiting cannot fix it.
     VIEW_MIRROR_FAILED = "view_mirror_failed"
+    #: Reserved. Unresolved patches are reported but do not fail a run — see
+    #: the note in compare_states for why a *receiver* cannot distinguish a
+    #: sender's bug from its own lag. Kept so run-history rows recorded while
+    #: this briefly did fail still classify.
+    UNRESOLVED_PATCH = "unresolved_patch"
 
 
 #: fail_kinds for which waiting longer can plausibly change the outcome —
@@ -495,6 +502,21 @@ class TestRunner:
                     f"{name} could not mirror the host's view: {mirror_error}",
                     FailKind.VIEW_MIRROR_FAILED,
                 )
+            # Unresolved patches are reported in the observed line and in
+            # /state, but deliberately do NOT fail the run.
+            #
+            # A receiving peer cannot tell "the sender broadcast against
+            # something it never published" from "I have not caught up yet".
+            # Both look identical: a parent GUID it does not hold. Sessions
+            # routinely produce a few during establishment — a peer that
+            # self-elects master reaches STATE_SYNCED holding no timelines at
+            # all, so even "has it joined?" does not separate them — and the
+            # suite showed three otherwise-green annotation tests tripping on
+            # exactly that. Failing here turned a normal startup event into a
+            # red suite.
+            #
+            # The check that CAN be enforced belongs at the sender, which
+            # always knows whether it published a parent (design.md D2, §5).
 
         for i in range(1, len(states)):
             st = states[i]
@@ -526,7 +548,8 @@ class TestRunner:
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
-                           "is_host", "host_guid", "view_mirror_error"}
+                           "is_host", "host_guid", "view_mirror_error",
+                           "unresolved_patches"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 

@@ -42,11 +42,44 @@ class OTIOPatcher:
     property changes or hierarchy insertions/moves/removals) to the local graph.
     """
 
+    #: Most recent unresolved patches retained for reporting. Bounded: this is a
+    #: diagnostic record, not a replay queue (see below).
+    _UNRESOLVED_HISTORY = 10
+
     def __init__(self) -> None:
         self.object_map: dict[str, otio.core.SerializableObject] = {}
         self._is_syncing: bool = False
         self._property_callbacks: list[Callable[[str, str, Any], None]] = []
         self._hierarchy_callbacks: list[Callable[[str, str, str], None]] = []
+        #: Descriptions of patches that could not be applied, most recent last.
+        self.unresolved_patches: list[str] = []
+        #: Total unresolved patches seen, which the bounded list above loses.
+        self.unresolved_patch_count: int = 0
+
+    def _record_unresolved(self, kind: str, target_uuid: "str | None") -> None:
+        """Record a patch that could not be applied because its target is unknown.
+
+        These used to be dropped in silence, and that is what let a peer receive
+        eight consecutive structural messages, apply none of them, and go on
+        reporting itself synced while its node graph stayed empty. A patch that
+        cannot be applied is a fact the session needs to surface.
+
+        Recorded, deliberately not queued for replay. The condition it signals —
+        a peer broadcasting a patch against an object its peers were never given
+        — is a bug at the sender, and a queue that silently succeeded later would
+        be the same "looks fine, is not" behaviour this record exists to remove.
+
+        :param kind: Message kind, e.g. ``"INSERT_CHILD"``.
+        :param target_uuid: GUID that could not be resolved.
+        """
+        self.unresolved_patch_count += 1
+        detail = (
+            f"{kind}: target {str(target_uuid)[:8]} not in object_map "
+            f"({len(self.object_map)} objects held)"
+        )
+        self.unresolved_patches.append(detail)
+        del self.unresolved_patches[:-self._UNRESOLVED_HISTORY]
+        _log(f"UNRESOLVED PATCH {detail}")
 
     def on_property_changed(
         self, callback: Callable[[str, str, Any], None]
@@ -363,6 +396,10 @@ class OTIOPatcher:
                 to_index: int = msg.to_index
                 parent = self.object_map.get(parent_uuid)
                 child = self.object_map.get(child_uuid)
+                if parent is None or child is None:
+                    self._record_unresolved(
+                        "MOVE_CHILD", parent_uuid if parent is None else child_uuid
+                    )
                 if parent is not None and child is not None:
                     current_index = next(
                         (i for i, item in enumerate(parent)
@@ -379,6 +416,8 @@ class OTIOPatcher:
                 parent_uuid = msg.parent_uuid
                 child_uuid = msg.child_uuid
                 parent = self.object_map.get(parent_uuid)
+                if parent is None:
+                    self._record_unresolved("REMOVE_CHILD", parent_uuid)
                 if parent is not None:
                     current_index = next(
                         (i for i, item in enumerate(parent)
@@ -403,11 +442,7 @@ class OTIOPatcher:
             elif isinstance(msg, InsertChild):
                 parent_uuid = msg.parent_uuid
                 if parent_uuid not in self.object_map:
-                    # DIAG(rv-follower-media-materialisation 1.1)
-                    _log(
-                        f"DIAG drop: INSERT_CHILD parent {str(parent_uuid)[:8]} "
-                        f"not in object_map ({len(self.object_map)} objects held)"
-                    )
+                    self._record_unresolved("INSERT_CHILD", parent_uuid)
                 if parent_uuid in self.object_map:
                     parent = self.object_map[parent_uuid]
                     index: int = msg.index

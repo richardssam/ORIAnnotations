@@ -219,6 +219,10 @@ class SyncManager:
         self._host_callbacks: list[Callable[["str | None", bool], None]] = []
 
         self._delta_buffer: list[dict[str, Any]] = []
+        #: True only while :meth:`apply_snapshot` replays buffered deltas, so
+        #: they are applied rather than buffered straight back onto the list
+        #: being iterated.
+        self._replaying: bool = False
         self._last_snapshot_time: float = 0
         self._last_who_is_master_time: float | None = None
         self._state_request_time: float | None = None
@@ -279,6 +283,24 @@ class SyncManager:
     @_is_syncing.setter
     def _is_syncing(self, val: bool) -> None:
         self.patcher._is_syncing = val
+
+    @property
+    def unresolved_patches(self) -> list[str]:
+        """Patches that could not be applied because their target was unknown.
+
+        Empty in a healthy session — a peer should never be sent a patch naming
+        an object it was not given. A non-empty list means some peer broadcast
+        against an object its peers do not hold, which is a defect at the
+        *sender*, and previously produced no signal anywhere at all.
+
+        :rtype: list
+        """
+        return self.patcher.unresolved_patches
+
+    @property
+    def unresolved_patch_count(self) -> int:
+        """Total unresolved patches seen, including those aged out of the list."""
+        return self.patcher.unresolved_patch_count
 
     @property
     def _property_callbacks(self) -> list[Callable[[str, str, Any], None]]:
@@ -1126,6 +1148,12 @@ class SyncManager:
         ).to_payload()
         payload["is_master"] = self.is_master
         payload["is_host"] = self.is_host
+        # Structural patches this peer could not apply. Carried for the same
+        # reason as the flags above — harness visibility — and because a peer
+        # that dropped patches is precisely one whose reported state should not
+        # be trusted as "synced with the sender".
+        payload["unresolved_patches"] = list(self.unresolved_patches)
+        payload["unresolved_patch_count"] = self.unresolved_patch_count
         return payload
 
     def _send_message(self, msg: ProtocolMessage) -> None:
@@ -1822,9 +1850,9 @@ class SyncManager:
 
         _log(f"apply_patch: command_schema={command_schema} event={event} source={source[:8]}")
 
-        if self.status == STATE_JOINING and command_schema != "LiveSession.1":
-            # DIAG(rv-follower-media-materialisation 1.1)
-            _log(f"DIAG buffer: {command_schema}/{event} held while JOINING")
+        if (self.status == STATE_JOINING
+                and command_schema != "LiveSession.1"
+                and not self._replaying):
             self._delta_buffer.append(payload)
             return None
 
@@ -1942,14 +1970,6 @@ class SyncManager:
         self, msg: AddTimeline, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
         tl_guid = msg.timeline_guid
-        # DIAG(rv-follower-media-materialisation 1.1)
-        if tl_guid and msg.timeline and tl_guid in self._timelines:
-            _existing = self._timelines[tl_guid]
-            _n_local = len(self._subtree_guids(_existing))
-            _log(
-                f"DIAG discard: ADD_TIMELINE {tl_guid[:8]} already held "
-                f"(local subtree has {_n_local} guids) — incoming copy dropped"
-            )
         # Check the GUID guard *before* deserializing: a timeline we already
         # hold must not pay the as_otio() cost.
         if tl_guid and msg.timeline and tl_guid not in self._timelines:
@@ -2180,6 +2200,28 @@ class SyncManager:
                 results.append(res)
         return results
 
+    @staticmethod
+    def _payload_sync_timestamp(payload: dict[str, Any]) -> float:
+        """Return the ``sync_timestamp`` an envelope carries, or ``0``.
+
+        The field lives in ``payload.command.payload``, alongside the message's
+        own fields — not in ``payload`` itself, where the replay comparison used
+        to look for it. Reading it one level too high returned the default
+        ``0`` for every message, so ``p_time > snapshot_timestamp`` was
+        universally false and **every** buffered delta was discarded: a peer
+        joining mid-edit silently lost every change made while it was joining.
+
+        Latent rather than observed — the delta buffer only fills when messages
+        arrive during the ``STATE_JOINING`` window — which is why this is fixed
+        and tested on its own rather than folded into a fix for something else.
+
+        :param payload: A received message envelope.
+        :returns: Epoch seconds, or ``0`` when the message carries none.
+        :rtype: float
+        """
+        command = payload.get("payload", {}).get("command", {})
+        return command.get("payload", {}).get("sync_timestamp", 0) or 0
+
     def apply_snapshot(self, snapshot_data: dict[str, Any]) -> list[tuple[str, Any]]:
         """Replace local state with a full snapshot and replay buffered deltas.
 
@@ -2235,20 +2277,26 @@ class SyncManager:
                         self.display_state = dict(ds)
                         break
 
+            # Replay with buffering disabled. The status is still
+            # STATE_JOINING here — it transitions below, after the replay, so
+            # that the on_synced callbacks observe the deltas already applied —
+            # and apply_patch buffers every non-session message while joining.
+            # Without this flag each replayed message is appended back onto the
+            # very list being iterated, which never terminates. That was
+            # unreachable while the timestamp comparison below always failed;
+            # it becomes reachable the moment the comparison works, so the two
+            # belong together.
             replay_results: list[tuple[str, Any]] = []
-            for payload in self._delta_buffer:
-                p_data = payload.get("payload", {})
-                p_time: float = p_data.get("sync_timestamp", 0)
-                if p_time > timestamp:
-                    res = self.apply_patch(payload)
-                    if res:
-                        replay_results.append(res)
-                else:
-                    # DIAG(rv-follower-media-materialisation 1.1)
-                    _log(
-                        f"DIAG stale: buffered {p_data.get('command_schema')} dropped,"
-                        f" sync_timestamp {p_time} <= snapshot {timestamp}"
-                    )
+            self._replaying = True
+            try:
+                for payload in self._delta_buffer:
+                    p_time: float = self._payload_sync_timestamp(payload)
+                    if p_time > timestamp:
+                        res = self.apply_patch(payload)
+                        if res:
+                            replay_results.append(res)
+            finally:
+                self._replaying = False
 
             self._delta_buffer = []
             self._state_request_time = None

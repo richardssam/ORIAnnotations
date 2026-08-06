@@ -28,6 +28,10 @@ def get_openrv_state():
         # follower mirrors rather than approximates, so this is how a mirror
         # failure becomes visible instead of looking like agreement.
         "view_mirror_error": None,
+        # Structural patches this peer was sent and could not apply. Empty in a
+        # healthy session; non-empty means some peer broadcast against an object
+        # this one was never given, which used to produce no signal at all.
+        "unresolved_patches": [],
     }
 
     try:
@@ -38,6 +42,9 @@ def get_openrv_state():
                 state["is_master"] = bool(_mgr_for_master.is_master)
                 state["is_host"] = bool(getattr(_mgr_for_master, "is_host", False))
                 state["host_guid"] = getattr(_mgr_for_master, "host_guid", None)
+                state["unresolved_patches"] = list(
+                    getattr(_mgr_for_master, "unresolved_patches", []) or []
+                )
             _pb = otio_sync_core.get_registered_playback_controller()
             if _pb is not None:
                 state["view_mirror_error"] = getattr(_pb, "mirror_failure", None)

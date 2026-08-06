@@ -47,6 +47,10 @@ def get_xstudio_state(port=14441):
         # assert which peer was allowed to change what everyone looks at.
         "is_host": None,
         "host_guid": None,
+        # Structural patches this peer was sent and could not apply. Empty in a
+        # healthy session; non-empty means some peer broadcast against an object
+        # this one was never given, which used to produce no signal at all.
+        "unresolved_patches": [],
         # Seeded here rather than inside the container read below, so a failed
         # container read cannot leave them absent entirely. media_exists
         # defaults True because "unknown" is not "missing" — defaulting False
@@ -73,6 +77,7 @@ def get_xstudio_state(port=14441):
                 if "is_host" in full:
                     state["is_host"] = full["is_host"]
                 state["host_guid"] = full.get("host_guid")
+                state["unresolved_patches"] = list(full.get("unresolved_patches") or [])
             # The synced timeline's name, resolved through the shared sync GUID.
             # This is the only container name that means the same thing on every
             # peer: the viewed-container name below reports the *timeline* when a

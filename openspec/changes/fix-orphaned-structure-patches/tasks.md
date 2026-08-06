@@ -27,10 +27,14 @@
 
 ## 4. Make the failure loud
 
-- [ ] 4.1 Promote the §1 drop instrumentation from debug logging to a reported failure, through the existing `mirror_failure` channel rather than a second one (design.md D3).
-- [ ] 4.2 Surface it in the inspector's `/state` so it is observable without reading application logs — the property whose absence let eight lost messages go unnoticed.
-- [ ] 4.3 Remove the §1 buffer/discard tracing, which has served its purpose; keep the drop reporting.
-- [ ] 4.4 Do **not** add a replay or retry queue. Under §3 the condition stops arising, and a queue that silently succeeds later is the behaviour this change removes.
+- [x] 4.1 Promote the §1 drop instrumentation from debug logging to a reported failure, through the existing `mirror_failure` channel rather than a second one (design.md D3).
+  - Recorded in core instead, by `OTIOPatcher._record_unresolved`, covering `INSERT_CHILD`, `MOVE_CHILD` and `REMOVE_CHILD`. `mirror_failure` lives on the OpenRV playback controller, and the drop happens in the patcher, which both applications share — routing it through an RV-only channel would have left xStudio silent on the same fault.
+- [x] 4.2 Surface it in the inspector's `/state` so it is observable without reading application logs — the property whose absence let eight lost messages go unnoticed.
+  - `unresolved_patches` / `unresolved_patch_count` on the manager, into `export_state()`, into both hooks, and shown in the runner's observed line.
+  - **Reported, deliberately not failed on** — I had it failing the run first, on the evidence that a healthy suite produced zero drops. That evidence did not hold: the next two runs tripped four otherwise-green tests. A *receiving* peer cannot tell "the sender broadcast against something it never published" from "I have not caught up yet" — both look like a parent GUID it does not hold — and sessions routinely produce a few while establishing. Gating on `STATE_SYNCED` did not help either, because a peer that self-elects master reaches `STATE_SYNCED` holding no timelines at all (observed: "0 objects held"). The enforceable version of this check is §5's, at the sender, which always knows what it published. Spec corrected to match.
+- [x] 4.3 Remove the §1 buffer/discard tracing, which has served its purpose; keep the drop reporting.
+- [x] 4.4 Do **not** add a replay or retry queue. Under §3 the condition stops arising, and a queue that silently succeeds later is the behaviour this change removes.
+  - The record is bounded to the last 10 with a separate total count, so it stays a diagnostic and cannot become a queue by accident.
 
 ## 5. Send-side guard
 
@@ -39,8 +43,10 @@
 
 ## 6. Delta-buffer replay comparison
 
-- [ ] 6.1 Fix `apply_snapshot`'s replay comparison, which reads `sync_timestamp` from `payload["payload"]` while the field lives one level deeper in `command.payload`, so it is always `0` and every buffered delta is discarded.
-- [ ] 6.2 Land it as its own commit with its own test. It did not cause this defect and must not ride along unexamined — it is on the join path, where a wrong fix is expensive to diagnose.
+- [x] 6.1 Fix `apply_snapshot`'s replay comparison, which reads `sync_timestamp` from `payload["payload"]` while the field lives one level deeper in `command.payload`, so it is always `0` and every buffered delta is discarded.
+  - `SyncManager._payload_sync_timestamp` reads the level the field is written to.
+- [x] 6.2 Land it as its own commit with its own test. It did not cause this defect and must not ride along unexamined — it is on the join path, where a wrong fix is expensive to diagnose.
+  - Landing it separately is exactly what caught the second half: **the replay path had never executed**, and fixing the comparison alone hangs. `apply_patch` buffers every non-session message while `STATE_JOINING`, and the status is still `STATE_JOINING` during replay — so each replayed message was appended back onto the list being iterated, and the loop never terminated. Unreachable while the comparison always failed; reachable the instant it worked. A peer joining mid-edit would have hung instead of silently losing its deltas — strictly worse. Guarded by a `_replaying` flag scoped to the replay, with tests pinning both termination and that buffering resumes afterwards.
 
 ## 7. Close out
 
