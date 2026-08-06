@@ -25,8 +25,14 @@ zip -r otiosyncdemo-1.2.rvpkg plugin.py utils.py sequence_sync.py playback_sync.
 # From the repo root, zip in the otio_sync_core library.
 cd ../..
 cd python
+# NOTE: this list is hand-maintained, and __init__.py imports these eagerly
+# inside a try/except ImportError. A module added to the library but not added
+# here therefore does not fail loudly — it makes `from .manager import
+# SyncManager` raise, the except swallows it, and the whole sync plugin goes
+# quietly inert. Add new otio_sync_core modules here in the same commit.
 zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/__init__.py \
+    otio_sync_core/authority.py \
     otio_sync_core/color.py \
     otio_sync_core/coords.py \
     otio_sync_core/shapes.py \

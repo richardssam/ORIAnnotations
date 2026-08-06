@@ -12,7 +12,7 @@ transparent proxy for intercepting attribute writes.
 # eager import here would break ``from otio_sync_core import coords`` for them.
 # When the sync deps ARE present (live sync plugins) these names resolve as before.
 try:
-    from . import color
+    from . import authority, color
     from .manager import SyncManager, sync_event_schema
     from .network import SyncNetworkProtocol, UDPNetwork
     from .rabbitmq_network import RabbitMQNetwork, resolve_host
@@ -31,6 +31,8 @@ try:
         get_registered_manager,
         register_annotation_controller,
         get_registered_annotation_controller,
+        register_playback_controller,
+        get_registered_playback_controller,
     )
 except ImportError:  # pragma: no cover - exercised only on incomplete installs
     pass

@@ -62,6 +62,7 @@ import opentimelineio as otio
 from xstudio.connection import Connection
 from xstudio.api.session.playhead import Playhead
 
+from otio_sync_core.authority import SUPPRESSED  # noqa: E402
 from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED, SyncManager  # noqa: E402
 from otio_sync_core.rabbitmq_network import RabbitMQNetwork, resolve_host  # noqa: E402
 from xstudio.plugin import PluginBase  # noqa: E402
@@ -237,6 +238,9 @@ class ORISyncPlugin(PluginBase):
             session_id=session_name,
             self_guid=str(self.uuid),
             network=network,
+            # Ranks this peer top for host election, so xStudio holds visibility
+            # authority whenever it is in the session.
+            app_name="xstudio",
         )
         self.manager.on_playback_changed(self.playback.apply_playback_state)
         self.manager.on_status_changed(
@@ -677,7 +681,20 @@ class ORISyncPlugin(PluginBase):
                     # have set to a transient per-clip timeline the peer lacks.
                     # Cached (short TTL) so per-frame scrub broadcasts stay cheap.
                     tl_guid = self.playback.cached_viewed_timeline_guid()
-                    self.manager.broadcast_playback_state(payload, timeline_guid=tl_guid)
+                    status = self.manager.broadcast_playback_state(
+                        payload, timeline_guid=tl_guid
+                    )
+                    # Visibility is host-owned and enforced in the manager; a
+                    # follower's view_mode/clip_guid are stripped there, not
+                    # here. Observed only to log it — the plugin never gates the
+                    # broadcast itself, which is what keeps the two host
+                    # applications from drifting on the rule.
+                    if status == SUPPRESSED and payload.get("view_mode"):
+                        _log(
+                            "broadcast_playback_state: visibility stripped (not host)"
+                            f" mode={payload.get('view_mode')!r}"
+                            f" clip={(payload.get('clip_guid') or '-')[:8]}"
+                        )
             elif cmd == "resolve_selection":
                 self.playback.resolve_and_broadcast_selection()
             elif cmd == "sync_container":
@@ -828,11 +845,18 @@ class ORISyncPlugin(PluginBase):
             self.manager.elect_self_as_master()
 
     def _on_synced(self) -> None:
-        _log(f"Session reached STATE_SYNCED (master={self.manager.is_master})")
+        _log(
+            f"Session reached STATE_SYNCED (master={self.manager.is_master},"
+            f" host={self.manager.is_host})"
+        )
         role = "MASTER" if self.manager.is_master else "CLIENT"
+        # Host is reported separately from master on purpose: they are different
+        # roles (snapshot authority vs visibility authority), and a master
+        # re-election does not move visibility.
+        seat = "HOST" if self.manager.is_host else "follower"
         print(
             f"[OTIOSync] Connected to session '{self.session_id_attr.value()}' "
-            f"on {self.mq_host_attr.value()} as {role}",
+            f"on {self.mq_host_attr.value()} as {role} ({seat})",
             file=sys.stderr,
         )
         # Reset the scan timer so the first bookmarks.bookmarks call is deferred

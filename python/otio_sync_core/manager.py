@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import logging as _logging
+import queue
 import time
 import uuid
 from typing import Any, Callable
 
 import opentimelineio as otio
 
+from . import authority
 from .network import SyncNetworkProtocol
 from .proxy import OTIOSyncProxy
 from .patcher import OTIOPatcher, _otio_to_dict, _dict_to_otio
@@ -31,6 +33,7 @@ from .protocol_messages import (
     RemoveTimeline,
     RenameTimeline,
     ReplaceAnnotationCommands,
+    PeerAnnounce,
     ReplaceTimeline,
     SetProperty,
     StateRequest,
@@ -126,10 +129,28 @@ class SyncManager:
     every state transition the election entails.  Callers MUST NOT elect by
     assigning :attr:`is_master`, :attr:`master_guid`, or :attr:`status` directly.
 
+    **Broadcast authority**
+
+    Separately from mastership, the manager holds the *host* role — the peer
+    permitted to broadcast **visibility** (which clip/sequence is shown, and in
+    which view mode).  Position and annotation remain multi-writer.  Host is
+    elected by capability from the peer table (:meth:`elect_host`) and is
+    deliberately distinct from master: master is the snapshot authority, elected
+    on liveness grounds, and a master re-election does not move visibility
+    authority.  Authority is enforced inside the ``broadcast_*`` methods, which
+    return :data:`~otio_sync_core.authority.SENT` /
+    :data:`~otio_sync_core.authority.SUPPRESSED`; plugins never test "am I host".
+
     :param session_id: Logical session identifier; scopes all network messages.
     :param self_guid: Stable GUID for this peer; auto-generated when not provided.
     :param network: Network backend satisfying :class:`~otio_sync_core.network.SyncNetworkProtocol`.
         May be set or replaced after construction.
+    :param app_name: Application this peer runs in (e.g. ``"xstudio"``,
+        ``"openrv"``).  Ranks the peer for host election; an unrecognised name
+        is still eligible, so a session of unranked peers still elects a host.
+    :param capabilities: Roles this peer can hold; defaults to
+        ``["visibility"]``.  Pass ``[]`` for a peer that must never host (the
+        sync viewer, a recorder).
     """
 
     def __init__(
@@ -137,6 +158,8 @@ class SyncManager:
         session_id: str = "default_session",
         self_guid: str | None = None,
         network: SyncNetworkProtocol | None = None,
+        app_name: str = "",
+        capabilities: "list[str] | None" = None,
     ) -> None:
         self.session_id = session_id
         self.self_guid: str = self_guid or str(uuid.uuid4())
@@ -169,6 +192,32 @@ class SyncManager:
         self.status: str = STATE_NONE
         self.is_master: bool = False
         self.master_guid: str | None = None
+
+        #: Application name and capabilities advertised by this peer.
+        self.app_name: str = app_name
+        self.capabilities: list[str] = (
+            list(capabilities)
+            if capabilities is not None
+            else [authority.CAPABILITY_VISIBILITY]
+        )
+        #: Whether this peer holds visibility authority.  Written only by
+        #: :meth:`elect_host`; never assign it directly.
+        self.is_host: bool = False
+        #: GUID of the elected host, or ``None`` before the first election.
+        self.host_guid: str | None = None
+        #: Peer table feeding host election: ``{guid: {"app", "capabilities"}}``.
+        #: Seeded with this peer so a solo session still elects a host.
+        self._peers: dict[str, dict[str, Any]] = {
+            self.self_guid: {
+                "app": self.app_name,
+                "capabilities": list(self.capabilities),
+            }
+        }
+        #: Host-election requests enqueued from threads other than the poll
+        #: thread.  Drained in :meth:`tick`; see :meth:`request_host_election`.
+        self._host_election_queue: "queue.Queue[str]" = queue.Queue()
+        self._host_callbacks: list[Callable[["str | None", bool], None]] = []
+
         self._delta_buffer: list[dict[str, Any]] = []
         self._last_snapshot_time: float = 0
         self._last_who_is_master_time: float | None = None
@@ -194,6 +243,7 @@ class SyncManager:
         ] = {
             ("LiveSession.1", "WHO_IS_MASTER"): self._h_who_is_master,
             ("LiveSession.1", "I_AM_MASTER"): self._h_i_am_master,
+            ("LiveSession.1", "PEER_ANNOUNCE"): self._h_peer_announce,
             ("LiveSession.1", "STATE_REQUEST"): self._h_state_request,
             ("LiveSession.1", "STATE_SNAPSHOT"): self._h_state_snapshot,
             ("PLAYBACK_SETTINGS_1.0", "SET"): self._h_playback_set,
@@ -383,7 +433,7 @@ class SyncManager:
         )
         return clip_tl_guid
 
-    def broadcast_add_timeline(self, tl_guid: str) -> None:
+    def broadcast_add_timeline(self, tl_guid: str) -> str:
         """Broadcast a timeline to all peers so they can register it.
 
         Works for both sequence timelines (new playlist / new sequence) and
@@ -393,12 +443,14 @@ class SyncManager:
         ignore the message.
 
         :param tl_guid: GUID of the timeline to broadcast.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
-            return
+            return authority.SUPPRESSED
         self._send_message(
             AddTimeline(
                 timeline_guid=tl_guid,
@@ -406,8 +458,9 @@ class SyncManager:
                 sync_timestamp=time.time(),
             )
         )
+        return authority.SENT
 
-    def broadcast_clip_timeline(self, tl_guid: str) -> None:
+    def broadcast_clip_timeline(self, tl_guid: str) -> str:
         """Broadcast a clip timeline to all peers so they can register its annotation track.
 
         Should be called once per clip timeline, immediately after
@@ -418,10 +471,12 @@ class SyncManager:
         Delegates to :meth:`broadcast_add_timeline`.
 
         :param tl_guid: GUID of the clip timeline to broadcast.
+        :returns: ``SENT`` / ``SUPPRESSED``, as :meth:`broadcast_add_timeline`.
+        :rtype: str
         """
-        self.broadcast_add_timeline(tl_guid)
+        return self.broadcast_add_timeline(tl_guid)
 
-    def broadcast_timeline_rename(self, tl_guid: str, new_name: str) -> None:
+    def broadcast_timeline_rename(self, tl_guid: str, new_name: str) -> str:
         """Rename a timeline locally and broadcast the change to all peers.
 
         Updates the timeline's ``name`` attribute in ``_timelines`` immediately,
@@ -430,13 +485,15 @@ class SyncManager:
 
         :param tl_guid: GUID of the timeline to rename.
         :param new_name: New display name for the timeline.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
             _log(f"broadcast_timeline_rename: unknown timeline {tl_guid}")
-            return
+            return authority.SUPPRESSED
         tl.name = new_name
         self._send_message(
             RenameTimeline(
@@ -445,8 +502,9 @@ class SyncManager:
                 sync_timestamp=time.time(),
             )
         )
+        return authority.SENT
 
-    def broadcast_remove_timeline(self, tl_guid: str) -> None:
+    def broadcast_remove_timeline(self, tl_guid: str) -> str:
         """Remove a timeline locally and broadcast the removal to all peers.
 
         Symmetric to :meth:`broadcast_add_timeline`.  Performs the same
@@ -459,19 +517,22 @@ class SyncManager:
         timeline is not the active one except when it is the last remaining.
 
         :param tl_guid: GUID of the timeline to remove.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         if self._remove_timeline_local(tl_guid) is None:
-            return
+            return authority.SUPPRESSED
         self._send_message(
             RemoveTimeline(
                 timeline_guid=tl_guid,
                 sync_timestamp=time.time(),
             )
         )
+        return authority.SENT
 
-    def broadcast_replace_timeline(self, tl_guid: str) -> None:
+    def broadcast_replace_timeline(self, tl_guid: str) -> str:
         """Push a wholesale replacement of a timeline's structure to all peers.
 
         Used for topology changes on OTIO-origin timelines (clip insert/remove,
@@ -485,12 +546,14 @@ class SyncManager:
         do **not** ignore this message — they replace their copy.
 
         :param tl_guid: GUID of the timeline to push.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
-            return
+            return authority.SUPPRESSED
         self._replace_timeline_local(tl_guid, tl)
         self._send_message(
             ReplaceTimeline(
@@ -499,6 +562,7 @@ class SyncManager:
                 sync_timestamp=time.time(),
             )
         )
+        return authority.SENT
 
     def reset_timelines(self) -> None:
         """Clear all registered timelines, the object map, and the active GUID.
@@ -777,9 +841,14 @@ class SyncManager:
         Transitions :attr:`status` to ``STATE_DISCOVERING``.  The caller is
         responsible for timing out and calling the appropriate method if no master
         responds (see class docstring for the full lifecycle).
+
+        Also announces this peer so every other peer can include it in host
+        election, and elects a host locally so a solo session is never hostless.
         """
         self._set_status(STATE_DISCOVERING)
         self.broadcast_master_discovery()
+        self.announce_peer()
+        self.elect_host()
 
     def broadcast_master_discovery(self) -> None:
         """Broadcast a ``WHO_IS_MASTER`` session message."""
@@ -823,6 +892,165 @@ class SyncManager:
             self.broadcast_master_response()
         self._set_status(STATE_SYNCED)
 
+    # ------------------------------------------------------------------
+    # Host Election (visibility authority)
+    # ------------------------------------------------------------------
+
+    def announce_peer(self, reply_requested: bool = True) -> None:
+        """Broadcast this peer's identity and capabilities.
+
+        Feeds every other peer's election table.  Called from
+        :meth:`start_session`, and again — with *reply_requested* ``False`` — in
+        answer to another peer's announcement.
+
+        :param reply_requested: Ask receiving peers to answer with their own
+            announcement.  ``True`` on the initial announcement only; an answer
+            that asked for answers would be an announcement storm.
+        """
+        self._send_message(PeerAnnounce(
+            peer_guid=self.self_guid,
+            app=self.app_name,
+            capabilities=list(self.capabilities),
+            reply_requested=reply_requested,
+        ))
+
+    def on_host_changed(
+        self, callback: Callable[["str | None", bool], None]
+    ) -> Callable[["str | None", bool], None]:
+        """Register a callback fired when the elected host changes.
+
+        The callback receives ``(host_guid, is_host)`` and observes a fully
+        elected manager — both :attr:`host_guid` and :attr:`is_host` are set
+        before it runs.  Also usable as a decorator.
+
+        :param callback: Callable receiving ``(host_guid, is_host)``.
+        :returns: The *callback* unchanged (decorator-compatible).
+        """
+        self._host_callbacks.append(callback)
+        return callback
+
+    def request_host_election(self, reason: str = "") -> None:
+        """Ask the poll thread to re-run host election.
+
+        The **only** thread-safe entry point.  Host state belongs to a single
+        writer — the thread that calls :meth:`tick` — so callers on other
+        threads enqueue rather than mutate, exactly as ``fix-discovery-thread-
+        safety`` did for master election.  Eligibility is re-evaluated when the
+        request is *drained*, not when it is enqueued, so a peer discovered
+        during queue latency is accounted for by the election it triggered.
+
+        :param reason: Short label recorded in the log, e.g. ``"peer-announce"``.
+        """
+        self._host_election_queue.put(reason or "unspecified")
+
+    def elect_host(self) -> "str | None":
+        """Re-evaluate the host from the peer table and apply the result.
+
+        The single host-election operation: it owns every field the transition
+        touches, so no call site assembles the sequence itself.  Callers MUST
+        NOT elect by assigning :attr:`host_guid` or :attr:`is_host` directly.
+
+        The order matters, for the same reason it does in
+        :meth:`elect_self_as_master`: :attr:`host_guid` and :attr:`is_host` are
+        both set *before* the :meth:`on_host_changed` callbacks fire, so a
+        callback never observes a half-elected manager.
+
+        Election is a pure function of the peer table
+        (:func:`~otio_sync_core.authority.elect_host_guid`), so two peers
+        evaluating the same peers reach the same host with no claim protocol —
+        and a peer that elects itself before hearing about a preferred peer
+        simply re-elects when that peer's announcement arrives.  Both host
+        applications reach this same code, so their post-election state is
+        identical by construction rather than by hand-replication.
+
+        Must run on the poll thread; other threads call
+        :meth:`request_host_election`.
+
+        :returns: The elected host GUID, or ``None`` when no peer is capable.
+        :rtype: str or None
+        """
+        elected = authority.elect_host_guid(self._peers)
+        if elected == self.host_guid:
+            return elected
+        previous = self.host_guid
+        self.host_guid = elected
+        self.is_host = elected == self.self_guid
+        _log(
+            f"elect_host: {(previous or 'none')[:8]} → {(elected or 'none')[:8]}"
+            f" (self={'HOST' if self.is_host else 'follower'},"
+            f" peers={len(self._peers)})"
+        )
+        for cb in self._host_callbacks:
+            try:
+                cb(self.host_guid, self.is_host)
+            except Exception as e:
+                _log(f"on_host_changed callback error: {e}")
+        return elected
+
+    def adopt_host(self, host_guid: "str | None") -> None:
+        """Adopt a host learned from session state rather than from election.
+
+        Used when applying a ``STATE_SNAPSHOT``: a joiner must not assume it is
+        host and start fighting the real one before its own announcement has
+        been answered.  Applies the same field order as :meth:`elect_host` and
+        fires the same callbacks.
+
+        A later :meth:`elect_host` may still move the role — a joining xStudio
+        legitimately takes visibility from an OpenRV-only session's host — but
+        it does so from a complete peer table rather than from an empty one.
+
+        :param host_guid: Host GUID carried in the snapshot; ``None`` is ignored
+            so a snapshot from a peer predating this field cannot clear a host
+            already elected locally.
+        """
+        if not host_guid or host_guid == self.host_guid:
+            return
+        self.host_guid = host_guid
+        self.is_host = host_guid == self.self_guid
+        _log(f"adopt_host: {host_guid[:8]} (self={'HOST' if self.is_host else 'follower'})")
+        for cb in self._host_callbacks:
+            try:
+                cb(self.host_guid, self.is_host)
+            except Exception as e:
+                _log(f"on_host_changed callback error: {e}")
+
+    def owns_visibility(self) -> bool:
+        """Return whether a local visibility transition may be read as user intent.
+
+        The follower rule (D3): a peer that does not own a category must not
+        infer, from a local state transition in that category, that a user
+        caused it.  A follower's view changes because it applied someone else's
+        message, and acting on that guess is what started playback on every peer
+        and reset a playhead over a seek that had just landed.
+
+        This is **not** the broadcast gate — that lives in ``broadcast_*`` and no
+        plugin consults it.  It is the one shared predicate the two plugins use
+        for their *local* intent branches (xStudio's auto-play on a Pinned Source
+        Mode transition, its frame-0 reset on a new isolation), so the answer
+        cannot drift between them and honours the same kill switch.  It replaces
+        the per-plugin "was a peer driving in the last N ms?" time windows, which
+        is the mechanism that kept failing.
+
+        :rtype: bool
+        """
+        return self.is_host or not authority.enforcement_enabled()
+
+    def drop_peer(self, peer_guid: str) -> None:
+        """Forget a peer and re-elect the host if it held the role.
+
+        The protocol has no departure message today, so nothing calls this on a
+        remote peer disconnecting — a departed host therefore keeps the role
+        until it (or a preferred peer) announces again.  The operation exists so
+        that when a departure signal is added, host failover is one call rather
+        than a second election implementation.
+
+        :param peer_guid: GUID of the peer to forget.
+        """
+        if self._peers.pop(peer_guid, None) is None:
+            return
+        _log(f"drop_peer: {peer_guid[:8]} ({len(self._peers)} remaining)")
+        self.elect_host()
+
     def request_state(self) -> None:
         """Send a ``STATE_REQUEST`` to the master and enter ``STATE_JOINING``.
 
@@ -861,6 +1089,7 @@ class SyncManager:
             snapshot_timestamp=time.time(),
             playback_state=playback_state or None,
             display_state=self.display_state or None,
+            host_guid=self.host_guid,
         ))
 
     def export_state(self) -> dict[str, Any]:
@@ -874,15 +1103,17 @@ class SyncManager:
         :func:`otio_sync_core.project_state`.  Works on any peer, not only the
         master.
 
-        Also carries ``is_master`` as an extra top-level key, purely for test
-        harness visibility (e.g. waiting for a script-driven test's driver app
-        to hold master before sending structural commands it would otherwise
-        silently be unable to broadcast). ``project_state``/``diff_states``
-        only read the named ``StateSnapshot`` fields, so this extra key is
-        inert for structural comparison.
+        Also carries ``is_master`` and ``is_host`` as extra top-level keys,
+        purely for test harness visibility (e.g. waiting for a script-driven
+        test's driver app to hold master before sending structural commands it
+        would otherwise silently be unable to broadcast, or asserting which peer
+        holds visibility authority — a distinction the harness cannot reason
+        about unless it collects it). ``project_state``/``diff_states`` only read
+        the named ``StateSnapshot`` fields, so these extra keys are inert for
+        structural comparison.
 
         :returns: A ``StateSnapshot``-shaped payload dict (timelines in wire
-            form), plus ``is_master``.
+            form), plus ``is_master`` and ``is_host``.
         """
         payload = StateSnapshot(
             target_guid="",
@@ -891,8 +1122,10 @@ class SyncManager:
             snapshot_timestamp=time.time(),
             playback_state=self.playback_state or None,
             display_state=self.display_state or None,
+            host_guid=self.host_guid,
         ).to_payload()
         payload["is_master"] = self.is_master
+        payload["is_host"] = self.is_host
         return payload
 
     def _send_message(self, msg: ProtocolMessage) -> None:
@@ -961,11 +1194,37 @@ class SyncManager:
             )
             self._send_message(msg)
 
+    def _enforce_visibility(self, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """Strip visibility fields when this peer is not the host.
+
+        **The** enforcement point for the visibility category, deliberately in
+        one place rather than at each call site: the failure this guards against
+        is a follower that drops ``view_mode`` but still carries a ``clip_guid``,
+        which still asserts what the session should look at.  Stripping the
+        whole field group together makes that mistake unavailable.
+
+        :param state: Outgoing playback/view state dict.
+        :returns: ``(state_to_send, status)`` where *status* is
+            :data:`~otio_sync_core.authority.SENT` when the message goes out
+            intact, or :data:`~otio_sync_core.authority.SUPPRESSED` when
+            visibility fields were removed from it.
+        """
+        if self.is_host or not authority.enforcement_enabled():
+            return state, authority.SENT
+        if not authority.asserts_visibility(state):
+            return state, authority.SENT
+        _log(
+            "broadcast_playback_state: stripped visibility fields"
+            f" (mode={state.get('view_mode')!r} clip={(state.get('clip_guid') or '-')[:8]})"
+            f" — host is {(self.host_guid or 'unelected')[:8]}"
+        )
+        return authority.strip_visibility_fields(state), authority.SUPPRESSED
+
     def broadcast_playback_state(
         self,
         state_dict: dict[str, Any],
         timeline_guid: str | None = None,
-    ) -> None:
+    ) -> str:
         """Broadcast the current view/playback state to all peers.
 
         This is the single authoritative view-state message (SELECTION_1.0 is
@@ -974,17 +1233,27 @@ class SyncManager:
         when the caller includes them in *state_dict* (they round-trip through
         ``PlaybackSettingsSet.from_payload``).
 
+        The message spans two authority categories — ``position`` (any peer) and
+        ``visibility`` (host only) — so enforcement applies to the *fields*: a
+        follower's message goes out carrying position, with the visibility
+        fields removed by :meth:`_enforce_visibility`.
+
         :param state_dict: View/playback fields — ``playing``, ``current_time``,
             ``playback_mode``, and optionally ``view_mode`` and ``clip_guid``.
         :param timeline_guid: GUID of the timeline being viewed; falls back to
             :attr:`active_timeline_guid`.
+        :returns: ``SENT`` when the state went out as given, ``SUPPRESSED`` when
+            it was withheld or had visibility fields stripped.
+        :rtype: str
         """
         if self._is_syncing or not self.network:
-            return
+            return authority.SUPPRESSED
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
+        inner, status = self._enforce_visibility(inner)
         self._send_message(PlaybackSettingsSet.from_payload(inner))
+        return status
 
     def clip_guid_at_frame(
         self, timeline_guid: "str | None", frame: int
@@ -1020,7 +1289,7 @@ class SyncManager:
                 t += dur
         return None
 
-    def broadcast_display_state(self, state_dict: dict[str, Any]) -> None:
+    def broadcast_display_state(self, state_dict: dict[str, Any]) -> str:
         """Broadcast the current display state to all peers and persist it.
 
         Expected keys in *state_dict*:
@@ -1035,10 +1304,16 @@ class SyncManager:
         ``metadata["display_settings"]`` so it survives a full session teardown
         if the OTIO file is saved to disk.
 
+        Categorised **position**, not visibility: reviewers legitimately toggle
+        channels and exposure locally, so every peer may broadcast it (see the
+        category table in :mod:`otio_sync_core.authority`).
+
         :param state_dict: Display state fields as listed above.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if self._is_syncing or not self.network:
-            return
+            return authority.SUPPRESSED
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
         self.display_state = inner
@@ -1048,6 +1323,7 @@ class SyncManager:
                 k: v for k, v in inner.items() if k != "sync_timestamp"
             }
         self._send_message(DisplaySettingsSet.from_payload(inner))
+        return authority.SENT
 
     @staticmethod
     def _annotation_track_end(track: otio.schema.Track) -> int:
@@ -1332,6 +1608,11 @@ class SyncManager:
         merged (appended) into the existing clip's metadata using a delta
         clip sent via :class:`InsertChild` rather than inserting a duplicate clip.
 
+        Categorised **annotation** — multi-writer, never gated — which is why
+        this is the one ``broadcast_*`` that keeps a domain return value instead
+        of a ``SENT``/``SUPPRESSED`` status: callers need the annotation clip's
+        GUID, and there is no authority outcome for them to observe.
+
         :param annotation_track_guid: GUID of the target Annotations track.
         :param clip_guid: GUID of the media clip being annotated.
         :param clip_local_time: 0-indexed time within the clip's source range.
@@ -1393,7 +1674,7 @@ class SyncManager:
         frame: float,
         fps: float,
         events: list,
-    ) -> None:
+    ) -> str:
         """Broadcast a mid-stroke partial annotation to peers (visual only, no timeline persistence).
 
         Called periodically while the user is actively drawing a stroke, before pen-up.
@@ -1404,21 +1685,24 @@ class SyncManager:
         :param frame: 0-indexed clip-local frame number.
         :param fps: Frame rate used to interpret *frame*.
         :param events: Serialised SyncEvent dicts (``PaintStart.1``, ``PaintPoints.1``).
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         self._send_message(PartialAnnotation(
             clip_guid=clip_guid,
             frame=frame,
             fps=fps,
             events=[_otio_to_dict(e) if not isinstance(e, dict) else e for e in events],
         ))
+        return authority.SENT
 
     def broadcast_replace_annotation_commands(
         self,
         annotation_clip_guid: str,
         events: list,
-    ) -> None:
+    ) -> str:
         """Replace all annotation_commands on an existing clip and broadcast to peers.
 
         Used when the user edits or modifies an existing committed annotation in-place
@@ -1430,13 +1714,15 @@ class SyncManager:
         :param annotation_clip_guid: Sync GUID of the annotation clip to update.
         :param events: Full replacement list of SyncEvent objects (strokes +
             captions) representing the current annotation state.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
         clip = self._object_map.get(annotation_clip_guid)
         if clip is None:
             _log(f"broadcast_replace_annotation_commands: clip {annotation_clip_guid} not found")
-            return
+            return authority.SUPPRESSED
 
         otio_events: list[otio.core.SerializableObject] = []
         for e in events:
@@ -1452,10 +1738,11 @@ class SyncManager:
             commands=list(otio_events),
             sync_timestamp=time.time(),
         ))
+        return authority.SENT
 
     def broadcast_move_child(
         self, parent_uuid: str, child_uuid: str, to_index: int
-    ) -> None:
+    ) -> str:
         """Move *child_uuid* to *to_index* within its parent and broadcast the change.
 
         Applies the reorder locally before broadcasting so the local OTIO model
@@ -1464,36 +1751,44 @@ class SyncManager:
         :param parent_uuid: GUID of the parent container.
         :param child_uuid: GUID of the child to move.
         :param to_index: Target position in the parent's child list.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if self._is_syncing:
             _log("broadcast_move_child: skipped (_is_syncing)")
-            return
+            return authority.SUPPRESSED
         if not self.network:
             _log("broadcast_move_child: skipped (no network)")
-            return
+            return authority.SUPPRESSED
         if self.status != STATE_SYNCED:
             _log(f"broadcast_move_child: skipped (status={self.status})")
-            return
+            return authority.SUPPRESSED
 
         msg = self.patcher.move_child(parent_uuid, child_uuid, to_index)
         if msg:
             self._send_message(msg)
+            return authority.SENT
+        return authority.SUPPRESSED
 
-    def broadcast_remove_child(self, parent_uuid: str, child_uuid: str) -> None:
+    def broadcast_remove_child(self, parent_uuid: str, child_uuid: str) -> str:
         """Remove *child_uuid* from its parent and broadcast the change.
 
         The child is removed from both the parent container and ``_object_map``.
 
         :param parent_uuid: GUID of the parent container.
         :param child_uuid: GUID of the child to remove.
+        :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
+        :rtype: str
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
-            return
+            return authority.SUPPRESSED
 
         msg = self.patcher.remove_child(parent_uuid, child_uuid)
         if msg:
             _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
             self._send_message(msg)
+            return authority.SENT
+        return authority.SUPPRESSED
 
     # ------------------------------------------------------------------
     # Message Handling
@@ -1564,6 +1859,25 @@ class SyncManager:
         self._last_who_is_master_time = None
         if self.status == STATE_DISCOVERING:
             return ("master_found", self.master_guid)
+        return None
+
+    def _h_peer_announce(
+        self, msg: PeerAnnounce, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        guid = msg.peer_guid or source
+        known = self._peers.get(guid)
+        entry = {"app": msg.app, "capabilities": list(msg.capabilities)}
+        if known != entry:
+            self._peers[guid] = entry
+            _log(
+                f"PEER_ANNOUNCE: {guid[:8]} app={msg.app!r}"
+                f" caps={entry['capabilities']} ({len(self._peers)} peers)"
+            )
+        if msg.reply_requested:
+            self.announce_peer(reply_requested=False)
+        # Already on the poll thread (apply_patch runs inside tick), so this is
+        # a direct election rather than an enqueue.
+        self.elect_host()
         return None
 
     def _h_state_request(
@@ -1720,6 +2034,7 @@ class SyncManager:
         :returns: List of ``(action, data)`` tuples requiring application
             action (subset of what :meth:`receive_and_apply_all` would return).
         """
+        self._drain_host_elections()
         app_events: list[tuple[str, Any]] = []
         for action, data in self.receive_and_apply_all():
             if action == "master_found":
@@ -1769,6 +2084,27 @@ class SyncManager:
                 app_events.append(("state_request_timeout", None))
 
         return app_events
+
+    def _drain_host_elections(self) -> None:
+        """Run any host election requested from another thread.
+
+        Eligibility is evaluated here, at drain time: :meth:`elect_host` reads
+        the peer table as it stands *now*, so a request enqueued before a
+        preferred peer announced still produces the right host.  A batch of
+        queued requests collapses into one election, since the result depends
+        only on the table and not on how many times it was asked for.
+        """
+        requested = False
+        reasons: list[str] = []
+        while True:
+            try:
+                reasons.append(self._host_election_queue.get_nowait())
+            except queue.Empty:
+                break
+            requested = True
+        if requested:
+            _log(f"host election requested ({', '.join(reasons)})")
+            self.elect_host()
 
     # Latest-wins message schemas mapped to a per-schema coalesce threshold:
     # within one drained batch, superseded messages of that schema are dropped
@@ -1872,6 +2208,9 @@ class SyncManager:
                 else:
                     self._traverse_and_map(tl)
             self.active_timeline_guid = snapshot_data.get("active_timeline_guid")
+            # Adopt the session's host before any local election runs, so a
+            # joiner does not assume the role and fight the incumbent.
+            self.adopt_host(snapshot_data.get("host_guid"))
             if "playback_state" in snapshot_data:
                 self.playback_state = snapshot_data["playback_state"]
 

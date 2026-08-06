@@ -53,6 +53,11 @@ async def _lifespan(app: FastAPI):  # noqa: ARG001
     _manager = SyncManager(
         session_id=cfg.get("session", "otio-sync-demo"),
         network=network,
+        app_name="sync_viewer",
+        # A passive observer must never be elected host: it has no view of its
+        # own to impose, and an RV-only session with a viewer attached would
+        # otherwise be able to elect the viewer and leave nobody driving.
+        capabilities=[],
     )
     _manager.start_session()
     print(

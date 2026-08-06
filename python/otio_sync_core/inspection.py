@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 _REGISTERED_MANAGER: "SyncManager | None" = None
 _REGISTERED_ANNOTATION_CONTROLLER: Any = None
+_REGISTERED_PLAYBACK_CONTROLLER: Any = None
 
 
 def register_manager(manager: "SyncManager") -> None:
@@ -49,3 +50,21 @@ def register_annotation_controller(controller: Any) -> None:
 def get_registered_annotation_controller() -> Any:
     """Return the registered annotation controller, or ``None`` if unregistered."""
     return _REGISTERED_ANNOTATION_CONTROLLER
+
+
+def register_playback_controller(controller: Any) -> None:
+    """Register the live ``PlaybackSyncController`` for inspection.
+
+    Lets the ``sync_test`` hook report whether this peer could actually mirror
+    the host's view (``controller.mirror_failure``).  Without it a follower that
+    failed to show the host's clip is indistinguishable from one that succeeded.
+
+    :param controller: The active ``PlaybackSyncController`` for this peer.
+    """
+    global _REGISTERED_PLAYBACK_CONTROLLER
+    _REGISTERED_PLAYBACK_CONTROLLER = controller
+
+
+def get_registered_playback_controller() -> Any:
+    """Return the registered playback controller, or ``None`` if unregistered."""
+    return _REGISTERED_PLAYBACK_CONTROLLER

@@ -230,6 +230,56 @@ class IAmMaster(ProtocolMessage):
 
 @register
 @dataclass
+class PeerAnnounce(ProtocolMessage):
+    """Peer identity broadcast: who I am and what I can be authoritative for.
+
+    Feeds the peer table that host election reads.  Election is a pure function
+    of that table, so every peer must learn of every other peer — not just of
+    the master.  A peer therefore announces on joining and *answers* another
+    peer's announcement, which is what lets a late joiner discover peers that
+    have long since gone quiet.  ``reply_requested`` stops that from becoming an
+    announcement storm: only the initial announcement asks for answers, and the
+    answers do not ask again.
+    """
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "PEER_ANNOUNCE"
+
+    peer_guid: str = doc_field(doc="GUID of the announcing peer.")
+    app: str = doc_field(
+        default="",
+        doc='Application name, e.g. "xstudio" or "openrv". Ranks the peer for '
+            "host election; an unranked name is still eligible.",
+    )
+    capabilities: list = doc_field(
+        default_factory=list,
+        doc='Roles this peer can hold, e.g. ["visibility"].',
+    )
+    reply_requested: bool = doc_field(
+        default=False,
+        doc="Whether receiving peers should answer with their own announcement.",
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "peer_guid": self.peer_guid,
+            "app": self.app,
+            "capabilities": list(self.capabilities),
+            "reply_requested": self.reply_requested,
+        }
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "PeerAnnounce":
+        return cls(
+            peer_guid=data.get("peer_guid"),
+            app=data.get("app") or "",
+            capabilities=list(data.get("capabilities") or []),
+            reply_requested=bool(data.get("reply_requested")),
+        )
+
+
+@register
+@dataclass
 class StateRequest(ProtocolMessage):
     """Joiner's request to the master for a full state snapshot."""
 
@@ -275,6 +325,11 @@ class StateSnapshot(ProtocolMessage):
     display_state: "dict | None" = doc_field(
         default=None, doc="Optional current display state to seed the joiner."
     )
+    host_guid: "str | None" = doc_field(
+        default=None,
+        doc="GUID of the session host (visibility authority) at snapshot time, "
+            "so a joiner does not assume it is host and fight the real one.",
+    )
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -287,6 +342,8 @@ class StateSnapshot(ProtocolMessage):
             payload["playback_state"] = self.playback_state
         if self.display_state is not None:
             payload["display_state"] = self.display_state
+        if self.host_guid is not None:
+            payload["host_guid"] = self.host_guid
         return payload
 
     @classmethod
@@ -298,6 +355,7 @@ class StateSnapshot(ProtocolMessage):
             snapshot_timestamp=data.get("snapshot_timestamp"),
             playback_state=data.get("playback_state"),
             display_state=data.get("display_state"),
+            host_guid=data.get("host_guid"),
         )
 
     def as_otio(self) -> dict[str, Any]:

@@ -1149,27 +1149,30 @@ class PlaybackSyncController:
                                         # drops), and asserting playing=True there starts
                                         # playback on every peer when no user asked for it,
                                         # which then echoes back around as a genuine-looking
-                                        # play command.  The echo guard is armed for
-                                        # _PLAYBACK_ECHO_GUARD_S after any received playback
-                                        # message, so an armed guard means "a peer is
-                                        # driving": claim the auto-play only when it is not.
-                                        # override=None falls back to broadcast_view_state's
-                                        # own default of playing=False — i.e. "do not assert
-                                        # play", leaving the peer's existing play state to be
-                                        # governed by whoever is actually driving.
-                                        _peer_driven = (
-                                            time.monotonic()
-                                            < self._playback_apply_suppress_until
-                                        )
+                                        # play command.
+                                        #
+                                        # This used to be decided by a time window — "is the
+                                        # echo guard armed, i.e. was a peer driving in the
+                                        # last N ms?" — which is a guess, and the mechanism
+                                        # that kept failing.  Under host-owned visibility the
+                                        # question is answerable rather than guessable: only
+                                        # the host's isolations are user-caused, because a
+                                        # follower's can only have come from applying someone
+                                        # else's message.  A follower therefore never claims
+                                        # the auto-play; override=None falls back to
+                                        # broadcast_view_state's default of playing=False —
+                                        # "do not assert play" — leaving the play state to
+                                        # whoever is actually driving.
+                                        _may_claim = self.plugin.manager.owns_visibility()
                                         self.broadcast_view_state(
                                             _cg, "source",
-                                            playing_override=None if _peer_driven else True,
+                                            playing_override=True if _may_claim else None,
                                         )
                                         _log(
                                             f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} "
                                             "mode=source playing="
-                                            + ("(unforced — peer-driven view switch)"
-                                               if _peer_driven else "True")
+                                            + ("True" if _may_claim
+                                               else "(unforced — not host, so not a local isolation)")
                                         )
                                     else:
                                         _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
@@ -1433,13 +1436,16 @@ class PlaybackSyncController:
             # user action" error as the auto-play inference above. Loop mode
             # applies either way: an isolated clip should loop for review no
             # matter who isolated it.
-            _peer_driven_isolation = (
-                time.monotonic() < self._playback_apply_suppress_until
-            )
-            if _peer_driven_isolation:
+            #
+            # Like that inference, this used to ask a time window whether a peer
+            # had been driving recently. It now asks who owns visibility: a
+            # follower's isolation cannot be a local user action, so it never
+            # resets the frame.
+            _local_isolation = self.plugin.manager.owns_visibility()
+            if not _local_isolation:
                 _log(
                     "[SEL] broadcast_view_state: new source-clip isolation"
-                    f" {(clip_guid or '-')[:8]} — peer-driven, keeping frame"
+                    f" {(clip_guid or '-')[:8]} — not host, so peer-driven: keeping frame"
                     f" {state['current_time']['value']:.0f} (loop still applied)"
                 )
             else:

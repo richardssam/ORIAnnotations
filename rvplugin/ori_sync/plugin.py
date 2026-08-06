@@ -259,13 +259,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self._current_host = host
         self._current_session_name = session_name
 
-        self.sync_manager = SyncManager(session_id=session_name)
+        # app_name ranks this peer for host election: xStudio is the preferred
+        # visibility authority, so RV hosts only an RV-only session.
+        self.sync_manager = SyncManager(session_id=session_name, app_name="openrv")
         # Expose the manager to the in-process sync_test inspector (it reads
         # manager.export_state() for /full_state and the active timeline name).
         try:
             import otio_sync_core
             otio_sync_core.register_manager(self.sync_manager)
             otio_sync_core.register_annotation_controller(self.annotation)
+            otio_sync_core.register_playback_controller(self.playback)
         except Exception as e:
             _log(f"Could not register manager for inspection: {e}")
         network = RabbitMQNetwork(
@@ -300,11 +303,24 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                         if _media_path(ref.target_url) not in self.sequence._path_to_source_group_map():
                             rv.commands.addSource(_media_path(ref.target_url))
 
+        @self.sync_manager.on_host_changed
+        def _on_host_changed(host_guid, is_host):
+            print(
+                f"[OTIOSync] Visibility authority: "
+                + ("this peer is HOST" if is_host
+                   else f"following host {(host_guid or 'none')[:8]}"),
+                file=sys.stderr,
+            )
+
         @self.sync_manager.on_synced
         def _on_synced():
             role = "MASTER" if self.sync_manager.is_master else "CLIENT"
+            # Host is reported separately from master on purpose: they are
+            # different roles (snapshot authority vs visibility authority) and
+            # conflating them in the log is how they get conflated in reasoning.
+            seat = "HOST" if self.sync_manager.is_host else "follower"
             print(
-                f"[OTIOSync] Connected to session '{session_name}' on {host} as {role}",
+                f"[OTIOSync] Connected to session '{session_name}' on {host} as {role} ({seat})",
                 file=sys.stderr,
             )
             if not self.sync_manager.is_master:
