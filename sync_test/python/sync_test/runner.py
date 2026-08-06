@@ -207,6 +207,13 @@ def _format_observed(states, app_names):
             # comparing like with like.
             if state.get("view_mode") is not None:
                 desc += f" view={state['view_mode']}"
+            # Which peer owns visibility. A media/view split between two peers
+            # means something different depending on who was allowed to set it:
+            # the host's view is the session's, a follower's is local drift.
+            if state.get("is_host") is not None:
+                desc += " host" if state["is_host"] else " follower"
+            if state.get("view_mirror_error"):
+                desc += f" MIRROR-FAILED({state['view_mirror_error']})"
             parts.append(desc)
     return " | ".join(parts) if parts else "<no apps>"
 
@@ -224,6 +231,10 @@ class FailKind:
     ANNOTATION_MISSING = "annotation_missing"
     STRUCTURAL_CONSENSUS = "structural_consensus"
     OTIO_EXPORT = "otio_export"
+    #: A follower could not show the view the host reported. Distinct from
+    #: state_mismatch: the peers may still *report* matching state, because the
+    #: follower kept whatever was on screen. Waiting cannot fix it.
+    VIEW_MIRROR_FAILED = "view_mirror_failed"
 
 
 #: fail_kinds for which waiting longer can plausibly change the outcome —
@@ -471,6 +482,20 @@ class TestRunner:
         if "media_exists" in base_state and not base_state["media_exists"]:
             return False, f"{app_names[0]} reports missing media: {base_state.get('media_path')}", FailKind.MISSING_MEDIA
 
+        # A follower that could not mirror the host's view is a failure even
+        # when every reported field matches: it kept showing what it already
+        # had, so "same timeline name, different clip" reads as agreement. The
+        # apps report the failure rather than substituting a local best guess,
+        # so the harness only has to notice it.
+        for name, st in zip(app_names, states):
+            mirror_error = st.get("view_mirror_error")
+            if mirror_error:
+                return (
+                    False,
+                    f"{name} could not mirror the host's view: {mirror_error}",
+                    FailKind.VIEW_MIRROR_FAILED,
+                )
+
         for i in range(1, len(states)):
             st = states[i]
             if "error" in st:
@@ -494,9 +519,14 @@ class TestRunner:
             # happened when the field was first added, turning a known,
             # tolerated split into `state_mismatch` failures on tests that had
             # never failed.
+            # `is_host`/`host_guid` differ between peers by construction — one
+            # peer holds visibility authority and the others do not — so they
+            # are reported for assertions, never for structural equality.
+            # `view_mirror_error` is checked explicitly above.
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
                            "view_mode",
-                           "annotations", "annotation_count", "is_master"}
+                           "annotations", "annotation_count", "is_master",
+                           "is_host", "host_guid", "view_mirror_error"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 
@@ -758,6 +788,47 @@ class TestRunner:
                 return True
             time.sleep(0.5)
         return False
+
+    def _select_host_driver(self, app_ports):
+        """Return the app that holds visibility authority, or ``None``.
+
+        Selection commands assert *visibility*, which only the elected host may
+        broadcast — a follower's are stripped in ``SyncManager.broadcast_*``, so
+        driving the wrong peer produces a test that silently asserts nothing.
+        This is the same hazard ``_wait_for_master`` covers for structural edits,
+        but it cannot be fixed by waiting: host election is a deterministic
+        function of the peer set, so a driver that is not host never becomes one.
+
+        It matters only where the peers are equally ranked. With xStudio in the
+        session xStudio always hosts, so the driver is already right; in an
+        OpenRV-only session the tie breaks on a random per-launch GUID, making
+        "is apps[0] the host?" a coin flip. Ask rather than assume.
+
+        Waits for every app to agree on one ``host_guid`` before answering, and
+        does not accept the first app that says ``is_host``. Election is a pure
+        function of the peer table, so a peer that is briefly alone elects
+        *itself* and only yields once the other peer's announcement arrives —
+        sampling before the set settles returns an answer that is true for a
+        few hundred milliseconds and wrong for the rest of the test.
+
+        :returns: The winning ``(name, port)`` tuple, or ``None`` if the apps do
+            not converge on a host within the timeout.
+        """
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            states = [(app, self.fetch_state(app[1])) for app in app_ports]
+            guids = {
+                st.get("host_guid")
+                for _, st in states
+                if "error" not in st
+            }
+            # One agreed, non-null host across every app: the set has settled.
+            if len(states) == len(app_ports) and len(guids) == 1 and None not in guids:
+                for app, st in states:
+                    if st.get("is_host") is True:
+                        return app
+            time.sleep(0.5)
+        return None
 
     _ANNOTATION_GEOMETRY_FORMULAS = {
         ("pen", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_thickness_from_rv_pen_width,
@@ -1196,6 +1267,29 @@ class TestRunner:
 
             if script_driven:
                 driver_app = app_ports[0]
+
+                # `drive_host: true` — drive whichever peer holds visibility
+                # authority rather than apps[0]. Needed when the peers are
+                # equally ranked for host election (an OpenRV-only session),
+                # where the tie breaks on a random per-launch GUID: driving
+                # apps[0] regardless would assert visibility propagation from a
+                # follower half the time, and a follower's visibility is
+                # stripped by design, so the test would fail for the reason it
+                # exists to prove works.
+                if test_data.get("drive_host"):
+                    host_app = self._select_host_driver(app_ports)
+                    if host_app is None:
+                        logging.warning(
+                            "drive_host: no app claimed visibility authority "
+                            f"within the timeout — falling back to {driver_app[0]}."
+                        )
+                    else:
+                        if host_app is not driver_app:
+                            logging.info(
+                                f"drive_host: {host_app[0]} holds visibility "
+                                f"authority — driving it instead of {driver_app[0]}."
+                            )
+                        driver_app = host_app
 
                 # Structural commands (add_media, set_selection, ...) are only
                 # ever broadcast by whichever peer holds master — a non-master

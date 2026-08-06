@@ -43,6 +43,10 @@ def get_xstudio_state(port=14441):
         "view_mode": None,
         "annotations": [],
         "is_master": None,
+        # Visibility authority, reported separately from is_master so a test can
+        # assert which peer was allowed to change what everyone looks at.
+        "is_host": None,
+        "host_guid": None,
         # Seeded here rather than inside the container read below, so a failed
         # container read cannot leave them absent entirely. media_exists
         # defaults True because "unknown" is not "missing" — defaulting False
@@ -65,6 +69,10 @@ def get_xstudio_state(port=14441):
             full = get_xstudio_full_state(port)
             if isinstance(full, dict) and "is_master" in full:
                 state["is_master"] = full["is_master"]
+            if isinstance(full, dict):
+                if "is_host" in full:
+                    state["is_host"] = full["is_host"]
+                state["host_guid"] = full.get("host_guid")
             # The synced timeline's name, resolved through the shared sync GUID.
             # This is the only container name that means the same thing on every
             # peer: the viewed-container name below reports the *timeline* when a
@@ -74,9 +82,33 @@ def get_xstudio_state(port=14441):
             # one instance reported 'Sequence 1' (the timeline) and the other
             # 'Added Media' (the bin containing it) — both correct, neither
             # comparable. Keyed by GUID, this agrees by construction.
+            #
+            # Clip timelines are excluded. `active_timeline_guid` can point at
+            # the single-clip timeline created when a clip is isolated, and that
+            # timeline is named after the clip — a full media path in xStudio.
+            # Resolving through it reports '/…/car_ACES_sRGB.mov' where OpenRV,
+            # which anchors at sequence level, reports 'Default Sequence': two
+            # peers in sync, describing different levels of the same hierarchy,
+            # which is the exact fault this resolution was added to remove.
+            # SyncManager already applies this rule when it syncs
+            # active_timeline_guid on a receiving peer ("Skip clip-level
+            # timelines: those are single-clip artefacts … should not shadow the
+            # sequence view"); the harness has to apply it too. Falls back to the
+            # session's sequence timeline, the level OpenRV reports.
             if isinstance(full, dict):
+                _timelines = full.get("timelines") or {}
+
+                def _is_clip_timeline(tl):
+                    return bool((tl or {}).get("metadata", {}).get("clip_timeline_for"))
+
                 _atg = full.get("active_timeline_guid")
-                _tl = (full.get("timelines") or {}).get(_atg)
+                _tl = _timelines.get(_atg)
+                if isinstance(_tl, dict) and _is_clip_timeline(_tl):
+                    _tl = next(
+                        (t for t in _timelines.values()
+                         if isinstance(t, dict) and not _is_clip_timeline(t)),
+                        None,
+                    )
                 if isinstance(_tl, dict) and _tl.get("name"):
                     synced_timeline_name = _tl["name"]
         except Exception:

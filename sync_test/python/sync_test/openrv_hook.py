@@ -19,6 +19,15 @@ def get_openrv_state():
         "view_mode": None,
         "annotations": [],
         "is_master": None,
+        # Visibility authority, reported separately from is_master: a test that
+        # asserts "the follower did not change what everyone looks at" needs to
+        # know which peer was allowed to.
+        "is_host": None,
+        "host_guid": None,
+        # Non-null when the host reported a view this peer could not show. A
+        # follower mirrors rather than approximates, so this is how a mirror
+        # failure becomes visible instead of looking like agreement.
+        "view_mirror_error": None,
     }
 
     try:
@@ -27,6 +36,11 @@ def get_openrv_state():
             _mgr_for_master = otio_sync_core.get_registered_manager()
             if _mgr_for_master is not None:
                 state["is_master"] = bool(_mgr_for_master.is_master)
+                state["is_host"] = bool(getattr(_mgr_for_master, "is_host", False))
+                state["host_guid"] = getattr(_mgr_for_master, "host_guid", None)
+            _pb = otio_sync_core.get_registered_playback_controller()
+            if _pb is not None:
+                state["view_mirror_error"] = getattr(_pb, "mirror_failure", None)
         except Exception:
             pass
         # Report the 1-indexed LOCAL frame (frame - frameStart + 1) rather than

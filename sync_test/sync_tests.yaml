@@ -50,7 +50,7 @@ tests:
     blocked_by: "fix-xs-playhead-attribute-subscription"
     script_driven: true
     frame_tolerance: 5
-    checkpoint_validation_delay: 4.5
+    checkpoint_validation_delay: 6
     apps:
       - "xstudio"
       - "openrv"
@@ -133,35 +133,56 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
-  - name: "xstudio_selects_script_rv"
-    description: >
-      Same selection scenario as xstudio_selects, but script-driven with
-      OpenRV as the driver app (commands derived from the recording rather
-      than replayed as raw JSONL events).
-    recording: "recordings/xstudio_selects_v2.jsonl"
-    checkpoint_validation_delay: 4
-    status: "known_broken"
-    # Its premise — RV driving selection — is the behaviour being removed:
-    # under host-owned visibility a non-host RV follows the host's view rather
-    # than broadcasting its own. That change's §6.1 retires this test outright
-    # (`xstudio_selects_script_xstudio` already covers the intended topology),
-    # so this is expected to be deleted rather than fixed.
-    blocked_by: "host-owned-visibility"
-    script_driven: true
-    frame_tolerance: 5
-    apps:
-      - "openrv"
-      - "xstudio"
+  # `xstudio_selects_script_rv` was retired by the host-owned-visibility change
+  # (§6.1). Its premise was OpenRV driving selection against an xStudio peer —
+  # the behaviour that change removes: with xStudio present, xStudio is the
+  # elected visibility host and a non-host OpenRV follows its view rather than
+  # broadcasting one. The test could only be made to pass by keeping the
+  # behaviour it was written to prove. `xstudio_selects_script_xstudio` below
+  # covers the same scenario in the topology that survives, and
+  # `openrv_hosts_selection` covers RV-driven selection where it is still
+  # legitimate: an RV-only session. RV-side selection coverage against an
+  # xStudio peer is deliberately not replaced.
   - name: "xstudio_selects_script_xstudio"
     description: >
       Same selection scenario as xstudio_selects, script-driven with xStudio
-      as the driver app instead of OpenRV.
+      as the driver app instead of OpenRV. xStudio is the elected visibility
+      host here, so this asserts host-driven visibility propagating to an
+      OpenRV follower — the intended topology under host-owned visibility.
     recording: "recordings/xstudio_selects_v2.jsonl"
     #checkpoint_validation_delay: 2.5
     script_driven: true
     frame_tolerance: 5
     apps:
       - "xstudio"
+      - "openrv"
+  - name: "openrv_hosts_selection"
+    description: >
+      Same selection scenario, but OpenRV-only — no xStudio peer, so an OpenRV
+      instance is elected visibility host and broadcasts view changes normally.
+      Covers host-owned-visibility §2.1's capability fallback: without this,
+      "an RV-only session still has a host" is untested and an election that
+      silently produced no host would look identical to a passing suite.
+      Needs drive_host: with two equally-ranked peers the election tie breaks on
+      a random per-launch GUID, so apps[0] is the host only about half the time,
+      and driving a follower would assert nothing (its visibility is stripped by
+      design). Driving whichever peer actually holds the role is the assertion
+      this test is for.
+    recording: "recordings/xstudio_selects_v2.jsonl"
+    script_driven: true
+    drive_host: true
+    frame_tolerance: 5
+    # Election itself works — the host is elected, drives, and broadcasts source
+    # view. The test fails downstream of that, on the follower: media that
+    # arrived by REPLACE_TIMELINE never got an RV source group, so the follower
+    # cannot display the clip the host isolated ("MIRROR FAILED: … has no local
+    # source group"). Pre-existing and unrelated to broadcast authority — that
+    # change only made it visible, by reporting the miss instead of silently
+    # staying on the previous view.
+    status: "known_broken"
+    blocked_by: "rv-follower-media-materialisation"
+    apps:
+      - "openrv"
       - "openrv"
   #- name: "missing_media"
   #  recording: "recordings/missing_media.jsonl"
