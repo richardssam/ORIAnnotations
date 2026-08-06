@@ -172,15 +172,6 @@ tests:
     script_driven: true
     drive_host: true
     frame_tolerance: 5
-    # Election itself works — the host is elected, drives, and broadcasts source
-    # view. The test fails downstream of that, on the follower: media that
-    # arrived by REPLACE_TIMELINE never got an RV source group, so the follower
-    # cannot display the clip the host isolated ("MIRROR FAILED: … has no local
-    # source group"). Pre-existing and unrelated to broadcast authority — that
-    # change only made it visible, by reporting the miss instead of silently
-    # staying on the previous view.
-    status: "known_broken"
-    blocked_by: "fix-orphaned-structure-patches"
     apps:
       - "openrv"
       - "openrv"

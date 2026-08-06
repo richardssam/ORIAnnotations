@@ -46,6 +46,37 @@ _DEFAULT_CONTAINERS = ("defaultSequence", "defaultStack")
 _OTIO_STACK_MARKERS = ("otio.timeline_name", "otio.timeline_metadata", "otio.metadata")
 
 
+def _derive_track_guids(manager, seq_name, timeline):
+    """Give *timeline*'s tracks deterministic sync GUIDs derived from *seq_name*.
+
+    A sync GUID is the session's shared name for an object, so it has to survive
+    the timeline being rebuilt.  These timelines are re-initialised while the
+    session is live — RV re-runs the init after the first media add — and each
+    rebuild constructs fresh ``Track`` objects.  Left to ``ensure_guid_and_map``
+    those get new random GUIDs, and every ``INSERT_CHILD`` broadcast afterwards
+    names a track no peer has ever been told about: the patches are dropped on
+    arrival, silently, and the media never appear.  Observed as a follower
+    holding 5 objects and 0 RV sources while reporting itself synced.
+
+    Deriving the GUID from the sequence name makes the rebuild produce the same
+    identity, so references peers already hold stay valid.  This is the rule the
+    timeline GUID immediately below already follows, and for the second reason
+    given there too: two peers that each auto-create the same sequence converge
+    on one identity instead of holding random per-instance ones.
+
+    ``ensure_guid_and_map`` preserves a GUID that is already set, so this must
+    run before :meth:`SyncManager.register_timeline`.
+
+    :param manager: The :class:`SyncManager`, for ``_derive_guid``.
+    :param seq_name: Sequence name, the same key the timeline GUID derives from.
+    :param timeline: Timeline whose tracks should be named.
+    """
+    for track in timeline.tracks:
+        track.metadata.setdefault("sync", {})["guid"] = manager._derive_guid(
+            f"rv_track:{seq_name}:{track.name}"
+        )
+
+
 class SequenceSyncController:
     def __init__(self, plugin):
         self.plugin = plugin
@@ -569,6 +600,7 @@ class SequenceSyncController:
             timeline.tracks.append(media_track)
             annotations_track = otio.schema.Track("Annotations")
             timeline.tracks.append(annotations_track)
+            _derive_track_guids(self.plugin.sync_manager, seq_name, timeline)
             _log(f"init tracks for {seq_group}: {[t.name for t in timeline.tracks]}")
 
             edl_counts = self._edl_frame_counts(seq_group)
@@ -622,6 +654,7 @@ class SequenceSyncController:
         timeline.tracks.append(media_track)
         annotations_track = otio.schema.Track("Annotations")
         timeline.tracks.append(annotations_track)
+        _derive_track_guids(self.plugin.sync_manager, timeline.name, timeline)
 
         for source_node in rv.commands.nodesOfType("RVFileSource"):
             clip = self._make_clip(source_node, fps)
