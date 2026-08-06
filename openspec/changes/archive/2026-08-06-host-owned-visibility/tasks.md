@@ -48,8 +48,12 @@
 
 ## 5. Retire superseded guards
 
-- [ ] 5.1 Only after §3 has soaked: remove visibility-related echo suppression made unnecessary. Separate, revertible commit (design.md Migration 5).
-  - **Deliberately not done in this pass** — the soak is a precondition and cannot happen inside it. The candidates are inventoried in `docs/visibility_authority_guards.md` so the deletion is a small, pre-scoped commit once §3 has run in a live session.
+- [x] 5.1 Only after §3 has soaked: remove visibility-related echo suppression made unnecessary. Separate, revertible commit (design.md Migration 5).
+  - **Soaked 2026-08-06. Outcome: do not delete.** The precondition was met — a live two-app session, xStudio host+master `44f3accf`, OpenRV follower `0cdfaa1f`. Resolved with a negative result rather than left open.
+  - The three candidate guards fired **0 times** on both peers, which read alone says "inert, delete them". That reading does not survive the rest of the session: **a guard cannot be shown unnecessary by a session in which the behaviour it guards is broken by another route.**
+  - The deletion's stated justification — *"a host's transitions are user-caused by definition"* — is **falsified**. The host isolated exactly the two clips the follower had isolated (`0090c5d3`, then `a407f8c8`), in the same order, seconds after registering the follower's `ADD_TIMELINE`. The host's transition was caused by a follower's structural message. With the premise gone, the deletion has no basis.
+  - The enforcement this change exists for **does** work: OpenRV stripped visibility 284 times and sent `view_mode` zero times, and the host correctly rejected its clip-timeline position messages. The gap is that authority is defined over *fields* while this travels through *structure*.
+  - Ownership moves to `fix-visibility-authority-bypass`, which carries the evidence and both defects. `docs/visibility_authority_guards.md` is updated so a later reader does not re-adopt the falsified premise from the inventory alone.
 - [x] 5.2 Keep position-related apply-scope guards — position stays multi-writer, so its echoes are still real.
   - Nothing removed. The retained set is listed with its justification in the same document, including the guards a visibility *transition* triggers but which protect a *position* field — the frame-0 reset being the clearest.
 - [x] 5.3 Record which guards were removed and which replaced them, so the next person can tell deliberate deletion from oversight.

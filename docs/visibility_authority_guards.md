@@ -24,16 +24,39 @@ actually protects a *position* field is **not** retired by this change. The
 frame-0 reset on a new isolation is the clearest example — it is triggered by a
 visibility transition but writes `current_time`.
 
-## Status: nothing has been deleted yet
+## Status: soaked 2026-08-06 — do not delete
 
-§5.1 is deliberately unchecked. `design.md`'s migration plan makes guard removal
-a separate, revertible commit taken **after** enforcement has soaked in a live
-session, on the argument `session-roles` D5 makes: enabling enforcement is safe
-to try because the kill switch (`ORI_VISIBILITY_AUTHORITY=0`) reverts it without
-a rebuild, whereas a deletion that turns out to be wrong has to be found and
-re-written. Every guard below is still present in the code.
+§5.1's precondition was met: a live two-app session, xStudio host+master, OpenRV
+follower. **The answer came back "do not delete", and the table below must not be
+acted on as it stands.** Every guard is still present in the code.
+
+The three candidates fired **0 times** on both peers. Read alone that says
+"inert, safe to remove". It is not, because a guard cannot be shown unnecessary
+by a session in which the behaviour it guards is broken by another route — and
+it was:
+
+> A follower isolated two clips and correctly broadcast **no visibility at all**
+> (284 strips, zero `view_mode` sends). Registering the follower's `ADD_TIMELINE`
+> fired the host's own selection machinery, and the host isolated the same two
+> clips, in the same order, seconds later — then broadcast that as visibility,
+> legitimately, because it is the host.
+
+That falsifies the justification stated below: **"a host's transitions are
+user-caused by definition" is false.** The host's transition there was caused by
+a follower's structural message. Enforcement is defined over *fields*; this
+travels through *structure*, where nothing looks at it.
+
+The enforcement this change delivered does work — the field-level rule held
+throughout, and the host correctly rejected the follower's clip-timeline
+position messages. The gap is in scope, not in implementation.
+
+Ownership of the deletion question moves to `fix-visibility-authority-bypass`.
+Re-read that change before removing anything here.
 
 ## Superseded by host-owned visibility — candidates for §5.1
+
+**Blocked — see the status section above.** The premise stated in this
+section's opening paragraph has been falsified by a live soak.
 
 These exist only to answer "did a user cause this local visibility transition, or
 did applying a peer's message cause it?". Under the follower rule (D3) that
