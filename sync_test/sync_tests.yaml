@@ -175,6 +175,35 @@ tests:
     apps:
       - "openrv"
       - "openrv"
+  - name: "host_departure_failover"
+    description: >
+      The host leaves mid-session and a survivor must take visibility
+      authority. Covers peer-departure's reason for existing: the peer table
+      feeds host election, so a departed host that stayed in the table would
+      stay elected — and because only the host may broadcast visibility, the
+      session's view would freeze with no peer permitted to change it and
+      nothing reporting why.
+
+      The peer is terminated rather than asked to disconnect, so no departure
+      notice is sent and the survivors must age it out. That is the crash path,
+      which nothing else covers and which no message can shortcut. Expect this
+      test to spend the liveness timeout waiting — that wait is the assertion.
+
+      xStudio outranks OpenRV for host, so disconnecting the host removes
+      xStudio and leaves OpenRV to discover it now holds authority alone.
+    script_driven: true
+    frame_tolerance: 5
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "disconnect_peer"
+        which: "host"
+      - action: "expect_host_failover"
+        timeout: 40.0
+    apps:
+      - "xstudio"
+      - "openrv"
   #- name: "missing_media"
   #  recording: "recordings/missing_media.jsonl"
   #  script_driven: true

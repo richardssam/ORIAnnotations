@@ -862,6 +862,39 @@ class TestRunner:
         )
         return False
 
+    def _wait_for_host_failover(self, app_ports, timeout=30.0):
+        """Wait for a surviving peer to hold visibility authority.
+
+        Called after a peer has been removed mid-test.  Until the survivors drop
+        the departed peer from their peer tables, election keeps returning it —
+        it is still a candidate — and because only the host may broadcast
+        visibility, the session's view stays frozen with nobody able to move it.
+
+        An unclean exit sends no departure notice, so this necessarily waits out
+        the liveness timeout.  The default budget is generous relative to it: a
+        tight bound here would turn a slow-but-working failover into a failure,
+        and this repo has already produced false diagnoses from machine latency
+        read as a protocol fault.
+
+        :returns: ``True`` once some surviving app reports ``is_host`` and every
+            app agrees on the same ``host_guid``.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            states = [(app, self.fetch_state(app[1])) for app in app_ports]
+            live = [(app, st) for app, st in states if "error" not in st]
+            guids = {st.get("host_guid") for _, st in live}
+            if live and len(guids) == 1 and None not in guids:
+                for app, st in live:
+                    if st.get("is_host") is True:
+                        logging.info(
+                            f"     {app[0]} took visibility authority "
+                            f"({time.time() - (deadline - timeout):.1f}s)"
+                        )
+                        return True
+            time.sleep(0.5)
+        return False
+
     def _select_host_driver(self, app_ports):
         """Return the app that holds visibility authority, or ``None``.
 
@@ -1397,6 +1430,52 @@ class TestRunner:
                         self._wait_for_media(
                             app_ports, timeout=cmd.get("timeout", 20.0)
                         )
+                        continue
+
+                    # Runner-level for the same reason as wait_for_media: the
+                    # subject is a peer that is going away, so it cannot be
+                    # asked to report on the outcome, and the assertion is about
+                    # what the *survivors* do.
+                    if action == "disconnect_peer":
+                        target = cmd.get("app")
+                        which = cmd.get("which", "host")
+                        if target is None and which == "host":
+                            host_app = self._select_host_driver(app_ports)
+                            if host_app is None:
+                                logging.error(
+                                    "disconnect_peer: no app claimed visibility "
+                                    "authority, so there is no host to remove "
+                                    "and the failover assertion would be vacuous."
+                                )
+                                failed = True
+                                break
+                            target = host_app[0]
+                        logging.info(f"  -> Disconnecting peer: {target}")
+                        if not spawner.terminate_app(target):
+                            logging.error(
+                                f"disconnect_peer: no running app named {target!r}"
+                            )
+                            failed = True
+                            break
+                        app_ports = [a for a in app_ports if a[0] != target]
+                        if driver_app[0] == target:
+                            driver_app = app_ports[0] if app_ports else None
+                        continue
+
+                    if action == "expect_host_failover":
+                        timeout = cmd.get("timeout", 30.0)
+                        logging.info(
+                            f"  -> Waiting up to {timeout:.0f}s for a survivor "
+                            "to take visibility authority..."
+                        )
+                        if not self._wait_for_host_failover(app_ports, timeout):
+                            logging.error(
+                                "No surviving peer took visibility authority. "
+                                "Only the host may broadcast visibility, so the "
+                                "session's view is frozen for everyone left."
+                            )
+                            failed = True
+                            break
                         continue
 
                     # Implicit gate. Deliberately automatic rather than left to

@@ -34,6 +34,7 @@ from .protocol_messages import (
     RenameTimeline,
     ReplaceAnnotationCommands,
     PeerAnnounce,
+    PeerDepart,
     ReplaceTimeline,
     SetProperty,
     StateRequest,
@@ -98,6 +99,22 @@ STATE_DISCOVERING = "DISCOVERING"
 STATE_JOINING = "JOINING"
 #: Snapshot received and applied; fully participating in the session.
 STATE_SYNCED = "SYNCED"
+
+#: Seconds between a peer's own ``PEER_ANNOUNCE`` heartbeats.
+#:
+#: The heartbeat is what makes silence meaningful: without it a peer that
+#: announced once and then legitimately went quiet is indistinguishable from one
+#: that died.  It asks for no answer, so cost is O(peers) per interval, not the
+#: O(peers²) answer cascade.
+PEER_HEARTBEAT_INTERVAL = 5.0
+
+#: Seconds of silence after which a peer is presumed gone and dropped.
+#:
+#: Three missed heartbeats.  The margin is deliberately generous: a peer whose
+#: poll thread has stalled (a machine under memory pressure, a long structural
+#: rebuild) is alive but quiet, and dropping it early causes a needless host
+#: re-election.  A peer wrongly dropped restores itself on its next heartbeat.
+PEER_LIVENESS_TIMEOUT = 15.0
 
 
 class SyncManager:
@@ -205,14 +222,24 @@ class SyncManager:
         self.is_host: bool = False
         #: GUID of the elected host, or ``None`` before the first election.
         self.host_guid: str | None = None
-        #: Peer table feeding host election: ``{guid: {"app", "capabilities"}}``.
+        #: Peer table feeding host election:
+        #: ``{guid: {"app", "capabilities", "last_seen"}}``.
         #: Seeded with this peer so a solo session still elects a host.
+        #:
+        #: ``last_seen`` is a *local* monotonic-ish stamp taken when this peer
+        #: heard from that one; it never crosses the wire, so no clock sync is
+        #: needed.  This peer's own entry is exempt from aging (see
+        #: :meth:`_age_out_peers`).
         self._peers: dict[str, dict[str, Any]] = {
             self.self_guid: {
                 "app": self.app_name,
                 "capabilities": list(self.capabilities),
+                "last_seen": time.time(),
             }
         }
+        #: When this peer last broadcast its own announcement.  Drives the
+        #: liveness heartbeat in :meth:`tick`.
+        self._last_announce_time: float = 0.0
         #: Host-election requests enqueued from threads other than the poll
         #: thread.  Drained in :meth:`tick`; see :meth:`request_host_election`.
         self._host_election_queue: "queue.Queue[str]" = queue.Queue()
@@ -260,6 +287,7 @@ class SyncManager:
             ("LiveSession.1", "WHO_IS_MASTER"): self._h_who_is_master,
             ("LiveSession.1", "I_AM_MASTER"): self._h_i_am_master,
             ("LiveSession.1", "PEER_ANNOUNCE"): self._h_peer_announce,
+            ("LiveSession.1", "PEER_DEPART"): self._h_peer_depart,
             ("LiveSession.1", "STATE_REQUEST"): self._h_state_request,
             ("LiveSession.1", "STATE_SNAPSHOT"): self._h_state_snapshot,
             ("PLAYBACK_SETTINGS_1.0", "SET"): self._h_playback_set,
@@ -998,22 +1026,31 @@ class SyncManager:
     # Host Election (visibility authority)
     # ------------------------------------------------------------------
 
-    def announce_peer(self, reply_requested: bool = True) -> None:
+    def announce_peer(self) -> None:
         """Broadcast this peer's identity and capabilities.
 
-        Feeds every other peer's election table.  Called from
-        :meth:`start_session`, and again — with *reply_requested* ``False`` — in
-        answer to another peer's announcement.
+        Feeds every other peer's election table, and doubles as this peer's
+        liveness heartbeat.  Called from :meth:`start_session` and periodically
+        from :meth:`_heartbeat`.
 
-        :param reply_requested: Ask receiving peers to answer with their own
-            announcement.  ``True`` on the initial announcement only; an answer
-            that asked for answers would be an announcement storm.
+        Nobody answers an announcement.  A joiner learns the existing peer set
+        from the snapshot it already requests (:meth:`adopt_peers`), and a peer
+        that has gone quiet is re-learned from its next heartbeat — so the
+        answer cascade that used to serve those purposes is gone, along with the
+        only step whose message count grew with the size of the session.
+
+        A peer on older code still sends a ``reply_requested`` flag and expects
+        answers.  It gets none, and instead learns this peer from the next
+        heartbeat — a few seconds later rather than immediately, which is the
+        whole of the incompatibility.
         """
+        # Any announcement counts as this peer's heartbeat, so joining or
+        # answering resets the clock and the periodic one does not pile on.
+        self._last_announce_time = time.time()
         self._send_message(PeerAnnounce(
             peer_guid=self.self_guid,
             app=self.app_name,
             capabilities=list(self.capabilities),
-            reply_requested=reply_requested,
         ))
 
     def on_host_changed(
@@ -1089,6 +1126,54 @@ class SyncManager:
                 _log(f"on_host_changed callback error: {e}")
         return elected
 
+    def _peer_roster(self) -> dict[str, dict[str, Any]]:
+        """Return the peer table in wire form, without liveness stamps.
+
+        ``last_seen`` is deliberately excluded: it is the *receiver's* own clock
+        reading of when it last heard from that peer.  Sending it would put one
+        machine's clock on the wire and require skew handling to interpret, for
+        no gain — the receiver stamps its own on adoption.
+
+        :returns: ``{guid: {"app", "capabilities"}}``.
+        """
+        return {
+            guid: {
+                "app": peer.get("app", ""),
+                "capabilities": list(peer.get("capabilities") or []),
+            }
+            for guid, peer in self._peers.items()
+        }
+
+    def adopt_peers(self, peers: "dict[str, dict[str, Any]] | None") -> None:
+        """Merge a snapshot's peer roster into the local peer table.
+
+        Lets a joiner learn the session's peers from the snapshot it already
+        requested, instead of every peer answering its announcement.
+
+        Merge rather than replace, and ignore an absent or empty roster: a peer
+        predating this field sends no roster, and treating that as "no peers"
+        would blank a table this peer has already populated from announcements.
+        Liveness is stamped locally on adoption, for the reason in
+        :meth:`_peer_roster`.
+
+        :param peers: Roster from the snapshot, or ``None`` when absent.
+        """
+        if not peers:
+            return
+        now = time.time()
+        learned = 0
+        for guid, peer in peers.items():
+            if guid == self.self_guid or guid in self._peers:
+                continue
+            self._peers[guid] = {
+                "app": peer.get("app", ""),
+                "capabilities": list(peer.get("capabilities") or []),
+                "last_seen": now,
+            }
+            learned += 1
+        if learned:
+            _log(f"adopt_peers: learned {learned} peer(s) ({len(self._peers)} total)")
+
     def adopt_host(self, host_guid: "str | None") -> None:
         """Adopt a host learned from session state rather than from election.
 
@@ -1140,11 +1225,15 @@ class SyncManager:
     def drop_peer(self, peer_guid: str) -> None:
         """Forget a peer and re-elect the host if it held the role.
 
-        The protocol has no departure message today, so nothing calls this on a
-        remote peer disconnecting — a departed host therefore keeps the role
-        until it (or a preferred peer) announces again.  The operation exists so
-        that when a departure signal is added, host failover is one call rather
-        than a second election implementation.
+        The single removal transition, reached by both detection paths:
+        :meth:`_h_peer_depart` when a peer announces its exit, and
+        :meth:`_age_out_peers` when one stops announcing at all.  Neither
+        removes the entry itself — a second election implementation is exactly
+        what this operation exists to prevent.
+
+        Re-electing is the point, not a side effect: because only the host may
+        broadcast visibility, a departed host that stayed elected would leave
+        the session's view frozen with no peer permitted to change it.
 
         :param peer_guid: GUID of the peer to forget.
         """
@@ -1192,6 +1281,7 @@ class SyncManager:
             playback_state=playback_state or None,
             display_state=self.display_state or None,
             host_guid=self.host_guid,
+            peers=self._peer_roster(),
         ))
         # A snapshot publishes every timeline it carries, as surely as an
         # ADD_TIMELINE does for one.
@@ -1229,6 +1319,7 @@ class SyncManager:
             playback_state=self.playback_state or None,
             display_state=self.display_state or None,
             host_guid=self.host_guid,
+            peers=self._peer_roster(),
         ).to_payload()
         payload["is_master"] = self.is_master
         payload["is_host"] = self.is_host
@@ -1988,17 +2079,34 @@ class SyncManager:
         guid = msg.peer_guid or source
         known = self._peers.get(guid)
         entry = {"app": msg.app, "capabilities": list(msg.capabilities)}
-        if known != entry:
-            self._peers[guid] = entry
+        # Every announcement refreshes liveness, including a periodic heartbeat
+        # that changes nothing — stamping only on change would let every peer
+        # age out while announcing.  `last_seen` is deliberately excluded from
+        # the change test below: a timestamp in the comparison would make each
+        # heartbeat look like a change and flood the log.
+        changed = known is None or any(known.get(k) != v for k, v in entry.items())
+        self._peers[guid] = {**entry, "last_seen": time.time()}
+        if changed:
             _log(
                 f"PEER_ANNOUNCE: {guid[:8]} app={msg.app!r}"
                 f" caps={entry['capabilities']} ({len(self._peers)} peers)"
             )
-        if msg.reply_requested:
-            self.announce_peer(reply_requested=False)
+        # Deliberately no answer: see announce_peer.  Answering was how a
+        # joiner used to learn quiet peers; the snapshot roster and the
+        # heartbeat cover that now, without the per-join burst.
         # Already on the poll thread (apply_patch runs inside tick), so this is
         # a direct election rather than an enqueue.
         self.elect_host()
+        return None
+
+    def _h_peer_depart(
+        self, msg: PeerDepart, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        # drop_peer already pops the entry and re-elects; doing either here
+        # would be a second election implementation, which is what drop_peer
+        # was written to prevent.  Same poll-thread position as
+        # _h_peer_announce, so the direct call is right.
+        self.drop_peer(msg.peer_guid or source)
         return None
 
     def _h_state_request(
@@ -2203,8 +2311,17 @@ class SyncManager:
                 self._last_who_is_master_time = None
                 self.elect_self_as_master()
 
+        # Liveness: announce our own presence, and forget peers that have gone
+        # quiet.  Gated on having a session at all rather than on being SYNCED:
+        # start_session announces once, and a peer retrying discovery after a
+        # state-request timeout would otherwise stay silent for the whole retry
+        # and be aged out by everyone else while alive and actively joining.
+        if self.status != STATE_NONE:
+            self._heartbeat()
+            self._age_out_peers()
+
         # Check for state snapshot timeout
-        if (self.status == STATE_JOINING 
+        if (self.status == STATE_JOINING
                 and getattr(self, "_state_request_time", None) is not None):
             if time.time() - self._state_request_time > 5.0:
                 _log("STATE_REQUEST timed out. Reverting to DISCOVERING.")
@@ -2214,6 +2331,49 @@ class SyncManager:
                 app_events.append(("state_request_timeout", None))
 
         return app_events
+
+    def _heartbeat(self) -> None:
+        """Re-announce this peer if the heartbeat interval has elapsed.
+
+        Poll-thread only, called from :meth:`tick`.  The announcement asks for
+        no answer: the storm the ``PeerAnnounce`` docstring warns about is the
+        answer cascade, and a re-announcement nobody answers costs one message
+        per peer per interval.
+
+        This is what gives :meth:`_age_out_peers` something to measure.  A peer
+        may legitimately sit idle for the whole session — a viewer watching a
+        screening touches nothing — so its *other* traffic cannot stand in for
+        liveness.
+        """
+        if time.time() - self._last_announce_time < PEER_HEARTBEAT_INTERVAL:
+            return
+        self.announce_peer()
+
+    def _age_out_peers(self) -> None:
+        """Drop peers not heard from within :data:`PEER_LIVENESS_TIMEOUT`.
+
+        The backstop for departures nobody announced — a crash, a killed
+        process, a lost network — where no ``PEER_DEPART`` will ever arrive.
+        Poll-thread only, called from :meth:`tick`.
+
+        Removal goes through :meth:`drop_peer`, which re-elects the host, so a
+        departed host does not keep visibility authority.  This peer's own entry
+        is never aged out: it is the one peer whose presence is not in question,
+        and dropping it would leave a solo session with no host.
+        """
+        now = time.time()
+        stale = [
+            guid
+            for guid, peer in self._peers.items()
+            if guid != self.self_guid
+            and now - peer.get("last_seen", now) > PEER_LIVENESS_TIMEOUT
+        ]
+        for guid in stale:
+            _log(
+                f"peer {guid[:8]} not heard from in"
+                f" {PEER_LIVENESS_TIMEOUT:.0f}s — presumed gone"
+            )
+            self.drop_peer(guid)
 
     def _drain_host_elections(self) -> None:
         """Run any host election requested from another thread.
@@ -2361,6 +2521,10 @@ class SyncManager:
                 else:
                     self._traverse_and_map(tl)
             self.active_timeline_guid = snapshot_data.get("active_timeline_guid")
+            # Adopt the peer set first, then the host: election reads the
+            # table, so adopting the host against a table that does not yet
+            # contain it would be a needless disagreement.
+            self.adopt_peers(snapshot_data.get("peers"))
             # Adopt the session's host before any local election runs, so a
             # joiner does not assume the role and fight the incumbent.
             self.adopt_host(snapshot_data.get("host_guid"))
@@ -2407,6 +2571,24 @@ class SyncManager:
             self._is_syncing = False
 
     def close(self) -> None:
-        """Stop the network backend and release all resources."""
-        if self.network:
-            self.network.stop()
+        """Announce departure, stop the network backend, release resources.
+
+        The departure is emitted here rather than from each host application's
+        disconnect path.  Both already call this, so both get the behaviour, and
+        a protocol message hand-replicated across two separately-written paths
+        would drift the way discovery cadence and snapshot assembly already
+        have — silently, with one host announcing its exit and the other not.
+
+        Best-effort by design: the message is enqueued and the backend is given
+        a bounded chance to flush it, but a lost departure simply means peers
+        fall back to aging this peer out, which is the case a crash takes
+        anyway.
+        """
+        if not self.network:
+            return
+        try:
+            self._send_message(PeerDepart(peer_guid=self.self_guid))
+        except Exception as e:
+            # Never let a courtesy message block teardown.
+            _log(f"PEER_DEPART send failed (peers will age us out): {e}")
+        self.network.stop()

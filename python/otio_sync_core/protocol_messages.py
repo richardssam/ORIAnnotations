@@ -235,11 +235,19 @@ class PeerAnnounce(ProtocolMessage):
 
     Feeds the peer table that host election reads.  Election is a pure function
     of that table, so every peer must learn of every other peer — not just of
-    the master.  A peer therefore announces on joining and *answers* another
-    peer's announcement, which is what lets a late joiner discover peers that
-    have long since gone quiet.  ``reply_requested`` stops that from becoming an
-    announcement storm: only the initial announcement asks for answers, and the
-    answers do not ask again.
+    the master.
+
+    Sent on joining and **periodically thereafter**.  The periodic send is what
+    makes silence meaningful: a peer may legitimately go quiet for a whole
+    session, so only the absence of announcements distinguishes one that is idle
+    from one that has died.  Peers age out anyone they have not heard from
+    within the liveness timeout.
+
+    Nobody answers an announcement.  Answering used to be how a joiner
+    discovered peers that had long since gone quiet; a joiner now learns them
+    from the roster in :class:`StateSnapshot`, and any it misses from their next
+    periodic announcement.  Dropping the answer removes the only step in this
+    protocol whose message count grew with the size of the session.
     """
 
     SCHEMA = "LiveSession.1"
@@ -255,17 +263,12 @@ class PeerAnnounce(ProtocolMessage):
         default_factory=list,
         doc='Roles this peer can hold, e.g. ["visibility"].',
     )
-    reply_requested: bool = doc_field(
-        default=False,
-        doc="Whether receiving peers should answer with their own announcement.",
-    )
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "peer_guid": self.peer_guid,
             "app": self.app,
             "capabilities": list(self.capabilities),
-            "reply_requested": self.reply_requested,
         }
 
     @classmethod
@@ -274,8 +277,37 @@ class PeerAnnounce(ProtocolMessage):
             peer_guid=data.get("peer_guid"),
             app=data.get("app") or "",
             capabilities=list(data.get("capabilities") or []),
-            reply_requested=bool(data.get("reply_requested")),
         )
+
+
+@register
+@dataclass
+class PeerDepart(ProtocolMessage):
+    """Peer's notice that it is leaving the session.
+
+    Removes the sender from every other peer's peer table, so a role elected
+    from that table — host, in particular — moves off a peer that has gone.
+    Without it the table is append-only and a departed host keeps visibility
+    authority, freezing the session's view with no peer permitted to change it.
+
+    **Best-effort.**  It is sent once, on a path with no delivery guarantee, and
+    a peer that crashes never sends it at all.  Correctness therefore does not
+    rest on it: peers also age out anyone they have not heard announce within
+    the liveness timeout, and this message only makes the common case prompt.
+    Do not add a consumer that assumes arrival.
+    """
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "PEER_DEPART"
+
+    peer_guid: str = doc_field(doc="GUID of the departing peer.")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"peer_guid": self.peer_guid}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "PeerDepart":
+        return cls(peer_guid=data.get("peer_guid"))
 
 
 @register
@@ -330,6 +362,14 @@ class StateSnapshot(ProtocolMessage):
         doc="GUID of the session host (visibility authority) at snapshot time, "
             "so a joiner does not assume it is host and fight the real one.",
     )
+    peers: dict = doc_field(
+        default_factory=dict,
+        doc="Peers present at snapshot time, as {guid: {app, capabilities}}, so "
+            "a joiner learns the peer set without every peer answering its "
+            "announcement. Not the only discovery path: a joiner that receives "
+            "no snapshot learns peers from their periodic announcements. "
+            "Carries no liveness stamp — that is the receiver's own clock.",
+    )
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -344,6 +384,8 @@ class StateSnapshot(ProtocolMessage):
             payload["display_state"] = self.display_state
         if self.host_guid is not None:
             payload["host_guid"] = self.host_guid
+        if self.peers:
+            payload["peers"] = {g: dict(p) for g, p in self.peers.items()}
         return payload
 
     @classmethod
@@ -356,6 +398,7 @@ class StateSnapshot(ProtocolMessage):
             playback_state=data.get("playback_state"),
             display_state=data.get("display_state"),
             host_guid=data.get("host_guid"),
+            peers=dict(data.get("peers") or {}),
         )
 
     def as_otio(self) -> dict[str, Any]:

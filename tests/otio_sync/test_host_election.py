@@ -171,7 +171,13 @@ def test_a_joining_preferred_peer_takes_the_role():
     assert rv.host_guid == "guid-xs"
 
 
-def test_announcement_is_answered_once_and_does_not_ask_for_answers():
+def test_an_announcement_is_not_answered():
+    """No answer cascade: join cost must not grow with the size of the session.
+
+    Answering used to be how a joiner learned peers that had gone quiet. The
+    snapshot roster and the periodic heartbeat cover that now, so the answer —
+    the only step whose message count scaled with peer count — is gone.
+    """
     xs = _manager("guid-xs", "xstudio")
     rv = _manager("guid-rv", "openrv")
     xs.start_session()
@@ -180,9 +186,9 @@ def test_announcement_is_answered_once_and_does_not_ask_for_answers():
 
     _deliver(xs, rv)
 
-    answers = _announcements(rv.network)
-    assert len(answers) == 1
-    assert answers[0]["payload"]["command"]["payload"]["reply_requested"] is False
+    assert _announcements(rv.network) == []
+    # The peer is still learned — it just costs nothing to learn.
+    assert "guid-xs" in rv._peers
 
 
 def test_host_change_fires_the_callback():
@@ -407,7 +413,6 @@ def test_peer_announce_round_trips():
         peer_guid="guid-xs",
         app="xstudio",
         capabilities=["visibility"],
-        reply_requested=True,
     )
 
     back = pm.PeerAnnounce.from_payload(msg.to_payload())
@@ -421,7 +426,6 @@ def test_peer_announce_tolerates_a_bare_payload():
 
     assert back.app == ""
     assert back.capabilities == []
-    assert back.reply_requested is False
 
 
 def test_state_snapshot_round_trips_the_host():

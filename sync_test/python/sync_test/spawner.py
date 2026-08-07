@@ -168,6 +168,38 @@ class AppSpawner:
         startup_wait = 5.0 if session_file else 2.0
         time.sleep(startup_wait)
 
+    def terminate_app(self, app_name):
+        """Terminate one spawned app, leaving the rest of the session running.
+
+        Used to test what the surviving peers do when a peer goes away — host
+        failover, most importantly, since a departed host that stayed elected
+        would freeze the session's view for everyone left.
+
+        Terminating rather than asking the app to disconnect is deliberate: it
+        exercises the *unclean* exit, where no departure notice is ever sent and
+        the survivors must fall back to ageing the peer out. That is the path a
+        crash takes, and the one that cannot be covered any other way.
+
+        :param app_name: Name as passed to :meth:`launch`, e.g. ``"openrv"``.
+        :returns: ``True`` if a process was terminated.
+        """
+        remaining = []
+        terminated = False
+        for name, p in self.processes:
+            if name == app_name and not terminated:
+                logging.info(f"Terminating {name} mid-test (PID: {p.pid})")
+                p.terminate()
+                try:
+                    p.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"{name} did not exit gracefully, killing...")
+                    p.kill()
+                terminated = True
+                continue
+            remaining.append((name, p))
+        self.processes = remaining
+        return terminated
+
     def __enter__(self):
         return self
 

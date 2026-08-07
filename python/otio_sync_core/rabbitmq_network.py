@@ -7,6 +7,7 @@ import logging as _logging
 import queue
 import socket
 import threading
+import time
 import uuid
 from typing import Any
 
@@ -290,11 +291,32 @@ class RabbitMQNetwork:
                 break
         return payloads
 
-    def stop(self) -> None:
+    def stop(self, flush_timeout: float = 0.5) -> None:
         """Signal background threads to exit and wait for them to finish.
 
-        Blocks for up to 2 seconds per thread.
+        Blocks for up to 2 seconds per thread, plus *flush_timeout* while the
+        publisher drains anything still queued.
+
+        The drain exists so a message enqueued immediately before shutdown — a
+        departure notice, most obviously — has a chance to reach the broker.
+        The publisher loop exits as soon as the stop event is set, so without
+        it that last message is simply discarded.
+
+        It is deliberately **bounded and best-effort**: callers include host
+        application disconnect paths that run on a UI thread, so this must not
+        become an unbounded wait for broker acknowledgement. Anything still
+        queued when the budget expires is dropped, exactly as before.
+
+        :param flush_timeout: Seconds to allow for draining queued messages.
+            Pass ``0`` to stop immediately without draining.
         """
+        deadline = time.time() + max(0.0, flush_timeout)
+        while (
+            not self._send_queue.empty()
+            and self._publisher_thread.is_alive()
+            and time.time() < deadline
+        ):
+            time.sleep(0.01)
         self._stop_event.set()
         if self._consumer_thread.is_alive():
             self._consumer_thread.join(timeout=2)
