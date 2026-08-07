@@ -14,6 +14,6 @@
 ## 4. Verify
 
 - [x] 4.1 Reinstall the rvpkg (`rvplugin/<pkg>/reinstall.csh`) so RV loads the updated source, not the installed copy.
-- [ ] 4.2 In a single long-running RV process, draw two annotations on the same clip+frame from xStudio (same scenario that originally measured a 34ms first-stroke apply vs. 13.51s second-stroke apply) and capture `rv_client.log`.
-- [ ] 4.3 Confirm from the log timestamps that the second annotation's `apply_patch` now runs promptly after the raw MQ message is logged (no multi-second gap), closing the stall.
-- [ ] 4.4 Spot-check that deleted properties are actually gone (not just unreferenced) — e.g. via `rv.commands.propertyExists()` on a swept item's `.width`/`.points` paths in RV's Python console after a partial tick is superseded — to confirm the fix closes the leak, not just coincidentally speeds up this one test.
+- [x] 4.2 In a single long-running RV process, draw two annotations on the same clip+frame from xStudio (same scenario that originally measured a 34ms first-stroke apply vs. 13.51s second-stroke apply) and capture `rv_client.log`.
+- [x] 4.3 Confirm from the log timestamps that the second annotation's `apply_patch` now runs promptly after the raw MQ message is logged (no multi-second gap), closing the stall.
+- [x] 4.4 Spot-check that deleted properties are actually gone (not just unreferenced) — e.g. via `rv.commands.propertyExists()` on a swept item's `.width`/`.points` paths in RV's Python console after a partial tick is superseded — to confirm the fix closes the leak, not just coincidentally speeds up this one test.

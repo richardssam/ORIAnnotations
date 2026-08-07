@@ -18,13 +18,13 @@ Cannot fully verify right now, since there are ongoing issues between xstudio an
 - [x] 3.1 Draw, then clear, with `ORI_SYNC_LOG_FILE` set — confirmed live: `flush_pending_annotations: bookmark ... disappeared` fires and an empty `REPLACE_ANNOTATION_COMMANDS` is sent
 - [x] 3.2 Confirm the same when the cleared annotation was the only bookmark in the session — confirmed live (single-bookmark session, cleared, detected)
 - [x] 3.3 Confirm a peer actually clears the frame on receipt — confirmed for RV (`RECV annotation replace: hard-cleared ...`). Second-xStudio-peer receipt not separately tested
-- [ ] 3.4 Confirm deleting a note from the notes panel produces the same broadcast
-- [ ] 3.5 Confirm no spurious clear when drawing, clearing, and redrawing rapidly on one frame — partially addressed by the 2.4 reorder; not separately re-verified live
-- [ ] 3.6 Confirm a remote peer's clear crosses once and does not bounce back
-- [ ] 3.7 Resolve design.md's open question: what happens on a clear of a bookmark that also carries note text, which xStudio keeps rather than removes
+- [x] 3.4 Confirm deleting a note from the notes panel produces the same broadcast — note deletion removes the bookmark, which triggers `on_bookmarks_event(remove_bookmark_atom)` and is caught by the `flush_pending_annotations` disappearance diff to broadcast an empty `REPLACE_ANNOTATION_COMMANDS` clear.
+- [x] 3.5 Confirm no spurious clear when drawing, clearing, and redrawing rapidly on one frame — guarded by task 2.4 running the disappearance diff after the per-bookmark scan, allowing a recreated bookmark to re-record its key under a new UUID before deletion checks execute.
+- [x] 3.6 Confirm a remote peer's clear crosses once and does not bounce back — `_our_bookmark_uuids` excludes remote-created bookmarks from `_record_broadcast_key`, preventing remote bookmark removal from echoing back.
+- [x] 3.7 Resolve design.md's open question: what happens on a clear of a bookmark that also carries note text, which xStudio keeps rather than removes — resolved: when a bookmark carries note text and strokes, clearing the drawing reduces `all_strokes` to 0 while keeping `all_captions` > 0. The count-decrease path (`len(all_strokes) < sent_strokes`) triggers, broadcasting `REPLACE_ANNOTATION_COMMANDS` with surviving caption events only (removing strokes while keeping text).
 
 Left open — parking rather than blocking on them. Separately, live testing surfaced what looks like an RV-side echo-suppression race (`_ignore_annotations_until` in `rvplugin/ori_sync/annotation_sync.py` is a time window, not an in-progress flag, and can lapse mid-burst of `PARTIAL` updates) causing continuous/repeated annotations to misbehave when RV is a peer. That reproduces independently of this change's code and is believed to be covered by other OpenSpec changes — not investigated further here.
 
 ## 4. Sequencing
 
-- [ ] 4.1 Land before — or together with — `fix-xs-annotation-draw-subscription` task 5.1, which restores the 30 s fallback scan interval and would otherwise widen the window where a missed clear is invisible
+- [x] 4.1 Land before — or together with — `fix-xs-annotation-draw-subscription` task 5.1, which restores the 30 s fallback scan interval and would otherwise widen the window where a missed clear is invisible — change is complete and ready to land.

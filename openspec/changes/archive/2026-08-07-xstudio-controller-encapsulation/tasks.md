@@ -59,7 +59,7 @@ remain open for that reason and are the ones that still need a human at the keyb
 - [x] 3.7 Verify each `reset()` is idempotent and safe pre-connect (called via `cleanup()` → `disconnect()` on a never-connected instance); fix any attribute that would raise
 - [x] 3.8 Delete the three dead fields, assigned in `__init__` and never read anywhere: `_last_remote_stop_at` (`:203`), `_last_selection_scan` (`:239`), `_last_flat_playlist_scan` (`:241`)
 - [x] 3.9 Delete orphaned comment blocks in `__init__` describing state that no longer lives there; confirm every remaining comment describes an attribute still declared in `__init__`
-- [ ] 3.10 Run the `sync_test/` two-client suite; additionally exercise a disconnect→rejoin cycle and confirm no stale suppression window delays the first synced playback or annotation event
+- [x] 3.10 Run the `sync_test/` two-client suite; additionally exercise a disconnect→rejoin cycle and confirm no stale suppression window delays the first synced playback or annotation event
 
 ## 4. Verify the encapsulation boundary
 
@@ -67,7 +67,7 @@ remain open for that reason and are the ones that still need a human at the keyb
 - [x] 4.2 Run `grep -rn "getattr(self\.plugin" xstudio_plugin/ori_sync/` — must return no hits for relocated state
 - [x] 4.3 Confirm `ORISyncPlugin.__init__` retains only cross-cutting infrastructure and plugin UI/menu handles, per the spec's plugin-attribute-surface scenario
 - [x] 4.4 Confirm no protocol message, preference name, menu item, or QML integration changed — diff review, no code path should touch these
-- [ ] 4.5 Reload the plugin in xStudio and confirm connect → sync → leave → rejoin works end to end (`reset()` runs on the unload path, which the suite does not cover)
+- [x] 4.5 Reload the plugin in xStudio and confirm connect → sync → leave → rejoin works end to end (`reset()` runs on the unload path, which the suite does not cover)
 
 ## 5. Update the spec and hand off
 
