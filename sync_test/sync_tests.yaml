@@ -52,8 +52,8 @@ tests:
     frame_tolerance: 5
     checkpoint_validation_delay: 6
     apps:
-      - "xstudio"
       - "openrv"
+      - "xstudio"
   - name: "delete_media_openrv_noscript"
     description: >
       JSONL replay (not script-driven) between two OpenRV instances: replays
@@ -370,6 +370,31 @@ tests:
     apps:
       - "xstudio"
       - "openrv"
+
+  - name: "xstudio_draws_two_annotations_stall_check"
+    description: >
+      Draws two consecutive pen annotations on the same clip+frame from xStudio
+      to OpenRV to confirm the second annotation applies promptly without a main-thread
+      stall and that pruned/superseded properties are deleted.
+    script_driven: true
+    frame_tolerance: 5
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "set_selection"
+        name: "car_ACES_sRGB.mov"
+      - action: "draw_annotation"
+        kind: "pen"
+        thickness: 0.004
+        color: [0.25, 0.5, 0.75, 1.0]
+      - action: "draw_annotation"
+        kind: "pen"
+        thickness: 0.004
+        color: [0.75, 0.25, 0.5, 1.0]
+    apps:
+      - "xstudio"
+      - "openrv"
+
 
   - name: "openrv_draws_rect_xstudio_verifies"
     description: >

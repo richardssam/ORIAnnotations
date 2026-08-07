@@ -46,6 +46,8 @@ The plugin SHALL synchronize paint strokes between instances by intercepting RV 
 
 The plugin SHALL additionally bind RV's internal `clear-paint` and `clear-all-paint` events (in addition to the existing `graph-state-change` binding) so that local annotation deletion is detected and broadcast, and SHALL bind changes to `<node>.paint.show` so that toggling annotation visibility is detected and broadcast.
 
+Because RV cannot mutate a dynamically-created pen node's properties from outside the call that created it, applying a mid-gesture partial update creates a fresh pen node per tick and supersedes the previous tick's node. When superseding a partial-tick pen node, the plugin SHALL delete that node's own RV properties (not merely remove it from the frame `order`), so mid-gesture ticks do not accumulate as orphaned property components on the node for the lifetime of the RV process.
+
 #### Scenario: Translating stroke to flat view
 - **WHEN** a user completes a paint stroke in RV
 - **THEN** the plugin SHALL extract the stroke properties and broadcast them as a flat view annotation payload.
@@ -77,6 +79,10 @@ The plugin SHALL additionally bind RV's internal `clear-paint` and `clear-all-pa
 #### Scenario: Show Drawings toggle is detected and broadcast
 - **WHEN** the user toggles "Show Drawings" for an RV source, changing `<node>.paint.show`
 - **THEN** the plugin SHALL broadcast the new value as `annotations_visible` via `display_settings`
+
+#### Scenario: Superseded partial-tick pen node is deleted, not just dereferenced
+- **WHEN** a later mid-gesture partial update supersedes an earlier tick's pen node for the same live gesture
+- **THEN** the plugin SHALL delete the superseded pen node's own RV properties in addition to removing it from the frame `order`
 
 ### Requirement: Dynamic OTIO Sync menu reflects connection state
 

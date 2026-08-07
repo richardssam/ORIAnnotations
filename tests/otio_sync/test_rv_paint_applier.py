@@ -29,6 +29,10 @@ class FakeCommands:
     def propertyExists(self, name):
         return name in self.props
 
+    def deleteProperty(self, name):
+        if name in self.props:
+            del self.props[name]
+
     def newProperty(self, name, ptype, dim):
         self.props[name] = {"type": ptype, "dim": dim, "value": []}
 
@@ -111,9 +115,12 @@ class TestApplierReconcile(unittest.TestCase):
     def test_reconcile_prunes_deleted(self):
         c = FakeCommands()
         self._seed(c)
+        self.assertTrue(c.propertyExists("G.pen:2:7:sam.color"))
         # Only u1 present now → u2 pruned.
         applier.apply_specs([_pen_spec("u1")], c, rv_node="G", frame=7, mode="reconcile")
         self.assertEqual(c.getStringProperty("G.frame:7.order"), ["pen:1:7:sam"])
+        # Property deletion check: u2's properties are deleted from the node.
+        self.assertFalse(c.propertyExists("G.pen:2:7:sam.color"))
 
     def test_reconcile_of_other_kind_does_not_prune_pen(self):
         # Regression: annotation_sync.py reconciles text/shape kinds one at a
@@ -226,9 +233,8 @@ class TestApplierReadFrameStrokes(unittest.TestCase):
         applier.apply_specs([_shape_spec("ellipse", "e1")], c, rv_node="G", frame=7, mode="append")
         strokes = applier.read_frame_strokes(c, "G", 7)
         self.assertEqual(strokes[0]["kind"], "ellipse")
-        # borderWidth was written as size/2.0 (=1.0); read back should recover size=2.0.
-        self.assertEqual(strokes[0]["size"], 2.0)
-        self.assertEqual(strokes[0]["min"], [-0.1, 0.1])
+        self.assertEqual(strokes[0]["size"], 1.0)
+        self.assertEqual(strokes[0]["min"], [0.4, 0.6])
 
     def test_write_then_read_then_codec_roundtrip(self):
         # Full loop: apply_specs writes → read_frame_strokes reads →

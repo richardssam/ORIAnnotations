@@ -64,6 +64,8 @@ The codec SHALL provide the only RV-touching function, `apply_specs(specs, comma
 
 Reconcile mode's kind-inferring prune (deriving which kinds it may prune from the kinds actually present in `specs`) SHALL remain unchanged for a non-empty `specs` list — callers routinely reconcile one kind (or even a single item) at a time, and a spec list that says nothing about a kind MUST NOT be read as "no items of that kind exist anymore." Annotation deletion that empties a frame entirely SHALL NOT be expressed by calling `apply_specs` with an empty `specs` list (which reconcile mode cannot distinguish from "no opinion, prune nothing"); callers needing a full clear SHALL clear the frame's `order` property directly instead, outside `apply_specs`.
 
+When reconcile mode prunes a managed item, it SHALL delete that item's own RV properties (via `commands.deleteProperty` on each of the item kind's known sub-property paths, absorbing errors for properties already absent) in addition to removing it from the frame `order` — a pruned item MUST NOT remain as an orphaned property component on the node.
+
 #### Scenario: Append mode adds nodes
 
 - **WHEN** `apply_specs` is called with `mode="append"` for a frame that has no existing managed nodes
@@ -78,6 +80,7 @@ Reconcile mode's kind-inferring prune (deriving which kinds it may prune from th
 
 - **WHEN** `apply_specs` is called with `mode="reconcile"` and an existing managed node's `uuid` is not present among the incoming specs
 - **THEN** that node SHALL be removed from the frame `order`
+- **AND** every RV property belonging to that node's component SHALL be deleted, not merely dereferenced from `order`
 
 #### Scenario: Reconcile with an empty specs list prunes nothing
 
