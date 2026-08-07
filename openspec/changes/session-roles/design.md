@@ -1,118 +1,164 @@
 ## Context
 
-The sync protocol treats every peer as an equal broadcaster. Echo loops between peers are currently suppressed by ~15 mechanisms, most of them wall-clock windows (`suppress_until = now + 1.5s`) scattered across both host plugins. The proposal introduces broadcast ownership (Phase 1, write leases per message category) and session roles (Phase 2, driver/reviewer/viewer permissions).
+**Split from the original two-phase proposal on 2026-08-07.** Phase 1 (write leases) is now `broadcast-ownership`; this document covers the role model only. The split is possible because the role check composes with *category authority*, which already exists — so this change has no dependency on leases and can land against today's code.
+
+The sync protocol has no per-participant permission concept. Every peer may emit anything, bounded only by category authority (visibility, host-only) and the `is_master` gate on structure. In a 20–30-person screening that is unusable.
 
 Relevant current state:
 
-- `SyncManager` (in `otio_sync_core`) already owns all `broadcast_*` methods, the master-election state machine, and `STATE_SNAPSHOT` assembly — it is the natural single enforcement point.
-- The two host plugins have measurably drifted on hand-replicated protocol behaviour (discovery re-broadcast cadence, snapshot assembly placement), which rules out per-plugin enforcement.
-- RV's host events are synchronous: a remote apply wrapped in `_rv_updating` reliably scopes its own echoes. xStudio's are not: applying a remote playhead change fires `attribute_changed` callbacks asynchronously, some arriving after the apply scope has exited. This asymmetry shapes the echo-filtering design below.
-- `RabbitMQNetwork` already filters self-sent messages by `source_guid`, and `SyncManager._is_syncing` already scopes snapshot application. Both are retained.
+- **`authority.py` exists** and defines four categories (`visibility` / `position` / `annotation` / `structure`), the `SENT` / `SUPPRESSED` status vocabulary, `strip_visibility_fields`, the `ORI_VISIBILITY_AUTHORITY` kill switch, and `elect_host_guid`.
+- **The enforcement point is built and proven.** `SyncManager._enforce_visibility` strips visibility fields in one place, called from `broadcast_playback_state`; a live soak recorded 284 strips and zero leaked `view_mode` sends. The role check goes in the same place.
+- **Plugins never test authority**, and this is test-guarded (`test_no_plugin_gates_a_broadcast_on_being_host`). Where a plugin genuinely needs to know, it asks one shared core predicate (`owns_visibility()`), not per-application logic.
+- **`elect_host_guid` is a pure function of the peer table**, ranked by `HOST_PREFERENCE` with a GUID tie-break, so every peer reaches the same host from the same inputs.
+- **A peer table exists** (`SyncManager._peers`, `{guid: {app, capabilities}}`), populated by `PEER_ANNOUNCE`, with a settled announce-on-join / answer-once cadence.
+- **`STATE_SNAPSHOT` already carries authority state** (`host_guid`), with the compatibility convention to copy: omit when unset, ignore `None` on receipt, adopt via a named operation rather than direct assignment.
+- **The sync viewer already declares `capabilities=[]`** specifically so a passive observer can never be elected host. Role-based exclusion generalises an idea already in the code.
+- The two host plugins have measurably drifted on hand-replicated protocol behaviour, which rules out per-plugin enforcement.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Structurally eliminate the asynchronous time-window echo guards (~9 of 15) by making "two peers broadcasting the same category" impossible in the steady state.
-- All peers converge on the same ownership view from the same message set, with no central authority.
-- One enforcement point (`SyncManager.broadcast_*`) shared by both hosts; the Phase 2 role gate slots into the same choke point.
-- Fully backwards-compatible protocol: peers that predate ownership ignore the new messages and behave as today.
-- Phase 2: driver/reviewer/viewer roles workable for 20–30-person sessions, with token-based driver reconnection.
+- Driver/reviewer/viewer roles workable for 20–30-person sessions, with token-based driver reconnection.
+- One enforcement point (`SyncManager.broadcast_*`) shared by both host applications, layered on the landed category check.
+- Zero behaviour change until a session opts in — `default_role: driver` reproduces today exactly, and is also the rollback.
+- Every peer reaches the same host from the same inputs, with role as an additional filter that does not disturb that property.
 
 **Non-Goals:**
 
 - Adversarial security. Enforcement is send-side; peers trust each other. Tokens gate accidents, not attackers.
 - Receive-side validation or broker-side filtering.
-- Locking the local UI of viewers/reviewers (local divergence + snap-back is accepted; see proposal).
-- Per-object or per-clip ownership granularity — two coarse categories (navigation, structure) only.
+- Locking the local UI of viewers/reviewers. Local divergence + snap-back is accepted, consistent with `host-owned-visibility` §7.2.
+- Re-cutting the category boundaries. They belong to `session-visibility-authority`; roles compose with them.
+- Contention resolution between peers that *do* have permission. That is `broadcast-ownership`, and this change neither provides nor requires it.
 - Stable cross-session peer identity (token elevation covers driver reconnection instead).
-- Fairness guarantees in contention. Correctness = convergence; who wins a photo-finish claim is best-effort.
 
 ## Decisions
 
-### D1: Ownership lives entirely in `SyncManager`; plugins never check it
+### D1: Roles are a static permission matrix evaluated in the existing choke point
 
-`SyncManager` holds a small `OwnershipLease` per category (`owner_guid`, `claim_ts`, `deadline`, `pending_claimant`). Every `broadcast_*` method checks the relevant category before sending and returns a status (`SENT` / `SUPPRESSED`) the plugin can observe for logging or UI.
+A `role → allowed field groups` table in core (the proposal's matrix, encoded once). Note **field groups, not message types** — the boundary runs inside `PLAYBACK_SETTINGS_1.0`, so a role table keyed on message type cannot express "a reviewer may scrub but not change the shot", which is the whole point of the reviewer tier.
 
-- *Alternative — per-plugin guard clauses (as in the proposal's first draft):* rejected; the hosts have already drifted on hand-replicated behaviour, and Phase 2 would double the duplicated surface.
-- *Alternative — receive-side validation:* rejected; requires role/ownership metadata on every message and N enforcement points instead of one.
+The `broadcast_*` guard becomes: role check, then category authority — both in `SyncManager`, both invisible to plugins except via the returned status.
 
-Category mapping is a static table in core: `broadcast_playback_state`, `broadcast_display_state`, selection → **navigation**; timeline add/remove/replace/rename, `SET_PROPERTY`, structural `INSERT_CHILD`/`REMOVE_CHILD`/`MOVE_CHILD` → **structure**; annotation paths → **no category** (multi-writer, never gated).
+- *Alternative — per-plugin role checks:* rejected. The applications have already drifted on hand-replicated behaviour, and `host-owned-visibility` §1.4 established (and test-guards) the invariant that plugins never gate a broadcast on authority. Any role-dependent *local* behaviour must go through a shared core predicate, the way `owns_visibility()` does.
+- *Alternative — receive-side validation:* rejected; requires role metadata on every message and N enforcement points instead of one.
 
-### D2: Convergence via deterministic ordering, not synchronized clocks
+Mechanically this reuses `strip_visibility_fields`' shape: strip the disallowed field groups in **one** core function, never at call sites. `SUPPRESSED` already means *"sent with fields stripped"* rather than *"not sent"*, and a mixed message is the normal case — this change must not redefine the status. Tests assert on the sent envelope, not on whether a send occurred, following `test_broadcast_authority.py`.
 
-`CLAIM_OWNERSHIP` carries `(category, peer_guid, claim_ts)`. Conflict rule, applied identically by every peer: an earlier `claim_ts` wins; exact ties break to the lower `peer_guid`. A claim never preempts a live (unexpired) lease held by a *different* peer — it is recorded as `pending_claimant` instead.
+### D2: Role is a ceiling; category authority is a gate
 
-The insight that makes this safe without clock sync: convergence only requires that all peers apply the same rule to the same message *content*. Clock skew between machines can bias *who* wins a simultaneous claim (a fairness concern, explicitly a non-goal) but cannot make two peers disagree about the winner, because both evaluate the same two `(claim_ts, guid)` pairs.
+The composition rule, stated here because this change introduces the axis that makes composition necessary:
 
-- *Alternative — Lamport/sequence numbers:* more machinery for the same convergence property; wall clock + GUID is sufficient because fairness is out of scope.
-- *Alternative — master arbitrates claims:* re-introduces a round-trip through one peer and couples ownership to master liveness; rejected.
+> A broadcast must pass **both** checks. Role says what this participant may ever emit; category authority says whether this peer is the one emitting it right now. A driver has permission to emit visibility; only the host actually does.
 
-### D3: Lease expiry is computed on each peer's local clock from message receipt
+Evaluation order is **role first, then category authority** — also the cheaper order, since role is static while a lease check (once `broadcast-ownership` lands) may touch expiry state.
 
-Each owner broadcast (any message in the category, plus the initial claim) refreshes the lease. Every peer sets `deadline = local_monotonic_now + T` on *receipt*. No deadline value crosses the wire, so cross-machine clock sync is never needed. Peers may disagree about the expiry instant by up to one network latency — harmless, because expiry only matters when someone tries to claim, and that claim then propagates and converges under D2.
+Four concepts coexist, and conflating any two re-introduces a bug this codebase has already had:
 
-On expiry: if a `pending_claimant` exists, ownership transfers to it (each peer applies this locally and deterministically — pending claims are ordered by the same D2 rule); otherwise the category becomes FREE. Owner disconnect is handled by the same expiry path, no special case.
+| Concept | Answers | Scope | Determined by |
+|---|---|---|---|
+| **master** | Who holds the canonical snapshot? | Session | Liveness / discovery timing |
+| **host** | Who chooses what everyone looks at? | Category (visibility) | Capability, `elect_host_guid` |
+| **lease owner** | Who is broadcasting this category *right now*? | Category (position, structure) | `broadcast-ownership` |
+| **role** | What is this *participant* permitted to emit at all? | Per peer | Policy + token (this change) |
 
-Default `T = 1.0 s` per category, configurable. The constraint that sets the floor: T must exceed the largest natural gap between broadcasts during continuous interaction (scrub events arrive at frame rate; structure operations can gap by several hundred ms during a `load_otio` rebuild). Structure may want a larger T than navigation.
+`host-owned-visibility` D2 rejected "host is always the master" precisely because a master re-election, which turns on liveness, would then silently change who controls the view. The same reasoning forbids collapsing role onto host: role is a property of a *person's seat*, host is a property of *one category*, and a session can legitimately have several drivers and one host.
 
-### D4: Claims are triggered by user input, never by the broadcast guard
+**Independence from `broadcast-ownership`.** Without leases, the category-authority step is simply `visibility → host?` and nothing for position/structure — which is today's behaviour. The role gate is fully functional against that. This is why the two changes were split, and it should stay true: no decision here may assume a lease exists.
 
-The guard in `broadcast_*` suppresses and returns `SUPPRESSED`; it does **not** auto-claim. Claiming is an explicit `manager.claim_category()` call made only from input-driven plugin paths. This is the load-bearing rule from the proposal's echo-filtering section: if apply-echoes could reach an auto-claiming guard, every remote apply would queue a claim and steal the lease at the next expiry.
+### D3: Role assignment is GUID-memory first, then token, then default
 
-How each host keeps echoes away from the claim call:
+Assignment on join: (1) GUID present in `peer_roles` → restore previous role; (2) token presented and hash matches → elevated role; (3) otherwise `default_role`.
 
-- **RV (synchronous events):** the existing `_rv_updating` apply-scope guard, converted to a depth-counted context manager (`with self._updating():`), wraps every remote apply. Events fired inside the scope never reach broadcast or claim paths. Complete and race-free because RV delivers events synchronously.
-- **xStudio (asynchronous events):** apply-scope flags cannot cover callbacks that arrive after the scope exits. The claim gate therefore keeps **one** residual per-category horizon: applying a remote message stamps `last_remote_apply[category] = now`, and `claim_category()` is a no-op within a short horizon (~0.3 s) of that stamp. This is honestly a time window — but it is one mechanism, in one place, with a benign failure mode (a spurious *claim request*, which D2/D3 resolve; never a broadcast echo), replacing five scattered windows whose failure mode was a live feedback loop.
+Tokens travel as salted hashes in the snapshot; the plaintext token is only ever sent by the *joining* peer inside its join message. Acceptable under the trust model — the broker is already unauthenticated, and tokens gate accidents rather than attackers.
 
-A suppressed broadcast never queues its payload. If a peer is granted ownership later (pending claim promoted), the plugin broadcasts its *current* state if the user is still interacting, or nothing. Replaying deferred state is itself an echo source.
+- *Alternative — stable cross-session peer identity:* rejected; introduces identity management concerns (shared machines, per-project identities) for a problem tokens solve statelessly.
+- *Alternative — role claim + peer approval:* rejected; more complex with no clear benefit.
 
-### D5: Guard removal is a separate, revertible step behind a kill switch
+The GUID-memory step exists for the reconnection edge case: a driver who drops and rejoins their own managed session would otherwise land on `default_role` (`viewer`) and be locked out of the session they are running. Token elevation is the fallback when the GUID changes.
 
-Phase 1 lands in three commits: (1) core ownership mechanism + protocol messages, dark — enforcement returns `SENT` unconditionally when disabled; (2) enforcement enabled by default (`ORI_BROADCAST_OWNERSHIP=0` env kill switch reverts to today's behaviour); (3) removal of the nine retired guards. The kill switch makes commit 2 safe to soak in real sessions; commit 3 is a pure deletion that reverts cleanly if the soak finds a gap in the replacement table.
+### D4: Both elections become role-aware, at different strengths
 
-Prerequisite: the xStudio guards being deleted live as plugin-resident state that conceptually belongs to `PlaybackSyncController`; the planned encapsulation cleanup (controller-owned state + per-controller `reset()`) should land first so commit 3 is a small, controller-local diff. That cleanup is tracked outside this change.
+- *Master election* **prefers** drivers. The election response carries the peer's role; a peer defers self-election briefly if it is not a driver and the discovery responses show a driver present. Master remains orthogonal to role — a reviewer promoted to master is master for state-sync only.
+- *Host election* **restricts** to drivers. This is the stronger form and it is not optional: a non-driver host holds visibility authority while its role forbids emitting visibility, so the session's shot freezes and nothing reports why. `elect_host_guid` gains a `role == driver` filter beside its existing capability check.
 
-### D6: Late joiners inherit ownership via `STATE_SNAPSHOT`
+Being a pure function of the peer table, the filter is one predicate and the determinism property is untouched — every peer still reaches the same host from the same inputs, which is the property that makes simultaneous election safe without a claim protocol.
 
-The snapshot gains a `broadcast_ownership` section: per category, `owner_guid` and `remaining_ms` (deadline expressed as a countdown, not an absolute time, for the same clock-independence reason as D3). Without this, a late joiner assumes both categories FREE and its first scrub fights the active driver. Phase 2 reuses the identical channel for `session_roles` (policy, `peer_roles` map, token hashes).
+Host election must also keep `fix-discovery-thread-safety`'s discipline, which `host-owned-visibility` already implements and which adding a role input must not erode: `elect_host()` owns the transition and no call site assembles it; other threads enqueue via `request_host_election()` rather than mutating; `_drain_host_elections()` re-checks eligibility **at drain time**, so a driver that announced during queue latency is taken into account. A role arriving between enqueue and drain is exactly the hazard that re-check exists for.
 
-### D7: Roles are a static permission matrix evaluated in the same choke point
+### D5: Role travels as a field on `PEER_ANNOUNCE`, not a new message
 
-Phase 2 adds a `role → allowed message set` table in core (exactly the proposal's matrix, encoded once). The `broadcast_*` guard becomes: role check, then ownership check — both in `SyncManager`, both invisible to plugins except via the returned status. Role state: `self_role`, `peer_roles: {guid → role}`, `role_policy` (default role, token hashes), all carried in `STATE_SNAPSHOT`.
+Role must reach `SyncManager._peers`, because D4's host filter reads the peer table. `PEER_ANNOUNCE` already carries `app` and `capabilities` into that table with a settled announce-on-join / answer-once cadence.
 
-Role assignment on join: (1) GUID present in `peer_roles` → restore previous role; (2) token presented and hash matches → elevated role; (3) otherwise `default_role`. Tokens travel as salted hashes in the snapshot; the plaintext token is only ever sent by the *joining* peer inside its join message (acceptable under the trust model — the broker is already unauthenticated).
+- *Alternative — a new `PEER_ROLE` message (the original proposal):* rejected. It would duplicate a message that now exists, with its own cadence to get right and its own storm risk. That message did not exist when the first draft was written; it does now.
 
-Master election prefers drivers (proposal's ordering). Implementation: the election response carries the peer's role; a peer defers self-election briefly if it is not a driver and the discovery responses show a driver present.
+A role change during a session re-announces, so promotion/demotion propagates through the same path as join.
 
-### D8: Interaction between ownership and the existing master concept
+### D6: The default role is `driver`, and that default is the rollback
 
-Master remains purely a state-sync role (snapshot authority). The existing `is_master` gate on OTIO-origin structure broadcasts in `sequence_sync.py` is subsumed by structure ownership: the master's structural rebuild paths must now `claim_category("structure")` like anyone else. This unifies two overlapping authority concepts into one, and multi-driver structure edits become safe (serialized by the lease) instead of silently master-only.
+`default_role: driver` means every peer is permitted everything, which is exactly today's behaviour — so the change is inert until a session opts into a stricter policy. This is deliberately the same "additive, reversible by configuration" shape as `ORI_VISIBILITY_AUTHORITY=0`, but it needs no env var because the policy itself carries the off switch.
+
+Two consequences worth stating so they are not undone later:
+
+- A session whose snapshot omits role policy must be treated as `default_role: driver`, not as "no one may broadcast". Following `host_guid`'s convention — omit when unset, ignore `None` on receipt — a peer predating this change cannot clear a session's role policy, and a session predating it cannot lock out a new peer.
+- Because the default is permissive, **the failure mode of a bug here is a session that behaves like today**, not a session that freezes. That is the right direction for a mechanism whose worst outcome would otherwise be "nobody can drive and nothing says why".
+
+### D7: A driverless session is recoverable by an explicit user action
+
+**Settled 2026-08-07.** D4's host restriction makes a new state reachable that cannot occur today: `default_role: viewer`, no token holder present (or the driver dropped and its GUID changed), so there are no drivers, therefore no peer eligible for host, therefore visibility is frozen with no way back. Tokens and GUID memory (D3) cover the common cases, but neither helps if nobody in the room has the token.
+
+The session therefore offers a **"Become controller"** menu action, and this is the deadlock's designed exit.
+
+**It elevates the peer to `driver`, and stops there.** It does *not* claim host directly. Host follows as a consequence: `elect_host_guid` is a pure function of the peer table (D4), so the moment a driver exists the next election resolves onto it. One user action, no second mechanism, and the determinism property is untouched.
+
+**It is offered only in the deadlock state** — no eligible driver in the peer table. This is the constraint that keeps the role model from being decorative: an always-available self-elevation button would make `default_role: viewer` advisory, and every token in D3 pointless. The waiver is safe precisely and only where it applies:
+
+> A session with no driver has no authority worth protecting. There is nobody to ask for permission, and nothing in flight to disrupt — the alternative to self-elevation is a session that stays frozen until everyone reconnects.
+
+Outside that state, elevation goes through the token, unchanged.
+
+**Concurrent clicks are safe by construction.** Two peers clicking in the same window both become drivers; host election then picks one deterministically by preference rank and GUID. Convergence, not contention — the same property that lets `broadcast-ownership` D2 resolve simultaneous claims without an arbiter. No locking, no "who clicked first".
+
+*Alternative — auto-promote a viewer when the last driver leaves:* rejected. It would silently hand control to whoever happens to be in the peer table, which is how a screening session acquires an accidental driver. An explicit action means a human chose it.
+
+*Alternative — a general "take control" action, always available:* rejected, as above; it collapses into "no roles".
+
+**Naming.** "Controller" is a UI label, not a fifth concept — the spec term stays `driver`, and the action's effect is exactly "set my role to driver". Anything else would add a term to the four-axis table in D2 that nothing else uses. Whether the button reads "Become controller", "Take control", or something else is a UI decision; the mapping to `driver` is not.
+
+This also answers the adjacent question about a general "request driver" affordance: there isn't one. `host-owned-visibility` §7.3's restraint (election only, no UI) still holds for the *normal* case. This is an escape hatch for a state that has no other exit, which is a different thing from a handoff mechanism — and it lands at the role layer, leaving the `claim_host()` seam §7.3 preserved in `elect_host` still unused and still available.
 
 ## Risks / Trade-offs
 
-- **[Lease T mistuned]** Too short: ownership churns during natural pauses (scrub hesitation, `load_otio` gaps), letting echoes or rival claims in. Too long: handoff feels sluggish. → Per-category configurable T, defaults 1.0 s navigation / 2.0 s structure; the soak period behind the D5 kill switch is where these get tuned. Instrument lease transfers in the log.
-- **[xStudio residual claim horizon is still a time window]** (D4) A very late async echo (> 0.3 s after apply) could trigger a spurious claim. → Failure mode is a pending claim resolved by D2/D3, not a broadcast; worst case is an unnecessary ownership transfer after the real owner goes idle, which self-corrects the moment either user next interacts.
-- **[Mixed-version sessions]** An old peer ignores `CLAIM_OWNERSHIP` and broadcasts freely; new peers suppress against it but it never suppresses against them. → Echo behaviour with an old peer is no worse than today (its guards still run); document that full echo elimination requires all peers upgraded. The protocol remains wire-compatible.
-- **[Guard removal deletes something the lease doesn't actually cover]** The proposal's replacement table is analysis, not proof. → D5's three-commit structure: guards are deleted only after enforcement has soaked with both mechanisms active; commit 3 reverts independently.
-- **[Structure lease vs. long rebuilds]** Applying a remote `REPLACE_TIMELINE` can take seconds (xStudio `load_otio`), during which the applying peer's own poll scans may detect "changes". → These scans must sit behind the apply-scope guard (the `_reload_suppress_until` replacement from the proposal), not behind ownership — already reflected in the replacement table.
-- **[Snapshot-carried role policy dies with the session]** If every peer leaves, tokens and role config are lost. → Accepted (proposal considered and rejected broker/external storage); screening organisers re-issue tokens per session.
+- **[A session ends up with no driver]** If `default_role` is `viewer` and the token holder never joins (or the driver drops and its GUID changes), nothing can change the shot and, under D4, nothing can even be elected host. → Tokens are the intended recovery and GUID memory covers the common reconnect; **D7's "Become controller" action is the guaranteed exit** when neither applies. The state must also be *visible* — a frozen session that offers no explanation is the failure `host-owned-visibility` D4 was written against — so the action's availability doubles as the indicator.
+- **[The escape hatch is mistaken for a handoff mechanism]** (D7) A "Become controller" button is one small step from "anyone can take over at any time", which would make roles decorative. → It is gated on the deadlock state (no eligible driver) and on nothing else; outside it, elevation goes through the token. Any later relaxation of that gate should be treated as re-opening D3, not as a UI tweak.
+- **[Role and host are conflated by a reader]** They are different axes and the matrix has host-only rows, which invites "driver == host". → D2's table above is the canonical four-axis statement. `broadcast-ownership` D7 tabulates only the three axes that exist without roles and defers the composition rule here, so the two documents overlap by subset rather than by duplication and cannot disagree.
+- **[Snapshot-carried role policy dies with the session]** If every peer leaves, tokens and role config are lost. → Accepted (broker/external storage considered and rejected); screening organisers re-issue tokens per session.
+- **[Field-group enforcement is subtler than per-message]** A role gate that stripped `view_mode` but left `clip_guid` would still be asserting what the session looks at. → Strip whole field groups in one core function, never at call sites — the rule `host-owned-visibility` §1.3 established and tested, including the `clip_guid`-without-`view_mode` case.
+- **[A landed mechanism is silently absent in RV]** New core modules must be added to `makepackage.csh`'s hand-maintained vendoring list; `__init__.py` imports inside `try/except ImportError`, so an omission leaves the plugin connected but inert. This exact fault shipped with `authority.py` (`host-owned-visibility` §6a.1). → Prefer extending `authority.py` to adding a module; update the list in the same commit; check the startup banner proves which copy RV loaded.
+- **[Tokens in an unauthenticated broker]** Plaintext tokens cross the wire on join. → Explicitly within the trust model (non-goal: adversarial security). Hashes, not plaintext, in the snapshot.
 
 ## Migration Plan
 
-1. **Phase 0 (prerequisite, separate change):** controller encapsulation cleanup in the xStudio plugin — move plugin-resident echo state into controllers, add per-controller `reset()`.
-2. **Phase 1a:** ownership state machine + `CLAIM_OWNERSHIP`/`RELEASE_OWNERSHIP` + snapshot section in `otio_sync_core`, enforcement disabled. Unit tests for D2 convergence (concurrent claims, expiry transfer, late join).
-3. **Phase 1b:** enforcement on by default with `ORI_BROADCAST_OWNERSHIP=0` kill switch; plugins wire `claim_category()` into input paths; RV's `_rv_updating` becomes a context manager; xStudio adds the claim horizon. Soak in the two-host test suite and live sessions.
-4. **Phase 1c:** delete the nine retired guards. Pure removal commit.
-5. **Phase 2a:** role matrix + policy in core and snapshot; role check in the guard; `PEER_ROLE` on join. Default policy `driver` — zero behaviour change until a session opts in.
-6. **Phase 2b:** host UI — role indication, token entry on join, "re-sync to driver" action.
+0. ~~**Enforcement point, status contract, category table, kill-switch pattern, deterministic election, peer table, snapshot-carried authority.**~~ **Done** — `host-owned-visibility`, archived 2026-08-06. This change builds on these rather than creating them.
+1. **2a:** role matrix + policy in core and snapshot; role check in the guard ahead of the category check; `role` field on `PEER_ANNOUNCE`; `elect_host_guid` restricted to drivers. Default policy `driver` — zero behaviour change until a session opts in. Expose role and elected host in the test inspector alongside the existing `is_host`/`host_guid`, in the runner's `ignore_keys`.
+2. **2b:** host UI — role indication, connected-peer roles, token entry on join, "re-sync to driver" action, and D7's **"Become controller"** action (enabled only when the peer table shows no eligible driver). The driverless state must be visible as well as recoverable.
 
-Rollback: each phase is additive and independently revertible; 1b and 2a have runtime kill switches (env var / `default_role: driver`).
+Not sequenced against `broadcast-ownership`. Either may land first; if leases land first, the guard gains a second category branch and no decision here changes.
+
+Rollback: `default_role: driver` restores today's behaviour without a rebuild (D6).
 
 ## Open Questions
 
-- Final T values per category (settle during 1b soak; see risk above).
-- Should destructive annotation operations (`clear-all-paint`) require structure ownership, given annotations are otherwise multi-writer? Leaning yes — a clear is not additive.
-- Phase 1 UX when a broadcast is suppressed: silent, or a subtle "peer X is driving" indicator? Silent is the 1b default; indicator may be folded into Phase 2 UI work.
-- `PEER_ROLE` as a new message vs. a field on the existing join/`WHO_IS_MASTER` exchange — decide when touching the join path in 2a.
-- Whether the sync test suite's inspector needs ownership state exposed in `ORI_FULLSTATE_FILE` for assertions (likely yes, cheap to add in 1a).
+- Runtime promotion/demotion is listed as a stretch goal — is it in 2a or deferred? It reuses D5's re-announce path, so it is cheap, but it adds an authority question (who may promote?) that the token model otherwise avoids. D7 answers the *self*-promotion case only, and only in the deadlock state; promoting someone else is still open.
+- ~~What exactly makes a driver "eligible" for D7's gate?~~ → **Settled by `peer-departure` (implemented 2026-08-07): present in the peer table now means present.** That change added `PEER_DEPART` for clean exits and a 5 s heartbeat / 15 s liveness timeout for everything else, both converging on `drop_peer()`. A driver that has gone stops being in the table within one timeout, so D7's gate needs no staleness rule of its own — exactly the outcome this question was holding out for. The residual is latency, not correctness: the escape hatch can stay greyed out for up to the liveness timeout after an unclean exit.
+- Should `STATE_SNAPSHOT` emission itself be role-gated, or left as a pure master concern? The matrix marks it master-only with a footnote; in practice the master should be a driver, but nothing yet enforces that.
+
+**Settled since the first draft:**
+
+- ~~Should a driverless session surface a visible state, or is silence acceptable?~~ → **Visible *and* actionable** (D7). A "Become controller" action, offered only in that state, both signals the condition and resolves it — a frozen session that explains nothing is the failure `host-owned-visibility` D4 was written against.
+- ~~Does role warrant a user-visible affordance beyond token entry?~~ → **Only the D7 escape hatch.** `host-owned-visibility` §7.3's "election only, no UI" restraint still governs the normal case; D7 is an exit from a state with no other exit, not a handoff mechanism, and it leaves the `claim_host()` seam unused.
+- ~~`PEER_ROLE` as a new message vs. a field on an existing exchange~~ → **field on `PEER_ANNOUNCE`** (D5). That message now exists with a settled cadence, and host election needs role in the peer table anyway.
+- ~~Whether a reviewer may navigate~~ → **position yes, visibility no.** The original "cannot navigate" conflated the two; `host-owned-visibility` split them, and a reviewer must be able to reach the frame they are annotating.
+- ~~Whether `display_state` is role-gated~~ → **no**, it is per-peer and ungated for every role including viewer (`host-owned-visibility` §7.1). Orthogonally, `broadcast-ownership` D8 does lease it on its own channel — the two compose, and neither implies the other.
+- ~~Whether the test inspector needs authority state exposed~~ → **yes**, pattern established by `host-owned-visibility` §2.4.
