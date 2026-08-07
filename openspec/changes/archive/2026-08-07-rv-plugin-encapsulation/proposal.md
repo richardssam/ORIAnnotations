@@ -23,7 +23,7 @@ None.
 
 ## Impact
 
-- **Code**: `rvplugin/ori_sync/plugin.py` (shrinks by ~150 lines: shim, dialog, clip construction), `rvplugin/ori_sync/sequence_sync.py` (gains `add_clip_from_path`), `rvplugin/ori_sync/utils.py` (gains the session dialog). No other module changes.
+- **Code**: `rvplugin/ori_sync/plugin.py` (shrinks by ~150 lines: shim, dialog, clip construction), `rvplugin/ori_sync/sequence_sync.py` (gains `add_clip_from_path`), `rvplugin/ori_sync/utils.py` (gains the session dialog). **Revised during implementation**: `sequence_sync.py` and `annotation_sync.py` also needed their three unguarded module-level `otio_sync_core` imports wrapped. Without that the disabled-menu requirement below is unreachable — a missing sync core aborted the mode load before `_build_menu` ran, so RV showed *no* OTIO Sync menu at all rather than the "Sync Unavailable" item. Every other `otio_sync_core` import in those files was already guarded; these three were the outliers.
 - **Protocol**: none.
 - **Ordering**: independent of `xstudio-controller-encapsulation` (different codebase; can proceed in parallel). Should land before `session-roles` implementation touches the RV plugin, purely to avoid merge friction.
 - **Testing**: two-client `sync_test/` suite unchanged; manual check of Add Clip and the import-failure menu state. RV loads the *installed* rvpkg copy, so `rvplugin/<pkg>/reinstall.csh` must be run before any in-RV verification, and the rvpkg `folders:`/`makepackage.csh` packaging must be confirmed to still include all modules (the packaging requirement already in `rv-plugin-module-structure`).

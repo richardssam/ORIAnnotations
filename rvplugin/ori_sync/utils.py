@@ -116,6 +116,51 @@ def _parse_ori_session(env_val):
     return (default_host, env_val)
 
 
+def session_dialog(title):
+    """Show a two-field dialog for MQ Host and Session Name.
+
+    The Qt widget imports are function-local on purpose: ``QtWidgets`` is only
+    needed when a dialog is actually shown, and keeping it lazy preserves
+    importability of this module in the headless contexts that use it for
+    :func:`_media_path` and :func:`_clip_effective_range`.
+
+    :param title: Dialog window title (e.g. "Create Session").
+    :returns: ``(host, name)`` or ``(None, None)`` on cancel.
+    :rtype: tuple
+    """
+    try:
+        from PySide2.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+    except ImportError:
+        try:
+            from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+        except ImportError:
+            _log("PySide not available — cannot show session dialog")
+            return None, None
+
+    default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
+    dlg = QDialog()
+    dlg.setWindowTitle(title)
+    dlg.setMinimumWidth(360)
+    layout = QFormLayout(dlg)
+    host_edit = QLineEdit(default_host)
+    name_edit = QLineEdit()
+    layout.addRow(QLabel("MQ Host:"), host_edit)
+    layout.addRow(QLabel("Session Name:"), name_edit)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    host_edit.returnPressed.connect(name_edit.setFocus)
+    name_edit.returnPressed.connect(dlg.accept)
+    layout.addRow(buttons)
+    if dlg.exec_() != QDialog.Accepted:
+        return None, None
+    host = host_edit.text().strip() or default_host
+    name = name_edit.text().strip()
+    if not name:
+        return None, None
+    return host, name
+
+
 def _media_path(url: str) -> str:
     """Normalise a ``file://`` URL (any variant) or local path to a canonical absolute POSIX path.
 

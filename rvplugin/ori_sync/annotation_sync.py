@@ -19,8 +19,23 @@ except ImportError:
         QtCore = None
 
 from utils import _log, _log_exc, _media_path, _clip_effective_range
-from otio_sync_core.manager import STATE_SYNCED
-from otio_sync_core import rv_annotation_codec, rv_paint_applier
+
+# Guarded so a missing sync core degrades to plugin.py's "Sync Unavailable"
+# menu rather than aborting the mode load outright. This is not a fallback that
+# lets sync limp along: plugin.py has already logged the ImportError to stderr,
+# connect_to_session hard-returns, and the menu offers no way to open a session.
+# The None sentinels below are deliberately not stubs -- any code path that
+# somehow reached them would raise AttributeError immediately and loudly.
+try:
+    from otio_sync_core.manager import STATE_SYNCED
+except ImportError:
+    STATE_SYNCED = "synced"
+
+try:
+    from otio_sync_core import rv_annotation_codec, rv_paint_applier
+except ImportError:
+    rv_annotation_codec = None
+    rv_paint_applier = None
 
 
 def _ensure_workspace_sync_event():

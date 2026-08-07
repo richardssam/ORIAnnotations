@@ -22,7 +22,13 @@ except ImportError:
     ORIGIN_NATIVE = "native"
     ORIGIN_OTIO_IMPORT = "otio_import"
 
-from otio_sync_core.rv_annotation_codec import font_size_to_rv
+# Guarded like the two imports above: when the sync core is missing, plugin.py
+# must still import far enough to build the "Sync Unavailable" menu. Nothing
+# that calls this can run in that state -- there is no session to sync.
+try:
+    from otio_sync_core.rv_annotation_codec import font_size_to_rv
+except ImportError:
+    font_size_to_rv = None
 
 # RV's native OTIO reader/writer (the `otio_reader` rv-package). Imported
 # defensively: a build without the package must degrade to native handling
@@ -715,6 +721,57 @@ class SequenceSyncController:
         self._init_timelines_from_sequences(seq_groups, fps)
         self.plugin.annotation._import_existing_rv_annotations()
         _log("Retry init complete")
+
+    def add_clip_from_path(self, path):
+        """Add *path* as an RV source and broadcast it as a clip on the active media track.
+
+        Drives the "Add Clip to Timeline…" menu action. The ``addSource`` call
+        and the in/out-point read are deliberately kept together: the points
+        read below are the ones RV sets *as a result of* loading the media, so
+        splitting them across a caller boundary would leave a silent ordering
+        dependency.
+
+        :param path: Absolute path to a media file.
+        :returns: The inserted :class:`otio.schema.Clip`, or ``None`` if there
+            is no sync manager or no active media track to insert into. In the
+            latter case the source is still added to RV locally and nothing is
+            broadcast, matching the pre-extraction behaviour.
+        :rtype: otio.schema.Clip or None
+        """
+        if not self.plugin.sync_manager:
+            _log("add_clip_from_path: no sync manager")
+            return None
+
+        rv.commands.addSource(path)
+
+        try:
+            fps = rv.commands.fps()
+            start = rv.commands.inPoint()
+            end = rv.commands.outPoint()
+            duration = end - start + 1
+            if start > 0:
+                start -= 1
+            time_range = otio.opentime.TimeRange(
+                otio.opentime.RationalTime(start, fps),
+                otio.opentime.RationalTime(duration, fps),
+            )
+        except Exception:
+            time_range = otio.opentime.TimeRange(
+                otio.opentime.RationalTime(0, 24),
+                otio.opentime.RationalTime(10000, 24),
+            )
+
+        clip = otio.schema.Clip(
+            name=os.path.basename(path),
+            media_reference=otio.schema.ExternalReference(
+                target_url=path, available_range=time_range
+            ),
+        )
+        if not self._active_media_track_guid:
+            _log("add_clip_from_path: no active media track — clip not broadcast")
+            return None
+        self.plugin.sync_manager.insert_child(self._active_media_track_guid, clip)
+        return clip
 
     def _make_otio_clip_for_sg(self, sg):
         """Create an OTIO Clip for a source group node, or None on failure."""

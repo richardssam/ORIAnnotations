@@ -5,7 +5,14 @@ import os
 import sys
 import time
 
-from utils import _log, _show_warning, _parse_ori_session, _media_path, _is_media_track
+from utils import (_log, _show_warning, _parse_ori_session, _media_path,
+                   _is_media_track, session_dialog)
+
+#: Set to the ImportError text when the sync core is unavailable. A swallowed
+#: import error is indistinguishable from a working plugin — this is what the
+#: vendored-pika packaging incident looked like from the outside — so the
+#: failure is both recorded here (to gate the menu) and written to stderr.
+_SYNC_IMPORT_ERROR = None
 
 try:
     from otio_sync_core import SyncManager, RabbitMQNetwork
@@ -17,7 +24,11 @@ except ImportError as e:
     SyncManager = None
     RabbitMQNetwork = None
     resolve_host = None
+    _SYNC_IMPORT_ERROR = str(e)
     _log(f"Import error: {e}")
+    # _log is a no-op unless ORI_SYNC_LOG_FILE/DEBUG_OTIO_SYNC is set, so
+    # stderr is the only place this is reliably visible.
+    print(f"[OTIOSync] sync core unavailable — import failed: {e}", file=sys.stderr)
 
     def timeline_origin(_tl):
         return "native"
@@ -90,125 +101,21 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         elif not SyncManager or not RabbitMQNetwork:
             _log("SyncManager/RabbitMQNetwork not available")
 
-    # Property Descriptors for compatibility/cross-controller accesses
-    @property
-    def _rv_node_to_timeline_guid(self):
-        return self.sequence._rv_node_to_timeline_guid
-    @_rv_node_to_timeline_guid.setter
-    def _rv_node_to_timeline_guid(self, value):
-        self.sequence._rv_node_to_timeline_guid = value
-
-    @property
-    def _sequence_input_order(self):
-        return self.sequence._sequence_input_order
-    @_sequence_input_order.setter
-    def _sequence_input_order(self, value):
-        self.sequence._sequence_input_order = value
-
-    @property
-    def _sg_to_path_cache(self):
-        return self.sequence._sg_to_path_cache
-    @_sg_to_path_cache.setter
-    def _sg_to_path_cache(self, value):
-        self.sequence._sg_to_path_cache = value
-
-    @property
-    def _sequence_settle_until(self):
-        return self.sequence._sequence_settle_until
-    @_sequence_settle_until.setter
-    def _sequence_settle_until(self, value):
-        self.sequence._sequence_settle_until = value
-
-    @property
-    def _active_media_track_guid(self):
-        return self.sequence._active_media_track_guid
-    @_active_media_track_guid.setter
-    def _active_media_track_guid(self, value):
-        self.sequence._active_media_track_guid = value
-
-    @property
-    def _track(self):
-        return self.sequence._track
-    @_track.setter
-    def _track(self, value):
-        self.sequence._track = value
-
-    @property
-    def _last_broadcast_frame(self):
-        return self.playback._last_broadcast_frame
-    @_last_broadcast_frame.setter
-    def _last_broadcast_frame(self, value):
-        self.playback._last_broadcast_frame = value
-
-    @property
-    def _last_selection(self):
-        return self.playback._last_selection
-    @_last_selection.setter
-    def _last_selection(self, value):
-        self.playback._last_selection = value
-
-    @property
-    def _last_display_state(self):
-        return self.display._last_display_state
-    @_last_display_state.setter
-    def _last_display_state(self, value):
-        self.display._last_display_state = value
-
-    @property
-    def _pending_stroke(self):
-        return self.annotation._pending_stroke
-    @_pending_stroke.setter
-    def _pending_stroke(self, value):
-        self.annotation._pending_stroke = value
-
-    @property
-    def _next_stroke_uuid(self):
-        return self.annotation._next_stroke_uuid
-    @_next_stroke_uuid.setter
-    def _next_stroke_uuid(self, value):
-        self.annotation._next_stroke_uuid = value
-
-    @property
-    def _stroke_timer(self):
-        return self.annotation._stroke_timer
-    @_stroke_timer.setter
-    def _stroke_timer(self, value):
-        self.annotation._stroke_timer = value
-
-    @property
-    def _last_partial_point_count(self):
-        return self.annotation._last_partial_point_count
-    @_last_partial_point_count.setter
-    def _last_partial_point_count(self, value):
-        self.annotation._last_partial_point_count = value
-
-    @property
-    def _partial_pen_nodes(self):
-        return self.annotation._partial_pen_nodes
-    @_partial_pen_nodes.setter
-    def _partial_pen_nodes(self, value):
-        self.annotation._partial_pen_nodes = value
-
-    @property
-    def _last_sent_replace_sig(self):
-        return self.annotation._last_sent_replace_sig
-    @_last_sent_replace_sig.setter
-    def _last_sent_replace_sig(self, value):
-        self.annotation._last_sent_replace_sig = value
-
-    @property
-    def _ignore_annotations_until(self):
-        return self.annotation._ignore_annotations_until
-    @_ignore_annotations_until.setter
-    def _ignore_annotations_until(self, value):
-        self.annotation._ignore_annotations_until = value
-
     @property
     def _in_session(self):
         return self.sync_manager is not None
 
     def _build_menu(self):
         """Return the menu list for the current session state."""
+        if _SYNC_IMPORT_ERROR:
+            # Offering Create/Join here would present functional-looking items
+            # that connect_to_session silently refuses. Say so instead.
+            return [
+                (self.MENU_TITLE, [
+                    ("Sync Unavailable (otio_sync_core import failed)", None, None,
+                     lambda: rv.commands.DisabledMenuState),
+                ])
+            ]
         if self._in_session:
             return [
                 (self.MENU_TITLE, [
@@ -627,45 +534,6 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             return
         self.annotation.on_graph_state_change(event)
 
-    def _session_dialog(self, title):
-        """Show a two-field dialog for MQ Host and Session Name.
-
-        :param title: Dialog window title (e.g. "Create Session").
-        :returns: ``(host, name)`` or ``(None, None)`` on cancel.
-        :rtype: tuple
-        """
-        try:
-            from PySide2.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
-        except ImportError:
-            try:
-                from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
-            except ImportError:
-                _log("PySide not available — cannot show session dialog")
-                return None, None
-
-        default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
-        dlg = QDialog()
-        dlg.setWindowTitle(title)
-        dlg.setMinimumWidth(360)
-        layout = QFormLayout(dlg)
-        host_edit = QLineEdit(default_host)
-        name_edit = QLineEdit()
-        layout.addRow(QLabel("MQ Host:"), host_edit)
-        layout.addRow(QLabel("Session Name:"), name_edit)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        host_edit.returnPressed.connect(name_edit.setFocus)
-        name_edit.returnPressed.connect(dlg.accept)
-        layout.addRow(buttons)
-        if dlg.exec_() != QDialog.Accepted:
-            return None, None
-        host = host_edit.text().strip() or default_host
-        name = name_edit.text().strip()
-        if not name:
-            return None, None
-        return host, name
-
     def do_create_session(self, event=None):
         """Prompt for host/name and create a new session (with master-check warning)."""
         if self._in_session:
@@ -675,7 +543,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name = self._session_dialog("Create Session")
+        host, name = session_dialog("Create Session")
         if name:
             self._pending_create_check = True
             self.connect_to_session(host, name)
@@ -690,7 +558,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name = self._session_dialog("Join Session")
+        host, name = session_dialog("Join Session")
         if name:
             self.connect_to_session(host, name)
         if event: event.reject()
@@ -709,23 +577,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             if event: event.reject()
             return
         path = paths[0] if isinstance(paths, (list, tuple)) else paths
-
-        rv.commands.addSource(path)
-
-        import opentimelineio.opentime as otio_time
-        try:
-            fps = rv.commands.fps()
-            start = rv.commands.inPoint()
-            end = rv.commands.outPoint()
-            duration = end - start + 1
-            if start > 0: start -= 1
-            time_range = otio_time.TimeRange(otio_time.RationalTime(start, fps), otio_time.RationalTime(duration, fps))
-        except Exception:
-            time_range = otio_time.TimeRange(otio_time.RationalTime(0, 24), otio_time.RationalTime(10000, 24))
-
-        clip = otio.schema.Clip(name=os.path.basename(path), media_reference=otio.schema.ExternalReference(target_url=path, available_range=time_range))
-        self.sync_manager.insert_child(self._active_media_track_guid, clip)
-
+        self.sequence.add_clip_from_path(path)
         if event: event.reject()
 
     def do_show_status(self, event=None):

@@ -1,8 +1,5 @@
-# RV Plugin Module Structure Specification
+## MODIFIED Requirements
 
-## Purpose
-Define the layout, modularity, and relationships between components in the OpenRV sync plugin.
-## Requirements
 ### Requirement: Module layout
 
 The OpenRV sync plugin SHALL be organised as a flat set of Python modules within `rvplugin/ori_sync/`, with `plugin.py` as the sole entry-point declared in `PACKAGE`.
@@ -38,69 +35,6 @@ The module set SHALL be:
 - **THEN** it SHALL call the shared dialog helper exported by `utils.py`
 - **AND** `plugin.py` SHALL NOT define its own Qt form-building code
 
-### Requirement: Delegated controller pattern
-
-Each domain controller SHALL be a plain Python class that receives a back-reference to the `OpenRVSyncPlugin` instance in its constructor. Controllers SHALL own their domain-specific state and methods.
-
-#### Scenario: Controller instantiation
-
-- **WHEN** `OpenRVSyncPlugin.__init__` runs
-- **THEN** it SHALL instantiate `SequenceSyncController(self)`, `PlaybackSyncController(self)`, `DisplaySyncController(self)`, and `AnnotationSyncController(self)`
-- **AND** store them as `self.sequence`, `self.playback`, `self.display`, and `self.annotation`
-
-#### Scenario: Cross-controller access
-
-- **WHEN** a controller needs to call a method on a sibling controller
-- **THEN** it SHALL access it via `self.plugin.<sibling_controller>.<method>()`
-- **AND** it SHALL NOT import sibling controller modules directly
-
-### Requirement: Shared state ownership
-
-The `_rv_updating` reentrancy guard and `sync_manager` reference SHALL remain as attributes of `OpenRVSyncPlugin`. Controllers SHALL access them via `self.plugin._rv_updating` and `self.plugin.sync_manager`.
-
-#### Scenario: Reentrancy guard check from controller
-
-- **WHEN** a controller method needs to check or set the reentrancy guard
-- **THEN** it SHALL read or write `self.plugin._rv_updating`
-- **AND** it SHALL NOT maintain a separate copy of this flag
-
-### Requirement: Event handler delegation
-
-RV event handlers registered in `init()` SHALL remain as methods on `OpenRVSyncPlugin`. Each handler SHALL delegate to the appropriate controller method and handle `event.reject()` locally.
-
-#### Scenario: Play-start event delegation
-
-- **WHEN** RV fires a `play-start` event
-- **THEN** `OpenRVSyncPlugin.on_rv_play_start` SHALL call `self.playback.broadcast_playback()` and then `event.reject()`
-
-#### Scenario: Graph-state-change event delegation
-
-- **WHEN** RV fires a `graph-state-change` event
-- **THEN** `OpenRVSyncPlugin.on_rv_graph_state_change` SHALL delegate to the appropriate controller based on event contents (annotation controller for pen/text changes, display controller for channel changes)
-
-### Requirement: Action dispatcher
-
-The `_handle_action` method SHALL remain in `plugin.py` and SHALL route sync actions to controller methods based on the action string.
-
-#### Scenario: Dispatching a playback action
-
-- **WHEN** `_handle_action` receives `action="playback_settings"`
-- **THEN** it SHALL call `self.playback.apply_playback(data)`
-
-#### Scenario: Dispatching an annotation action
-
-- **WHEN** `_handle_action` receives `action="annotation_commands_added"`
-- **THEN** it SHALL call `self.annotation.apply_annotation_render(delta_clip)` with the delta clip extracted from the data tuple
-
-### Requirement: Import dependency DAG
-
-Module imports SHALL form a strict directed acyclic graph: `utils` ← `{controllers}` ← `plugin`. No controller SHALL import another controller module at the top level.
-
-#### Scenario: No circular imports
-
-- **WHEN** any module in `rvplugin/ori_sync/` is imported
-- **THEN** the import SHALL succeed without `ImportError` or `AttributeError` caused by circular references
-
 ### Requirement: Packaging includes all modules
 
 The `makepackage.csh` script SHALL include **every** Python module present in `rvplugin/ori_sync/` in the `.rvpkg` zip archive. The module list is hand-maintained, so adding a module to the plugin directory without adding it to `makepackage.csh` SHALL be treated as a defect: RV loads the installed package copy, and a missing module makes the plugin fail to import at load time.
@@ -115,6 +49,8 @@ The `makepackage.csh` script SHALL include **every** Python module present in `r
 
 - **WHEN** a new Python module is added to `rvplugin/ori_sync/`
 - **THEN** it SHALL be added to the `zip` module list in `makepackage.csh` in the same change
+
+## ADDED Requirements
 
 ### Requirement: Controller state is not re-exposed on the plugin
 
@@ -157,4 +93,3 @@ appear in a menu callback.
 
 - **WHEN** the user selects "Add Clip to Timeline…" and cancels the file dialog
 - **THEN** the menu callback SHALL reject the event without calling into any controller
-
