@@ -6,6 +6,11 @@ try:
 except ImportError:
     STATE_SYNCED = "synced"
 
+try:
+    from otio_sync_core.authority import CHANNEL_DISPLAY
+except ImportError:
+    CHANNEL_DISPLAY = "display"
+
 from utils import _log
 
 
@@ -194,6 +199,9 @@ class DisplaySyncController:
         state = self._read_rv_display_state()
         if state == self._last_display_state:
             return
+        # Detected only when not applying a remote message (guard above), so
+        # this is always a locally-driven change — safe to claim (design.md D4).
+        self.plugin.sync_manager.claim_category(CHANNEL_DISPLAY)
         prev = self._last_display_state
         self._last_display_state = state
         # Guard the normalisation writes with _rv_updating so that the

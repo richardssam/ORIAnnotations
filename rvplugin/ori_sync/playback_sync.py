@@ -11,9 +11,10 @@ except ImportError:
     STATE_SYNCED = "synced"
 
 try:
-    from otio_sync_core.authority import SUPPRESSED
+    from otio_sync_core.authority import SUPPRESSED, CHANNEL_POSITION
 except ImportError:
     SUPPRESSED = "SUPPRESSED"
+    CHANNEL_POSITION = "position"
 
 from utils import _log, _log_exc, _media_path, _clip_effective_range
 
@@ -96,6 +97,10 @@ class PlaybackSyncController:
     def _broadcast_playback(self):
         if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
             return
+        # Input-driven only by construction: every call site funnels through
+        # here and the guard above already excludes remote-apply scopes, so
+        # claiming can never be triggered by an echo (design.md D4).
+        self.plugin.sync_manager.claim_category(CHANNEL_POSITION)
         fps = rv.commands.fps()
         current_frame = rv.commands.frame()
         playing = rv.commands.isPlaying()

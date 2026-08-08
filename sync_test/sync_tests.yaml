@@ -40,14 +40,14 @@ tests:
       OpenRV peer receives the same insertion via the real sync broadcast
       path (not a JSONL replay).
     recording: "recordings/add_media_v2.jsonl"
-    status: "known_broken"
+    #status: "known_broken"
     # Never passed: 23 runs, 0 passes as of 2026-08-05, failing on a position
     # assertion (`expected frame ~137, got 100`) rather than anything
     # structural. Tracked in that change's baseline table; its §3.1 (did this
     # regress at the rebase or earlier?) and §3.4 are still open, and §3.2a
     # re-recorded `add_media_notc.jsonl` while this test consumes
     # `add_media_v2.jsonl` — so the re-record may not have covered it.
-    blocked_by: "fix-xs-playhead-attribute-subscription"
+    #blocked_by: "fix-xs-playhead-attribute-subscription"
     script_driven: true
     frame_tolerance: 5
     checkpoint_validation_delay: 6
@@ -599,6 +599,63 @@ tests:
       kind: "text"
       nominal: 0.09259259259259259
       position: [0.15, -0.08]
+    apps:
+      - "openrv"
+      - "xstudio"
+
+  # broadcast-ownership 1b soak coverage. No prior test in this suite ever
+  # drives two peers into the same broadcast category at once, which is
+  # exactly why the position/structure echo guards this change targets have
+  # no positive evidence either way (design.md D5's exit criterion — a guard
+  # cannot be shown unnecessary by a quiet session, only by a contended one
+  # that stays quiet). These two cases exist to give commit 1c's guard
+  # deletion something real to point to. UNVERIFIED against a live pair of
+  # apps as of authoring — the `concurrent_commands`/
+  # `expect_ownership_convergence` runner actions are new; run this suite
+  # once against real RV/xStudio processes before relying on it.
+  - name: "contended_position_scrub"
+    description: >
+      Both peers set_frame to different targets at (as close to) the same
+      instant. Asserts the position lease converges on a single owner rather
+      than staying split, and that both peers end up agreeing on one frame
+      rather than each keeping its own.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "concurrent_commands"
+        by_app:
+          openrv: {action: "set_frame", frame: 20}
+          xstudio: {action: "set_frame", frame: 60}
+      - action: "expect_ownership_convergence"
+        channel: "position"
+        timeout: 15.0
+    apps:
+      - "openrv"
+      - "xstudio"
+
+  - name: "contended_structure_add_media"
+    description: >
+      Both peers add a different clip to the timeline at (as close to) the
+      same instant. Asserts the structure lease converges on a single owner
+      and both peers end up holding the same resulting clip set (both
+      insertions land, serialised by the lease transfer rather than one
+      silently overwriting the other).
+    script_driven: true
+    checkpoint_validation_delay: 6
+    frame_tolerance: 5
+    commands:
+      - action: "concurrent_commands"
+        by_app:
+          openrv: {action: "add_media", url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"}
+          xstudio: {action: "add_media", url: "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"}
+      - action: "expect_ownership_convergence"
+        channel: "structure"
+        timeout: 15.0
+      - action: "wait_for_media"
     apps:
       - "openrv"
       - "xstudio"

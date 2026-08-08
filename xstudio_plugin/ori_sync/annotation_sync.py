@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """AnnotationSyncController — owns annotation send/receive state and methods."""
 
+import contextlib
 import datetime
 import json
 import threading
@@ -101,12 +102,24 @@ class AnnotationSyncController:
         # increasingly large cumulative stroke lists at every PARTIAL arrival.
         self._last_partial_render_time: dict[tuple, float] = {}
 
-        # Monotonic deadline before which show_atom annotation flushes are
-        # suppressed.  Set briefly after load_otio reloads (e.g. on move_child)
-        # so that xStudio's bookmark-re-trigger burst is not mistaken for new
-        # local strokes.  Written by structure/playback after a reload via
-        # self.plugin.annotation._reload_suppress_until.
-        self._reload_suppress_until: float = 0.0
+        # Suppresses show_atom annotation flushes so xStudio's bookmark-
+        # re-trigger burst is not mistaken for new local strokes. Two parts,
+        # replacing the previous single wall-clock deadline (broadcast-
+        # ownership, xstudio-plugin-module-structure spec: "apply-scope guard,
+        # not a wall-clock window"):
+        #
+        # * _reload_apply_depth — depth-counted, true for exactly as long as a
+        #   remote structural apply (e.g. a load_otio rebuild) is actually in
+        #   progress, however long that takes. A fixed deadline armed *before*
+        #   a slow rebuild could expire mid-rebuild; this cannot.
+        #   See remote_structural_apply_scope().
+        # * _reload_residual_until — a short, genuinely-fixed wall-clock window
+        #   armed *after* a suppressed operation completes, covering xStudio's
+        #   asynchronous echo events that arrive after the call has already
+        #   returned (both after a load_otio rebuild and after a single
+        #   bookmark set_annotation() call — see arm_reload_residual()).
+        self._reload_apply_depth: int = 0
+        self._reload_residual_until: float = 0.0
 
         # Cross-thread annotation trigger: set on xStudio thread by
         # _on_annotation_draw_event; read and cleared on poll thread by
@@ -132,13 +145,59 @@ class AnnotationSyncController:
         self._broadcast_annotation_keys.clear()
         # Transient per-session state: guards, counters and scan timestamps.
         self._annotation_pending_time = None
-        self._reload_suppress_until = 0.0
+        self._reload_apply_depth = 0
+        self._reload_residual_until = 0.0
         self._annotation_flush_retries = 0
         self._annotation_retry_deadline = None
         self._core_events_received = 0
         self._last_annotation_scan = 0.0
         self._last_partial_render_time.clear()
         self._live_stroke_current_key = None
+
+    @contextlib.contextmanager
+    def remote_structural_apply_scope(self):
+        """Scope around a remote structural apply (e.g. a ``load_otio`` rebuild).
+
+        Active for exactly as long as the apply is actually in progress —
+        covering a slow rebuild fully, unlike the previous implementation's
+        fixed deadline armed *before* the call, which could expire mid-rebuild
+        on a sufficiently large timeline. Reentrant (depth-counted) in case a
+        structural apply is ever nested.
+
+        Does **not** by itself cover xStudio's asynchronous echo events that
+        arrive after the call returns — call :meth:`arm_reload_residual` on
+        the success path for that, or :meth:`clear_reload_state` on failure.
+        """
+        self._reload_apply_depth += 1
+        try:
+            yield
+        finally:
+            self._reload_apply_depth = max(0, self._reload_apply_depth - 1)
+
+    def arm_reload_residual(self, seconds: float = 0.5) -> None:
+        """Arm a short post-apply window covering xStudio's async echo events.
+
+        Called after a successful structural reload (or directly after a
+        single ``bm.set_annotation()`` call, which has no need for the
+        depth-counted scope above since it is not a variable-duration
+        rebuild) — either way, this covers the asynchronous show_atom burst
+        xStudio fires once the call has already returned.
+        """
+        self._reload_residual_until = time.monotonic() + seconds
+
+    def clear_reload_state(self) -> None:
+        """Clear both the apply-scope depth and the residual window immediately.
+
+        Called on a failed structural apply, matching the previous
+        implementation's behaviour of un-suppressing immediately on exception
+        rather than honouring the deadline it never got to arm properly.
+        """
+        self._reload_apply_depth = 0
+        self._reload_residual_until = 0.0
+
+    def reload_in_progress(self) -> bool:
+        """True while a remote structural apply is active or in its post-apply echo window."""
+        return self._reload_apply_depth > 0 or time.monotonic() < self._reload_residual_until
 
     # ── annotation event handlers ──────────────────────────────────────
 
@@ -1273,7 +1332,7 @@ class AnnotationSyncController:
                 # Suppress the show_atom burst that xStudio fires when displaying
                 # the new bookmark — without this, the flush scan re-runs and
                 # echoes the remote strokes back as if they were drawn locally.
-                self._reload_suppress_until = time.monotonic() + 0.5
+                self.arm_reload_residual(0.5)
                 _log(
                     f"Applied remote annotation: {len(pen_strokes)} stroke(s),"
                     f" {len(captions)} caption(s) at frame {frame}"

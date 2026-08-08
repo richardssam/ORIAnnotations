@@ -370,6 +370,15 @@ class StateSnapshot(ProtocolMessage):
             "no snapshot learns peers from their periodic announcements. "
             "Carries no liveness stamp — that is the receiver's own clock.",
     )
+    broadcast_ownership: "dict | None" = doc_field(
+        default=None,
+        doc="Per-channel write-lease state at snapshot time, as "
+            '{"position"|"display"|"structure": {"owner_guid": str, '
+            '"remaining_ms": float}}. A channel with no live owner is omitted, '
+            "not sent with a null owner, so a peer predating this field — or a "
+            "snapshot taken while every channel happened to be free — cannot "
+            "be read as clearing a lease another peer already holds.",
+    )
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -386,6 +395,10 @@ class StateSnapshot(ProtocolMessage):
             payload["host_guid"] = self.host_guid
         if self.peers:
             payload["peers"] = {g: dict(p) for g, p in self.peers.items()}
+        if self.broadcast_ownership:
+            payload["broadcast_ownership"] = {
+                ch: dict(info) for ch, info in self.broadcast_ownership.items()
+            }
         return payload
 
     @classmethod
@@ -399,6 +412,7 @@ class StateSnapshot(ProtocolMessage):
             display_state=data.get("display_state"),
             host_guid=data.get("host_guid"),
             peers=dict(data.get("peers") or {}),
+            broadcast_ownership=data.get("broadcast_ownership"),
         )
 
     def as_otio(self) -> dict[str, Any]:
@@ -1057,3 +1071,78 @@ class ReplaceAnnotationCommands(ProtocolMessage):
     def as_otio(self) -> list:
         """Return the OTIO SyncEvent list, deserializing any wire-form entries."""
         return [_from_wire(c) for c in self.commands]
+
+
+# ---------------------------------------------------------------------------
+# Broadcast ownership family — BROADCAST_OWNERSHIP_1.0
+# ---------------------------------------------------------------------------
+
+
+@register
+@dataclass
+class ClaimOwnership(ProtocolMessage):
+    """A peer's claim to the write lease for one broadcast-ownership channel.
+
+    Sent both when a peer claims a free channel and when it re-claims a
+    channel it already holds (refreshing the lease). ``claim_ts`` is a wall
+    clock reading, not a local monotonic one — it is compared against another
+    peer's ``claim_ts`` for the deterministic tiebreak (earlier wins, lower
+    ``peer_guid`` breaks an exact tie), which only works if every peer
+    evaluates the same two values (design.md D2). Every peer, including the
+    claimant itself, resolves this message through the same rule.
+    """
+
+    SCHEMA = "BROADCAST_OWNERSHIP_1.0"
+    EVENT = "CLAIM_OWNERSHIP"
+
+    category: str = doc_field(
+        doc='Lease channel being claimed: "position", "display", or "structure".'
+    )
+    peer_guid: str = doc_field(doc="GUID of the claiming peer.")
+    claim_ts: "float | None" = doc_field(
+        default=None,
+        doc="Wall-clock epoch seconds when the claim was made; drives the "
+            "deterministic tiebreak between simultaneous claims.",
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "peer_guid": self.peer_guid,
+            "claim_ts": self.claim_ts,
+        }
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "ClaimOwnership":
+        return cls(
+            category=data.get("category"),
+            peer_guid=data.get("peer_guid"),
+            claim_ts=data.get("claim_ts"),
+        )
+
+
+@register
+@dataclass
+class ReleaseOwnership(ProtocolMessage):
+    """A peer's explicit release of a broadcast-ownership channel it holds.
+
+    Frees the channel (or promotes a pending claimant) immediately rather than
+    waiting for the lease to expire. Best-effort: a peer that disconnects
+    without sending this is still handled — the lease simply expires through
+    the ordinary silence-based path.
+    """
+
+    SCHEMA = "BROADCAST_OWNERSHIP_1.0"
+    EVENT = "RELEASE_OWNERSHIP"
+
+    category: str = doc_field(
+        doc='Lease channel being released: "position", "display", or "structure".'
+    )
+    peer_guid: str = doc_field(doc="GUID of the releasing peer.")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"category": self.category, "peer_guid": self.peer_guid}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "ReleaseOwnership":
+        return cls(category=data.get("category"), peer_guid=data.get("peer_guid"))

@@ -13,11 +13,23 @@ import os
 import sys
 
 import opentimelineio as otio
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../python')))
 
+from otio_sync_core import authority  # noqa: E402
 from otio_sync_core.manager import SyncManager, STATE_SYNCED  # noqa: E402
 from otio_sync_core import protocol_messages as pm  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_ownership_gating(monkeypatch):
+    """This file predates broadcast-ownership and is about the unpublished-
+    parent report, not lease contention; disable ownership enforcement so a
+    peer that never claims a lease still broadcasts structural messages,
+    matching what these tests were written to check.
+    """
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "0")
 
 
 class FakeNetwork:

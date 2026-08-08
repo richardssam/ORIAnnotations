@@ -37,6 +37,12 @@ class FakeNetwork:
 def _enforcement_on(monkeypatch):
     """Enforcement is on by default; the kill-switch test overrides it."""
     monkeypatch.delenv(authority.ENFORCEMENT_ENV, raising=False)
+    # This file predates broadcast-ownership and exercises the *visibility*
+    # category in isolation; ownership enforcement (position/display/structure
+    # leases) is covered separately in test_broadcast_ownership.py. Disable it
+    # here so a peer that never claims a lease still gets SENT for position,
+    # display, and structure, matching what these tests were written to check.
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "0")
 
 
 def _synced(guid, app, is_host):

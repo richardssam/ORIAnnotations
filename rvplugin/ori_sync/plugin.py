@@ -1,6 +1,7 @@
 import rv.commands
 import rv.extra_commands
 import rv.rvtypes
+import contextlib
 import os
 import sys
 import time
@@ -65,7 +66,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         rv.rvtypes.MinorMode.__init__(self)
 
         self.sync_manager = None
-        self._rv_updating = False
+        self._updating_depth = 0
         self._timer = None
         self._current_session_name = None
         self._current_host = None
@@ -104,6 +105,48 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
     @property
     def _in_session(self):
         return self.sync_manager is not None
+
+    @property
+    def _rv_updating(self):
+        """``True`` while any remote-apply scope is open, including nested ones.
+
+        Depth-counted rather than a plain flag: RV's events are synchronous, so
+        an apply that itself triggers a further apply (e.g. ``on_synced``'s
+        view rebuild calling into ``_apply_playback``, which does its own
+        inner apply scope) must not have the inner scope's exit re-enable
+        broadcasting before the outer one is done. A plain bool collapsed to
+        ``False`` the instant *any* nested scope exited, which is exactly the
+        gap a synchronous echo event could land in.
+
+        Every existing call site keeps working unchanged: assigning ``True``/
+        ``False`` here increments/decrements :attr:`_updating_depth` rather
+        than overwriting a flag, so the many ``self._rv_updating = True`` /
+        ``finally: self._rv_updating = False`` pairs throughout this plugin
+        nest correctly with no call-site changes. New code should prefer the
+        :meth:`_updating` context manager instead.
+        """
+        return self._updating_depth > 0
+
+    @_rv_updating.setter
+    def _rv_updating(self, value):
+        if value:
+            self._updating_depth += 1
+        else:
+            self._updating_depth = max(0, self._updating_depth - 1)
+
+    @contextlib.contextmanager
+    def _updating(self):
+        """Context manager form of the depth-counted apply-scope guard.
+
+        ``with self._updating(): ...`` is equivalent to the existing
+        ``self._rv_updating = True`` / ``finally: self._rv_updating = False``
+        pattern, preferred for new call sites.
+        """
+        self._rv_updating = True
+        try:
+            yield
+        finally:
+            self._rv_updating = False
 
     def _build_menu(self):
         """Return the menu list for the current session state."""

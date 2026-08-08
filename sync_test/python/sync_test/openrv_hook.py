@@ -28,6 +28,10 @@ def get_openrv_state():
         # follower mirrors rather than approximates, so this is how a mirror
         # failure becomes visible instead of looking like agreement.
         "view_mirror_error": None,
+        # Per-channel write-lease state ({"position"|"display"|"structure":
+        # {"owner_guid", "remaining_ms"}}), omitted per-channel when free.
+        # Differs between peers by construction, like is_host/host_guid.
+        "broadcast_ownership": {},
         # Structural patches this peer was sent and could not apply. Empty in a
         # healthy session; non-empty means some peer broadcast against an object
         # this one was never given, which used to produce no signal at all.
@@ -50,6 +54,9 @@ def get_openrv_state():
                 )
                 state["unpublished_parents"] = list(
                     getattr(_mgr_for_master, "unpublished_parents", []) or []
+                )
+                state["broadcast_ownership"] = dict(
+                    getattr(_mgr_for_master, "ownership_snapshot", {}) or {}
                 )
             _pb = otio_sync_core.get_registered_playback_controller()
             if _pb is not None:

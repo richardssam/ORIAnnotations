@@ -19,6 +19,7 @@ try:
 except ImportError:
     _add_media_atom = None
 from otio_sync_core.manager import STATE_SYNCED
+from otio_sync_core.authority import CHANNEL_STRUCTURE
 from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
 
 _MEDIA_NAME_TIMEOUT_MS = 2000
@@ -554,6 +555,7 @@ class StructureSyncController:
                 and "guid" in clip.metadata["sync"]
             }
 
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
             # Simulate the moves to transform stored_order into current_order,
             # broadcasting each MOVE_CHILD so the remote peer receives the full sequence.
             temp_order = list(stored_order)
@@ -707,6 +709,7 @@ class StructureSyncController:
                 self._xs_media_order[tl_guid] = list(current_order)
                 continue
 
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
             # Simulate the moves to transform stored_order into current_order,
             # broadcasting each MOVE_CHILD so the remote peer receives the full sequence.
             temp_order = list(stored_order)
@@ -772,6 +775,7 @@ class StructureSyncController:
             stored_names = set(stored_order)
             current_names = set(current_order)
 
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
             # Broadcast removals first so the OTIO track stays consistent when
             # inserts arrive immediately after (e.g. replace = delete + add).
             removed_names = stored_names - current_names
@@ -898,6 +902,7 @@ class StructureSyncController:
                     self.plugin._sync_playlists.pop(pl_uuid, None)
                     self._release_timeline_item_sub(pl_uuid)
                     try:
+                        self.plugin.claim_lease(CHANNEL_STRUCTURE)
                         self.plugin.manager.broadcast_remove_timeline(pl_uuid)
                     except Exception:
                         pass
@@ -959,6 +964,7 @@ class StructureSyncController:
                         self._xs_sequence_media_names[tl_guid] = set()
                     self.subscribe_timeline_item_events(tl_guid, xs_tl)
                     self.subscribe_sequence_playlist_events(tl_guid, playlist)
+                    self.plugin.claim_lease(CHANNEL_STRUCTURE)
                     self.plugin.manager.broadcast_add_timeline(tl_guid)
                     _log(
                         f"New sequence timeline {xs_tl.name!r}"
@@ -974,6 +980,7 @@ class StructureSyncController:
                 if not tl_guid:
                     continue
                 self.plugin.manager.register_timeline(tl)
+                self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 self.plugin.manager.broadcast_add_timeline(tl_guid)
                 _log(f"New flat playlist {playlist.name!r} → broadcast")
 
@@ -1001,6 +1008,7 @@ class StructureSyncController:
                     f"Timeline rename: {otio_tl.name!r} → {current_name!r}"
                     f" ({tl_guid[:8]})"
                 )
+                self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 self.plugin.manager.broadcast_timeline_rename(tl_guid, current_name)
 
     def _purge_local_playlist_entry(self, tl_guid: str) -> None:
@@ -1134,6 +1142,7 @@ class StructureSyncController:
                 continue  # still present
             self._purge_local_playlist_entry(tl_guid)
             try:
+                self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 self.plugin.manager.broadcast_remove_timeline(tl_guid)
             except Exception:
                 _log_exc(f"poll_deleted_playlists: broadcast failed for {tl_guid[:8]}")
@@ -1196,6 +1205,7 @@ class StructureSyncController:
             prev_media_names = self._xs_sequence_media_names.get(tl_guid, set())
             removed_media_names = prev_media_names - current_media_name_set
             if removed_media_names:
+                self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 removed_basenames = {os.path.basename(n) for n in removed_media_names}
                 for clip in list(video_track):
                     if not isinstance(clip, otio.schema.Clip):
@@ -1263,6 +1273,7 @@ class StructureSyncController:
                     clip_guid = clip.metadata.get("sync", {}).get("guid")
                     if clip_guid:
                         self.plugin.media.register(media, clip_guid, tl_guid)
+                    self.plugin.claim_lease(CHANNEL_STRUCTURE)
                     self.plugin.manager.insert_child(track_guid, clip, new_index)
                     _log(f"sequence new media: {_bn!r} at index {new_index}")
                     known_names = known_names | {media_name, _bn}
@@ -1408,6 +1419,7 @@ class StructureSyncController:
                             if matched_media and clip_guid:
                                 self.plugin.media.register(matched_media, clip_guid, tl_guid)
 
+                            self.plugin.claim_lease(CHANNEL_STRUCTURE)
                             self.plugin.manager.insert_child(track_guid, clip, new_idx)
                             _log(
                                 f"sequence track new media: {clip.name!r} inserted at index {new_idx}"
@@ -1507,6 +1519,7 @@ class StructureSyncController:
             if xs_clip_names == stored:
                 continue
 
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
             # Diff: names in stored but gone from current → deleted.
             stored_counts = Counter(stored)
             current_counts = Counter(xs_clip_names)
@@ -1647,6 +1660,7 @@ class StructureSyncController:
                 # already sent, not unsent. See fix-sequence-track-reconciliation.
                 self._reset_sequence_broadcast_record(tl_guid, new_otio)
                 self.update_xs_media_order(tl_guid, new_otio)
+                self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 self.plugin.manager.broadcast_replace_timeline(tl_guid)
             except Exception:
                 _log_exc(f"poll_sequence_source_ranges: rebuild failed for {tl_guid[:8]}")
@@ -1666,6 +1680,10 @@ class StructureSyncController:
         clip_guid = clip_obj.metadata.get("sync", {}).get("guid", "")
         if not clip_guid:
             return
+        # Feeds claim_lease()'s horizon (design.md D4): an asynchronous
+        # item/timeline callback attributable to this apply must not be
+        # allowed to claim the structure lease the sending peer still holds.
+        self.plugin.stamp_remote_apply(CHANNEL_STRUCTURE)
         _log(f"apply_remote_clip_insert: clip={clip_guid[:8]} name={clip_obj.name!r}")
         for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
             otio_tl = self.plugin.manager.timelines.get(tl_guid)
@@ -1894,39 +1912,42 @@ class StructureSyncController:
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
             _t_prep = time.monotonic()
-            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
             _log(f"apply_sequence_insert: calling load_otio tl={tl_guid[:8]}")
-            xs_timeline.load_otio(otio_str, clear=True)
-            _t_load = time.monotonic()
-            if tl_guid in self.plugin._sync_playlists:
-                playlist = self.plugin._sync_playlists[tl_guid][0]
-                self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
-            _t_boot = time.monotonic()
-            try:
-                self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
-            except Exception:
-                pass
-            _t_sos = time.monotonic()
-            _log(
-                f"sequence insert: reloaded timeline {tl_guid[:8]} — "
-                f"prep={_t_prep-_t0:.2f}s load_otio={_t_load-_t_prep:.2f}s "
-                f"bootstrap={_t_boot-_t_load:.2f}s set_on_screen={_t_sos-_t_boot:.2f}s"
-            )
-            # The local xStudio track now reflects otio_tl exactly — reseed the
-            # broadcast record from it so this peer's own incremental
-            # reconciliation recognises every clip it carries (including ones a
-            # remote insert or replace just added) as already sent.
-            if tl_guid in self._xs_sequence_playlists:
-                self._reset_sequence_broadcast_record(tl_guid, otio_tl)
+            with self.plugin.annotation.remote_structural_apply_scope():
+                xs_timeline.load_otio(otio_str, clear=True)
+                _t_load = time.monotonic()
+                if tl_guid in self.plugin._sync_playlists:
+                    playlist = self.plugin._sync_playlists[tl_guid][0]
+                    self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
+                _t_boot = time.monotonic()
+                try:
+                    self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
+                except Exception:
+                    pass
+                _t_sos = time.monotonic()
+                _log(
+                    f"sequence insert: reloaded timeline {tl_guid[:8]} — "
+                    f"prep={_t_prep-_t0:.2f}s load_otio={_t_load-_t_prep:.2f}s "
+                    f"bootstrap={_t_boot-_t_load:.2f}s set_on_screen={_t_sos-_t_boot:.2f}s"
+                )
+                # The local xStudio track now reflects otio_tl exactly — reseed the
+                # broadcast record from it so this peer's own incremental
+                # reconciliation recognises every clip it carries (including ones a
+                # remote insert or replace just added) as already sent.
+                if tl_guid in self._xs_sequence_playlists:
+                    self._reset_sequence_broadcast_record(tl_guid, otio_tl)
+            self.plugin.annotation.arm_reload_residual()
         except Exception:
-            self.plugin.annotation._reload_suppress_until = 0.0
+            self.plugin.annotation.clear_reload_state()
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")
 
     # ── remote remove/move child ───────────────────────────────────────
 
     def apply_remote_remove_child(self, data: dict) -> None:
         self._structural_mutation_suppress_until = time.monotonic() + 1.5
+        # Feeds claim_lease()'s horizon (design.md D4).
+        self.plugin.stamp_remote_apply(CHANNEL_STRUCTURE)
         """Apply a REMOVE_CHILD event from a remote peer to the local xStudio session.
 
         The manager has already removed the clip from the OTIO track before this
@@ -2011,22 +2032,23 @@ class StructureSyncController:
             prepared_otio = self.plugin.media.prepare_otio_for_load(otio_tl)
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
-            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
             self._xs_sequence_track_names[tl_guid] = None
-            xs_timeline.load_otio(otio_str, clear=True)
-            if tl_guid in self.plugin._sync_playlists:
-                playlist = self.plugin._sync_playlists[tl_guid][0]
-                self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
-            self.update_xs_media_order(tl_guid, otio_tl)
-            if tl_guid in self._xs_sequence_playlists:
-                self._reset_sequence_broadcast_record(tl_guid, otio_tl)
-            _log(f"remote remove_child: reloaded sequence timeline {tl_guid[:8]}")
-            try:
-                self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
-            except Exception:
-                pass
+            with self.plugin.annotation.remote_structural_apply_scope():
+                xs_timeline.load_otio(otio_str, clear=True)
+                if tl_guid in self.plugin._sync_playlists:
+                    playlist = self.plugin._sync_playlists[tl_guid][0]
+                    self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
+                self.update_xs_media_order(tl_guid, otio_tl)
+                if tl_guid in self._xs_sequence_playlists:
+                    self._reset_sequence_broadcast_record(tl_guid, otio_tl)
+                _log(f"remote remove_child: reloaded sequence timeline {tl_guid[:8]}")
+                try:
+                    self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
+                except Exception:
+                    pass
+            self.plugin.annotation.arm_reload_residual()
         except Exception:
-            self.plugin.annotation._reload_suppress_until = 0.0
+            self.plugin.annotation.clear_reload_state()
             _log_exc(
                 f"remote remove_child: reload failed for timeline {tl_guid[:8]}"
             )
@@ -2059,6 +2081,8 @@ class StructureSyncController:
 
     def apply_remote_move_child(self, data: dict) -> None:
         self._structural_mutation_suppress_until = time.monotonic() + 1.5
+        # Feeds claim_lease()'s horizon (design.md D4).
+        self.plugin.stamp_remote_apply(CHANNEL_STRUCTURE)
         """Reorder a media clip in the xStudio timeline to match a remote MOVE_CHILD event.
 
         ``track.move_children`` triggers xStudio's QML delegate model directly
@@ -2174,27 +2198,28 @@ class StructureSyncController:
             prepared_otio = self.plugin.media.prepare_otio_for_load(otio_tl)
             self.plugin.builder.fill_source_ranges(prepared_otio)
             otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
+            self._xs_sequence_track_names[tl_guid] = None
             # Suppress show_atom bursts that xStudio fires when it re-triggers
             # existing bookmarks after the timeline is rebuilt.
-            self.plugin.annotation._reload_suppress_until = time.monotonic() + 2.0
-            self._xs_sequence_track_names[tl_guid] = None
-            xs_timeline.load_otio(otio_str, clear=True)
-            if tl_guid in self.plugin._sync_playlists:
-                playlist = self.plugin._sync_playlists[tl_guid][0]
-                self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
-            self.update_xs_media_order(tl_guid, otio_tl)
-            # Re-activate the timeline in the UI — load_otio does not restore
-            # the viewed source automatically.
-            try:
-                self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
-            except Exception:
-                pass
-            _log(
-                f"move_child: reloaded timeline {tl_guid[:8]}"
-                f" — {child_uuid[:8]} now at index {to_index}"
-            )
+            with self.plugin.annotation.remote_structural_apply_scope():
+                xs_timeline.load_otio(otio_str, clear=True)
+                if tl_guid in self.plugin._sync_playlists:
+                    playlist = self.plugin._sync_playlists[tl_guid][0]
+                    self.plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
+                self.update_xs_media_order(tl_guid, otio_tl)
+                # Re-activate the timeline in the UI — load_otio does not restore
+                # the viewed source automatically.
+                try:
+                    self.plugin.connection.api.session.set_on_screen_source(xs_timeline)
+                except Exception:
+                    pass
+                _log(
+                    f"move_child: reloaded timeline {tl_guid[:8]}"
+                    f" — {child_uuid[:8]} now at index {to_index}"
+                )
+            self.plugin.annotation.arm_reload_residual()
         except Exception:
-            self.plugin.annotation._reload_suppress_until = 0.0
+            self.plugin.annotation.clear_reload_state()
             _log_exc(f"move_child: failed to reload timeline {tl_guid[:8]}")
             return
 

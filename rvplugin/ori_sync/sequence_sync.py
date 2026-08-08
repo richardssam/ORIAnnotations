@@ -42,6 +42,12 @@ except Exception:  # pragma: no cover - depends on the RV runtime
 
 from utils import _log, _log_exc, _media_path, _is_media_track
 
+try:
+    from otio_sync_core.authority import CHANNEL_STRUCTURE, SENT
+except ImportError:
+    CHANNEL_STRUCTURE = "structure"
+    SENT = "SENT"
+
 #: RV's built-in default containers, never treated as shared sync timelines.
 _DEFAULT_CONTAINERS = ("defaultSequence", "defaultStack")
 #: ``otio`` component properties RV's otio_reader stamps on an imported Stack.
@@ -387,26 +393,32 @@ class SequenceSyncController:
     def check_otio_snapshots(self):
         """Diff each OTIO Stack against its last export; push on topology change.
 
-        Only the master runs this. Peers must never broadcast OTIO changes — they
-        only receive and apply. Without this gate, a peer that imported an OTIO
-        file would echo ADD_TIMELINE back to the master, which would re-broadcast
-        it, causing duplicate Stack/Sequence nodes from repeated
-        ``create_rv_node_from_otio`` calls.
+        Any peer may run this — the structure lease (``broadcast-ownership``)
+        serialises concurrent pushes instead of a hard ``is_master`` gate, so
+        multi-writer OTIO edits become safe rather than silently master-only
+        (design.md D7, subsuming the prior gate). ``broadcast_add_timeline``/
+        ``broadcast_replace_timeline`` self-check the lease and suppress if
+        this peer does not hold it; the ``claim_category`` call below is what
+        lets the peer whose *local* graph actually changed acquire it, rather
+        than never claiming and always losing to whichever peer got there
+        first historically (the master).
 
         Gated on the ``_otio_dirty`` flag (set by STACKS/SEQUENCES graph events)
-        so the whole-timeline serialization does not run every poll tick. A clip
-        insert/remove/large re-edit changes the serialized structure and triggers
-        a ``REPLACE_TIMELINE`` push; a brand-new Stack triggers ``ADD_TIMELINE``.
+        so the whole-timeline serialization does not run every poll tick, and
+        so claiming only happens in response to a local, input-driven graph
+        change — never from applying a remote one (design.md D4): a remote
+        ``apply_otio_snapshot`` rebuilds the graph inside the plugin's apply
+        scope, which does not set ``_otio_dirty``.  A clip insert/remove/large
+        re-edit changes the serialized structure and triggers a
+        ``REPLACE_TIMELINE`` push; a brand-new Stack triggers ``ADD_TIMELINE``.
         """
         mgr = self.plugin.sync_manager
         if not mgr or mgr.status != STATE_SYNCED or not self._otio_rw_available():
             return
-        if not mgr.is_master:
-            self._otio_dirty = False  # clear flag but never broadcast as peer
-            return
         if not self._otio_dirty:
             return
         self._otio_dirty = False
+        mgr.claim_category(CHANNEL_STRUCTURE)
         for stack in self._otio_stack_groups():
             tl = self._export_otio_stack(stack)
             if not tl:
@@ -418,16 +430,27 @@ class SequenceSyncController:
                 mgr.register_timeline(tl)
                 self._otio_stack_to_guid[stack] = guid
                 self._otio_guid_to_root[guid] = stack
-                self._otio_last_export[guid] = wire
-                mgr.broadcast_add_timeline(guid)
-                _log(f"check_otio_snapshots: new OTIO timeline {guid[:8]} broadcast")
+                status = mgr.broadcast_add_timeline(guid)
+                if status == SENT:
+                    self._otio_last_export[guid] = wire
+                    _log(f"check_otio_snapshots: new OTIO timeline {guid[:8]} broadcast")
+                else:
+                    # Lease not held (yet) — leave the export baseline stale so
+                    # this is detected again next tick and retried once this
+                    # peer holds the structure lease, rather than being marked
+                    # "already handled" and silently dropped.
+                    self._otio_dirty = True
             elif self._otio_last_export.get(guid) != wire:
-                self._otio_last_export[guid] = wire
                 # Remap object_map to the new structure (preserves persisting
-                # clip guids), then push the wholesale replacement to peers.
+                # clip guids) — this mirrors this peer's own live RV graph and
+                # is not conditional on the lease. Only the *push* to peers is.
                 mgr._replace_timeline_local(guid, tl)
-                mgr.broadcast_replace_timeline(guid)
-                _log(f"check_otio_snapshots: topology change → replace push {guid[:8]}")
+                status = mgr.broadcast_replace_timeline(guid)
+                if status == SENT:
+                    self._otio_last_export[guid] = wire
+                    _log(f"check_otio_snapshots: topology change → replace push {guid[:8]}")
+                else:
+                    self._otio_dirty = True
 
     def apply_otio_snapshot(self, tl):
         """Build/replace RV nodes for a received OTIO-origin timeline.
@@ -770,6 +793,7 @@ class SequenceSyncController:
         if not self._active_media_track_guid:
             _log("add_clip_from_path: no active media track — clip not broadcast")
             return None
+        self.plugin.sync_manager.claim_category(CHANNEL_STRUCTURE)
         self.plugin.sync_manager.insert_child(self._active_media_track_guid, clip)
         return clip
 
@@ -1003,6 +1027,10 @@ class SequenceSyncController:
                 continue
 
             self._sequence_input_order[seq_group] = current
+            # A detected local reorder/add/delete — claim before the
+            # broadcast_*/insert_child calls below (design.md D4: input-driven
+            # only, never from applying a remote message).
+            self.plugin.sync_manager.claim_category(CHANNEL_STRUCTURE)
 
             timeline = self.plugin.sync_manager._timelines.get(tl_guid)
             if not timeline:
@@ -1168,6 +1196,7 @@ class SequenceSyncController:
             tl_guid = timeline.metadata["sync"]["guid"]
             self._rv_node_to_timeline_guid[seq_group] = tl_guid
             self._sequence_input_order[seq_group] = self._get_sequence_inputs(seq_group)
+            self.plugin.sync_manager.claim_category(CHANNEL_STRUCTURE)
             self.plugin.sync_manager.broadcast_add_timeline(tl_guid)
             _log(f"New RVSequenceGroup '{seq_name}' → timeline {tl_guid[:8]} broadcast")
 
@@ -1187,6 +1216,7 @@ class SequenceSyncController:
                 continue
             if current_name and current_name != (tl.name or ""):
                 _log(f"Sequence rename: '{tl.name}' → '{current_name}' (node={seq_group})")
+                self.plugin.sync_manager.claim_category(CHANNEL_STRUCTURE)
                 self.plugin.sync_manager.broadcast_timeline_rename(tl_guid, current_name)
 
     def _poll_deleted_sequences(self):
@@ -1217,6 +1247,7 @@ class SequenceSyncController:
             # identity); only remove the timeline when nothing maps to it.
             if tl_guid in self._rv_node_to_timeline_guid.values():
                 continue
+            self.plugin.sync_manager.claim_category(CHANNEL_STRUCTURE)
             self.plugin.sync_manager.broadcast_remove_timeline(tl_guid)
             _log(
                 f"Deleted RVSequenceGroup '{seq_group}' → timeline "

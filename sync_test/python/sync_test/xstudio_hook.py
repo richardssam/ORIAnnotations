@@ -47,6 +47,10 @@ def get_xstudio_state(port=14441):
         # assert which peer was allowed to change what everyone looks at.
         "is_host": None,
         "host_guid": None,
+        # Per-channel write-lease state ({"position"|"display"|"structure":
+        # {"owner_guid", "remaining_ms"}}), omitted per-channel when free.
+        # Differs between peers by construction, like is_host/host_guid.
+        "broadcast_ownership": {},
         # Structural patches this peer was sent and could not apply. Empty in a
         # healthy session; non-empty means some peer broadcast against an object
         # this one was never given, which used to produce no signal at all.
@@ -90,6 +94,7 @@ def get_xstudio_state(port=14441):
                 state["host_guid"] = full.get("host_guid")
                 state["unresolved_patches"] = list(full.get("unresolved_patches") or [])
                 state["unpublished_parents"] = list(full.get("unpublished_parents") or [])
+                state["broadcast_ownership"] = dict(full.get("broadcast_ownership") or {})
             # The synced timeline's name, resolved through the shared sync GUID.
             # This is the only container name that means the same thing on every
             # peer: the viewed-container name below reports the *timeline* when a

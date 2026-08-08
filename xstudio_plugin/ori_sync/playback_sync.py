@@ -19,6 +19,7 @@ from xstudio.core import (
     get_global_playhead_events_atom, viewport_atom, active_viewport_atom,
 )
 from otio_sync_core.manager import STATE_SYNCED
+from otio_sync_core.authority import CHANNEL_POSITION
 from .utils import _log, _log_exc, bounded, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread playhead/viewport reads.  Generous
@@ -518,7 +519,7 @@ class PlaybackSyncController:
                     _log(f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}")
                 return
 
-            if time.monotonic() < self.plugin.annotation._reload_suppress_until:
+            if self.plugin.annotation.reload_in_progress():
                 return
             _log(f"[SEL] show_atom (annotation/bookmark): {_shape} — queuing annotation flush")
             if self.plugin.manager and self.plugin.manager.status == STATE_SYNCED:
@@ -1668,6 +1669,10 @@ class PlaybackSyncController:
         self._playback_apply_suppress_until = (
             time.monotonic() + _PLAYBACK_ECHO_GUARD_S
         )
+        # Feeds claim_lease()'s horizon (design.md D4): an asynchronous
+        # attribute_changed callback attributable to this apply must not be
+        # allowed to claim the position lease the sending peer still holds.
+        self.plugin.stamp_remote_apply(CHANNEL_POSITION)
         # Record the driver's position here too, ahead of the same early
         # returns — broadcast_view_state needs it to avoid putting our own
         # position on the wire while being driven, and by the time `frame` is

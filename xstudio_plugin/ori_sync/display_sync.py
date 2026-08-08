@@ -9,6 +9,7 @@ from xstudio.api.intrinsic.viewport import Viewport
 from xstudio.core import serialise_atom
 
 from otio_sync_core.manager import STATE_SYNCED  # noqa: E402
+from otio_sync_core.authority import CHANNEL_DISPLAY  # noqa: E402
 
 from .utils import _log, _log_exc, bounded_timeout
 
@@ -233,6 +234,11 @@ class DisplaySyncController:
         if vp is None:
             return
 
+        # Feeds claim_lease()'s horizon (design.md D4): an asynchronous
+        # attribute-changed callback attributable to this apply must not be
+        # allowed to claim the display lease the sending peer still holds.
+        self.plugin.stamp_remote_apply(CHANNEL_DISPLAY)
+
         pan = state.get("pan")
         zoom = state.get("zoom")
         exposure = state.get("exposure", 0.0)
@@ -314,4 +320,5 @@ class DisplaySyncController:
         self._last_display_state = state
         _log(f"Poll display: broadcasting exposure={state['exposure']:.3f} "
              f"channel={state['channel']} zoom={state['zoom']} pan={state['pan']}")
+        self.plugin.claim_lease(CHANNEL_DISPLAY)
         manager.broadcast_display_state(state)

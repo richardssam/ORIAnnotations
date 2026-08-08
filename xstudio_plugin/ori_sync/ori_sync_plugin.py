@@ -62,10 +62,19 @@ import opentimelineio as otio
 from xstudio.connection import Connection
 from xstudio.api.session.playhead import Playhead
 
-from otio_sync_core.authority import SUPPRESSED  # noqa: E402
+from otio_sync_core.authority import (  # noqa: E402
+    SUPPRESSED,
+    CHANNEL_POSITION,
+    CHANNEL_STRUCTURE,
+)
 from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED, SyncManager  # noqa: E402
 from otio_sync_core.rabbitmq_network import RabbitMQNetwork, resolve_host  # noqa: E402
 from xstudio.plugin import PluginBase  # noqa: E402
+
+#: Horizon (seconds) after a remote apply within which claim_lease() is a
+#: no-op, so a late-arriving asynchronous echo callback cannot steal the
+#: lease the peer that just sent it is still holding (design.md D4).
+_CLAIM_HORIZON_S = 0.3
 
 # ── plugin ─────────────────────────────────────────────────────────────────────
 
@@ -149,6 +158,15 @@ class ORISyncPlugin(PluginBase):
         # Items are (command_name, payload_dict).
         self._cmd_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
 
+        # Wall-clock time each broadcast-ownership channel's remote apply was
+        # last observed locally: {"position"|"display"|"structure": float}.
+        # Feeds claim_lease()'s horizon. xStudio's apply-triggered callbacks
+        # (attribute_changed, show_atom, ...) arrive asynchronously, some after
+        # the apply that caused them has already returned, so a synchronous
+        # apply-scope flag (RV's approach) cannot filter them out; this bounded
+        # horizon is the residual mechanism design.md D4 keeps for that reason.
+        self._last_remote_apply: dict[str, float] = {}
+
         # True while the session dialog is open in "create" mode (vs "join").
         self._pending_create_check: bool = False
 
@@ -196,6 +214,42 @@ class ORISyncPlugin(PluginBase):
                 _log_exc("ORI_SESSION auto-connect failed")
         else:
             _log("Plugin loaded — no ORI_SESSION set, starting disconnected")
+
+    # ── broadcast-ownership: claim horizon ─────────────────────────────────────
+
+    def stamp_remote_apply(self, channel: str) -> None:
+        """Record that a remote message in *channel* was just applied locally.
+
+        Call this wherever a remote playback/display/structure message is
+        applied (mirrored across the owning controller's apply path). Feeds
+        :meth:`claim_lease`'s horizon: an asynchronous xStudio callback
+        attributable to this apply must not be allowed to claim the lease
+        that peer already holds (design.md D4).
+
+        :param channel: One of ``"position"``, ``"display"``, ``"structure"``.
+        """
+        self._last_remote_apply[channel] = time.monotonic()
+
+    def claim_lease(self, channel: str) -> None:
+        """Claim *channel*'s write lease, unless within the post-apply echo horizon.
+
+        The xStudio counterpart of RV's synchronous ``_rv_updating`` apply-scope
+        guard: xStudio delivers some callbacks (``attribute_changed``,
+        ``show_atom``, ...) asynchronously, some arriving after the apply scope
+        that caused them has already exited, so a flag alone cannot filter them.
+        This bounded horizon is the one residual time-window design.md D4 keeps
+        in the claim path for that reason — its failure mode is a spurious
+        *claim request* (resolved by the manager's own convergence rule), never
+        a re-broadcast.
+
+        :param channel: One of ``"position"``, ``"display"``, ``"structure"``.
+        """
+        if not self.manager:
+            return
+        last = self._last_remote_apply.get(channel, 0.0)
+        if time.monotonic() - last < _CLAIM_HORIZON_S:
+            return
+        self.manager.claim_category(channel)
 
     # ── connection lifecycle ───────────────────────────────────────────────────
 
@@ -681,6 +735,10 @@ class ORISyncPlugin(PluginBase):
                     # have set to a transient per-clip timeline the peer lacks.
                     # Cached (short TTL) so per-frame scrub broadcasts stay cheap.
                     tl_guid = self.playback.cached_viewed_timeline_guid()
+                    # No-ops within the post-remote-apply horizon (claim_lease),
+                    # so an asynchronous echo of the message we just applied
+                    # cannot steal the lease its sender still holds (D4).
+                    self.claim_lease(CHANNEL_POSITION)
                     status = self.manager.broadcast_playback_state(
                         payload, timeline_guid=tl_guid
                     )
@@ -736,9 +794,23 @@ class ORISyncPlugin(PluginBase):
 
     # ── manager event dispatch ─────────────────────────────────────────────────
 
+    #: Actions that represent a remote structural apply, for the claim-horizon
+    #: stamp below. ``insert_child`` is excluded here — it also covers
+    #: annotation inserts, which are not structural, so it is stamped
+    #: individually inside its own branch instead.
+    _STRUCTURAL_ACTIONS = frozenset({
+        "move_child", "remove_child", "add_timeline", "remove_timeline",
+        "replace_timeline", "timeline_renamed",
+    })
+
     def _handle_manager_event(self, action: str, data) -> None:
         """React to events returned by manager.tick()."""
         _log(f"Event: {action}")
+        if action in self._STRUCTURAL_ACTIONS:
+            # Feeds claim_lease()'s horizon (design.md D4): an asynchronous
+            # callback attributable to this apply must not be allowed to
+            # claim the structure lease the sending peer still holds.
+            self.stamp_remote_apply(CHANNEL_STRUCTURE)
         if action == "state_request_received":
             requester_guid = data
             _log(f"State request from {requester_guid[:8]} — sending snapshot")
@@ -774,6 +846,8 @@ class ORISyncPlugin(PluginBase):
             if ann_cmds:
                 self.annotation.apply_remote_annotation(child_obj, ann_cmds)
             elif isinstance(child_obj, otio.schema.Clip):
+                # Structural, not annotation — feeds claim_lease()'s horizon.
+                self.stamp_remote_apply(CHANNEL_STRUCTURE)
                 self.structure.apply_remote_clip_insert(child_obj)
 
         elif action == "annotation_commands_added":

@@ -10,6 +10,7 @@ import bisect
 import uuid
 import subprocess
 import contextlib
+import threading
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -546,13 +547,17 @@ class TestRunner:
             # `is_host`/`host_guid` differ between peers by construction — one
             # peer holds visibility authority and the others do not — so they
             # are reported for assertions, never for structural equality.
+            # `broadcast_ownership` is the same story one level down: peers
+            # converge on who owns each lease channel, but `remaining_ms`
+            # differs by network latency and local clock reading, so it is
+            # never a structural-equality criterion either.
             # `view_mirror_error` is checked explicitly above.
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
                            "is_host", "host_guid", "view_mirror_error",
                            "unresolved_patches", "unpublished_parents",
-                           "media_count"}
+                           "media_count", "broadcast_ownership"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}
             s2 = {k: v for k, v in st.items() if k not in ignore_keys}
 
@@ -894,6 +899,82 @@ class TestRunner:
                         return True
             time.sleep(0.5)
         return False
+
+    def _wait_for_ownership_convergence(self, app_ports, channel, timeout=15.0):
+        """Wait for every live peer to agree on the owner of a broadcast-ownership channel.
+
+        Companion to :meth:`_wait_for_host_failover`, same shape: polls every
+        peer's ``/state`` (which carries ``broadcast_ownership`` per-channel,
+        see the openrv/xstudio hooks) until they all report the same
+        ``owner_guid`` for *channel*. Used after a deliberately-contended
+        command (:meth:`_send_concurrent_commands`) to confirm the lease
+        settles on one peer rather than staying split — the property
+        broadcast-ownership exists to guarantee (design.md D2).
+
+        :param app_ports: ``[(name, port), ...]`` for every peer in the test.
+        :param channel: ``"position"``, ``"display"``, or ``"structure"``.
+        :param timeout: Seconds to wait before giving up.
+        :returns: The agreed owner GUID, or ``None`` if the peers never
+            converge within *timeout* (each still reports a different owner,
+            or some report no owner at all).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            states = [(app, self.fetch_state(app[1])) for app in app_ports]
+            live = [(app, st) for app, st in states if "error" not in st]
+            owners = {
+                (st.get("broadcast_ownership") or {}).get(channel, {}).get("owner_guid")
+                for _, st in live
+            }
+            if live and len(owners) == 1 and None not in owners:
+                owner = next(iter(owners))
+                logging.info(
+                    f"     {channel} lease converged on {owner[:8]} "
+                    f"({time.time() - (deadline - timeout):.1f}s)"
+                )
+                return owner
+            time.sleep(0.25)
+        logging.warning(
+            f"_wait_for_ownership_convergence: peers never agreed on a {channel} "
+            f"owner within {timeout:.0f}s"
+        )
+        return None
+
+    def _send_concurrent_commands(self, by_app_commands, app_ports):
+        """Send one command to each named app at (as close to) the same instant.
+
+        Fires every ``send_command`` call from its own thread so the requests
+        overlap on the wire instead of the usual command loop's one-at-a-time,
+        ``sleep(1.0)``-between ordering — that ordering would hand each
+        broadcast-ownership lease to whichever peer happened to go first,
+        which proves nothing about contention. Genuine overlap is what
+        exercises the deterministic-tiebreak/transfer path (design.md D2/D3)
+        rather than a race that never actually happens.
+
+        :param by_app_commands: ``{app_name: command_dict}``.
+        :param app_ports: ``[(name, port), ...]`` for every peer in the test.
+        :returns: ``{app_name: response_dict}``, the same shape
+            :meth:`send_command` returns per app.
+        """
+        port_by_name = {name: port for name, port in app_ports}
+        results = {}
+        lock = threading.Lock()
+
+        def _fire(name, cmd):
+            res = self.send_command(port_by_name[name], cmd)
+            with lock:
+                results[name] = res
+
+        threads = [
+            threading.Thread(target=_fire, args=(name, cmd))
+            for name, cmd in by_app_commands.items()
+            if name in port_by_name
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=35.0)
+        return results
 
     def _select_host_driver(self, app_ports):
         """Return the app that holds visibility authority, or ``None``.
@@ -1473,6 +1554,50 @@ class TestRunner:
                                 "No surviving peer took visibility authority. "
                                 "Only the host may broadcast visibility, so the "
                                 "session's view is frozen for everyone left."
+                            )
+                            failed = True
+                            break
+                        continue
+
+                    # Runner-level, not forwarded to a single app's hook: this
+                    # is the deliberately-contended case broadcast-ownership
+                    # needs coverage for (design.md 1b migration step) — no
+                    # existing test drives two peers into the same category at
+                    # once, which is why the position/structure guards have no
+                    # positive evidence either way that they are safe to
+                    # retire. `by_app` maps app name -> the command to send it;
+                    # every entry fires from its own thread so the requests
+                    # overlap on the wire (see _send_concurrent_commands).
+                    if action == "concurrent_commands":
+                        by_app = cmd.get("by_app", {})
+                        logging.info(f"  -> Sending concurrent commands: {by_app}")
+                        results = self._send_concurrent_commands(by_app, app_ports)
+                        for name, res in results.items():
+                            if "error" in res:
+                                logging.error(
+                                    f"concurrent_commands: {name} failed: {res['error']}"
+                                )
+                                failed = True
+                        if failed:
+                            break
+                        continue
+
+                    # Confirms the lease actually settles on one peer after a
+                    # concurrent_commands contention, rather than staying
+                    # split between two peers' local views forever.
+                    if action == "expect_ownership_convergence":
+                        channel = cmd.get("channel", "position")
+                        timeout = cmd.get("timeout", 15.0)
+                        logging.info(
+                            f"  -> Waiting up to {timeout:.0f}s for the {channel} "
+                            "lease to converge..."
+                        )
+                        if self._wait_for_ownership_convergence(
+                            app_ports, channel, timeout
+                        ) is None:
+                            logging.error(
+                                f"Peers never agreed on a single {channel} owner — "
+                                "the lease stayed split instead of converging."
                             )
                             failed = True
                             break

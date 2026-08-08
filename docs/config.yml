@@ -61,6 +61,7 @@ protocol_messages:
       timelines: {"tl-guid-1": {"OTIO_SCHEMA": "Timeline.1", "name": "Sequence 1"}}
       active_timeline_guid: "tl-guid-1"
       snapshot_timestamp: 1738339200.0
+      broadcast_ownership: {"position": {"owner_guid": "peer-abc123", "remaining_ms": 850.0}}
 
   AddTimeline:
     _category: Timeline
@@ -81,6 +82,19 @@ protocol_messages:
     default:
       timeline_guid: "tl-guid-1"
       sync_timestamp: 1738339200.0
+
+  ClaimOwnership:
+    _category: Ownership
+    default:
+      category: "position"
+      peer_guid: "peer-abc123"
+      claim_ts: 1738339200.0
+
+  ReleaseOwnership:
+    _category: Ownership
+    default:
+      category: "position"
+      peer_guid: "peer-abc123"
 
   PlaybackSettingsSet:
     _category: Settings

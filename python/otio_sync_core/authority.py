@@ -14,11 +14,14 @@ Category         Contents                                            Authority
 ``structure``    timeline add/remove/replace/rename, child edits      any peer
 ===============  ==================================================  ==========
 
-``structure`` is listed for completeness and is **not** gated here — it stays
-governed by ``is_master`` exactly as it is today; folding it in belongs to
-``session-roles``.  ``display_state`` sits under ``position`` deliberately:
-reviewers legitimately toggle channels and exposure locally, so it is per-peer
-(host-owned-visibility §7.1).
+``position`` and ``structure`` are additionally gated by a write **lease**
+(``broadcast-ownership``): any peer may broadcast them, but only whichever
+peer currently holds that category's lease.  This subsumes the ``is_master``
+gate structure used to sit behind.  ``display_state`` sits under ``position``
+for *authority* purposes — reviewers legitimately toggle channels and
+exposure locally, so it is per-peer (host-owned-visibility §7.1) — but takes
+its own lease *channel*, so adjusting exposure never blocks another peer's
+scrub (design.md D8).  See :data:`LEASE_CHANNELS` below.
 
 Visibility and position travel as *field groups* inside one
 ``PLAYBACK_SETTINGS_1.0`` message, so enforcement applies to the fields rather
@@ -225,3 +228,107 @@ def elect_host_guid(peers: Mapping[str, Mapping[str, Any]]) -> "str | None":
     if not candidates:
         return None
     return min(candidates)[1]
+
+
+# ---------------------------------------------------------------------------
+# Broadcast ownership (write leases) — position, display, structure
+# ---------------------------------------------------------------------------
+
+#: Playhead position, play/stop, playback mode — a field group of
+#: ``PLAYBACK_SETTINGS_1.0``, gated alongside (but independently of) visibility.
+CHANNEL_POSITION = "position"
+#: Pan/zoom/exposure/channel — its own message (``DISPLAY_SETTINGS_1.0``) and its
+#: own lease channel, deliberately not shared with ``CHANNEL_POSITION`` (D8):
+#: adjusting exposure must never block someone else's scrub, or vice versa.
+CHANNEL_DISPLAY = "display"
+#: Timeline add/remove/replace/rename and structural child mutations.
+CHANNEL_STRUCTURE = "structure"
+
+#: Every channel that takes a write lease. ``visibility`` and ``annotation``
+#: are deliberately absent: visibility is a static single writer (no
+#: contention to resolve) and annotation stays multi-writer by design.
+LEASE_CHANNELS: tuple[str, ...] = (CHANNEL_POSITION, CHANNEL_DISPLAY, CHANNEL_STRUCTURE)
+
+#: Seconds of broadcast silence after which an unrefreshed lease expires.
+#: Working defaults within the agreed 500ms-2s envelope (design.md D3/D8):
+#: display releases fastest (a stopped gesture has no clip-boundary gap to
+#: ride out), structure slowest (a remote rebuild can gap for hundreds of ms).
+LEASE_DURATIONS: dict[str, float] = {
+    CHANNEL_DISPLAY: 0.5,
+    CHANNEL_POSITION: 1.0,
+    CHANNEL_STRUCTURE: 2.0,
+}
+
+#: Fields of ``PLAYBACK_SETTINGS_1.0`` that assert **position** — the
+#: counterpart to :data:`VISIBILITY_FIELDS`, gated by the position lease
+#: rather than by host status.
+POSITION_FIELDS: tuple[str, ...] = ("current_time", "playing", "playback_mode")
+
+
+def strip_position_fields(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return *state* with every position field removed.
+
+    Mirrors :func:`strip_visibility_fields`: the position field group is
+    removed together so a message cannot lose ``playing`` while still
+    asserting ``current_time``.
+
+    :param state: Outgoing playback/view state dict.
+    :returns: A new dict carrying only the non-position fields.
+    :rtype: dict
+    """
+    return {k: v for k, v in state.items() if k not in POSITION_FIELDS}
+
+
+def asserts_position(state: Mapping[str, Any]) -> bool:
+    """Return whether *state* carries any position field.
+
+    :param state: A playback/view state dict (outgoing or as received).
+    :rtype: bool
+    """
+    return any(state.get(f) is not None for f in POSITION_FIELDS)
+
+
+def resolve_claim(
+    current: "tuple[float, str] | None", incoming: "tuple[float, str]"
+) -> "tuple[float, str]":
+    """Return the winning ``(claim_ts, peer_guid)`` pair between two claims.
+
+    Pure function of its two arguments, so every peer evaluating the same pair
+    of claims reaches the same winner without synchronized clocks (design.md
+    D2): tuple comparison is lexicographic, so the earlier ``claim_ts`` wins
+    and an exact tie breaks to the lower ``peer_guid`` — the same
+    ``min()``-over-a-deterministic-key shape as :func:`elect_host_guid`.
+
+    :param current: The best claim known so far, or ``None`` when there isn't one.
+    :param incoming: The claim being weighed against it.
+    :returns: Whichever of *current* / *incoming* sorts first; *incoming* when
+        *current* is ``None``.
+    :rtype: tuple
+    """
+    if current is None:
+        return incoming
+    return min(current, incoming)
+
+
+#: Environment variable that disables ownership-lease enforcement at runtime.
+OWNERSHIP_ENFORCEMENT_ENV = "ORI_BROADCAST_OWNERSHIP"
+
+
+def ownership_enforcement_enabled() -> bool:
+    """Return whether position/structure/display broadcasts are lease-gated.
+
+    **Enabled by default** as of migration step 1b (design.md): step 1a
+    shipped the mechanism dark (default disabled) behind this same switch;
+    now that both host plugins wire ``claim_category()`` into their
+    input-driven paths, the default flips to on. Setting
+    ``ORI_BROADCAST_OWNERSHIP=0`` reverts to the pre-lease behaviour —
+    unconditional broadcast for position/display/structure — so the whole
+    mechanism can still be backed out of a live session without a rebuild if
+    the 1b soak finds a problem. Read per call rather than cached at import,
+    exactly like :func:`enforcement_enabled` — a disabled switch must revert
+    enforcement completely, not leave a claim/expiry state machine running
+    against a policy no longer in force.
+
+    :rtype: bool
+    """
+    return os.environ.get(OWNERSHIP_ENFORCEMENT_ENV, "1").strip().lower() not in _FALSEY

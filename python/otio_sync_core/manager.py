@@ -13,6 +13,7 @@ import logging as _logging
 import queue
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import opentimelineio as otio
@@ -25,11 +26,13 @@ from .protocol_messages import (
     ProtocolMessage,
     message_for,
     AddTimeline,
+    ClaimOwnership,
     DisplaySettingsSet,
     IAmMaster,
     InsertChild,
     PartialAnnotation,
     PlaybackSettingsSet,
+    ReleaseOwnership,
     RemoveTimeline,
     RenameTimeline,
     ReplaceAnnotationCommands,
@@ -115,6 +118,37 @@ PEER_HEARTBEAT_INTERVAL = 5.0
 #: rebuild) is alive but quiet, and dropping it early causes a needless host
 #: re-election.  A peer wrongly dropped restores itself on its next heartbeat.
 PEER_LIVENESS_TIMEOUT = 15.0
+
+
+@dataclass
+class OwnershipLease:
+    """Local state for one broadcast-ownership channel (position/display/structure).
+
+    ``deadline`` is a *local* ``time.monotonic()`` reading, set on receipt of a
+    claim or a category broadcast — never a value carried on the wire, so no
+    cross-machine clock sync is needed (design.md D3).  ``claim_ts`` is the
+    current owner's wall-clock claim time, kept so a losing claim can still be
+    compared against it while the lease is unconfirmed (see ``confirmed``).
+
+    ``confirmed`` distinguishes a lease that only exists because a claim was
+    granted from one that has been backed by at least one real broadcast in
+    its category. This is the mechanism that reconciles two requirements that
+    would otherwise conflict: two peers claiming the same free channel in the
+    same latency window must still converge on one winner (design.md D2,
+    "every peer applies the same rule to the same message set"), *and* a peer
+    that is actively driving must never be interrupted mid-operation
+    (design.md "owner holds until idle"). While unconfirmed, an incoming claim
+    is resolved against the current claimant like any other pending one — so
+    the earliest of the two racing claims wins on every peer regardless of
+    arrival order. Once a real broadcast confirms the lease, incoming claims
+    can no longer preempt it; they only queue as ``pending_claimant``.
+    """
+
+    owner_guid: "str | None" = None
+    claim_ts: "float | None" = None
+    deadline: "float | None" = None
+    confirmed: bool = False
+    pending_claimant: "tuple[float, str] | None" = None
 
 
 class SyncManager:
@@ -245,6 +279,14 @@ class SyncManager:
         self._host_election_queue: "queue.Queue[str]" = queue.Queue()
         self._host_callbacks: list[Callable[["str | None", bool], None]] = []
 
+        #: Write-lease state for the position/display/structure channels
+        #: (``broadcast-ownership``). Visibility and annotation have no entry
+        #: here: visibility is a static single writer and annotation stays
+        #: multi-writer, neither needs contention resolution.
+        self._leases: dict[str, OwnershipLease] = {
+            channel: OwnershipLease() for channel in authority.LEASE_CHANNELS
+        }
+
         self._delta_buffer: list[dict[str, Any]] = []
         #: True only while :meth:`apply_snapshot` replays buffered deltas, so
         #: they are applied rather than buffered straight back onto the list
@@ -290,6 +332,8 @@ class SyncManager:
             ("LiveSession.1", "PEER_DEPART"): self._h_peer_depart,
             ("LiveSession.1", "STATE_REQUEST"): self._h_state_request,
             ("LiveSession.1", "STATE_SNAPSHOT"): self._h_state_snapshot,
+            ("BROADCAST_OWNERSHIP_1.0", "CLAIM_OWNERSHIP"): self._h_claim_ownership,
+            ("BROADCAST_OWNERSHIP_1.0", "RELEASE_OWNERSHIP"): self._h_release_ownership,
             ("PLAYBACK_SETTINGS_1.0", "SET"): self._h_playback_set,
             ("DISPLAY_SETTINGS_1.0", "SET"): self._h_display_set,
             ("TIMELINE_1.0", "ADD_TIMELINE"): self._h_add_timeline,
@@ -539,9 +583,12 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
             return authority.SUPPRESSED
+        self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
         self._send_message(
             AddTimeline(
                 timeline_guid=tl_guid,
@@ -584,10 +631,13 @@ class SyncManager:
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
             _log(f"broadcast_timeline_rename: unknown timeline {tl_guid}")
             return authority.SUPPRESSED
+        self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
         tl.name = new_name
         self._send_message(
             RenameTimeline(
@@ -616,8 +666,11 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            return authority.SUPPRESSED
         if self._remove_timeline_local(tl_guid) is None:
             return authority.SUPPRESSED
+        self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
         self._send_message(
             RemoveTimeline(
                 timeline_guid=tl_guid,
@@ -645,9 +698,12 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
             return authority.SUPPRESSED
+        self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
         self._replace_timeline_local(tl_guid, tl)
         self._send_message(
             ReplaceTimeline(
@@ -1222,6 +1278,308 @@ class SyncManager:
         """
         return self.is_host or not authority.enforcement_enabled()
 
+    # ------------------------------------------------------------------
+    # Broadcast Ownership (write leases: position, display, structure)
+    # ------------------------------------------------------------------
+
+    def _settle_lease_expiry(self, channel: str) -> None:
+        """Apply expiry to *channel*'s lease if its deadline has passed.
+
+        Lazy: evaluated on access (from :meth:`_owns_channel`, :meth:`_apply_claim`,
+        and wire-section building) rather than on a timer, since nothing needs to
+        react to an expiry except the next thing that consults ownership.  On
+        expiry, a pending claimant is promoted (through the same resolution rule
+        used everywhere else); otherwise the channel becomes free.
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        """
+        lease = self._leases[channel]
+        if lease.deadline is None or time.monotonic() < lease.deadline:
+            return
+        previous = lease.owner_guid
+        if lease.pending_claimant is not None:
+            claim_ts, guid = lease.pending_claimant
+            lease.owner_guid = guid
+            lease.claim_ts = claim_ts
+            lease.deadline = time.monotonic() + authority.LEASE_DURATIONS[channel]
+            lease.confirmed = False
+            lease.pending_claimant = None
+            _log(f"lease[{channel}]: expired ({(previous or '-')[:8]}), transferred to {guid[:8]}")
+        else:
+            lease.owner_guid = None
+            lease.claim_ts = None
+            lease.deadline = None
+            lease.confirmed = False
+            if previous:
+                _log(f"lease[{channel}]: expired ({previous[:8]}), now free")
+
+    def _owns_channel(self, channel: str) -> bool:
+        """Return whether this peer currently holds *channel*'s write lease.
+
+        The broadcast gate for position/display/structure, called from inside
+        the relevant ``broadcast_*`` methods exactly as :meth:`owns_visibility`
+        underpins :meth:`_enforce_visibility` — plugins never call this
+        directly.  When ownership enforcement is disabled (the default for
+        this commit; see :func:`authority.ownership_enforcement_enabled`),
+        every peer is treated as owning every channel, so a disabled switch
+        reverts broadcast behaviour completely rather than partially.
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        :rtype: bool
+        """
+        if not authority.ownership_enforcement_enabled():
+            return True
+        self._settle_lease_expiry(channel)
+        return self._leases[channel].owner_guid == self.self_guid
+
+    def _refresh_lease_confirmed(self, channel: str) -> None:
+        """Refresh *channel*'s deadline and mark it confirmed by real traffic.
+
+        Called after this peer is found to own *channel*, immediately before it
+        broadcasts within it.  Marking ``confirmed`` is what makes
+        :meth:`_apply_claim` stop treating the lease as merely provisional, so
+        a peer that is genuinely driving is never interrupted mid-operation
+        (see :class:`OwnershipLease`).
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        """
+        if not authority.ownership_enforcement_enabled():
+            return
+        lease = self._leases[channel]
+        lease.deadline = time.monotonic() + authority.LEASE_DURATIONS[channel]
+        lease.confirmed = True
+
+    def _apply_claim(self, channel: str, claim_ts: float, peer_guid: str) -> None:
+        """Resolve a claim (local or received) against *channel*'s lease state.
+
+        The single resolution path for both this peer's own claims and ones it
+        receives, so both are decided by the identical rule (design.md D2's
+        "a claim resolves identically on the claiming peer and every
+        receiver").  See :class:`OwnershipLease` for why *confirmed* is the
+        axis that decides whether an incoming claim can still win outright
+        (unconfirmed — still within the initial contention window) or can only
+        queue as ``pending_claimant`` (confirmed — actively held, not
+        interrupted mid-operation).
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        :param claim_ts: Wall-clock time the claim was made.
+        :param peer_guid: GUID of the claiming peer.
+        """
+        self._settle_lease_expiry(channel)
+        lease = self._leases[channel]
+        candidate = (claim_ts, peer_guid)
+
+        if lease.owner_guid == peer_guid:
+            # The current owner re-claiming (self-refresh, or an echo of its
+            # own claim) just reaffirms what it already holds.
+            lease.claim_ts = claim_ts
+            self._refresh_lease(channel)
+            return
+
+        if lease.owner_guid is not None and lease.confirmed:
+            # Actively held: never preempted, only queued (owner holds until idle).
+            lease.pending_claimant = authority.resolve_claim(lease.pending_claimant, candidate)
+            return
+
+        # Free, or only provisionally claimed (not yet confirmed by real
+        # traffic) — still within the initial contention window. Resolve the
+        # incoming candidate against whatever is currently the best claim
+        # (the provisional owner, if any, and any existing pending claimant),
+        # so two peers racing to claim a free channel converge on the same
+        # winner regardless of which claim each sees first.
+        current = (lease.claim_ts, lease.owner_guid) if lease.owner_guid is not None else None
+        best = authority.resolve_claim(current, candidate)
+        if lease.pending_claimant is not None:
+            best = authority.resolve_claim(best, lease.pending_claimant)
+        lease.pending_claimant = None
+        if current is not None and best == current:
+            return
+        lease.owner_guid = best[1]
+        lease.claim_ts = best[0]
+        self._refresh_lease(channel)
+
+    def _refresh_lease(self, channel: str) -> None:
+        """Push *channel*'s deadline forward without changing ``confirmed``.
+
+        Used when granting or reaffirming a claim — distinct from
+        :meth:`_refresh_lease_confirmed`, which additionally marks the lease
+        as backed by real category traffic.
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        """
+        self._leases[channel].deadline = time.monotonic() + authority.LEASE_DURATIONS[channel]
+
+    def claim_category(self, channel: str) -> None:
+        """Claim the write lease for *channel*, broadcasting ``CLAIM_OWNERSHIP``.
+
+        Input-driven only: callers MUST call this only from a path caused by
+        this peer's own local user input, never from the broadcast-suppression
+        path or from applying a remote message.  Claiming from an echo would
+        let ownership cycle back to a non-driving peer at the next expiry,
+        reproducing the same feedback loop this mechanism exists to remove
+        (design.md D4).
+
+        Applies the claim to local state through the same resolution rule used
+        for a received claim, then broadcasts it — so this peer's own view
+        stays consistent with what every other peer will compute on receipt.
+
+        A no-op while ownership enforcement is disabled (the kill switch):
+        plugins are expected to call this unconditionally from every
+        input-driven path (e.g. every scrub), and a disabled switch reverting
+        enforcement "completely" (design.md D5) includes not flooding the
+        session with claims nobody is going to honour.
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        :raises ValueError: If *channel* is not a recognised lease channel.
+        """
+        if channel not in authority.LEASE_CHANNELS:
+            raise ValueError(f"unknown lease channel: {channel!r}")
+        if not authority.ownership_enforcement_enabled():
+            return
+        claim_ts = time.time()
+        self._apply_claim(channel, claim_ts, self.self_guid)
+        self._send_message(
+            ClaimOwnership(category=channel, peer_guid=self.self_guid, claim_ts=claim_ts)
+        )
+
+    def release_category(self, channel: str) -> None:
+        """Release *channel*'s lease if this peer holds it, broadcasting the release.
+
+        Frees the channel (or promotes a pending claimant) immediately rather
+        than waiting for expiry, so a peer that is done driving hands off
+        without a stall.  A no-op if this peer does not currently hold the
+        lease, or while ownership enforcement is disabled (see
+        :meth:`claim_category`).
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        :raises ValueError: If *channel* is not a recognised lease channel.
+        """
+        if channel not in authority.LEASE_CHANNELS:
+            raise ValueError(f"unknown lease channel: {channel!r}")
+        if not authority.ownership_enforcement_enabled():
+            return
+        if self._leases[channel].owner_guid != self.self_guid:
+            return
+        self._release_local(channel)
+        self._send_message(ReleaseOwnership(category=channel, peer_guid=self.self_guid))
+
+    def _release_local(self, channel: str) -> None:
+        """Free *channel* locally (or promote its pending claimant), no broadcast.
+
+        Shared by :meth:`release_category` (this peer releasing) and
+        :meth:`_h_release_ownership` (another peer's release arriving).
+
+        :param channel: One of :data:`authority.LEASE_CHANNELS`.
+        """
+        lease = self._leases[channel]
+        if lease.pending_claimant is not None:
+            claim_ts, guid = lease.pending_claimant
+            lease.owner_guid = guid
+            lease.claim_ts = claim_ts
+            lease.deadline = time.monotonic() + authority.LEASE_DURATIONS[channel]
+            lease.confirmed = False
+            lease.pending_claimant = None
+        else:
+            lease.owner_guid = None
+            lease.claim_ts = None
+            lease.deadline = None
+            lease.confirmed = False
+
+    def _h_claim_ownership(
+        self, msg: ClaimOwnership, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        if msg.category not in authority.LEASE_CHANNELS or not msg.peer_guid or msg.claim_ts is None:
+            return None
+        self._apply_claim(msg.category, msg.claim_ts, msg.peer_guid)
+        return None
+
+    def _h_release_ownership(
+        self, msg: ReleaseOwnership, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        if msg.category not in authority.LEASE_CHANNELS:
+            return None
+        lease = self._leases[msg.category]
+        if lease.owner_guid != msg.peer_guid:
+            # Stale or foreign release (e.g. arriving after expiry already
+            # moved the lease on); nothing to do.
+            return None
+        self._release_local(msg.category)
+        return None
+
+    def _lease_wire_section(self) -> dict[str, dict[str, Any]]:
+        """Build the ``broadcast_ownership`` section for an outgoing ``STATE_SNAPSHOT``.
+
+        A channel with no live owner is omitted entirely, mirroring the
+        omit-when-unset convention already established for ``host_guid`` —
+        see :meth:`adopt_ownership` for why that matters.
+
+        :returns: ``{channel: {"owner_guid": str, "remaining_ms": float}}``,
+            possibly empty.
+        """
+        now = time.monotonic()
+        section: dict[str, dict[str, Any]] = {}
+        for channel in authority.LEASE_CHANNELS:
+            self._settle_lease_expiry(channel)
+            lease = self._leases[channel]
+            if lease.owner_guid is None or lease.deadline is None:
+                continue
+            section[channel] = {
+                "owner_guid": lease.owner_guid,
+                "remaining_ms": max(0.0, lease.deadline - now) * 1000.0,
+            }
+        return section
+
+    @property
+    def ownership_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Per-channel lease state, for test-harness visibility.
+
+        Same shape and omit-when-unset convention as the wire section (see
+        :meth:`_lease_wire_section`), exposed independently of building a full
+        ``STATE_SNAPSHOT`` so a test hook can poll it cheaply — the pattern
+        ``is_host``/``host_guid`` already established (host-owned-visibility
+        §2.4).
+
+        :returns: ``{channel: {"owner_guid": str, "remaining_ms": float}}``.
+        """
+        return self._lease_wire_section()
+
+    def adopt_ownership(self, ownership: "dict[str, dict[str, Any]] | None") -> None:
+        """Adopt write-lease state learned from a ``STATE_SNAPSHOT``.
+
+        Mirrors :meth:`adopt_host`'s compatibility convention: an absent or
+        empty payload is ignored entirely, and only channels actually present
+        in *ownership* are touched — so a peer predating this field, or a
+        snapshot taken while every channel happened to be free, cannot be
+        mistaken for "every lease is free" and clear one this peer or another
+        peer already holds.
+
+        A channel this peer already holds live is left untouched: adoption is
+        for a joiner *learning* the session's ownership view, not for a
+        snapshot overriding state this peer is the current authority on.
+
+        :param ownership: The snapshot's ``broadcast_ownership`` section, or
+            ``None``/empty when absent.
+        """
+        if not ownership:
+            return
+        now = time.monotonic()
+        for channel, info in ownership.items():
+            if channel not in authority.LEASE_CHANNELS:
+                continue
+            owner_guid = info.get("owner_guid")
+            remaining_ms = info.get("remaining_ms")
+            if not owner_guid or remaining_ms is None:
+                continue
+            lease = self._leases[channel]
+            if lease.owner_guid == self.self_guid and lease.deadline and lease.deadline > now:
+                continue
+            lease.owner_guid = owner_guid
+            lease.claim_ts = None
+            lease.deadline = now + max(0.0, remaining_ms / 1000.0)
+            lease.confirmed = True
+            lease.pending_claimant = None
+            _log(f"adopt_ownership: {channel} -> {owner_guid[:8]} ({remaining_ms:.0f}ms remaining)")
+
     def drop_peer(self, peer_guid: str) -> None:
         """Forget a peer and re-elect the host if it held the role.
 
@@ -1282,6 +1640,7 @@ class SyncManager:
             display_state=self.display_state or None,
             host_guid=self.host_guid,
             peers=self._peer_roster(),
+            broadcast_ownership=self._lease_wire_section() or None,
         ))
         # A snapshot publishes every timeline it carries, as surely as an
         # ADD_TIMELINE does for one.
@@ -1320,6 +1679,7 @@ class SyncManager:
             display_state=self.display_state or None,
             host_guid=self.host_guid,
             peers=self._peer_roster(),
+            broadcast_ownership=self._lease_wire_section() or None,
         ).to_payload()
         payload["is_master"] = self.is_master
         payload["is_host"] = self.is_host
@@ -1430,6 +1790,34 @@ class SyncManager:
         )
         return authority.strip_visibility_fields(state), authority.SUPPRESSED
 
+    def _enforce_position(self, state: dict[str, Any], status: str) -> tuple[dict[str, Any], str]:
+        """Strip position fields when this peer does not hold the position lease.
+
+        Called beside :meth:`_enforce_visibility` from :meth:`broadcast_playback_state`,
+        so a single ``PLAYBACK_SETTINGS_1.0`` message can lose either field group,
+        both, or neither, independently.  ``SUPPRESSED`` already means "sent, with
+        some fields stripped", not "not sent" — a message that keeps its position
+        fields but loses visibility (or vice versa) is the normal case, not an
+        edge case (design.md D1).
+
+        :param state: Outgoing state, already passed through :meth:`_enforce_visibility`.
+        :param status: The status so far (SENT/SUPPRESSED from the visibility check).
+        :returns: ``(state_to_send, status)``; *status* becomes SUPPRESSED if
+            position fields are stripped here, even when the visibility check
+            alone would have said SENT.
+        """
+        if self._owns_channel(authority.CHANNEL_POSITION):
+            self._refresh_lease_confirmed(authority.CHANNEL_POSITION)
+            return state, status
+        if not authority.asserts_position(state):
+            return state, status
+        _log(
+            "broadcast_playback_state: stripped position fields"
+            f" — position owned by "
+            f"{(self._leases[authority.CHANNEL_POSITION].owner_guid or 'free')[:8]}"
+        )
+        return authority.strip_position_fields(state), authority.SUPPRESSED
+
     def broadcast_playback_state(
         self,
         state_dict: dict[str, Any],
@@ -1462,6 +1850,7 @@ class SyncManager:
         inner["sync_timestamp"] = time.time()
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
         inner, status = self._enforce_visibility(inner)
+        inner, status = self._enforce_position(inner, status)
         self._send_message(PlaybackSettingsSet.from_payload(inner))
         return status
 
@@ -1524,6 +1913,13 @@ class SyncManager:
         """
         if self._is_syncing or not self.network:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_DISPLAY):
+            _log(
+                "broadcast_display_state: suppressed — display lease held by "
+                f"{(self._leases[authority.CHANNEL_DISPLAY].owner_guid or 'free')[:8]}"
+            )
+            return authority.SUPPRESSED
+        self._refresh_lease_confirmed(authority.CHANNEL_DISPLAY)
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
         self.display_state = inner
@@ -1973,9 +2369,13 @@ class SyncManager:
         if self.status != STATE_SYNCED:
             _log(f"broadcast_move_child: skipped (status={self.status})")
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            _log("broadcast_move_child: skipped (structure lease not held)")
+            return authority.SUPPRESSED
 
         msg = self.patcher.move_child(parent_uuid, child_uuid, to_index)
         if msg:
+            self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
             self._send_message(msg)
             return authority.SENT
         return authority.SUPPRESSED
@@ -1992,10 +2392,13 @@ class SyncManager:
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            return authority.SUPPRESSED
 
         msg = self.patcher.remove_child(parent_uuid, child_uuid)
         if msg:
             _log(f"broadcast_remove_child: removed {child_uuid} from {parent_uuid}")
+            self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
             self._send_message(msg)
             return authority.SENT
         return authority.SUPPRESSED
@@ -2528,6 +2931,9 @@ class SyncManager:
             # Adopt the session's host before any local election runs, so a
             # joiner does not assume the role and fight the incumbent.
             self.adopt_host(snapshot_data.get("host_guid"))
+            # Learn who holds each write lease so this joiner's first scrub
+            # or structural edit doesn't fight the peer already driving.
+            self.adopt_ownership(snapshot_data.get("broadcast_ownership"))
             if "playback_state" in snapshot_data:
                 self.playback_state = snapshot_data["playback_state"]
 
