@@ -12,77 +12,107 @@ CONF_ENV_FILE="/opt/homebrew/etc/rabbitmq/rabbitmq-env.conf" /opt/homebrew/opt/r
 ```
 
 # Demos
+
 * Sync: - do recording.
-   * play
-   * stop
-   * scrub
-   * RGBA toggling
-   * Exposure
-   * colorspace change
-   * Pan/Zoom
+  * play
+  * stop
+  * scrub
+  * RGBA toggling
+  * Exposure
+  * colorspace change
+  * Pan/Zoom
 * Sync 2 - do recording.
-   * Clip Selection
-   * Pen Annotations
-   * Text Annotations (including moving them around)
-   * Shapes
+  * Clip Selection
+  * Pen Annotations
+  * Text Annotations (including moving them around)
+  * Shapes
 * Sync Reorder:
-   * Adding clips
-   * Removing clips
-   * Re-ordering clips
+  * Adding clips
+  * Removing clips
+  * Re-ordering clips
 * Do Varient of sync 2 with play, scrub and sequence, and then convert to OTIO.
 * Show Recording to OTIO.
 
+# Carried out of fix-visibility-authority-bypass (archived 2026-08-09)
+
+Defect 1 was withdrawn on evidence, so these outlived the change that found
+them. Reasoning is in that change's `evidence.md`, soaks 6–8.
+
+* [ ] **Scan-through guard exemptions are dormant, not closed.** `_playing_started_at`
+  is set only by a *remote* play, so the 0.3s `_playing_just_started` exemption
+  opens only when a peer induced playback — which is exactly what made the
+  2026-08-06 symptom possible. Peer-initiated playback is a legitimate feature;
+  when it works on purpose, the hole reopens. Fix: key the exemption on a recent
+  deliberate selection (`max(_last_source_atom_at, _last_selection_change_at)`,
+  as the PSM freshness gate already does), not on recent play.
+* [ ] **Does xStudio playback itself flip Pinned Source Mode?** If so,
+  `_in_single_clip` is not evidence of user intent during playback, and it is the
+  other exemption that let 08-06 through. Untested.
+* [ ] **The host forces `frame=0` + loop on every isolation.** Implicated in three
+  separate symptoms: it armed the scan-through guard, it is the frame-0 bounce in
+  RV, and it leaves playback running after every selection. A behaviour decision —
+  make it deliberately.
+* [ ] **Bin-only media cannot be isolated across peers.** No shared OTIO clip exists
+  to name, so RV declines (honestly, since the `_forget_current_clip` fix). Making
+  it work means minting and announcing a clip timeline for it.
+* [ ] **8 bin sources stay loaded** alongside the sequence's per-clip source groups.
+  Not duplicates; whether RV should hold the whole bin is a product question.
+* [ ] **Rethink xStudio→RV sync: "create what is viewed" rather than replicate
+  xStudio's setup.** Would dissolve bin-vs-sequence guid normalization, the
+  object-map lookup, and bin-only media having nothing to name. Own change.
+* [ ] **`docs/visibility_authority_guards.md` §5.1 is unblocked but undecided.** The
+  objection was retracted 2026-08-09; the zero-fire counts still are not evidence.
+  Needs a fresh soak against current code.
 
 # Todo Critical
 
-- [x] Annotations are still different sizes between RV and xSTUDIO need to investigate.
-- [ ] Need to figure out how to handle regular playlists reordering for xstudio playlists in rv.
-- [x] XStudio plugin for annotations inport/export - currently imports are failing.
-- [ ] Test a media handler, so missing media can be substituted.
-- [x] Test Squares, arrows, and circles from new OpenRV.
-- [ ] Handle x, y flip
-- [ ] Handle play backwards. (xstudio doesnt have a button for this)
-- [x] Need loop controls, do we loop, or rock-and-roll? - started, but not complete.
-- [ ] Changes to frame rate.
+* [x] Annotations are still different sizes between RV and xSTUDIO need to investigate.
+* [ ] Need to figure out how to handle regular playlists reordering for xstudio playlists in rv.
+* [x] XStudio plugin for annotations inport/export - currently imports are failing.
+* [ ] Test a media handler, so missing media can be substituted.
+* [x] Test Squares, arrows, and circles from new OpenRV.
+* [ ] Handle x, y flip
+* [ ] Handle play backwards. (xstudio doesnt have a button for this)
+* [x] Need loop controls, do we loop, or rock-and-roll? - started, but not complete.
+* [ ] Changes to frame rate.
 
 * Creating prototype C++ changes to OTIO, currently its failing running the tests.
 
-
 # TODO Cleanup
+
 - [x] Move loader and saver for RV to export/import menu.
-- [ ] Figure out if we can move the pika install into the plugin for xstudio
-- [ ] README says it needs a OTIO_PLUGIN_MANIFEST_PATH for xstudio. Can we make it part of the plugin.
+* [ ] Figure out if we can move the pika install into the plugin for xstudio
+* [ ] README says it needs a OTIO_PLUGIN_MANIFEST_PATH for xstudio. Can we make it part of the plugin.
 
 # Sync Security and Session Users
+
 - [ ] Sync manager should keep track of who is connected.
-- [ ] Need security controls for who can drive, or modify, or annotate.
-- [ ] Laser pointer.
-- [ ] We should be able to request the state of a particular host, and be able to compare it to what it thinks is there.
-- [x] Update protocol to new format (only slightly different to before).
-- [x] Add in menu options for registering with environment variable for stream-name.
-- [ ] Handle encryption and possibly compression.
+* [ ] Need security controls for who can drive, or modify, or annotate.
+* [ ] Laser pointer.
+* [ ] We should be able to request the state of a particular host, and be able to compare it to what it thinks is there.
+* [x] Update protocol to new format (only slightly different to before).
+* [x] Add in menu options for registering with environment variable for stream-name.
+* [ ] Handle encryption and possibly compression.
 
-- [x] Fix text size issues.
-- [x] Figure out issue with xstudio and timecode in quicktime files.
-
-
+* [x] Fix text size issues.
+* [x] Figure out issue with xstudio and timecode in quicktime files.
 
 # openrv_sync_plugin
 
-- [x] importing full OTIO sessions (Assuming single track).
-- [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
-- [ ] Figure out redraw issue where text gets visually duplicated for a moment. - created test for this - text_annotations_xstudio_to_rv duplicate text not in rv file.
-- [ ] Handle clear annotations.
-- [ ] Revisit testing rvio for annotation rendering.
+* [x] importing full OTIO sessions (Assuming single track).
+* [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
+* [ ] Figure out redraw issue where text gets visually duplicated for a moment. - created test for this - text_annotations_xstudio_to_rv duplicate text not in rv file.
+* [ ] Handle clear annotations.
+* [ ] Revisit testing rvio for annotation rendering.
 
 # XStudio Plugin
 
-- [ ] Add tests for full OTIO sessions - need to understand what options there are (e.g. edits, different frame rates, etc).
-- [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
-- [ ] Handle clear annotations, not clear if we need to handle the undo/redo delete.
-- [x] Handle partial annotations.
-- [ ] Handle Shapes as OTIO objects: draw a Square/Circle/Arrow/Line; confirm **no** mid-drag partial is broadcast and the shape appears only on pen-up.
-- [ ] When selecting a clip, the very first time it will play-once, rather than loop.
+* [ ] Add tests for full OTIO sessions - need to understand what options there are (e.g. edits, different frame rates, etc).
+* [x] Add colorspace OTIO/OCIO attributes and link it to OCIO.
+* [ ] Handle clear annotations, not clear if we need to handle the undo/redo delete.
+* [x] Handle partial annotations.
+* [ ] Handle Shapes as OTIO objects: draw a Square/Circle/Arrow/Line; confirm **no** mid-drag partial is broadcast and the shape appears only on pen-up.
+* [ ] When selecting a clip, the very first time it will play-once, rather than loop.
 
 ## Known Limitations
 
@@ -266,26 +296,24 @@ xStudio UI?  Currently using internal actor calls that may not be the intended p
 
 * Exposure is currently applied to all clips (all RVColor nodes normalized on change). This avoids spurious re-broadcasts when navigating between clips.
 
-
 # Questions for openrv
 
 How to lock out parts of the interface
-
 
 33/42 tasks done. The remaining 9 are all live verification — no more implementation code needed.
 
 The code work is complete. What's left is you running live tests in RV (+xStudio) to confirm:
 
-Task	What to verify
-6.3	Paint a stroke on an OTIO-origin clip; confirm it reaches the peer
-7.2	Run an existing native-timeline test (add/delete/reorder clip); confirm no regression
-8.1	Already covered by otio_import_rv_to_rv passing — just needs checkbox
-8.2	Swap a clip's source file; confirm a whole-OTIO push arrives on peer (not a per-property patch)
-8.3	Trim a cut in/out; confirm it reaches peer via REPLACE_TIMELINE
-8.4	Change OCIO colorspace on an OTIO clip; confirm it syncs
-8.5	Add a clip to the OTIO sequence; confirm REPLACE_TIMELINE reaches peer
-8.6	Connect an older peer with no sync.origin; confirm treated as native
-8.7	Reorder in a native session; confirm MOVE_CHILD still fires, not snapshot
+Task What to verify
+6.3 Paint a stroke on an OTIO-origin clip; confirm it reaches the peer
+7.2 Run an existing native-timeline test (add/delete/reorder clip); confirm no regression
+8.1 Already covered by otio_import_rv_to_rv passing — just needs checkbox
+8.2 Swap a clip's source file; confirm a whole-OTIO push arrives on peer (not a per-property patch)
+8.3 Trim a cut in/out; confirm it reaches peer via REPLACE_TIMELINE
+8.4 Change OCIO colorspace on an OTIO clip; confirm it syncs
+8.5 Add a clip to the OTIO sequence; confirm REPLACE_TIMELINE reaches peer
+8.6 Connect an older peer with no sync.origin; confirm treated as native
+8.7 Reorder in a native session; confirm MOVE_CHILD still fires, not snapshot
 8.2 and 8.3 description in the tasks says "property patch" — worth noting those actually fall back to whole-OTIO push (per the §5 implementation choices), so the assertions should say "REPLACE_TIMELINE arrives" not "SET_PROPERTY arrives". Once you've done the live run, I can check those off and we can archive the change.
 
 ORI_SESSION="amqps://aswf:29a5953658144449ac73385b9e3144eedb76@146.235.219.100:5671/aswf?cacertfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/ca.pem&certfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.crt&keyfile=/Users/sam/git/ORIAnnotations/scratch/RabbitMQCertsandsecrets/aswf-amqps-kit/client.key:samtest"  ORI_SYNC_LOG_FILE=/Users/sam/git/ORIAnnotations/rvplugin/ori_sync/xstudio_host2.log xstudio test_media/source/encoded/*.mov
@@ -295,16 +323,11 @@ ORI_SESSION="amqps://aswf:29a5953658144449ac73385b9e3144eedb76@146.235.219.100:5
 # Openspec changes
 
 * fix-visibility-authority-bypass - Fixing some issues where a client is still affecting the host, and/or ignoring the host.
-* fix-playback-position-echo-loop - NEARLY DONE - Need to do some manual verification, should address SOON.
-* fix-xs-playhead-attribute-subscription - NEARLY DONE - Need some manual verification.
-* xs-detect-deleted-bookmarks - NEED TO VERIFY.
-* xstudio-controller-encapsulation - NEED TO VERIFY.
 
 Later:
+
 * define-neutral-viewport-coordinates - Long term future task - need to define proper viewport coordinates that correctly work across OTIO.
 * network-send-robustness - suspected RV network blocking.
 * rv-plugin-encapsulation - Need some cleanup of rv-plugin, might be fairly straightfoward.
 * session-roles - THE BIG ONE - definately started with host-owned-visibility - not clear what we should do before this.
 * structure-events - xstudio - currently relies on a 1-second periodic poll loop for changes - possibly revamp when we get better playlist listeners.
-
-* 

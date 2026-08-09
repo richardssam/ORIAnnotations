@@ -303,3 +303,111 @@ is load-bearing and was missed twice. Stated operationally:
 - **`Dequeue timeout` on the PSM poll** cost 2.1 s at 12:09:32 and delayed a
   `show_atom` past its selection event. The stale-actor read hazard; unrelated
   to this change.
+
+---
+
+# Soaks 6–8 — 2026-08-09 14:57–15:10 — defect 1 withdrawn
+
+Three runs closed the question this change was opened on. **Defect 1 does not
+exist as described.** A follower's structural message does not move the host's
+view, and did not on 2026-08-06 either. Defect 2 was real and is fixed (4.2).
+
+## Soak 6 (14:57) — the follower's route, exercised properly
+
+First run meeting every condition in "What a reproducing run needs": real
+sequence, follower isolating three clips **on Sequence 1's Video Track**.
+
+```
+14:57:18.110  [rv] view-change sourceGroup000001 → clip 'graphic' e15a5c8b
+14:57:18.121  [rv] announce clip timeline 1f6fd428 → SENT
+14:57:18.207  [xs] ADD_TIMELINE: registered clip_tl=1f6fd428 for seq_clip=e15a5c8b
+              (same for car 14:57:30 and laser 14:57:34)
+```
+
+The host's last selection activity was **14:56:51.697**, 26 s before the first
+isolation. After it: zero `[SEL]` lines, zero view-state broadcasts, zero
+provenance tags. Display unmoved.
+
+Why it cannot move: `SyncManager._h_add_timeline` returns `None` for any
+timeline carrying `clip_timeline_for`, so the host application is never
+notified and no viewer container is built. Only a *full sequence* timeline
+reaches `return ("add_timeline", tl)`. That branch dates to `a6c697a`
+(2026-05-25) — **already in place when the 08-06 evidence was recorded**, so it
+is neither the cause nor a later fix.
+
+## Soak 7 (15:04) — the host's scan-through, follower idle
+
+```
+15:04:52.267  playing=True
+15:04:58.461  [SEL] show_atom name='graphic_ACES_sRGB' container=timeline
+15:04:58.465  [SEL] → suppressed (playing through sequence)
+15:05:01.905  [SEL] show_atom name='laser_ACES_sRGB'   container=timeline
+15:05:01.911  [SEL] → suppressed (playing through sequence)
+```
+
+**graphic, then laser** — the identical pair, in the identical order, that the
+08-06 session recorded as the host following the follower. Produced here with
+the follower doing nothing at all. It is the order those clips sit on the Video
+Track. The correlation was coincidence.
+
+## Soak 8 (15:10) — and why it is currently silent
+
+Play at 15:10:06.764, edit crossed at 15:10:06.953 — **189 ms**, inside the
+0.3 s `_playing_just_started` exemption — and still suppressed.
+
+`_playing_started_at` has exactly one assignment outside init/reset
+(`xstudio_plugin/ori_sync/playback_sync.py`, in the **`RECV playback`** apply
+path). A local user pressing play never sets it, so the subtraction is against
+0.0 and the exemption cannot open. **The 0.3 s window is reachable only when a
+peer induced the playback.**
+
+## Reconstruction of 2026-08-06
+
+Consistent with everything above and with the user's own recollection — *"as
+soon as the client started picking things, it was affecting the frame (but not
+the clip) of the host"*:
+
+1. The follower's position messages drove the **host's play state**.
+2. Being remote-induced, that set `_playing_started_at`, opening the 0.3 s
+   exemption.
+3. 22 ms later (`20:38:24.218` play → `20:38:24.240` show_atom) the host
+   crossed an edit. Exempted, so it broadcast as
+   `new source-clip isolation — forcing frame=0 + loop`.
+4. The second crossing at `20:38:24.932` escaped via the other exemption:
+   `PSM True→False` 17 ms earlier made `_in_single_clip` true.
+5. Read from the outside: the host followed the follower's clips.
+
+Step 1 is reconstruction — only the excerpt in this file survives from that
+session. Steps 2–5 are confirmed against current code and the soaks above.
+
+The chain no longer starts, because `d652343` ("Fixing playback position echo
+loop", 2026-08-06) and the position write leases in `82c0a16` removed the
+remote-induced play. **Not fixed by this change, and not fixed by the guard —
+the trigger was removed from underneath it.**
+
+## Carried forward — the exemptions are dormant, not closed
+
+Both remain, and one is wired to something that will legitimately return:
+
+- **A peer starting playback is a feature, not a bug.** The moment it works on
+  purpose, the 0.3 s window reopens and the first edit crossing after it
+  broadcasts as a deliberate isolation.
+- **The guard cannot do what it documents.** Its comment describes a *local*
+  race — "the poll may already have set `_last_polled_playing` before the
+  show_atom for the user's own click arrives" — yet only a *remote* play arms
+  it. The right signal is a recent deliberate selection
+  (`max(_last_source_atom_at, _last_selection_change_at)`, as the PSM freshness
+  gate already uses), which is independent of who pressed play.
+- **`_in_single_clip` is not evidence of user intent during playback** if
+  playback itself can flip PSM. Untested.
+
+## Disposition
+
+| defect | verdict |
+|---|---|
+| 1 — follower's structure moves the host's view | **withdrawn**; route inert since 2026-05-25, symptom was a position echo surfacing through the scan-through guard |
+| 2 — host cannot pull a diverged follower back | **real, fixed** by 4.2 (`_verified_view` written only on adopted/already-displayed) |
+
+Groups 5–7 lapse with defect 1: §5 would have placed a provenance guard at a
+`return None`. Groups 1, 2, 4 and 3.0 are implemented and landed in `6b17f8a` —
+they stand on their own merits regardless of the defect that motivated them.

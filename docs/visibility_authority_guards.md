@@ -41,22 +41,51 @@ it was:
 > clips, in the same order, seconds later — then broadcast that as visibility,
 > legitimately, because it is the host.
 
-That falsifies the justification stated below: **"a host's transitions are
-user-caused by definition" is false.** The host's transition there was caused by
-a follower's structural message. Enforcement is defined over *fields*; this
-travels through *structure*, where nothing looks at it.
-
 The enforcement this change delivered does work — the field-level rule held
 throughout, and the host correctly rejected the follower's clip-timeline
-position messages. The gap is in scope, not in implementation.
+position messages.
 
-Ownership of the deletion question moves to `fix-visibility-authority-bypass`.
-Re-read that change before removing anything here.
+### Retracted 2026-08-09 — the reading above does not hold
+
+The paragraph quoted above was read as falsifying the justification stated
+below (*"a host's transitions are user-caused by definition"*), on the grounds
+that the host isolated the follower's two clips in the follower's order. That
+inference is **wrong**, and the guard-deletion question is no longer blocked
+by it.
+
+`graphic` then `laser` is simply the order those clips appear on the Video
+Track. Reproduced 2026-08-09 15:04 with the **follower completely idle**: the
+host pressed play, crossed two edits, and emitted the same two
+`container=timeline` `show_atom`s in the same order. Nothing structural was
+received. The host's transition was its own sequence scan-through.
+
+Registering a follower's clip-timeline `ADD_TIMELINE` cannot move the host's
+display at all: `SyncManager._h_add_timeline` returns `None` for any timeline
+carrying `clip_timeline_for`, so the host application is never notified. That
+branch has been in place since 2026-05-25 — it was already closed when the
+20:38 session was recorded, so it cannot be what changed either.
+
+What actually happened on 08-06 is reconstructed in
+`openspec/changes/archive/2026-08-09-fix-visibility-authority-bypass/evidence.md`:
+the follower's position messages drove the *host's play state*, which is the
+only thing that sets `_playing_started_at`, which opened the scan-through
+guard's 0.3 s exemption, which let the next edit crossing broadcast as a
+deliberate isolation. A position echo, surfacing as an apparent clip-follow.
+
+**What this does and does not license.** It removes *this* objection to §5.1.
+It is not itself a reason to delete anything: the original zero-fire counts
+were gathered in a session whose behaviour we now understand differently, so
+they are still not evidence. Deleting these guards needs its own soak, taken
+deliberately, against the current code.
 
 ## Superseded by host-owned visibility — candidates for §5.1
 
-**Blocked — see the status section above.** The premise stated in this
-section's opening paragraph has been falsified by a live soak.
+**Not blocked, not approved — see the retraction above (2026-08-09).** The
+objection that blocked this section has itself been withdrawn: the host
+transition it cited was sequence scan-through, not a follower's structural
+message. What remains is that the zero-fire counts were gathered before that
+was understood, so they are not yet evidence for deletion. Take a fresh soak
+against current code and decide on that.
 
 These exist only to answer "did a user cause this local visibility transition, or
 did applying a peer's message cause it?". Under the follower rule (D3) that

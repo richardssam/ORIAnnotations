@@ -51,21 +51,29 @@
       Claiming the lease instead would not have worked: `_apply_claim` queues
       behind a *confirmed* owner. Also fixes annotation binding for a peer that
       does not hold the lease.
-- [ ] 3.1 Run a two-app soak (xStudio host + OpenRV follower) repeating the
+- [x] 3.1 Run a two-app soak (xStudio host + OpenRV follower) repeating the
       2026-08-06 sequence: follower isolates two clips locally, host stays in
       sequence view. Capture both logs.
-- [ ] 3.2 From the provenance logging (1.3/1.4), name the actual route from the
+- [x] 3.2 From the provenance logging (1.3/1.4), name the actual route from the
       follower's `ADD_TIMELINE` to the host's `source_atom` and PSM flip.
       Record it in `evidence.md` as observed, not inferred.
-- [ ] 3.3 Confirm or refute defect 2's inferred mechanism. Design D5 argues
+- [x] 3.3 Confirm or refute defect 2's inferred mechanism. Design D5 argues
       `mode_changed` was `True` at `20:38:26.899`, so a silent no-op inside
       `_switch_to_sequence_view` is a live alternative. Record which branch the
       2.2 outcome names.
-- [ ] 3.4 Measure the observed delay between the remote apply and the host's
-      display change across the soak; use it to size the settle window in 1.1
-      (design Open Question 2).
-- [ ] 3.5 Sample free memory and swap alongside the soak — swap-induced latency
+- [x] 3.4 **Not applicable.** Measure the delay between a remote apply and the
+      host's display change — there were none to measure across soaks 6-8. The
+      settle window it would have sized feeds §5, which has lapsed. Revisit if
+      provenance is ever acted on.
+- [x] 3.5 Sample free memory and swap alongside the soak — swap-induced latency
       has previously mimicked timing races here.
+
+**Group 3 outcome.** 3.2 was answered in the negative: there is no route. A
+follower's clip-timeline `ADD_TIMELINE` reaches `_h_add_timeline`'s
+`return None` branch (present since `a6c697a`, 2026-05-25) and never notifies
+the host application. Soak 7 reproduced 08-06's exact `show_atom` pair with the
+follower idle — it was the host's own sequence scan-through. **Defect 1 is
+withdrawn.** See `evidence.md`, soaks 6-8.
 
 ## 4. OpenRV compares against the displayed view (D4)
 
@@ -97,47 +105,73 @@
 
 ## 5. The host does not change what it displays because of a peer (D3, D1)
 
-- [ ] 5.1 At the site named by 3.2, classify a display change occurring inside
+**Withdrawn — defect 1 does not exist.** 5.1 would place a provenance guard at
+"the site named by 3.2", and 3.2 found the site is a `return None`. Nothing to
+guard. The tasks are left unedited below so the reasoning can be audited.
+
+- [x] ~~5.1~~ At the site named by 3.2, classify a display change occurring inside
       a provenance window as `remote-induced`, using 1.1's query. Keep this
       distinct from `_selection_broadcast_suppress_until` (own-echo) and
       `_applied_clip_echo_guid` (delayed own-echo) — same shape, opposite
       remedy; they may share a helper but not a variable.
-- [ ] 5.2 If 3.2 shows the route can be prevented outright, prevent it. Only if
+- [x] ~~5.2~~ If 3.2 shows the route can be prevented outright, prevent it. Only if
       it cannot, revert the host to the view it held before the remote message
       arrived. Log every revert with the peer that opened the window.
-- [ ] 5.3 Ensure the host still broadcasts its own genuine visibility changes
+- [x] ~~5.3~~ Ensure the host still broadcasts its own genuine visibility changes
       unchanged — the guard must key on provenance, not on message shape
       (design D3, rejected alternative).
-- [ ] 5.4 Add a test in `tests/otio_sync/` (alongside
+- [x] ~~5.4~~ Add a test in `tests/otio_sync/` (alongside
       `test_broadcast_authority.py`) that a remote structural message applied
       on the host leaves the host's displayed view unchanged and emits no
       visibility broadcast attributable to it.
 
 ## 6. Suite coverage for a follower that changes its own view (D7)
 
-- [ ] 6.1 Add a `sync_test` scenario where the follower isolates a clip
+**Withdrawn with §5** — 6.2 and 6.3 assert the behaviour §5 would have built.
+A follower-isolates-locally scenario is still worth having, but as ordinary
+coverage rather than as a defect regression; carried to `TODO.md`.
+
+- [x] ~~6.1~~ Add a `sync_test` scenario where the follower isolates a clip
       locally — no existing scenario does this, which is why eleven runs missed
       both defects.
-- [ ] 6.2 Assert the host's displayed clip is unchanged after 6.1, and that the
+- [x] ~~6.2~~ Assert the host's displayed clip is unchanged after 6.1, and that the
       host emitted no visibility broadcast caused by it.
-- [ ] 6.3 Assert that a subsequent host sequence instruction is adopted by the
+- [x] ~~6.3~~ Assert that a subsequent host sequence instruction is adopted by the
       diverged follower, and that its recorded outcome is `adopted` — not
       `already-displayed`.
-- [ ] 6.4 Run the suite and confirm both new assertions fail against the
+- [x] ~~6.4~~ Run the suite and confirm both new assertions fail against the
       pre-fix code (revert 4 and 5 locally, or run on a stashed tree) — a test
       that has never failed has not been shown to cover the defect.
 
 ## 7. Close out
 
-- [ ] 7.1 Re-run the soak from 3.1 against the fixed build; confirm zero
+- [x] ~~7.1~~ Re-run the soak from 3.1 against the fixed build; confirm zero
       remote-induced host display changes and that a diverged follower is
       recoverable.
-- [ ] 7.2 Update `docs/visibility_authority_guards.md`: record that the bypass
+- [x] 7.2 Update `docs/visibility_authority_guards.md`: record that the bypass
       is closed, and that the §5.1 guard-deletion decision now needs a fresh
       soak taken after this change — the zero-fire counts from 2026-08-06 are
       not evidence.
-- [ ] 7.3 Unblock `openspec/changes/host-owned-visibility` §5.1 with a pointer
+- [x] 7.3 Unblock `openspec/changes/host-owned-visibility` §5.1 with a pointer
       to 7.1's soak as the evidence it must be re-decided on.
-- [ ] 7.4 Update `evidence.md` with the confirmed mechanisms from 3.2 and 3.3,
+- [x] 7.4 Update `evidence.md` with the confirmed mechanisms from 3.2 and 3.3,
       keeping the original inferred reading marked as superseded rather than
       deleting it.
+
+---
+
+## Disposition (2026-08-09)
+
+Archived with defect 1 **withdrawn on evidence** and defect 2 **fixed**.
+
+Implemented and landed in `6b17f8a`: groups 1, 2, 4 and task 3.0, plus four
+follower-side defects found while trying to reproduce defect 1 (mirroring audio
+tracks duplicating RV source groups; the scan-through guard swallowing bin
+clicks; an unresolvable isolation leaving OpenRV naming a clip it was not
+displaying; field-strip logging firing per message). None of those four was on
+this list — they are recorded in `evidence.md` soaks 3-5.
+
+Withdrawn: groups 5 and 6, and 7.1. The remaining live items are carried in
+`TODO.md` under "Carried out of fix-visibility-authority-bypass", chiefly that
+the scan-through exemptions are dormant rather than closed — the trigger was
+removed by the position-echo fix, not by the guard.
