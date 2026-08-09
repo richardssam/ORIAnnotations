@@ -11,6 +11,18 @@ try:
 except ImportError:
     otio = None
 
+
+def _node_type(node):
+    """``rv.commands.nodeType`` that answers ``None`` for a node RV no longer has.
+
+    The maps outlive the graph — a node deleted elsewhere leaves its entry
+    behind, and asking RV about it raises rather than returning empty.
+    """
+    try:
+        return rv.commands.nodeType(node)
+    except Exception:
+        return None
+
 try:
     from otio_sync_core.manager import STATE_SYNCED
 except ImportError:
@@ -452,6 +464,129 @@ class SequenceSyncController:
                 else:
                     self._otio_dirty = True
 
+    def _release_native_nodes_for_guid(self, guid):
+        """Tear down natively-built sequence nodes registered under *guid*.
+
+        Source groups are left alone: they are shared between graphs and are
+        managed by addSource/deleteNode elsewhere — only the sequence nodes are
+        this GUID's to remove.
+
+        A node that RV refuses to delete (``defaultSequence`` and the other
+        default views raise "can't delete default views") is still
+        **unregistered**.  Leaving it mapped is what creates the ambiguity: one
+        GUID answering to two nodes, with the resolution order deciding which
+        one a peer's instruction lands on.  Unmapped, it stays in the graph as
+        an inert node rather than a second candidate.
+
+        :param guid: Sync GUID whose native nodes should be released.
+        """
+        if not guid:
+            return
+        stale = [
+            node for node, mapped in list(self._rv_node_to_timeline_guid.items())
+            if mapped == guid and _node_type(node) != "RVSourceGroup"
+        ]
+        for node in stale:
+            try:
+                rv.commands.deleteNode(node)
+                _log(f"apply_otio_snapshot: deleted stale native node {node} for {guid[:8]}")
+            except Exception as e:
+                _log(
+                    f"apply_otio_snapshot: could not delete stale native node"
+                    f" {node} for {guid[:8]} ({e}) — unregistering it anyway so the"
+                    " GUID resolves to one node"
+                )
+            self._rv_node_to_timeline_guid.pop(node, None)
+
+    @staticmethod
+    def _clip_media_urls(track):
+        """Every ``target_url`` referenced by the clips on *track*.
+
+        Items without an external media reference (gaps, transitions,
+        generators) contribute nothing, so a track of those answers empty.
+        """
+        urls = set()
+        for item in track:
+            ref = getattr(item, "media_reference", None)
+            url = getattr(ref, "target_url", None)
+            if url:
+                urls.add(str(url))
+        return urls
+
+    def _reader_timeline(self, tl):
+        """Return the timeline to hand to RV's OTIO reader, redundant tracks removed.
+
+        Two kinds of track make the reader build nodes that RV does not want,
+        and both are cheaper to remove here than to unpick from the graph
+        afterwards:
+
+        **Annotations.**  The logical Annotations track carries annotation
+        clips with no media, so the reader would try to build source nodes for
+        them.  The full timeline (with the track) stays registered in the
+        manager for ``annotation_track_guid_for_clip``; only the media tracks
+        are rebuilt into RV nodes.
+
+        **Audio tracks that mirror a video track.**  xStudio exports a parallel
+        Audio track over the same movies (observed 2026-08-09 11:35: a 3-clip
+        Video Track and a 2-clip Audio Track over car/graphic).  RV has no
+        notion that an audio clip is the same *source* as the video clip on the
+        same media, so ``_create_media`` gives each one its own RVSourceGroup
+        holding ``[movie, blank-movieproc]`` and ``_create_stack`` wires a
+        second RVSequenceGroup of those blank-video sources into the same
+        stack.  An RV source already plays its movie's audio, so the track buys
+        nothing and costs a duplicate group per clip.
+
+        Only *redundant* audio is dropped — a track whose media is not already
+        covered by a video track (a separate stem, say) is real audio and is
+        kept, blank video and all.
+
+        :param tl: The received timeline. Never mutated.
+        :returns: *tl* itself when nothing needs removing, else a deep copy.
+        """
+        try:
+            def is_annotations(t):
+                return "annotation" in (t.name or "").lower()
+
+            video_media = set()
+            for track in tl.tracks:
+                if is_annotations(track):
+                    continue
+                if getattr(track, "kind", None) != "Audio":
+                    video_media |= self._clip_media_urls(track)
+
+            drop = []
+            for track in tl.tracks:
+                if is_annotations(track):
+                    drop.append(track.name)
+                    continue
+                if getattr(track, "kind", None) != "Audio":
+                    continue
+                media = self._clip_media_urls(track)
+                # An empty audio track references nothing a video track could
+                # be missing, so it is redundant too.
+                if media <= video_media:
+                    drop.append(track.name)
+                    _log(
+                        f"apply_otio_snapshot: dropping audio track '{track.name}'"
+                        f" ({len(media)} media already on a video track) — RV sources"
+                        " carry their own audio"
+                    )
+            if not drop:
+                return tl
+            reader_tl = copy.deepcopy(tl)
+            keep = [
+                t for t in reader_tl.tracks
+                if not (is_annotations(t) or (
+                    getattr(t, "kind", None) == "Audio"
+                    and self._clip_media_urls(t) <= video_media
+                ))
+            ]
+            reader_tl.tracks[:] = keep
+            return reader_tl
+        except Exception as e:
+            _log(f"apply_otio_snapshot: could not strip redundant tracks: {e}")
+            return tl
+
     def apply_otio_snapshot(self, tl):
         """Build/replace RV nodes for a received OTIO-origin timeline.
 
@@ -484,20 +619,16 @@ class SequenceSyncController:
                 self._otio_stack_to_guid.pop(old_root, None)
             except Exception as e:
                 _log(f"apply_otio_snapshot: could not delete old root {old_root}: {e}")
-        # Strip the logical Annotations track before the reader: it carries only
-        # annotation clips (no media), so create_rv_node_from_otio would try to
-        # build source nodes for them.  The full timeline (with the track) stays
-        # registered in the manager for annotation_track_guid_for_clip; here we
-        # only rebuild the media tracks into RV nodes.
-        reader_tl = tl
-        try:
-            if any("annotation" in (t.name or "").lower() for t in tl.tracks):
-                reader_tl = copy.deepcopy(tl)
-                keep = [t for t in reader_tl.tracks if "annotation" not in (t.name or "").lower()]
-                reader_tl.tracks[:] = keep
-        except Exception as e:
-            _log(f"apply_otio_snapshot: could not strip annotation track: {e}")
-            reader_tl = tl
+        # A timeline first built by the *native* path lives in
+        # _rv_node_to_timeline_guid, not _otio_guid_to_root, so the teardown
+        # above finds nothing and leaves it behind.  ``add_timeline`` picks its
+        # builder by origin but ``replace_timeline`` always lands here, so any
+        # natively-built timeline that is later replaced ends up with two live
+        # graphs claiming one GUID — observed 2026-08-08 22:35, where
+        # RVSequenceGroup 'Sequence 1' and Stack 'tracks' both answered to
+        # c744cb45.
+        self._release_native_nodes_for_guid(guid)
+        reader_tl = self._reader_timeline(tl)
         try:
             rv.commands.addSourceBegin()
             try:
@@ -532,6 +663,11 @@ class SequenceSyncController:
         except Exception:
             pass
         _log(f"apply_otio_snapshot: built nodes for {guid[:8]} root={root}")
+        # RV's reader adds a source per clip without consulting what is already
+        # loaded, and nothing here removes the previous set — so this is the
+        # point at which duplicates would appear.  Dumped every time so the
+        # growth is attributable to a specific rebuild rather than inferred.
+        self.log_source_group_inventory(f"after otio rebuild of {guid[:8]}")
 
     def _replay_otio_annotations(self, tl):
         """Re-apply any persisted annotations for clips in *tl* onto new RV nodes.
@@ -965,29 +1101,92 @@ class SequenceSyncController:
             pass
         return []
 
+    def media_path_for_source_group(self, sg):
+        """Return the media path *sg* is showing, or ``None``.
+
+        Read from the node itself.  The obvious alternative — inverting
+        :meth:`_path_to_source_group_map` — is wrong whenever two source groups
+        show the same media: that map is keyed by *path*, so the second group
+        overwrites the first and the inverse has no answer for the loser.
+
+        Duplicate source groups are normal here, not exceptional: each rebuild
+        of a timeline's nodes can load the same media again. On 2026-08-09
+        08:47 a user isolated one of the duplicates and the isolation was
+        dropped without a broadcast — the map knew 8 source groups, one per
+        media file, and the node on screen was not one of them.
+
+        :param sg: RVSourceGroup node name.
+        :returns: Normalised media path, or ``None`` for a placeholder or a
+            group with no file source.
+        """
+        try:
+            for n in rv.commands.nodesInGroup(sg):
+                if rv.commands.nodeType(n) == "RVFileSource":
+                    path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
+                    if path and not self._is_placeholder_movie(path):
+                        return _media_path(path)
+        except Exception:
+            pass
+        return None
+
+    def log_source_group_inventory(self, why):
+        """Log every RVSourceGroup and the media it shows, flagging duplicates.
+
+        Diagnostic for the accumulation this plugin cannot prevent: the native
+        loader calls addSource only for paths not already loaded, but
+        ``apply_otio_snapshot`` hands the timeline to RV's own
+        ``create_rv_node_from_otio``, which builds a source per clip with no
+        such check — and the teardown there deliberately leaves source groups
+        alone.  Every REPLACE_TIMELINE can therefore add another full set.
+
+        :param why: Short reason, logged alongside, so the dump is attributable.
+        """
+        try:
+            groups = list(rv.commands.nodesOfType("RVSourceGroup"))
+        except Exception:
+            _log(f"source-group inventory ({why}): could not list nodes")
+            return
+        by_path = {}
+        for sg in groups:
+            by_path.setdefault(self.media_path_for_source_group(sg), []).append(sg)
+        dupes = {p: sgs for p, sgs in by_path.items() if p and len(sgs) > 1}
+        _log(
+            f"source-group inventory ({why}): {len(groups)} groups,"
+            f" {len([p for p in by_path if p])} distinct media,"
+            f" {len(dupes)} duplicated"
+        )
+        for path, sgs in sorted(by_path.items(), key=lambda kv: str(kv[0])):
+            label = os.path.basename(path) if path else "<no media>"
+            _log(f"  {label}: {sgs}")
+
     def _path_to_source_group_map(self):
-        """Return {path: source_group_node_name} for all currently loaded RVSourceGroups."""
+        """Return {path: source_group_node_name} for all currently loaded RVSourceGroups.
+
+        Lossy by construction when several source groups share one media file —
+        only the last wins.  Fine for "which node should I show for this
+        media?"; use :meth:`media_path_for_source_group` for the reverse
+        question, which this map cannot answer for a duplicate.
+        """
         mapping = {}
         for sg in rv.commands.nodesOfType("RVSourceGroup"):
-            try:
-                for n in rv.commands.nodesInGroup(sg):
-                    if rv.commands.nodeType(n) == "RVFileSource":
-                        path = rv.commands.getStringProperty(f"{n}.media.movie")[0]
-                        if path and not self._is_placeholder_movie(path):
-                            mapping[_media_path(path)] = sg
-            except Exception:
-                pass
+            path = self.media_path_for_source_group(sg)
+            if path:
+                mapping[path] = sg
         return mapping
 
     def _check_sequence_reorders(self):
         """Detect clip deletions and reorders in any tracked sequence and broadcast patches."""
         if not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
             return
-        path_to_sg = self._path_to_source_group_map()
-        for path, sg in path_to_sg.items():
-            self._sg_to_path_cache[sg] = path
-        sg_to_path = {v: k for k, v in path_to_sg.items()}
         source_groups_set = set(rv.commands.nodesOfType("RVSourceGroup"))
+        # Per node rather than by inverting the path-keyed map, which holds one
+        # source group per media file and so cannot name the duplicates.
+        sg_to_path = {}
+        for sg in source_groups_set:
+            path = self.media_path_for_source_group(sg)
+            if path:
+                sg_to_path[sg] = path
+                self._sg_to_path_cache[sg] = path
         for seq_group, tl_guid in list(self._rv_node_to_timeline_guid.items()):
             # Use nodeConnections order — this is what changes when the user drags clips
             # (nodesOfType order is stable and does not reflect drag reorders).

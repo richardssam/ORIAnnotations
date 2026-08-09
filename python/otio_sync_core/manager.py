@@ -119,6 +119,49 @@ PEER_HEARTBEAT_INTERVAL = 5.0
 #: re-election.  A peer wrongly dropped restores itself on its next heartbeat.
 PEER_LIVENESS_TIMEOUT = 15.0
 
+#: Seconds after a remote apply returns during which a local change is still
+#: attributed to the peer whose message caused it.
+#:
+#: A remote message rarely changes the display from inside :meth:`apply_patch`.
+#: It changes what the host application *holds*, and the display follows through
+#: that application's own event or poll machinery — in the 2026-08-06 soak, 3.3 s
+#: after the ``ADD_TIMELINE`` that started it.  A window that closed when the
+#: apply returned would therefore see none of the changes it exists to attribute.
+#:
+#: This value is a starting point taken from that single trace and is expected to
+#: be re-sized from the traces the provenance logging itself produces.  Too short
+#: misses the attribution; too long risks blaming a peer for a host action taken
+#: moments later, which is why the window records *which* peer and is logged
+#: rather than acted on silently.
+REMOTE_APPLY_SETTLE_SECONDS = 5.0
+
+#: ``(command_schema, event)`` pairs that open no provenance window, because
+#: they cannot change what any peer displays.
+#:
+#: Found the hard way.  The first soak with provenance logging tagged all 12
+#: host selection events "remote-induced?", every one of them blaming
+#: ``LiveSession.1/PEER_ANNOUNCE`` — the 5-second liveness heartbeat, against a
+#: 5-second settle window.  158 heartbeats arrived over that session, so the
+#: window was open essentially all the time and the signal said "a peer did
+#: this" about a user clicking in their own bin.  A provenance window that never
+#: closes is worse than none: it would have the host reverting its own user's
+#: actions.
+#:
+#: This is a denylist, not an allowlist, and deliberately so.  A message type
+#: added later defaults to *being tracked*; the failure mode of that default is
+#: an over-attribution that shows up in a log, while the failure mode of the
+#: opposite default is the bypass this change exists to close, silently
+#: reopened.  ``STATE_SNAPSHOT`` is absent on purpose — it carries structure.
+NON_DISPLAY_EVENTS = frozenset({
+    ("LiveSession.1", "WHO_IS_MASTER"),
+    ("LiveSession.1", "I_AM_MASTER"),
+    ("LiveSession.1", "PEER_ANNOUNCE"),
+    ("LiveSession.1", "PEER_DEPART"),
+    ("LiveSession.1", "STATE_REQUEST"),
+    ("BROADCAST_OWNERSHIP_1.0", "CLAIM_OWNERSHIP"),
+    ("BROADCAST_OWNERSHIP_1.0", "RELEASE_OWNERSHIP"),
+})
+
 
 @dataclass
 class OwnershipLease:
@@ -292,6 +335,29 @@ class SyncManager:
         #: they are applied rather than buffered straight back onto the list
         #: being iterated.
         self._replaying: bool = False
+
+        #: Clip timelines this peer has announced, so :meth:`broadcast_clip_timeline`
+        #: sends each once without the callers having to decide.
+        self._announced_clip_timelines: set[str] = set()
+
+        #: Per-category ``(last_logged_key, repeats_since)`` for the field-strip
+        #: logs (see :meth:`_log_field_strip`).
+        self._strip_log_runs: dict[str, tuple[Any, int]] = {}
+
+        #: Remote-apply provenance (see :meth:`remote_apply_context`).  A stack
+        #: rather than a flag because a handler may itself apply a message: a
+        #: single "source" field would be left holding the inner message's peer
+        #: after the inner apply returned, and a depth counter alone loses which
+        #: peer the surviving frame belongs to.
+        self._remote_apply_stack: list[dict[str, Any]] = []
+        #: The most recently completed apply, kept for the settle window.  None
+        #: until the first remote message is applied.
+        self._remote_apply_settled: dict[str, Any] | None = None
+        #: Seconds after an apply returns during which a local change is still
+        #: attributable to the peer that sent it.  A display change reaches the
+        #: host application through its own event/poll machinery, so it lands
+        #: *after* the apply returns, not inside it.
+        self.remote_apply_settle_seconds: float = REMOTE_APPLY_SETTLE_SECONDS
 
         #: Sync GUIDs the session has actually seen — carried in a structural
         #: message this peer sent, or in one it received.  Deliberately *not*
@@ -568,7 +634,7 @@ class SyncManager:
         )
         return clip_tl_guid
 
-    def broadcast_add_timeline(self, tl_guid: str) -> str:
+    def broadcast_add_timeline(self, tl_guid: str, lease_gated: bool = True) -> str:
         """Broadcast a timeline to all peers so they can register it.
 
         Works for both sequence timelines (new playlist / new sequence) and
@@ -577,18 +643,36 @@ class SyncManager:
         all connected peers.  Peers that already hold the same GUID silently
         ignore the message.
 
+        Every suppression is logged.  It used to return ``SUPPRESSED`` from
+        three branches without a word, and that is how a follower's clip
+        timelines went unannounced across two full soaks with nobody able to see
+        why: the message simply was not there.
+
         :param tl_guid: GUID of the timeline to broadcast.
+        :param lease_gated: Whether the structure write-lease is required.  See
+            :meth:`broadcast_clip_timeline` for the one case that passes False.
         :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
         :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
+            _log(
+                f"broadcast_add_timeline: suppressed {tl_guid[:8]}"
+                f" — not synced (status={self.status})"
+            )
             return authority.SUPPRESSED
-        if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+        if lease_gated and not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            owner = self._leases[authority.CHANNEL_STRUCTURE].owner_guid
+            _log(
+                f"broadcast_add_timeline: suppressed {tl_guid[:8]}"
+                f" — no structure lease (owner={(owner or 'free')[:8]})"
+            )
             return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
         if tl is None:
+            _log(f"broadcast_add_timeline: suppressed {tl_guid[:8]} — no such timeline")
             return authority.SUPPRESSED
-        self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
+        if lease_gated:
+            self._refresh_lease_confirmed(authority.CHANNEL_STRUCTURE)
         self._send_message(
             AddTimeline(
                 timeline_guid=tl_guid,
@@ -609,13 +693,43 @@ class SyncManager:
         already have the timeline (same deterministic GUID) will skip the
         ``ADD_TIMELINE`` message.
 
-        Delegates to :meth:`broadcast_add_timeline`.
+        **Not gated on the structure write-lease**, unlike every other
+        structural broadcast.  The lease exists to stop two peers making
+        conflicting structural *mutations*; this is not one.  A clip timeline's
+        GUID comes from :meth:`_derive_guid`, so every peer computes the same
+        one from the same clip, and :meth:`_h_add_timeline` ignores a GUID it
+        already holds.  Two peers announcing the same clip timeline therefore
+        cannot conflict — the second message is a no-op by construction.
+
+        Gating it did real damage.  A peer that did not hold the structure
+        lease had these dropped silently, including from the annotation paths
+        that need the peer to register the Annotations track before an
+        ``INSERT_CHILD`` can bind to it.  Claiming the lease here instead would
+        not fix it: :meth:`_apply_claim` queues a claim behind a *confirmed*
+        owner rather than granting it, so the announcement would still be
+        dropped whenever another peer was actively doing structural work — the
+        case where a race is most likely, and the failure would be silent again.
+
+        Announced at most once per clip timeline, tracked here rather than by
+        the callers.  Every call site used to gate on
+        ``clip_guid not in _clip_timelines`` — "did *I* create this?" — when the
+        question is "have my peers been told?".  A clip timeline this peer built
+        while *applying a remote instruction* answers no to the first and yes to
+        the second, so it was never announced to anyone; on 2026-08-09 08:58 an
+        isolation went unannounced for exactly that reason, and the annotation
+        paths carry the same gate, where the cost is an INSERT_CHILD the peer
+        cannot bind.
 
         :param tl_guid: GUID of the clip timeline to broadcast.
         :returns: ``SENT`` / ``SUPPRESSED``, as :meth:`broadcast_add_timeline`.
         :rtype: str
         """
-        return self.broadcast_add_timeline(tl_guid)
+        if tl_guid in self._announced_clip_timelines:
+            return authority.SUPPRESSED
+        status = self.broadcast_add_timeline(tl_guid, lease_gated=False)
+        if status == authority.SENT:
+            self._announced_clip_timelines.add(tl_guid)
+        return status
 
     def broadcast_timeline_rename(self, tl_guid: str, new_name: str) -> str:
         """Rename a timeline locally and broadcast the change to all peers.
@@ -1764,6 +1878,42 @@ class SyncManager:
             self._send_message(msg)
             self._note_session_guids(child_obj)
 
+    #: Emit a field-strip line every this many identical repeats, so a long
+    #: unchanging run still shows its scale without waiting for it to end.
+    STRIP_LOG_HEARTBEAT = 100
+
+    def _log_field_strip(self, category: str, key: Any, message: str) -> None:
+        """Log a field strip once per distinct *key*, not once per message.
+
+        A follower broadcasts position on every rendered frame while the user
+        scrubs, and each of those messages is stripped.  Logging each one buried
+        the log: the 2026-08-09 12:27 session recorded 36 identical
+        ``stripped visibility fields`` lines in three minutes, all naming the
+        same clip.  What a reader needs is *that* it happened, for which view,
+        and roughly how often — never 36 copies.
+
+        A run that is still in progress is not silent: every
+        :attr:`STRIP_LOG_HEARTBEAT` repeats emits a line, so a peer stuck
+        stripping the same field group for minutes still says so.  The trailing
+        count is folded into the line that ends the run.
+
+        :param category: Field group being stripped; runs are tracked per group
+            so visibility and position do not mask each other.
+        :param key: What makes this strip distinct — repeats collapse when equal.
+        :param message: The line to log when the run changes.
+        """
+        prev_key, repeats = self._strip_log_runs.get(category, (None, 0))
+        if key == prev_key:
+            repeats += 1
+            self._strip_log_runs[category] = (key, repeats)
+            if repeats % self.STRIP_LOG_HEARTBEAT == 0:
+                _log(f"{message} (still, {repeats} identical so far)")
+            return
+        if repeats:
+            message = f"{message} — previous run repeated {repeats}x"
+        self._strip_log_runs[category] = (key, 0)
+        _log(message)
+
     def _enforce_visibility(self, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
         """Strip visibility fields when this peer is not the host.
 
@@ -1783,10 +1933,14 @@ class SyncManager:
             return state, authority.SENT
         if not authority.asserts_visibility(state):
             return state, authority.SENT
-        _log(
+        view_mode = state.get("view_mode")
+        clip_guid = state.get("clip_guid")
+        self._log_field_strip(
+            authority.VISIBILITY,
+            (view_mode, clip_guid, self.host_guid),
             "broadcast_playback_state: stripped visibility fields"
-            f" (mode={state.get('view_mode')!r} clip={(state.get('clip_guid') or '-')[:8]})"
-            f" — host is {(self.host_guid or 'unelected')[:8]}"
+            f" (mode={view_mode!r} clip={(clip_guid or '-')[:8]})"
+            f" — host is {(self.host_guid or 'unelected')[:8]}",
         )
         return authority.strip_visibility_fields(state), authority.SUPPRESSED
 
@@ -1811,10 +1965,12 @@ class SyncManager:
             return state, status
         if not authority.asserts_position(state):
             return state, status
-        _log(
+        owner = self._leases[authority.CHANNEL_POSITION].owner_guid
+        self._log_field_strip(
+            authority.CHANNEL_POSITION,
+            owner,
             "broadcast_playback_state: stripped position fields"
-            f" — position owned by "
-            f"{(self._leases[authority.CHANNEL_POSITION].owner_guid or 'free')[:8]}"
+            f" — position owned by {(owner or 'free')[:8]}",
         )
         return authority.strip_position_fields(state), authority.SUPPRESSED
 
@@ -2448,11 +2604,81 @@ class SyncManager:
             return None
 
         self._is_syncing = True
+        # Session plumbing and lease bookkeeping cannot move anyone's view, so
+        # they open no window — see NON_DISPLAY_EVENTS for what happens when
+        # they do.
+        track_provenance = (command_schema, event) not in NON_DISPLAY_EVENTS
+        if track_provenance:
+            self._remote_apply_stack.append({
+                "source": source,
+                "command_schema": command_schema,
+                "event": event,
+                "started_at": time.monotonic(),
+            })
         try:
             msg = msg_cls.from_payload(data)
             return handler(msg, data, source)
         finally:
+            if track_provenance:
+                frame = self._remote_apply_stack.pop()
+                frame["ended_at"] = time.monotonic()
+                self._remote_apply_settled = frame
             self._is_syncing = False
+
+    def remote_apply_context(self) -> "dict[str, Any] | None":
+        """What remote message, if any, this moment is attributable to.
+
+        Returns ``None`` when nothing a peer sent can account for what is
+        happening now; otherwise a dict describing the apply::
+
+            {"source": peer_guid, "command_schema": ..., "event": ...,
+             "age": seconds_since_the_apply_started,
+             "settling_for": seconds_since_it_returned or None,
+             "in_apply": bool}
+
+        Callers use this to tell *a peer caused this* from *the user did this*.
+        Every other signal available at the point a display change is noticed —
+        which container the media sits in, whether playback is running, whether
+        the guid matches one recently applied — is a proxy for that question,
+        and the bypass this exists to close is the case where every proxy
+        answers "the user" and the true answer is "a peer" (see
+        ``fix-visibility-authority-bypass`` design D2/D3).
+
+        ``in_apply`` is False during the settle window, when the apply has
+        returned and the host application's own machinery is still reacting to
+        it.  That is where a display change is normally observed, so the window
+        is the point of the method rather than a tolerance on it.
+
+        Read from a different thread than the one applying (the host plugins
+        poll).  The stack is only appended to and popped from, and the settled
+        frame is replaced by whole-object assignment, so a reader sees either
+        the old frame or the new one, never a half-written one.
+        """
+        now = time.monotonic()
+        if self._remote_apply_stack:
+            frame = self._remote_apply_stack[-1]
+            return {
+                "source": frame["source"],
+                "command_schema": frame["command_schema"],
+                "event": frame["event"],
+                "age": now - frame["started_at"],
+                "settling_for": None,
+                "in_apply": True,
+            }
+        frame = self._remote_apply_settled
+        if frame is None:
+            return None
+        settling_for = now - frame["ended_at"]
+        if settling_for > self.remote_apply_settle_seconds:
+            return None
+        return {
+            "source": frame["source"],
+            "command_schema": frame["command_schema"],
+            "event": frame["event"],
+            "age": now - frame["started_at"],
+            "settling_for": settling_for,
+            "in_apply": False,
+        }
 
     # ------------------------------------------------------------------
     # Receive-side handlers (registered in ``self._handlers``)

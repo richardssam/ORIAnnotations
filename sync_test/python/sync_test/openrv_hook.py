@@ -28,6 +28,10 @@ def get_openrv_state():
         # follower mirrors rather than approximates, so this is how a mirror
         # failure becomes visible instead of looking like agreement.
         "view_mirror_error": None,
+        # What became of the last remote view instruction: {"outcome": one of
+        # adopted|already-displayed|declined|failed, "reason", "view_mode",
+        # "clip_guid", "timeline_guid", "at"}. None before the first one.
+        "view_outcome": None,
         # Per-channel write-lease state ({"position"|"display"|"structure":
         # {"owner_guid", "remaining_ms"}}), omitted per-channel when free.
         # Differs between peers by construction, like is_host/host_guid.
@@ -61,6 +65,13 @@ def get_openrv_state():
             _pb = otio_sync_core.get_registered_playback_controller()
             if _pb is not None:
                 state["view_mirror_error"] = getattr(_pb, "mirror_failure", None)
+                # What became of the last remote view instruction — adopted,
+                # already-displayed, declined, or failed — and why.  Reporting
+                # only the failure left "quietly ignored the host" looking
+                # identical to "complied", which is how a six-second divergence
+                # went unrecorded at both ends.
+                _outcome = getattr(_pb, "view_outcome", None)
+                state["view_outcome"] = dict(_outcome) if _outcome else None
         except Exception:
             pass
         # Report the 1-indexed LOCAL frame (frame - frameStart + 1) rather than

@@ -1204,11 +1204,14 @@ class AnnotationSyncController:
                     clip_guid, preferred_timeline_guid=self.plugin.sync_manager.active_timeline_guid
                 )
                 if not annotation_track_guid:
-                    is_new = clip_guid not in self.plugin.sync_manager._clip_timelines
                     clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
                     if clip_tl_guid:
-                        if is_new:
-                            self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
+                        # Unconditional — the manager announces each clip
+                        # timeline once.  Gating on local creation meant a clip
+                        # timeline built during a remote apply was never
+                        # announced, and the peer then had no Annotations track
+                        # to bind this INSERT_CHILD to.
+                        self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
                         self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
                         annotation_track_guid = self.plugin.sync_manager.annotation_track_guid_for_clip(
                             clip_guid, preferred_timeline_guid=self.plugin.sync_manager.active_timeline_guid
@@ -1259,11 +1262,10 @@ class AnnotationSyncController:
                 # No track yet (e.g. flat-playlist first annotation) — create the
                 # clip timeline locally and broadcast it so xStudio registers the
                 # Annotations track, then re-look up.
-                is_new = clip_guid not in self.plugin.sync_manager._clip_timelines
                 clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
                 if clip_tl_guid:
-                    if is_new:
-                        self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
+                    # Unconditional — see the sibling call above.
+                    self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
                     self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
                     annotation_track_guid = self.plugin.sync_manager.annotation_track_guid_for_clip(
                         clip_guid,

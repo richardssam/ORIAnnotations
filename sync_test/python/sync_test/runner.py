@@ -215,6 +215,16 @@ def _format_observed(states, app_names):
                 desc += " host" if state["is_host"] else " follower"
             if state.get("view_mirror_error"):
                 desc += f" MIRROR-FAILED({state['view_mirror_error']})"
+            # A *declined* instruction is reported but does not fail: declining
+            # can be correct (a sequence-mode clip change tracks the playhead,
+            # not a selection). What must never happen again is it being
+            # invisible — "received the host's view and did nothing" read
+            # exactly like "complied" for the six seconds a session stayed
+            # diverged. Adopted/already-displayed are the normal case and stay
+            # out of the line.
+            _vo = state.get("view_outcome") or {}
+            if _vo.get("outcome") == "declined":
+                desc += f" VIEW-DECLINED({_vo.get('reason')})"
             if state.get("unresolved_patches"):
                 desc += f" UNRESOLVED-PATCHES({len(state['unresolved_patches'])})"
             if state.get("unpublished_parents"):
@@ -552,10 +562,16 @@ class TestRunner:
             # differs by network latency and local clock reading, so it is
             # never a structural-equality criterion either.
             # `view_mirror_error` is checked explicitly above.
+            # `view_outcome` is per-peer by construction — only a follower
+            # receives view instructions at all, and the record carries a
+            # wall-clock `at`, so structural equality on it would fail every
+            # comparison. It is reported in the observed line and available to
+            # assertions instead.
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
                            "is_host", "host_guid", "view_mirror_error",
+                           "view_outcome",
                            "unresolved_patches", "unpublished_parents",
                            "media_count", "broadcast_ownership"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}

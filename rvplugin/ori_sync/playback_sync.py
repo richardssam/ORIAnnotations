@@ -1,3 +1,5 @@
+import time
+
 import rv.commands
 
 try:
@@ -11,12 +13,28 @@ except ImportError:
     STATE_SYNCED = "synced"
 
 try:
-    from otio_sync_core.authority import SUPPRESSED, CHANNEL_POSITION
+    from otio_sync_core.authority import SUPPRESSED, CHANNEL_POSITION, POSITION_FIELDS
 except ImportError:
     SUPPRESSED = "SUPPRESSED"
     CHANNEL_POSITION = "position"
+    POSITION_FIELDS = ("current_time", "playing", "playback_mode")
 
 from utils import _log, _log_exc, _media_path, _clip_effective_range
+
+def _same_view(a, b):
+    """Whether two view-outcome records describe the same outcome for the same view.
+
+    Used to collapse a run of identical outcomes into one log line: in sequence
+    mode every position message carries the view too, so an unchanged view
+    otherwise reports itself dozens of times a second.
+    """
+    if not a or not b:
+        return False
+    return all(
+        a.get(k) == b.get(k)
+        for k in ("outcome", "view_mode", "clip_guid", "timeline_guid")
+    )
+
 
 # rv.commands.playMode()/setPlayMode() <-> wire playback_mode string.
 _PLAY_MODE_TO_WIRE = {0: "loop", 1: "play-once", 2: "ping-pong"}
@@ -35,19 +53,29 @@ class PlaybackSyncController:
         self._cur_clip_guid = None
         # Last playback mode received from a peer.
         self._cur_playback_mode = "loop"
-        # Last view-state actually applied from a remote message, used to
-        # detect real transitions (mode/clip/timeline change) vs. a clip
-        # changing under continuous playhead motion in sequence mode, which
-        # must NOT re-trigger a view switch (position is authoritative there).
-        self._last_applied_view_mode = None
-        self._last_applied_clip_guid = None
-        self._last_applied_tl_guid = None
-        # Set when the host's reported view could not be shown here, and
-        # surfaced through the test inspector's /state.  A follower mirrors the
-        # host rather than approximating it (D4), so an unshowable view has to
-        # be reported: silently displaying the nearest local match is what made
-        # the wrong-clip divergence invisible.
-        self.mirror_failure = None
+        # Shortcut for "this instruction is already satisfied":
+        # ``(view_mode, clip_guid, timeline_guid, view_node)`` for the last
+        # instruction that demonstrably landed.  Not a record of what RV shows —
+        # the fourth element is re-checked against the live ``viewNode()`` before
+        # the shortcut is taken, so a local view change invalidates it, and it is
+        # cleared outright when an instruction is declined or fails.
+        self._verified_view = None
+        # What became of the last remote view instruction, and why — surfaced
+        # through the test inspector's /state.  A follower mirrors the host
+        # rather than approximating it (D4), so an unshowable view has to be
+        # reported: silently displaying the nearest local match is what made the
+        # wrong-clip divergence invisible.
+        #
+        # Reporting only *failures* left the same hole one step over.  A
+        # follower that received the host's view and quietly did nothing looked
+        # exactly like one that complied — in the 2026-08-06 soak a peer ignored
+        # `mode=sequence` for six seconds and produced no record at either end.
+        # So every exit from the view block records one of four outcomes, and
+        # "did nothing" is one of them.
+        self.view_outcome = None
+        # Backs the :attr:`mirror_failure` property.  Sticky: set on a failure,
+        # cleared only when the follower next agrees with the host (D6).
+        self._mirror_failure_reason = None
 
     def _frame_base(self):
         """Return the RV frame that corresponds to protocol position 0.
@@ -72,27 +100,139 @@ class PlaybackSyncController:
         except Exception:
             return 1
 
-    def _report_mirror_failure(self, detail):
-        """Record and log that the host's reported view could not be shown.
+    #: The four things that can become of a remote view instruction.  Exactly
+    #: one is recorded per instruction; there is deliberately no fifth meaning
+    #: "nothing happened", because that is what the soak could not distinguish
+    #: from compliance.
+    VIEW_ADOPTED = "adopted"                      # a view switch was performed
+    VIEW_ALREADY_DISPLAYED = "already-displayed"  # already showing it
+    VIEW_DECLINED = "declined"                    # deliberately not actioned
+    VIEW_FAILED = "failed"                        # attempted, could not complete
 
-        A follower that cannot adopt the host's view reports the failure rather
-        than substituting its closest local approximation (D4).  The record is
-        read back by the sync_test inspector, so a test can catch "same timeline
-        name, different clip" instead of the two peers silently disagreeing.
+    #: Outcomes that mean the follower and the host agree about what is shown.
+    _VIEW_OK = (VIEW_ADOPTED, VIEW_ALREADY_DISPLAYED)
 
-        :param detail: Human-readable reason, e.g. ``"no source group for …"``.
+    @property
+    def mirror_failure(self):
+        """Reason the host's view could not be shown, or ``None``.
+
+        Kept so the pre-existing readers — the inspector, ``openrv_hook``, the
+        suite's ``VIEW_MIRROR_FAILED`` check — see exactly what they saw before:
+        a string on a hard failure, ``None`` otherwise.
+
+        A *declined* instruction deliberately does not surface here.  Declining
+        can be correct (a sequence-mode clip change under a moving playhead is
+        not an isolation request), so routing it into the failure channel would
+        turn every scrub into a suite failure.  It is reported as its own
+        outcome instead, on :attr:`view_outcome`.
+
+        This is sticky across a decline: it survives until the follower next
+        actually agrees with the host, because a failure followed by a decline
+        is still a peer that cannot show what the host is showing.
         """
-        self.mirror_failure = detail
-        _log(f"MIRROR FAILED: {detail}")
+        return self._mirror_failure_reason
+
+    def _record_view_outcome(self, outcome, reason=None, view_mode=None,
+                             clip_guid=None, timeline_guid=None):
+        """Record what became of the host's view instruction, and why.
+
+        The record is read back by the sync_test inspector, so a test can catch
+        "same timeline name, different clip" — or "instruction quietly ignored"
+        — instead of the two peers silently disagreeing.
+
+        :param outcome: One of the four ``VIEW_*`` constants.
+        :param reason: Human-readable detail; required for declined/failed.
+        """
+        previous = self.view_outcome
+        self.view_outcome = {
+            "outcome": outcome,
+            "reason": reason,
+            "view_mode": view_mode,
+            "clip_guid": clip_guid,
+            "timeline_guid": timeline_guid,
+            "at": time.time(),
+        }
+        if outcome in self._VIEW_OK:
+            self._mirror_failure_reason = None
+            # `already-displayed` is the outcome a stale comparison hides
+            # behind: it is what "I ignored the host because I think I already
+            # match" reports as.  Leaving it silent put it back out of reach of
+            # the logs — the 2026-08-08 21:08 soak recorded ~124 of them and
+            # showed none.  Log it, but only when it *changes*, so a steady
+            # stream of position messages carrying an unchanged view does not
+            # drown the log the way logging every one would.
+            if outcome == self.VIEW_ALREADY_DISPLAYED and not _same_view(previous, self.view_outcome):
+                _log(
+                    f"VIEW ALREADY-DISPLAYED: mode={view_mode}"
+                    f" clip={str(clip_guid or '-')[:8]} tl={str(timeline_guid or '-')[:8]}"
+                    f" — {reason}"
+                )
+            return
+        if outcome == self.VIEW_FAILED:
+            self._mirror_failure_reason = reason
+        label = "MIRROR FAILED" if outcome == self.VIEW_FAILED else "VIEW DECLINED"
+        _log(f"{label}: {reason}")
         try:
             import sys
-            print(f"[OTIOSync] Cannot show the host's view: {detail}", file=sys.stderr)
+            verb = ("Cannot show" if outcome == self.VIEW_FAILED
+                    else "Did not adopt")
+            print(f"[OTIOSync] {verb} the host's view: {reason}", file=sys.stderr)
         except Exception:
             pass
 
-    def _clear_mirror_failure(self):
-        """Clear any recorded mirror failure after a successful view adoption."""
-        self.mirror_failure = None
+    def _displayed_view(self):
+        """Return ``(view_mode, view_node, timeline_guid)`` for what RV shows now.
+
+        Read from ``rv.commands.viewNode()`` — the application, not a variable
+        this class maintains.  Anything this class maintains parts company with
+        the display the moment the user changes the view locally, which is
+        permitted and which no message records.
+
+        Deliberately reports the source-mode view by its **node**, not by clip
+        GUID.  Resolving a node back to a clip means scanning every source group
+        and then the whole object map, per message, and this runs on every
+        position update in a scrub.  The node is the identity the switch helpers
+        already work in, and comparing there is both cheaper and more direct.
+
+        :returns: ``("source", node, tl_guid)``, ``("sequence", node, tl_guid)``,
+            or ``(None, None, None)`` when the view cannot be read.
+        """
+        try:
+            view = rv.commands.viewNode()
+            node_type = rv.commands.nodeType(view) if view else None
+        except Exception:
+            return (None, None, None)
+        if not view:
+            return (None, None, None)
+        seq = self.plugin.sequence
+        if node_type == "RVSourceGroup":
+            clip_tls = getattr(self.plugin.sync_manager, "_clip_timelines", {}) or {}
+            return ("source", view, clip_tls.get(view))
+        tl_guid = seq._rv_node_to_timeline_guid.get(view)
+        if tl_guid is None:
+            # OTIO-origin timelines live in _otio_guid_to_root (Stack → Sequence),
+            # so the displayed node may be the stack's inner sequence group.
+            for guid, root in list(seq._otio_guid_to_root.items()):
+                if root == view:
+                    tl_guid = guid
+                    break
+                try:
+                    if view in seq._get_sequence_inputs(root):
+                        tl_guid = guid
+                        break
+                except Exception:
+                    pass
+        return ("sequence", view, tl_guid)
+
+    def _report_mirror_failure(self, detail):
+        """Record that the host's reported view could not be shown.
+
+        A follower that cannot adopt the host's view reports the failure rather
+        than substituting its closest local approximation (D4).
+
+        :param detail: Human-readable reason, e.g. ``"no source group for …"``.
+        """
+        self._record_view_outcome(self.VIEW_FAILED, detail)
 
     def _broadcast_playback(self):
         if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
@@ -163,6 +303,47 @@ class PlaybackSyncController:
                 f" clip={(clip_guid or '-')[:8]} — position still sent"
             )
 
+    def _forget_current_clip(self, reason, view_mode=None):
+        """Stop naming a clip we can no longer identify.
+
+        ``_cur_clip_guid`` is written only where a view change *resolves*
+        (:meth:`broadcast_view_state` locally, the apply path remotely).  A
+        local isolation that cannot be resolved to a clip therefore used to
+        leave the previous clip in place, and every position message after it
+        went on naming that clip while RV displayed something else.
+
+        Observed 2026-08-09 12:27: isolating ``seq_C`` — bin media with no clip
+        in the shared sequence — produced
+
+            SEND playback ... view=sourceGroup000005 ... mode=source clip=7b7fd1f4
+
+        where ``sourceGroup000005`` is seq_C and ``7b7fd1f4`` is laser, the clip
+        isolated before it.  It stayed wrong for 11 s across three isolations.
+        Only the follower visibility strip kept it off the wire; as host, or
+        holding the lease, RV would have told the peer to show laser.
+
+        Reporting ``source`` with no clip is a state the protocol already
+        handles: the receiving side declines it as "source mode with no
+        clip_guid" and records a mirror failure, which is the honest outcome —
+        the peers *are* looking at different things, and neither should pretend
+        otherwise.
+
+        :param reason: Why the clip could not be named; logged.
+        :param view_mode: Mode to report going forward, or ``None`` to keep the
+            current one (for a view we cannot classify at all).
+        """
+        if self._cur_clip_guid is None and (
+            view_mode is None or view_mode == self._cur_view_mode
+        ):
+            return
+        _log(
+            f"view-change: forgetting current clip"
+            f" {(self._cur_clip_guid or '-')[:8]} — {reason}"
+        )
+        self._cur_clip_guid = None
+        if view_mode is not None:
+            self._cur_view_mode = view_mode
+
     def _apply_playback(self, data):
         """Apply an incoming unified view-state message (SELECTION_1.0 retired).
 
@@ -192,38 +373,147 @@ class PlaybackSyncController:
         timeline_guid = data.get("timeline_guid")
 
         if view_mode is not None:
-            mode_changed = view_mode != self._last_applied_view_mode
-            clip_changed = clip_guid != self._last_applied_clip_guid
-            tl_changed = timeline_guid != self._last_applied_tl_guid
+            # Compared against the view RV is *displaying*, never against a
+            # record of what it last adopted.  A cache of "what we show" goes
+            # stale two ways, and both were observed: the user changes the view
+            # locally (no message records it), and a switch that FAILED was
+            # still written to the cache — after which the identical instruction
+            # reported "already displayed", cleared the failure, and became a
+            # permanent no-op the host could not override (2026-08-08 21:43:47).
+            cur_mode, cur_node, cur_tl = self._displayed_view()
+            _displayed = (
+                f"displayed mode={cur_mode} node={cur_node}"
+                f" tl={str(cur_tl or '-')[:8]}"
+            )
+            # Fast path.  Re-resolving the target node means scanning every
+            # source group, and this runs on every position update.  The
+            # shortcut is safe only because it is re-checked against the live
+            # view node: a local view change invalidates it, which is exactly
+            # what the cache it replaces failed to do.
+            verified = self._verified_view
+            already_verified = verified is not None and verified == (
+                view_mode, clip_guid, timeline_guid, cur_node
+            )
+            if already_verified:
+                self._record_view_outcome(
+                    self.VIEW_ALREADY_DISPLAYED,
+                    reason=f"verified against {_displayed}",
+                    view_mode=view_mode, clip_guid=clip_guid,
+                    timeline_guid=timeline_guid,
+                )
             try:
-                if view_mode == "sequence":
-                    if mode_changed or tl_changed:
-                        # Entering or switching sequences (incl. the initial
-                        # connect) → show the full sequence.
+                if already_verified:
+                    pass  # outcome already recorded above
+                elif view_mode == "sequence":
+                    if cur_mode != "sequence" or (
+                        timeline_guid is not None and cur_tl != timeline_guid
+                    ):
+                        # Not showing this sequence — including the case that
+                        # matters most, where RV is on a locally isolated clip
+                        # and the host is telling it to come back.
                         self._switch_to_sequence_view(timeline_guid)
-                    # A sequence-mode clip_guid change is deliberately NOT
-                    # actioned.  In sequence view xStudio's clip_guid tracks the
-                    # clip under the playhead (emitted on show_atom media-change),
-                    # so it changes while merely SCRUBBING — and there is no
-                    # distinct "user selected a clip" signal (the Timeline
-                    # selection actor stays empty; only the playhead moves).
-                    # Isolating on it would wrongly yank RV to a single clip on
-                    # every scrub, so RV stays on the sequence.  Explicit
-                    # isolation comes via SOURCE mode (double-click in xStudio),
-                    # handled by the branch below.
+                    elif clip_guid is not None:
+                        # A sequence-mode clip_guid change is deliberately NOT
+                        # actioned.  In sequence view xStudio's clip_guid tracks
+                        # the clip under the playhead (emitted on show_atom
+                        # media-change), so it changes while merely SCRUBBING —
+                        # and there is no distinct "user selected a clip" signal
+                        # (the Timeline selection actor stays empty; only the
+                        # playhead moves).  Isolating on it would wrongly yank RV
+                        # to a single clip on every scrub, so RV stays on the
+                        # sequence.  Explicit isolation comes via SOURCE mode
+                        # (double-click in xStudio), handled by the branch below.
+                        #
+                        # Recorded rather than silent: this is a *correct*
+                        # decline, and it has to be distinguishable from the
+                        # incorrect kind — an instruction dropped because the
+                        # comparison above was stale.
+                        self._record_view_outcome(
+                            self.VIEW_DECLINED,
+                            reason="sequence-mode clip change tracks the playhead,"
+                                   " not a selection — staying on the sequence",
+                            view_mode=view_mode, clip_guid=clip_guid,
+                            timeline_guid=timeline_guid,
+                        )
+                    else:
+                        self._record_view_outcome(
+                            self.VIEW_ALREADY_DISPLAYED,
+                            reason=f"verified against {_displayed}",
+                            view_mode=view_mode, clip_guid=clip_guid,
+                            timeline_guid=timeline_guid,
+                        )
                 elif view_mode == "source":
-                    if mode_changed or clip_changed:
-                        self._switch_to_source_view(clip_guid)
-            except Exception:
+                    # Always delegated: deciding "am I already showing this
+                    # clip?" needs the clip resolved to its source group, which
+                    # is work the switch helper already does.  It short-circuits
+                    # to already-displayed when the node it resolves is the one
+                    # on screen, so the comparison still happens against the
+                    # display rather than against a record of it.
+                    self._switch_to_source_view(clip_guid)
+                else:
+                    self._record_view_outcome(
+                        self.VIEW_DECLINED,
+                        reason=f"unknown view_mode {view_mode!r}",
+                        view_mode=view_mode, clip_guid=clip_guid,
+                        timeline_guid=timeline_guid,
+                    )
+            except Exception as exc:
                 _log_exc("apply view-state: view switch failed")
-            self._last_applied_view_mode = view_mode
-            self._last_applied_clip_guid = clip_guid
-            self._last_applied_tl_guid = timeline_guid
+                self._record_view_outcome(
+                    self.VIEW_FAILED,
+                    reason=f"view switch raised: {exc}",
+                    view_mode=view_mode, clip_guid=clip_guid,
+                    timeline_guid=timeline_guid,
+                )
+            # Record the shortcut only when the instruction actually landed, and
+            # only against the node that is on screen *now* — after the switch,
+            # not the one we intended to reach.  A declined or failed
+            # instruction records nothing, so the next identical message
+            # re-resolves instead of inheriting an agreement that never
+            # happened.  That inheritance is the bug this replaces: a failed
+            # switch used to be written here unconditionally, and the repeat
+            # then reported success.
+            if (self.view_outcome or {}).get("outcome") in self._VIEW_OK:
+                try:
+                    landed_node = rv.commands.viewNode()
+                except Exception:
+                    landed_node = None
+                self._verified_view = (
+                    view_mode, clip_guid, timeline_guid, landed_node
+                )
+            else:
+                self._verified_view = None
             # Sync _cur_* immediately so on_rv_frame_changed / on_rv_play_start
             # callbacks that fire during the frame/play calls below broadcast the
             # right mode instead of echoing stale "sequence" state back to peers.
             self._cur_view_mode = view_mode
-            self._cur_clip_guid = clip_guid or None
+            # Only SOURCE mode names a clip.  A sequence-mode clip_guid is the
+            # sender's playhead position — the receiving branch above already
+            # refuses to act on it for that reason — so recording it here as
+            # "the clip we are showing" is the same mistake one step later.
+            #
+            # It cost a real isolation: the host reported clip 26ca26dd in
+            # sequence mode at 09:54:13, RV stored it, and when the user
+            # isolated that very clip at 09:54:19 the change was skipped as
+            # "already the current clip" and never broadcast (2026-08-09).
+            self._cur_clip_guid = (clip_guid or None) if view_mode == "source" else None
+
+        # A message carrying no position fields is one whose sender did not hold
+        # the position lease: the manager stripped them on the way out.  Absent
+        # means "not mine to say", not "zero" — and the defaults below read it
+        # as zero, so every such message stopped playback and seeked to the
+        # start of the view.  That is the jump-to-first-frame seen whenever the
+        # host reported its view while the follower held position
+        # (2026-08-09 09:54:21, `value=None` with the view switch alongside).
+        #
+        # The view block above already gets this right by only acting when
+        # view_mode is present; this is the same rule for the other field group.
+        if not any(field in data for field in POSITION_FIELDS):
+            _log(
+                "RECV playback: no position fields (stripped by sender) —"
+                f" view applied, position left alone (mode={view_mode})"
+            )
+            return
 
         playing = data.get("playing", False)
         playback_mode = data.get("playback_mode", "loop")
@@ -277,23 +567,40 @@ class PlaybackSyncController:
         """
         seq_node = None
         if timeline_guid:
-            for rv_node, tl_guid_map in self.plugin.sequence._rv_node_to_timeline_guid.items():
-                if (tl_guid_map == timeline_guid
-                        and rv.commands.nodeType(rv_node) != "RVSourceGroup"):
-                    seq_node = rv_node
-                    break
-            if seq_node is None:
-                # OTIO-origin timelines are not in _rv_node_to_timeline_guid —
-                # they are tracked in _otio_guid_to_root (Stack → Sequence).
+            # The OTIO root wins when both exist.  A timeline rebuilt by
+            # apply_otio_snapshot is registered there, and the display is left
+            # on it; a native entry surviving alongside is stale by definition.
+            # The old order took the native entry first, so a GUID with both
+            # would switch to the orphan while the display sat on the root —
+            # two nodes answering to one GUID, resolved differently by the
+            # switch and by the display read (2026-08-08 22:35).
+            root = self.plugin.sequence._otio_guid_to_root.get(timeline_guid)
+            if root and rv.commands.nodeType(root) == "RVStackGroup":
                 # Use the inner RVSequenceGroup so setViewNode/setFrame work.
-                root = self.plugin.sequence._otio_guid_to_root.get(timeline_guid)
-                if root and rv.commands.nodeType(root) == "RVStackGroup":
-                    inputs = self.plugin.sequence._get_sequence_inputs(root)
-                    seq_node = next(
-                        (n for n in inputs
-                         if rv.commands.nodeType(n) == "RVSequenceGroup"),
-                        root,
-                    )
+                inputs = self.plugin.sequence._get_sequence_inputs(root)
+                seq_node = next(
+                    (n for n in inputs
+                     if rv.commands.nodeType(n) == "RVSequenceGroup"),
+                    root,
+                )
+            native = [
+                rv_node
+                for rv_node, mapped in self.plugin.sequence._rv_node_to_timeline_guid.items()
+                if mapped == timeline_guid
+                and rv.commands.nodeType(rv_node) != "RVSourceGroup"
+            ]
+            if seq_node is not None and native:
+                # Not fatal — the root is the right answer — but one GUID owning
+                # two nodes means something registered a node it should have
+                # replaced, and that has to be visible where it happens rather
+                # than inferred from odd behaviour a soak later.
+                _log(
+                    f"apply view-state: WARNING {timeline_guid[:8]} resolves to"
+                    f" both OTIO root {seq_node} and native {native}"
+                    " — using the root; the native entries are stale"
+                )
+            elif seq_node is None and native:
+                seq_node = native[0]
         if seq_node is None:
             # Only substitute when there is no choice to get wrong: a session
             # holding exactly one sequence has only one node the host can mean.
@@ -324,7 +631,9 @@ class PlaybackSyncController:
         self.plugin._rv_updating = True
         try:
             rv.commands.setViewNode(seq_node)
-            self._clear_mirror_failure()
+            self._record_view_outcome(
+                self.VIEW_ADOPTED, view_mode="sequence", timeline_guid=timeline_guid
+            )
             _log(f"apply view-state: sequence → {seq_node} ({(timeline_guid or '')[:8]})")
         finally:
             self.plugin._rv_updating = False
@@ -374,6 +683,18 @@ class PlaybackSyncController:
         # identical content but move annotations to a different paint node
         # (sourceGroup_paint vs seq_p_sourceGroup), hiding locally-drawn strokes.
         current_view = rv.commands.viewNode()
+        if current_view == source_group:
+            # Already showing exactly the node the host named — compared against
+            # the display, so this is the spec's "an instruction matching the
+            # displayed view is still a no-op".  Returning here matters beyond
+            # saving work: falling through would re-run setFrame(1) on every
+            # position update in a scrub and fight the position apply below.
+            self._record_view_outcome(
+                self.VIEW_ALREADY_DISPLAYED,
+                reason=f"already showing {source_group}",
+                view_mode="source", clip_guid=clip_guid,
+            )
+            return
         if current_view != source_group:
             try:
                 seq_inputs = self.plugin.sequence._get_sequence_inputs(current_view)
@@ -382,7 +703,11 @@ class PlaybackSyncController:
                     # clip the host named, so we are already showing exactly it.
                     # Switching anyway would move annotations to a different
                     # paint node and hide locally-drawn strokes.
-                    self._clear_mirror_failure()
+                    self._record_view_outcome(
+                        self.VIEW_ALREADY_DISPLAYED,
+                        reason=f"{current_view} already shows {source_group}",
+                        view_mode="source", clip_guid=clip_guid,
+                    )
                     _log(
                         f"apply view-state: flat-playlist source mode — {current_view} "
                         f"already shows {source_group}, skipping view switch"
@@ -394,7 +719,9 @@ class PlaybackSyncController:
         try:
             rv.commands.setViewNode(source_group)
             rv.commands.setFrame(1)  # jump to first frame of this source
-            self._clear_mirror_failure()
+            self._record_view_outcome(
+                self.VIEW_ADOPTED, view_mode="source", clip_guid=clip_guid
+            )
             _log(f"apply view-state: source → {source_group} (clip {clip_guid[:8]})")
         finally:
             self.plugin._rv_updating = False
@@ -466,9 +793,10 @@ class PlaybackSyncController:
         # first one as a highlight (the view mode doesn't change — RV's native
         # "selection" is a loop/highlight concept, not a view switch; see
         # design.md's resolved highlight-only note).
-        sg_to_path = {v: k for k, v in self.plugin.sequence._path_to_source_group_map().items()}
         for node in selection:
-            media_path = sg_to_path.get(node)
+            # Per node, for the same reason as on_view_changed: inverting the
+            # path-keyed map loses every duplicate source group but one.
+            media_path = self.plugin.sequence.media_path_for_source_group(node)
             if media_path:
                 clip_guid = self._clip_guid_for_media_path(media_path)
                 if clip_guid:
@@ -480,10 +808,29 @@ class PlaybackSyncController:
         event.reject()
 
     def on_view_changed(self, event):
-        if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
+        """RV's view node changed — decide whether it is ours to broadcast.
+
+        Reports every path, including the ones that do nothing.  This function
+        used to be silent unless it reached a broadcast, so a local isolation
+        that produced no message was indistinguishable from one that never
+        reached the function at all — four different causes, one empty log, and
+        a soak spent failing to tell them apart (2026-08-09 08:32).
+        """
+        view = None
+        try:
+            view = rv.commands.viewNode()
+        except Exception:
+            pass
+        if self.plugin._rv_updating:
+            _log(f"view-change {view}: ignored — applying a remote message")
             event.reject()
             return
-        view = rv.commands.viewNode()
+        if not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
+            _log(f"view-change {view}: ignored — not synced")
+            event.reject()
+            return
+        node_type = rv.commands.nodeType(view) if view else None
+        _log(f"view-change {view} ({node_type})")
         tl_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view)
         if tl_guid and rv.commands.nodeType(view) != "RVSourceGroup":
             # Sequence/timeline view — covers both switching to a different
@@ -492,22 +839,75 @@ class PlaybackSyncController:
                 self.plugin.sync_manager.active_timeline_guid = tl_guid
                 _log(f"SEND view-state [sequence]: view={view} tl={tl_guid}")
                 self.broadcast_view_state(None, "sequence")
+            else:
+                _log(
+                    f"view-change {view}: sequence unchanged"
+                    f" (tl={str(tl_guid)[:8]}) — nothing to send"
+                )
         elif rv.commands.nodeType(view) == "RVSourceGroup":
             # Clip selection: user double-clicked into a source group.
             # Map source group → media path → OTIO clip GUID and broadcast.
-            sg_to_path = {v: k for k, v in self.plugin.sequence._path_to_source_group_map().items()}
-            media_path = sg_to_path.get(view)
+            # Asked of the node directly, not by inverting the path-keyed map:
+            # duplicate source groups for one media file collapse in that map,
+            # and the loser then has no media path at all.
+            media_path = self.plugin.sequence.media_path_for_source_group(view)
+            if not media_path:
+                _log(
+                    f"view-change {view}: isolated a source group with no media"
+                    " path (placeholder, or no file source) — cannot broadcast"
+                )
+                self.plugin.sequence.log_source_group_inventory(
+                    f"{view} has no media path"
+                )
+                self._forget_current_clip(
+                    f"{view} has no media path", view_mode="source"
+                )
             if media_path:
                 clip_guid = self._clip_guid_for_media_path(media_path)
+                if clip_guid and clip_guid == self._cur_clip_guid:
+                    _log(
+                        f"view-change {view}: clip {clip_guid[:8]} is already the"
+                        " current clip — not re-broadcasting"
+                    )
+                elif not clip_guid:
+                    _log(
+                        f"view-change {view}: no clip in the object map matches"
+                        f" {media_path} — cannot broadcast this isolation"
+                    )
+                    self._forget_current_clip(
+                        f"{view} shows media no shared clip names",
+                        view_mode="source",
+                    )
                 if clip_guid and clip_guid != self._cur_clip_guid:
                     _clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
                     _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
                     _log(f"SEND view-state [source]: clip '{_clip_label}' guid={clip_guid[:8]} view={view}")
-                    is_new = clip_guid not in self.plugin.sync_manager._clip_timelines
                     clip_tl_guid = self.plugin.sync_manager.get_or_create_clip_timeline(clip_guid)
                     if clip_tl_guid:
-                        if is_new:
-                            self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
+                        # Unconditional: the manager announces each clip
+                        # timeline once.  Gating here on whether *this* peer
+                        # created it is what left one built during a remote
+                        # apply unannounced.
+                        status = self.plugin.sync_manager.broadcast_clip_timeline(clip_tl_guid)
+                        _log(
+                            f"view-change {view}: announce clip timeline"
+                            f" {clip_tl_guid[:8]} → {status}"
+                        )
                         self.plugin.sync_manager.active_timeline_guid = clip_tl_guid
+                    else:
+                        _log(
+                            f"view-change {view}: no clip timeline for"
+                            f" {clip_guid[:8]} — nothing to announce"
+                        )
                     self.broadcast_view_state(clip_guid, "source")
+        else:
+            _log(
+                f"view-change {view} ({node_type}): not a known sequence and not"
+                " a source group — no view-state sent"
+            )
+            # No mode override: we cannot classify this view, so claiming
+            # "source" would be a different guess rather than fewer.  Dropping
+            # the clip is what matters — whatever this node is, it is not the
+            # clip we were naming.
+            self._forget_current_clip(f"{view} is a {node_type}, not a clip")
         event.reject()

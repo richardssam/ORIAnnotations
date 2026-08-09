@@ -112,6 +112,10 @@ class PlaybackSyncController:
         # for a few seconds after this so the FIRST selected clip isn't decided
         # against a stale cached Pinned Source Mode (see _read_pinned_source_mode_fresh).
         self._last_source_atom_at: float = 0.0
+        #: When the selection poll last saw the selection actually change.
+        #: A user selection can arrive this way with no source_atom, and the
+        #: PSM freshness gate has to treat it as just as deliberate.
+        self._last_selection_change_at: float = 0.0
         self._cached_viewed_tl_guid: str | None = None
         self._cached_viewed_tl_at: float = 0.0
         # Current local view state (unify-view-state-sync): the mode and active
@@ -244,6 +248,7 @@ class PlaybackSyncController:
         self._pending_scrub_state = None
         self._pending_scrub_due = 0.0
         self._last_source_atom_at = 0.0
+        self._last_selection_change_at = 0.0
         self._last_playhead_scan = 0.0
         self._viewport_name = None
         self._last_scanned_playhead_key = None
@@ -261,6 +266,51 @@ class PlaybackSyncController:
         self._selection_broadcast_suppress_until = 0.0
         self._viewport_container_is_playlist = False
         self._viewport_container_is_timeline = False
+
+    def _is_scan_through(
+        self, *, is_seq_media: bool, is_playlist: bool, in_single_clip: bool
+    ) -> bool:
+        """Is this ``show_atom`` playback moving through a sequence, not a selection?
+
+        xStudio fires a ``show_atom`` whenever the on-screen media changes, and
+        a playing sequence changes it once per edit.  Those are not user
+        selections and must not be broadcast as view state.
+
+        The four ways an event escapes the guard:
+
+        ``is_seq_media`` false
+            Media that belongs to no sequence cannot be scanned through.
+
+        ``is_playlist``
+            Scan-through is the *sequence playhead* advancing, so it reports the
+            Timeline container; a Playlist (bin) event is the user picking
+            media.  ``is_seq_media`` is true for a bin click only because the
+            bin→sequence normalization just rewrote the guid — that records
+            where the media *also* lives, not what caused the event.  This is
+            the same distinction ``view_mode`` draws a few lines below, for the
+            same reason.  Without it, every isolation armed the guard against
+            the next bin click (an isolation forces play), so bin selections
+            stopped reaching the peer until playback happened to stop.
+            Measured over the 2026-08-09 12:07 session: all 8 suppressions were
+            bin clicks, and none of the 26 Timeline ``show_atom``\\ s was ever
+            caught — the guard fired only on events it was meant to pass.
+
+        ``in_single_clip``
+            An isolated clip is always a deliberate user switch.
+
+        just-started playback
+            Race guard: the poll may already have set ``_last_polled_playing``
+            before the ``show_atom`` for the user's own click arrives.
+
+        :param is_seq_media: The media appears on a tracked sequence.
+        :param is_playlist: The viewed container is a Playlist (the bin).
+        :param in_single_clip: Pinned Source Mode reports an isolated clip.
+        """
+        if not is_seq_media or is_playlist or in_single_clip:
+            return False
+        if not self._last_polled_playing:
+            return False
+        return (time.monotonic() - self._playing_started_at) >= 0.3
 
     def cached_viewed_timeline_guid(self, ttl: float = 0.5) -> str | None:
         """Return the viewed timeline guid, cached for *ttl* seconds.
@@ -345,7 +395,11 @@ class PlaybackSyncController:
                         if _media_name_hint:
                             break
 
-                _log(f"[SEL] show_atom media-change: name={_media_name_hint!r} uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}")
+                _log(
+                    f"[SEL] show_atom media-change: name={_media_name_hint!r}"
+                    f" uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}"
+                    f"{self._provenance_note()}"
+                )
                 # Determine view_mode by checking whether this media UUID belongs
                 # to a tracked sequence (Timeline) playlist.
                 _seq_tl_guid: str | None = None
@@ -444,15 +498,27 @@ class PlaybackSyncController:
                 #   4. fallback when container type is unknown.
                 # Normally use the cached Pinned Source Mode, but it is only
                 # refreshed when the selection poll runs, which lags xStudio by a
-                # poll or more.  When a deliberate selection (source_atom) fired
-                # within the last few seconds the user may have just entered
-                # single-clip ("select a clip in the timeline") mode whose PSM
-                # flip we have not polled yet — read PSM fresh so the FIRST
-                # selected clip is not mislabelled as mode=sequence against a
-                # stale PSM=True.  Gated on a recent selection so scrub/playback
-                # show_atoms keep using the cheap cached value.
+                # poll or more.  When a deliberate selection fired within the
+                # last few seconds the user may have just entered single-clip
+                # ("select a clip in the timeline") mode whose PSM flip we have
+                # not polled yet — read PSM fresh so the FIRST selected clip is
+                # not mislabelled as mode=sequence against a stale PSM=True.
+                # Still gated on a recent selection so scrub/playback show_atoms
+                # keep using the cheap cached value.
+                #
+                # "Deliberate selection" is deliberately NOT just source_atom.
+                # A double-click can reach us through the selection poll with no
+                # source_atom at all, and then the stale PSM=True makes the
+                # scan-through guard below swallow it — four consecutive
+                # attempts to select one clip were dropped that way on
+                # 2026-08-09 08:58-08:59, while the ones that did fire a
+                # source_atom went through.  The poll's own change detection is
+                # the missing signal, so it counts too.
                 _psm = self._last_pinned_source_mode
-                if time.monotonic() - self._last_source_atom_at < 3.0:
+                _selected_recently = max(
+                    self._last_source_atom_at, self._last_selection_change_at
+                )
+                if time.monotonic() - _selected_recently < 3.0:
                     _fresh_psm = self._read_pinned_source_mode_fresh()
                     if _fresh_psm is not None:
                         _psm = _fresh_psm
@@ -488,18 +554,10 @@ class PlaybackSyncController:
                 ):
                     _log("[SEL] → suppressed (delayed clip echo)")
                     return
-                # Suppress show_atoms fired while xStudio's sequence is playing
-                # through clips — those aren't user selections, they're scan-through
-                # events.  But allow the first one after play starts (race guard:
-                # poll may have already set _last_polled_playing before this fires).
-                # Never suppress when already in single-clip mode: those are always
-                # deliberate user clip-switches, not playback scan-through events.
-                _playing_just_started = (time.monotonic() - self._playing_started_at < 0.3)
-                if (
-                    _is_seq_media
-                    and self._last_polled_playing
-                    and not _playing_just_started
-                    and not _in_single_clip
+                if self._is_scan_through(
+                    is_seq_media=_is_seq_media,
+                    is_playlist=is_playlist,
+                    in_single_clip=_in_single_clip,
                 ):
                     _log("[SEL] → suppressed (playing through sequence)")
                     return
@@ -516,7 +574,10 @@ class PlaybackSyncController:
                         if clip_tl_guid:
                             self.plugin.manager.active_timeline_guid = clip_tl_guid
                     self.broadcast_view_state(clip_guid, view_mode)
-                    _log(f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}")
+                    _log(
+                        f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}"
+                        f"{self._provenance_note()}"
+                    )
                 return
 
             if self.plugin.annotation.reload_in_progress():
@@ -621,7 +682,10 @@ class PlaybackSyncController:
             and (isinstance(event[1], source_atom) or isinstance(event[1], selection_changed_atom))
         ):
             return
-        _log(f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution")
+        _log(
+            f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution"
+            f"{self._provenance_note()}"
+        )
         now = time.monotonic()
         # Mark that a deliberate selection just happened — the show_atom handler
         # reads PSM fresh for a short window after this (see the show_atom
@@ -641,6 +705,31 @@ class PlaybackSyncController:
     def enqueue_selection_update(self) -> None:
         """Enqueue selection resolution to the poll thread command queue."""
         self.plugin._cmd_queue.put(("resolve_selection", None))
+
+    def _provenance_note(self) -> str:
+        """Log suffix naming the remote apply this moment is attributable to.
+
+        Empty when nothing a peer sent can account for what just happened —
+        the ordinary case of a user acting on this machine, and the one that
+        has to stay quiet in the log.
+
+        Observation only for now.  The soak that this logging exists to make
+        legible (tasks 3.1-3.2) has to name the route from a follower's
+        structural message to this host's display change before a guard can be
+        placed on it; guarding the wrong one of three candidate routes yields a
+        fix that passes review and fails the next session.
+        """
+        try:
+            ctx = self.plugin.manager.remote_apply_context() if self.plugin.manager else None
+        except Exception:
+            return ""
+        if not ctx:
+            return ""
+        where = "in-apply" if ctx["in_apply"] else f"settling+{ctx['settling_for']:.2f}s"
+        return (
+            f" [PROVENANCE remote-induced? source={str(ctx['source'])[:8]}"
+            f" {ctx['command_schema']}/{ctx['event']} {where} age={ctx['age']:.2f}s]"
+        )
 
     def _read_pinned_source_mode_fresh(self) -> "bool | None":
         """Read Pinned Source Mode now, from a live playhead (bounded).
@@ -1037,6 +1126,7 @@ class PlaybackSyncController:
                     if self._last_sel_names != sel_names:
                         _log(f"[SEL] Timeline.selection changed: {sel_names}")
                         self._last_sel_names = sel_names
+                        self._last_selection_change_at = time.monotonic()
                     for item in selected_items:
                         if type(item).__name__ == "Clip":
                             clip_name = getattr(item, "name", None)
@@ -1053,6 +1143,7 @@ class PlaybackSyncController:
                     if self._last_src_names != src_names:
                         _log(f"[SEL] Playlist.playhead_selection changed: {src_names}")
                         self._last_src_names = src_names
+                        self._last_selection_change_at = time.monotonic()
                     if selected_sources:
                         clip_name = selected_sources[0].name
                         clip_uuid_str = str(selected_sources[0].uuid)
@@ -1107,9 +1198,15 @@ class PlaybackSyncController:
                             self._last_pinned_source_mode is not None
                             and psm != self._last_pinned_source_mode
                         ):
+                            # PSM True→False is the host *entering single-clip
+                            # mode* — the display change defect 1 is about.  It
+                            # is polled, so it is observed well after the remote
+                            # apply that may have caused it: this is the site the
+                            # settle window exists for.
                             _log(
                                 f"[SEL] Pinned Source Mode:"
                                 f" {self._last_pinned_source_mode} → {psm}"
+                                f"{self._provenance_note()}"
                             )
                             if psm is True:
                                 # User re-pinned to the timeline — broadcast clear so

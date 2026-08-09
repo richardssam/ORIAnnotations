@@ -13,6 +13,7 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../python')))
 
+import opentimelineio as otio  # noqa: E402
 from otio_sync_core import authority  # noqa: E402
 from otio_sync_core.manager import SyncManager, STATE_SYNCED  # noqa: E402
 from otio_sync_core import protocol_messages as pm  # noqa: E402
@@ -195,6 +196,77 @@ def test_structure_lease_gates_add_timeline():
 
     rv.claim_category(authority.CHANNEL_STRUCTURE)
     assert rv.broadcast_add_timeline("tl-1") == authority.SENT
+
+
+def test_clip_timeline_announcement_is_not_lease_gated():
+    """A clip timeline is a derived announcement, not a structural mutation.
+
+    Its GUID is deterministic, so every peer computes the same one and a
+    duplicate is ignored on receipt — two peers announcing it cannot conflict.
+    Gating it dropped a follower's clip timelines silently, including from the
+    annotation paths that need the peer to hold the Annotations track before an
+    INSERT_CHILD can bind to it.
+    """
+    rv = _manager("rv")
+    track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+    track.metadata["sync"] = {"guid": "trk-1"}
+    for guid in ("clip-1", "clip-2"):
+        clip = otio.schema.Clip(name=guid)
+        clip.metadata["sync"] = {"guid": guid}
+        track.append(clip)
+    tl = otio.schema.Timeline(name="seq")
+    tl.metadata["sync"] = {"guid": "tl-1"}
+    tl.tracks.append(track)
+    rv.register_timeline(tl)
+
+    clip_tl = rv.get_or_create_clip_timeline("clip-1")
+    assert clip_tl
+
+    # No structure lease held, and a *confirmed* one held elsewhere — the case
+    # where claiming would not have helped, because a claim queues behind a
+    # confirmed owner rather than granting.
+    assert rv.broadcast_clip_timeline(clip_tl) == authority.SENT
+
+    rv.apply_patch(_claim_envelope("someone-else", authority.CHANNEL_STRUCTURE, 0.0))
+    rv._leases[authority.CHANNEL_STRUCTURE].confirmed = True
+    # A *different* clip, so this tests the lease rather than the announce-once
+    # rule covered by the next test.
+    clip_tl2 = rv.get_or_create_clip_timeline("clip-2")
+    assert rv.broadcast_clip_timeline(clip_tl2) == authority.SENT
+    # The sequence timeline is still gated — only the derived one is exempt.
+    assert rv.broadcast_add_timeline("tl-1") == authority.SUPPRESSED
+
+
+def test_clip_timeline_is_announced_once_regardless_of_who_created_it():
+    """"Have my peers been told?" — not "did I create it?".
+
+    The callers used to gate on ``clip_guid not in _clip_timelines``, so a clip
+    timeline this peer built while *applying a remote message* was never
+    announced: it answers no to "did I create it" and yes to "does it exist".
+    """
+    rv = _manager("rv")
+    clip = otio.schema.Clip(name="c")
+    clip.metadata["sync"] = {"guid": "clip-1"}
+    track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+    track.metadata["sync"] = {"guid": "trk-1"}
+    track.append(clip)
+    tl = otio.schema.Timeline(name="seq")
+    tl.metadata["sync"] = {"guid": "tl-1"}
+    tl.tracks.append(track)
+    rv.register_timeline(tl)
+
+    # Built while applying something else — exactly the case that went silent.
+    clip_tl = rv.get_or_create_clip_timeline("clip-1")
+
+    assert rv.broadcast_clip_timeline(clip_tl) == authority.SENT
+    # ... and not again, without the caller having to know.
+    assert rv.broadcast_clip_timeline(clip_tl) == authority.SUPPRESSED
+
+    sent = [
+        e for e in rv.network.sent
+        if e["payload"]["command_schema"] == pm.AddTimeline.SCHEMA
+    ]
+    assert len(sent) == 1, "announced more than once"
 
 
 # ---------------------------------------------------------------------------

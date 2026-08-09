@@ -55,9 +55,12 @@ def get_registered_annotation_controller() -> Any:
 def register_playback_controller(controller: Any) -> None:
     """Register the live ``PlaybackSyncController`` for inspection.
 
-    Lets the ``sync_test`` hook report whether this peer could actually mirror
-    the host's view (``controller.mirror_failure``).  Without it a follower that
-    failed to show the host's clip is indistinguishable from one that succeeded.
+    Lets the ``sync_test`` hook report what this peer did with the host's view:
+    ``controller.view_outcome`` (adopted / already-displayed / declined /
+    failed, with the reason) and the derived ``controller.mirror_failure``.
+    Without it a follower that failed to show the host's clip — or that
+    received the instruction and quietly did nothing — is indistinguishable
+    from one that succeeded.
 
     :param controller: The active ``PlaybackSyncController`` for this peer.
     """
