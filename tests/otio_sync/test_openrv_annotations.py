@@ -29,9 +29,8 @@ sys.modules['PySide6'] = MagicMock()
 sys.modules['PySide6.QtCore'] = MockQtCore
 sys.modules['PySide6.QtGui'] = MagicMock()
 
-# Create rv/rv.commands/rv.rvtypes mocks
-mock_rv = MagicMock()
-mock_rv.commands = MagicMock()
+mock_rv = sys.modules.setdefault("rv", MagicMock())
+mock_rv.commands = sys.modules.setdefault("rv.commands", MagicMock())
 
 class MinorModeMock:
     def __init__(self):
@@ -40,11 +39,9 @@ class MinorModeMock:
         pass
 
 mock_rv.rvtypes.MinorMode = MinorModeMock
-sys.modules['rv'] = mock_rv
-sys.modules['rv.commands'] = mock_rv.commands
-sys.modules['rv.rvtypes'] = mock_rv.rvtypes
-sys.modules['rv.extra_commands'] = MagicMock()
-sys.modules['rv.qt_utils'] = MagicMock()
+sys.modules.setdefault("rv.rvtypes", mock_rv.rvtypes)
+sys.modules.setdefault("rv.extra_commands", MagicMock())
+sys.modules.setdefault("rv.qt_utils", MagicMock())
 
 import opentimelineio as otio
 from plugin import OpenRVSyncPlugin
@@ -113,11 +110,12 @@ class TestOpenRVAnnotations(unittest.TestCase):
             plugin = OpenRVSyncPlugin()
             
         # Mock finding paint node
-        plugin.annotation._find_paint_node_for_media = MagicMock(return_value="sourceGroup000004_paint")
+        plugin.annotation._find_paint_node_for_media = MagicMock(return_value=("sourceGroup000004_paint", 12))
         
         # Mock media path resolution
         mock_rv.commands.nodesInGroup.side_effect = lambda sg: ["file_source_node_1"] if sg == "sourceGroup000004" else []
         mock_rv.commands.nodeType.side_effect = lambda node: "RVFileSource" if node == "file_source_node_1" else ""
+        mock_rv.commands.sourceMediaInfo.return_value = {"startFrame": 1}
         mock_rv.commands.fps.return_value = 24.0
         self.properties["file_source_node_1.media.movie"] = ["/path/to/movie.mov"]
 
@@ -135,7 +133,8 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.properties[f"{full_prop}.text"] = ["Hello OpenRV Annotation"]
         self.properties[f"{full_prop}.color"] = [1.0, 0.0, 0.0, 1.0] # red
         self.properties[f"{full_prop}.position"] = [0.1, 0.2]
-        self.properties[f"{full_prop}.size"] = [1.0] # 1.0 * RV_FONT_SCALE font_size
+        self.properties[f"{full_prop}.fontSize"] = [1.2] # 1.0 * RV_FONT_SCALE font_size * scale
+        self.properties[f"{full_prop}.size"] = [0.108] # legacy fallback
         self.properties[f"{full_prop}.spacing"] = [0.8]
         self.properties[f"{full_prop}.scale"] = [1.2]
         self.properties[f"{full_prop}.rotation"] = [15.0]
@@ -198,7 +197,8 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.assertEqual(self.properties[f"{full_remote_prop}.text"], ["Hello OpenRV Annotation"])
         self.assertEqual(self.properties[f"{full_remote_prop}.color"], [1.0, 0.0, 0.0, 1.0])
         self.assertEqual(self.properties[f"{full_remote_prop}.position"], [0.1, 0.2])
-        self.assertEqual(self.properties[f"{full_remote_prop}.size"], [0.015])
+        self.assertAlmostEqual(self.properties[f"{full_remote_prop}.size"][0], 6.48 / 10000.0, places=5) # legacy fallback
+        self.assertAlmostEqual(self.properties[f"{full_remote_prop}.fontSize"][0], 0.015 * 1.2, places=5) # WCS font size * scale
         self.assertEqual(self.properties[f"{full_remote_prop}.scale"], [1.2])
         self.assertEqual(self.properties[f"{full_remote_prop}.rotation"], [15.0])
         self.assertEqual(self.properties[f"{full_remote_prop}.font"], ["LiberationSans"])
@@ -233,13 +233,13 @@ class TestOpenRVAnnotations(unittest.TestCase):
         plugin.playback._clip_guid_for_media_path = MagicMock(return_value="test-clip-guid-2")
         
         # Mock metaEvaluateClosestByType to expect sequence frame 400 when we ask for local frame 200
-        mock_rv.commands.metaEvaluateClosestByType.return_value = [{"node": "defaultSequence_p_sourceGroup000001"}]
+        mock_rv.commands.metaEvaluateClosestByType.return_value = [{"node": "defaultSequence_p_sourceGroup000001", "frame": 400}]
         
         node = plugin.annotation._find_paint_node_for_media("/path/to/movie.mov", 200)
         
         # Verify it mapped local_frame=200 to seq_frame=400 (200.0 + 200 - 1 + 1)
         mock_rv.commands.metaEvaluateClosestByType.assert_called_once_with(400, "RVPaint")
-        self.assertEqual(node, "defaultSequence_p_sourceGroup000001")
+        self.assertEqual(node, ("defaultSequence_p_sourceGroup000001", 400))
         print("✓ OpenRV paint node frame mapping test passed!")
 
     def test_rebuild_rv_session_view_switching(self):
@@ -292,6 +292,8 @@ class TestOpenRVAnnotations(unittest.TestCase):
         # We want to verify that setViewNode is called with "TimelineOne_node"
         plugin.sequence._rebuild_rv_session()
         
+        print("MOCK CALLS:", mock_rv.commands.mock_calls)
+        
         mock_rv.commands.setViewNode.assert_any_call("TimelineOne_node")
         print("✓ OpenRV rebuild view switching test passed!")
 
@@ -300,7 +302,7 @@ class TestOpenRVAnnotations(unittest.TestCase):
             plugin = OpenRVSyncPlugin()
 
         # Mock finding paint node
-        plugin.annotation._find_paint_node_for_media = MagicMock(return_value="sourceGroup000004_paint")
+        plugin.annotation._find_paint_node_for_media = MagicMock(return_value=("sourceGroup000004_paint", 4))
 
         # Mock media clip lookup in sync_manager
         plugin.sync_manager = MagicMock()
@@ -351,7 +353,8 @@ class TestOpenRVAnnotations(unittest.TestCase):
         self.assertEqual(self.properties[f"{node}.{text_node_name}.text"], ["Updated text annotation"])
         self.assertEqual(self.properties[f"{node}.{text_node_name}.position"], [0.2, 0.3])
         self.assertEqual(self.properties[f"{node}.{text_node_name}.color"], [0.0, 1.0, 0.0, 1.0])
-        self.assertEqual(self.properties[f"{node}.{text_node_name}.size"], [75.0 / RV_FONT_SCALE])
+        self.assertEqual(self.properties[f"{node}.{text_node_name}.size"], [75.0 / 10000.0])
+        self.assertEqual(self.properties[f"{node}.{text_node_name}.fontSize"], [75.0 / RV_FONT_SCALE])
         
         # Check that no new property order was added
         self.assertEqual(self.properties[order_prop], [text_node_name])

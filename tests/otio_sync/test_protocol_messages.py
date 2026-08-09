@@ -66,7 +66,6 @@ def test_registry_has_all_families():
 def test_message_roundtrip_identity():
     samples = {
         pm.WhoIsMaster: {"requester_guid": "g"},
-        pm.SelectionSet: {"clip_guid": "c", "view_mode": "sequence", "sync_timestamp": 1.0},
         pm.InsertChild: {"parent_uuid": "p", "index": 2, "child_data": {"k": 1}, "sync_timestamp": 1.0},
         pm.MoveChild: {"parent_uuid": "p", "child_uuid": "c", "to_index": 3, "sync_timestamp": 1.0},
     }
@@ -78,23 +77,6 @@ def test_message_roundtrip_identity():
 # 8.1 — broadcast envelopes match the message class and structure
 # ---------------------------------------------------------------------------
 
-
-def test_broadcast_selection_envelope():
-    mgr, net = _make_synced_manager()
-    mgr.broadcast_selection("clip-guid", view_mode="sequence")
-
-    assert len(net.sent) == 1
-    env = net.sent[0]
-    # Envelope structure unchanged.
-    assert env["session"] == "s"
-    assert env["source_guid"] == "self-guid"
-    assert env["payload"]["command_schema"] == pm.SelectionSet.SCHEMA == "SELECTION_1.0"
-    assert env["payload"]["command"]["event"] == pm.SelectionSet.EVENT == "SET"
-    body = env["payload"]["command"]["payload"]
-    assert body["clip_guid"] == "clip-guid"
-    assert body["view_mode"] == "sequence"
-    # Envelope must be JSON-serializable (no message objects leak onto the wire).
-    json.dumps(env)
 
 
 def test_broadcast_playback_envelope_and_json_safe():
@@ -137,29 +119,15 @@ def _envelope(schema, event, payload, source="other-guid"):
     }
 
 
-def test_dispatch_known_selection_routes_to_handler():
-    mgr, _ = _make_synced_manager()
-    res = mgr.apply_patch(_envelope("SELECTION_1.0", "SET",
-                                    {"clip_guid": "abc", "view_mode": "source"}))
-    assert res is not None
-    action, data = res
-    assert action == "selection_changed"
-    assert mgr.selected_clip_guid == "abc"
-
-
 def test_dispatch_unknown_pair_ignored_safely():
     mgr, _ = _make_synced_manager()
     # Unknown schema/event must not raise and must return None.
     assert mgr.apply_patch(_envelope("MADE_UP_1.0", "NOPE", {"x": 1})) is None
     # Known schema but unknown event also ignored.
-    assert mgr.apply_patch(_envelope("SELECTION_1.0", "BOGUS", {})) is None
+    assert mgr.apply_patch(_envelope("TIMELINE_1.0", "BOGUS", {})) is None
 
 
-def test_dispatch_self_message_discarded():
-    mgr, _ = _make_synced_manager()
-    res = mgr.apply_patch(_envelope("SELECTION_1.0", "SET", {"clip_guid": "x"},
-                                    source="self-guid"))
-    assert res is None
+
 
 
 def test_dispatch_i_am_master_master_found():

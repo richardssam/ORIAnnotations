@@ -27,10 +27,10 @@ sys.modules.setdefault("PySide2.QtCore", MagicMock())
 sys.modules.setdefault("PySide6", MagicMock())
 sys.modules.setdefault("PySide6.QtCore", MagicMock())
 
-_mock_rv = MagicMock()
-sys.modules["rv"] = _mock_rv
-sys.modules["rv.commands"] = _mock_rv.commands
+_mock_rv = sys.modules.setdefault("rv", MagicMock())
+sys.modules.setdefault("rv.commands", _mock_rv.commands)
 
+import sequence_sync
 from sequence_sync import SequenceSyncController  # noqa: E402
 
 
@@ -44,12 +44,12 @@ def _make_controller():
 
 class TestMakeClipFrameNormalize(unittest.TestCase):
     def setUp(self):
-        _mock_rv.commands.reset_mock()
-        _mock_rv.commands.getStringProperty.return_value = ["/x/car.mov"]
-        _mock_rv.commands.getFloatProperty.return_value = [24.0]
+        sequence_sync.rv.commands.reset_mock()
+        sequence_sync.rv.commands.getStringProperty.return_value = ["/x/car.mov"]
+        sequence_sync.rv.commands.getFloatProperty.return_value = [24.0]
 
     def test_no_timecode_start_frame_1_normalizes_to_0(self):
-        _mock_rv.commands.sourceMediaInfo.return_value = {"startFrame": 1, "endFrame": 101}
+        sequence_sync.rv.commands.sourceMediaInfo.return_value = {"startFrame": 1, "endFrame": 101}
         ctrl = _make_controller()
         clip = ctrl._make_clip("sourceGroup0_source", fps=24.0)
         self.assertIsNotNone(clip)
@@ -60,7 +60,7 @@ class TestMakeClipFrameNormalize(unittest.TestCase):
     def test_real_timecode_start_frame_unchanged(self):
         # 01:00:00:00 @ 24fps -> startFrame=86400; must NOT be treated as the
         # synthetic no-timecode default (only exactly 1 is normalized).
-        _mock_rv.commands.sourceMediaInfo.return_value = {"startFrame": 86400, "endFrame": 86500}
+        sequence_sync.rv.commands.sourceMediaInfo.return_value = {"startFrame": 86400, "endFrame": 86500}
         ctrl = _make_controller()
         clip = ctrl._make_clip("sourceGroup0_source", fps=24.0)
         self.assertIsNotNone(clip)
@@ -69,7 +69,7 @@ class TestMakeClipFrameNormalize(unittest.TestCase):
         self.assertEqual(avail.duration.value, 101.0)
 
     def test_start_frame_0_unchanged(self):
-        _mock_rv.commands.sourceMediaInfo.return_value = {"startFrame": 0, "endFrame": 100}
+        sequence_sync.rv.commands.sourceMediaInfo.return_value = {"startFrame": 0, "endFrame": 100}
         ctrl = _make_controller()
         clip = ctrl._make_clip("sourceGroup0_source", fps=24.0)
         self.assertIsNotNone(clip)

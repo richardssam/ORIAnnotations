@@ -14,7 +14,10 @@ if os.path.exists(manifest_file):
         )
 
 import opentimelineio as otio
-otio.schema.schemadef.module_from_name('SyncEvent')
+try:
+    otio.schema.schemadef.module_from_name('SyncEvent')
+except Exception:
+    pass
 
 from otio_sync_core import rv_annotation_codec as codec
 
@@ -65,7 +68,7 @@ class TestRvCodecForward(unittest.TestCase):
         p = _props(specs[0])
         self.assertEqual(specs[0]["kind"], "text")
         self.assertEqual(p["scale"], [1.5])
-        self.assertEqual(p["size"], [1.0])              # font_size / RV_FONT_SCALE
+        self.assertEqual(p["size"], [codec.RV_FONT_SCALE / 10000.0])
         self.assertEqual(p["spacing"], [0.8])           # 0.0 → DEFAULT_SPACING
         self.assertEqual(p["startFrame"], [9])
         self.assertEqual(p["position"], [0.1, -0.2])

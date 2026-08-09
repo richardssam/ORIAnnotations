@@ -80,6 +80,7 @@ class FakeXsTimeline:
     def __init__(self, uuid: str, otio_str: str) -> None:
         self.uuid = uuid
         self._otio_str = otio_str
+        self.tracks = []
 
     def to_otio_string(self) -> str:
         return self._otio_str
@@ -116,6 +117,9 @@ class FakePlugin:
         self.media = types.SimpleNamespace(register=lambda *a, **k: None)
         self._sync_playlists: dict = {}
         self.builder = None  # set by _build_plugin(), needs the back-reference
+
+    def claim_lease(self, channel: str) -> None:
+        self.manager.claim_category(channel)
 
 
 def _build_plugin() -> FakePlugin:
