@@ -290,11 +290,12 @@ class PlaybackSyncController:
         # `displayed` is what RV is actually showing; `mode` is what we are
         # broadcasting.  Logging both is what makes a mislabelled position
         # visible in a log rather than only in a peer's playhead.
+        broadcast_clip_guid = self._cur_clip_guid if displayed_mode == "source" else None
         _log(
             f"SEND playback playing={playing} frame={current_frame} base={base}"
             f" fps={fps} view={view} tl={timeline_guid or '-'}"
             f" displayed={displayed_mode}"
-            f" mode={self._cur_view_mode} clip={(self._cur_clip_guid or '')[:8]}"
+            f" mode={displayed_mode} clip={(broadcast_clip_guid or '')[:8]}"
         )
         state = {
             "playing": playing,
@@ -308,8 +309,8 @@ class PlaybackSyncController:
             # Carry the current view alongside every position update (not just
             # explicit view-state changes) so a peer receiving a pure scrub/play
             # update also keeps the right mode/clip — single broadcast path (D4).
-            "view_mode": self._cur_view_mode,
-            "clip_guid": self._cur_clip_guid,
+            "view_mode": displayed_mode,
+            "clip_guid": broadcast_clip_guid,
         }
         status = self.plugin.sync_manager.broadcast_playback_state(state)
         self._last_broadcast_frame = current_frame

@@ -285,6 +285,34 @@ def test_unreadable_state_with_nothing_known_still_broadcasts_frame_zero():
     assert state["current_time"]["value"] == 0.0
 
 
+# ── view switch echo guard ──────────────────────────────────────────────────
+
+
+def test_remote_induced_selection_returns_true():
+    ctrl = _controller()
+    ctrl.plugin.manager.remote_apply_context = lambda: {
+        "source": "peer1",
+        "command_schema": "PLAYBACK_SETTINGS",
+        "event": "SET",
+        "in_apply": False,
+        "settling_for": 0.05,
+        "age": 0.05,
+    }
+
+    is_remote, note = ctrl._provenance()
+    assert is_remote is True
+    assert "remote-induced" in note
+
+
+def test_genuine_local_selection_returns_false():
+    ctrl = _controller()
+    ctrl.plugin.manager.remote_apply_context = lambda: None
+
+    is_remote, note = ctrl._provenance()
+    assert is_remote is False
+    assert note == ""
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -395,10 +395,11 @@ class PlaybackSyncController:
                         if _media_name_hint:
                             break
 
+                _is_remote, _prov_note = self._provenance()
                 _log(
                     f"[SEL] show_atom media-change: name={_media_name_hint!r}"
                     f" uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}"
-                    f"{self._provenance_note()}"
+                    f"{_prov_note}"
                 )
                 # Determine view_mode by checking whether this media UUID belongs
                 # to a tracked sequence (Timeline) playlist.
@@ -573,10 +574,11 @@ class PlaybackSyncController:
                         clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
                         if clip_tl_guid:
                             self.plugin.manager.active_timeline_guid = clip_tl_guid
+                    _is_remote, _prov_note = self._provenance()
                     self.broadcast_view_state(clip_guid, view_mode)
                     _log(
                         f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}"
-                        f"{self._provenance_note()}"
+                        f"{_prov_note}"
                     )
                 return
 
@@ -682,9 +684,10 @@ class PlaybackSyncController:
             and (isinstance(event[1], source_atom) or isinstance(event[1], selection_changed_atom))
         ):
             return
+        _is_remote, _prov_note = self._provenance()
         _log(
             f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution"
-            f"{self._provenance_note()}"
+            f"{_prov_note}"
         )
         now = time.monotonic()
         # Mark that a deliberate selection just happened — the show_atom handler
@@ -706,30 +709,26 @@ class PlaybackSyncController:
         """Enqueue selection resolution to the poll thread command queue."""
         self.plugin._cmd_queue.put(("resolve_selection", None))
 
-    def _provenance_note(self) -> str:
-        """Log suffix naming the remote apply this moment is attributable to.
+    def _provenance(self) -> tuple[bool, str]:
+        """Return (is_remote_induced, log_suffix) for the current moment.
 
-        Empty when nothing a peer sent can account for what just happened —
-        the ordinary case of a user acting on this machine, and the one that
-        has to stay quiet in the log.
-
-        Observation only for now.  The soak that this logging exists to make
-        legible (tasks 3.1-3.2) has to name the route from a follower's
-        structural message to this host's display change before a guard can be
-        placed on it; guarding the wrong one of three candidate routes yields a
-        fix that passes review and fails the next session.
+        is_remote_induced is True if this selection/change is attributable to a
+        recently applied remote message (within the settling window). The suffix
+        is empty when nothing a peer sent accounts for what just happened — the
+        ordinary case of a user acting on this machine.
         """
         try:
             ctx = self.plugin.manager.remote_apply_context() if self.plugin.manager else None
         except Exception:
-            return ""
+            return False, ""
         if not ctx:
-            return ""
+            return False, ""
         where = "in-apply" if ctx["in_apply"] else f"settling+{ctx['settling_for']:.2f}s"
-        return (
+        note = (
             f" [PROVENANCE remote-induced? source={str(ctx['source'])[:8]}"
             f" {ctx['command_schema']}/{ctx['event']} {where} age={ctx['age']:.2f}s]"
         )
+        return True, note
 
     def _read_pinned_source_mode_fresh(self) -> "bool | None":
         """Read Pinned Source Mode now, from a live playhead (bounded).
@@ -1203,10 +1202,11 @@ class PlaybackSyncController:
                             # is polled, so it is observed well after the remote
                             # apply that may have caused it: this is the site the
                             # settle window exists for.
+                            _is_remote, _prov_note = self._provenance()
                             _log(
                                 f"[SEL] Pinned Source Mode:"
                                 f" {self._last_pinned_source_mode} → {psm}"
-                                f"{self._provenance_note()}"
+                                f"{_prov_note}"
                             )
                             if psm is True:
                                 # User re-pinned to the timeline — broadcast clear so
@@ -1214,8 +1214,11 @@ class PlaybackSyncController:
                                 seq_tl_guid = self.plugin.manager.sequence_timeline_guid
                                 if seq_tl_guid:
                                     self.plugin.manager.active_timeline_guid = seq_tl_guid
-                                self.broadcast_view_state(None, "sequence")
-                                _log("[SEL] → broadcast view-state: sequence (returned to sequence view)")
+                                if _is_remote:
+                                    _log("[SEL] → broadcast view-state suppressed (remote-induced)")
+                                else:
+                                    self.broadcast_view_state(None, "sequence")
+                                    _log("[SEL] → broadcast view-state: sequence (returned to sequence view)")
                             elif psm is False:
                                 # User double-clicked a clip — xStudio enters single-clip
                                 # mode.  The show_atom fired ~80 ms ago (suppressed or not);
@@ -1262,16 +1265,19 @@ class PlaybackSyncController:
                                         # "do not assert play" — leaving the play state to
                                         # whoever is actually driving.
                                         _may_claim = self.plugin.manager.owns_visibility()
-                                        self.broadcast_view_state(
-                                            _cg, "source",
-                                            playing_override=True if _may_claim else None,
-                                        )
-                                        _log(
-                                            f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} "
-                                            "mode=source playing="
-                                            + ("True" if _may_claim
-                                               else "(unforced — not host, so not a local isolation)")
-                                        )
+                                        if _is_remote:
+                                            _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} suppressed (remote-induced)")
+                                        else:
+                                            self.broadcast_view_state(
+                                                _cg, "source",
+                                                playing_override=True if _may_claim else None,
+                                            )
+                                            _log(
+                                                f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} "
+                                                "mode=source playing="
+                                                + ("True" if _may_claim
+                                                   else "(unforced — not host, so not a local isolation)")
+                                            )
                                     else:
                                         _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
                                 else:
@@ -1310,8 +1316,12 @@ class PlaybackSyncController:
                     _rctg = self.plugin.manager.get_or_create_clip_timeline(_rcg)
                     if _rctg:
                         self.plugin.manager.active_timeline_guid = _rctg
-                    self.broadcast_view_state(_rcg, "source")
-                    _log(f"[SEL] → broadcast view-state clip {_rcg[:8]} mode=source (from selection, reliable)")
+                    _is_remote, _prov_note = self._provenance()
+                    if _is_remote:
+                        _log(f"[SEL] → reliable selection broadcast suppressed (remote-induced)")
+                    else:
+                        self.broadcast_view_state(_rcg, "source")
+                        _log(f"[SEL] → broadcast view-state clip {_rcg[:8]} mode=source (from selection, reliable)")
 
         except Exception as e:
             _log_exc(f"[SEL] poll failed: {e}")
