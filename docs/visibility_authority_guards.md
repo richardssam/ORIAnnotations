@@ -154,8 +154,10 @@ a different problem: these guards had picked up second jobs since this table
 was written, and retiring them cleanly would need splitting the mixed-purpose
 ones into separate single-purpose mechanisms first, deliberately left as a
 future pass rather than folded into a "pure removal" commit. See
-`openspec/changes/broadcast-ownership/tasks.md` Group 3 for the full
-per-guard reasoning.
+`openspec/changes/archive/2026-08-10-broadcast-ownership/tasks.md` Group 3 for
+the full per-guard reasoning, and `openspec/changes/retire-position-structure-echo-guards`
+(queued behind `session-roles`) for the follow-on that owns actually retiring
+them.
 
 ## Known residual: `timeline_guid` is not a visibility field
 
