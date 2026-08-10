@@ -181,13 +181,6 @@ class PlaybackSyncController:
         # Rolling rather than fixed: refreshed per message, so it expires only
         # once the peer stops driving and genuine local scrubs go out again.
         self._playback_apply_suppress_until: float = 0.0
-        # Monotonic deadline refreshed whenever we broadcast a *local* playhead
-        # move (scrubbing).  Used only to suppress selection-driven clip-start
-        # seeks while we are the one driving playback — a peer following our scrub
-        # crosses clip boundaries and echoes selections back, and applying those
-        # seeks would snap our own playhead to clip starts.  Kept separate from
-        # _playback_apply_suppress_until, which doubles as the broadcast echo guard.
-        self._local_scrub_active_until: float = 0.0
         # Monotonic timestamp of when playback last transitioned False→True.
         # Used to allow the first show_atom after play-start to broadcast even
         # though _last_polled_playing is already True (race-condition guard).
@@ -257,7 +250,6 @@ class PlaybackSyncController:
         self._last_received_frame = None
         self._last_polled_playing = None
         self._playback_apply_suppress_until = 0.0
-        self._local_scrub_active_until = 0.0
         self._playing_started_at = 0.0
         self._last_show_atom_media = None
         self._last_show_atom_seq_tl_guid = None
@@ -989,10 +981,6 @@ class PlaybackSyncController:
             "view_mode": self._cur_view_mode,
             "clip_guid": self._cur_clip_guid,
         }
-
-        # Mark local playback as active so an echoed selection from a following
-        # peer doesn't seek our own playhead to a clip start mid-scrub.
-        self._local_scrub_active_until = time.monotonic() + 0.4
 
         # Position-only updates while paused (scrubbing) are rate-limited:
         # xStudio fires one of these per rendered frame (~60 Hz) while dragging

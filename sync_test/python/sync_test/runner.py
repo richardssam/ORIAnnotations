@@ -1325,10 +1325,21 @@ class TestRunner:
                     logging.info(f"Running in script-driven mode. Using {len(test_data['commands'])} commands from config.")
                     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
                     commands = []
+                    def _resolve_url(c):
+                        c = dict(c)
+                        if c.get("action") == "add_media" and c.get("url") and not os.path.isabs(c["url"]):
+                            c["url"] = os.path.join(repo_root, c["url"])
+                        return c
+
                     for cmd in test_data['commands']:
-                        cmd = dict(cmd)
-                        if cmd.get("action") == "add_media" and cmd.get("url") and not os.path.isabs(cmd["url"]):
-                            cmd["url"] = os.path.join(repo_root, cmd["url"])
+                        cmd = _resolve_url(cmd)
+                        # concurrent_commands nests its per-app commands under
+                        # by_app instead of at the top level, so the resolution
+                        # above never reaches them without this.
+                        if cmd.get("action") == "concurrent_commands" and "by_app" in cmd:
+                            cmd["by_app"] = {
+                                app: _resolve_url(sub) for app, sub in cmd["by_app"].items()
+                            }
                         commands.append(cmd)
                 elif recording_path:
                     logging.info(f"Running in script-driven mode. Deriving commands from {recording_path}")

@@ -111,11 +111,51 @@ Do not delete these while position remains open to every peer. Each one guards a
 | `_last_applied_frame` / `_last_polled_frame` exact-match check | `xstudio_plugin/ori_sync/playback_sync.py` | Position echo detection in the poll loop. |
 | `_last_received_frame` (the driver's position, echoed back rather than our own) | `xstudio_plugin/ori_sync/playback_sync.py` | Keeps a view-change message from clobbering a peer's seek with a freshly-acquired playhead's 0. |
 | Throttled scrub flush re-checking the guard at flush time | `xstudio_plugin/ori_sync/playback_sync.py` | A position captured before a peer began driving must not be released afterwards. |
-| `_local_scrub_active_until` | `xstudio_plugin/ori_sync/playback_sync.py` | Stops selection-driven clip-start seeks snapping our playhead while we drive. |
-| `_loop_mode_apply_suppress_until` | `xstudio_plugin/ori_sync/playback_sync.py` | `playback_mode` is position. |
+| ~~`_local_scrub_active_until`~~ | `xstudio_plugin/ori_sync/playback_sync.py` | **Deleted 2026-08-10** — turned out to be dead code (armed, never read) by the time `broadcast-ownership` went looking for it. Not a lease-retirement; something else had already stopped consulting it. |
+| `_loop_mode_apply_suppress_until` | `xstudio_plugin/ori_sync/playback_sync.py` | `playback_mode` is position, but **not solely for that reason** — see 2026-08-10 note below. |
 | `_applying_pinned_mode` | `xstudio_plugin/ori_sync/playback_sync.py` | Apply-scope flag around a write we make ourselves — not a time window, and not an inference. |
 | `_rv_updating` (apply-scope, depth-independent) | `rvplugin/ori_sync/*.py` | RV's events are synchronous, so this scope is complete and race-free. It guards position and annotation echoes too. |
-| `_structural_mutation_suppress_until` | `xstudio_plugin/ori_sync/structure_sync.py` | Structure, untouched by this change. |
+| `_structural_mutation_suppress_until` | `xstudio_plugin/ori_sync/structure_sync.py` | Structure — see 2026-08-10 note below for why leasing doesn't fully cover this one either. |
+
+### 2026-08-10 — `broadcast-ownership` Group 3 findings
+
+`broadcast-ownership` (position/structure write leases) landed and was soak-tested
+live, including two deliberately-contended two-peer test cases
+(`contended_position_scrub`, `contended_structure_add_media` in
+`sync_test/sync_tests.yaml`) — both converge cleanly and repeatably. That
+satisfies the D5 exit criterion (a positive demonstration under contention) for
+the *lease mechanism itself*. It does **not** mean every guard in the table
+above is now retirable, and re-reading each one found most are not:
+
+- **`_local_scrub_active_until`** was deleted — dead code, unrelated to leasing.
+- **`_playback_apply_suppress_until`** and its close relatives
+  (`_last_applied_frame`/`_last_polled_frame`, `_last_received_frame`, the
+  throttled-flush recheck) are plausibly retirable but were **not** deleted: the
+  guard's 0.4s window is longer than the newer claim-horizon's 0.3s, leaving a
+  gap where a peer that already holds the lease (from an unrelated, earlier
+  claim) could broadcast a stale echo of a *different* peer's just-applied frame.
+  The contended soak checked eventual convergence, not this narrower
+  during-handover window — an absence of failure here is not yet the positive
+  demonstration D5 asks for.
+- **`_loop_mode_apply_suppress_until`** is not a pure echo guard at all: two of
+  its three arm sites suppress echo from local self-writes (carrying loop mode
+  onto a newly-acquired playhead; forcing loop on an isolated clip), unrelated
+  to any peer. Only the third is a remote-apply case, and all three share one
+  read site that can't tell them apart.
+- **`_structural_mutation_suppress_until`**'s five arm sites are cleanly
+  remote-apply-only, but the guard's own surrounding comments describe a second
+  job — giving xStudio's actor model time to settle after a `load_otio` /
+  `remove_container` call before local structural polls re-scan it. That is an
+  actor-model consistency concern, not a broadcast-authority one, and leasing
+  doesn't touch it.
+
+None of this reopens the earlier "zero firings is not evidence" warning — it's
+a different problem: these guards had picked up second jobs since this table
+was written, and retiring them cleanly would need splitting the mixed-purpose
+ones into separate single-purpose mechanisms first, deliberately left as a
+future pass rather than folded into a "pure removal" commit. See
+`openspec/changes/broadcast-ownership/tasks.md` Group 3 for the full
+per-guard reasoning.
 
 ## Known residual: `timeline_guid` is not a visibility field
 
