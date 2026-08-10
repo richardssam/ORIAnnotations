@@ -197,6 +197,26 @@ class BroadcastTimelineGuidTest(unittest.TestCase):
 
         self.assertIsNone(self._broadcast()["timeline_guid"])
 
+    # ── view_mode vs displayed view ─────────────────────────────────────
+    def test_broadcast_during_switch_to_source_does_not_report_sequence(self):
+        self._show("sourceGroup000000", start=96899)
+        self.ctrl._cur_view_mode = "sequence"
+        self.ctrl._cur_clip_guid = None
+
+        state = self._broadcast()
+
+        self.assertEqual(state["view_mode"], "source")
+        self.assertIsNone(state["clip_guid"])
+
+    def test_settled_view_broadcasts_unchanged(self):
+        self._show("seq1", start=1)
+        self.ctrl._cur_view_mode = "sequence"
+        self.ctrl._cur_clip_guid = None
+
+        state = self._broadcast()
+
+        self.assertEqual(state["view_mode"], "sequence")
+
 
 if __name__ == "__main__":
     unittest.main()
