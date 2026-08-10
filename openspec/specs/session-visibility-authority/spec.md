@@ -6,11 +6,12 @@ Define who may change what a synchronised review session is looking at. Visibili
 ### Requirement: Broadcast authority is split by category
 Sync traffic SHALL be divided into categories with distinct authority, so that controlling what the session looks at is a separate permission from moving within it.
 
-- **visibility** — which clip or sequence is on screen, and in which view mode — SHALL be broadcast only by the session host.
-- **position** — playhead position, play/stop, playback mode — SHALL remain broadcastable by any peer.
-- **annotation** SHALL remain broadcastable by any peer.
+- **visibility** — which clip or sequence is on screen, and in which view mode — SHALL be broadcast only by the session host. This is a static, single-writer rule and needs no additional contention resolution.
+- **position** — playhead position, play/stop, playback mode, and display state (channel, exposure, pan/zoom) — SHALL remain broadcastable by any peer, but only by whichever peer currently holds that category's ownership lease (`broadcast-ownership`).
+- **structure** — timeline add/remove/replace/rename and structural child mutations — SHALL remain broadcastable by any peer, but only by whichever peer currently holds the structure ownership lease (`broadcast-ownership`).
+- **annotation** SHALL remain broadcastable by any peer, with no ownership lease.
 
-Visibility and position currently travel as field groups within one message, so enforcement SHALL apply to the fields rather than to the message type: a non-host peer MAY broadcast a message carrying position, and SHALL NOT broadcast one asserting visibility.
+Visibility, position, and structure currently travel as field groups within one or more messages, so enforcement SHALL apply to the fields rather than to the message type: a non-host peer MAY broadcast a message carrying position, and SHALL NOT broadcast one asserting visibility; a peer that does not hold the position or structure lease SHALL NOT broadcast fields in that category regardless of host status.
 
 Stripping those fields is necessary and **not sufficient**. Authority is over
 the **displayed outcome**, not over one message's fields: a non-host peer SHALL
@@ -37,7 +38,7 @@ isolations — is an instance of exactly that gap, reached by a different route.
 See `openspec/changes/archive/2026-08-09-fix-visibility-authority-bypass/evidence.md`.
 
 #### Scenario: A follower may scrub but not change what is shown
-- **WHEN** a peer that is not the host moves its playhead
+- **WHEN** a peer that is not the host moves its playhead while holding the position lease
 - **THEN** the position SHALL be broadcast and followed by other peers
 - **WHEN** that same peer changes which clip it is viewing locally
 - **THEN** no visibility change SHALL be broadcast
@@ -47,10 +48,15 @@ See `openspec/changes/archive/2026-08-09-fix-visibility-authority-bypass/evidenc
 - **THEN** that visibility change SHALL be broadcast
 - **AND** every other peer SHALL adopt it
 
+#### Scenario: A peer without the position lease does not broadcast position
+- **WHEN** a peer moves its playhead while another peer holds the position lease
+- **THEN** its position fields SHALL NOT be broadcast
+
 #### Scenario: Authority is enforced in one place
 - **WHEN** any peer attempts a broadcast
 - **THEN** authority SHALL be evaluated at a single shared enforcement point rather than separately in each host application
-- **AND** the caller SHALL be told whether the broadcast was sent or suppressed
+- **AND** that evaluation SHALL include both the static visibility rule and the position/structure lease check
+- **AND** the caller SHALL be told whether the broadcast was sent or suppressed, where a message that is sent with some field groups stripped is reported as suppressed
 
 #### Scenario: A follower's structural message does not move the host's view
 - **WHEN** a non-host peer changes its own view, and that produces a structural message
