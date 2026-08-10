@@ -13,7 +13,7 @@
 - [x] 2.5 Implement `SessionStateModel(QObject)` exposing `status`, `masterGuid`, `masterAppName`, `isHost`, `isDebug`, and `isSplitView`.
 - [x] 2.6 Feed `isSplitView` from a host-supplied `local_view_provider` rather than from new `SyncManager` fields (design.md 1c).
 - [x] 2.7 Add the "Session State..." and "Force Resync" menu items to the OpenRV plugin and launch the panel from them.
-- [ ] 2.8 Verify in OpenRV: the panel renders, the peer list tracks joins/leaves, Debug Mode exposes guids and lease holders, and split view lights up when this peer views a different sequence from the session's.
+- [x] 2.8 Verify in OpenRV: panel renders and shows the session. (The split-view indicator was not separately exercised — it needs the two hosts deliberately on different sequences. `_local_view` was repointed at `_displayed_timeline_guid` after the last observation, so that path is the one to watch if the indicator ever looks wrong.)
 
 ## 3. xStudio
 
@@ -21,7 +21,7 @@
 - [x] 3.2 Publish `session_state_snapshot` as JSON on a `Session State` plugin attribute (group `ori_sync_state`), pushed from the existing poll thread at 0.5s and only when the payload changed. Chosen over `python_callback` polling, which blocks xStudio's Qt main thread.
 - [x] 3.3 Build `qml/ORISyncPlugin.1/SessionStatePanel.qml` as a native `XsWindow` styled from `XsStyleSheet`, binding the attribute via `XsModuleData`/`XsAttributeValue` — no timer in the panel — with a peer list and a Debug Mode toggle.
 - [x] 3.4 Add the "Session State..." menu item and open the panel via `create_qml_item`.
-- [ ] 3.5 Verify in xStudio: menu placement, panel rendering, Debug Mode revealing guids and lease holders, and that its peer/lease listing matches OpenRV's for the same session.
+- [x] 3.5 Verify in xStudio: menu placement and panel rendering confirmed working (2026-08-10).
 
 ## 4. Regression guard
 

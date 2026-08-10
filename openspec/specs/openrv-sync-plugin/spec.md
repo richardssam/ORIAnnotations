@@ -53,6 +53,10 @@ The plugin SHALL support runtime-configurable session identity. The session name
 ### Requirement: Synchronized Playback
 The plugin SHALL synchronize the playhead (frame) and playback state (play/stop) between all instances.
 
+The broadcast frame is expressed relative to the view the sender is displaying, so the accompanying timeline guid SHALL identify **that** view — the isolated clip's own timeline when a single clip is displayed, the sequence's timeline when the sequence is displayed. A position SHALL NOT be attributed to a timeline the sender is not displaying, because a receiver has no other way to tell which coordinate space a frame belongs to and would apply it to the wrong one.
+
+When the displayed view has no timeline shared with the session, the broadcast SHALL carry no timeline guid rather than substituting the session's active timeline. "A position in a view you do not have" and "a position in your sequence" are different claims, and only the first one is true.
+
 #### Scenario: Scrubbing while paused
 
 - **WHEN** a paused peer moves its playhead to a new frame
@@ -68,6 +72,24 @@ The plugin SHALL synchronize the playhead (frame) and playback state (play/stop)
 
 - **WHEN** a peer applies a playback state received from another peer
 - **THEN** it SHALL NOT re-broadcast that state back to the session
+
+#### Scenario: An isolated clip is labelled with its own timeline
+
+- **WHEN** OpenRV is displaying a single isolated clip and broadcasts a playback state
+- **THEN** the timeline guid SHALL be that clip's own timeline guid
+- **AND** SHALL NOT be the guid of the sequence the clip belongs to
+
+#### Scenario: A position from an unshared view is not attributed to a shared timeline
+
+- **WHEN** OpenRV is displaying media that has no timeline shared with the session
+- **THEN** the broadcast SHALL carry no timeline guid
+- **AND** peers SHALL NOT move their playheads in response to it
+
+#### Scenario: Sequence views are unaffected
+
+- **WHEN** OpenRV is displaying a sequence and broadcasts a playback state
+- **THEN** the timeline guid SHALL be that sequence's timeline guid
+- **AND** peers displaying the same sequence SHALL move their playheads to the corresponding frame
 
 ### Requirement: Synchronized Selection
 The plugin SHALL synchronize the active node/clip selection.
@@ -129,17 +151,25 @@ Because RV cannot mutate a dynamically-created pen node's properties from outsid
 
 The plugin SHALL rebuild the "OTIO Sync" menu via `defineModeMenu` whenever connection state changes, showing session management items appropriate to the current state. The connected/disconnected menus below apply when the sync core imported successfully; when it did not, the unavailable menu defined in "Sync core import failure is visible in the menu" applies instead.
 
+The "Sync Status" item is replaced by "Session State…", which opens the shared Session State panel (see the `session-state-ui` spec) instead of printing a one-line summary to the console. The connected menu additionally offers "Force Resync", which re-requests the full session state from the master.
+
 #### Scenario: Disconnected menu
 
 - **WHEN** the plugin is not in a session and the sync core is available
-- **THEN** the OTIO Sync menu SHALL contain "Create Session…", "Join Session…", a separator, "Add Clip to Timeline…", and "Sync Status"
+- **THEN** the OTIO Sync menu SHALL contain "Create Session…", "Join Session…", a separator, "Add Clip to Timeline…", and "Session State…"
 - **AND** "Add Clip to Timeline…" SHALL be in `DisabledMenuState`
 
 #### Scenario: Connected menu
 
 - **WHEN** the plugin is in a session named `{name}`
-- **THEN** the OTIO Sync menu SHALL contain "Leave Session ({name})", a separator, "Add Clip to Timeline…", and "Sync Status"
+- **THEN** the OTIO Sync menu SHALL contain "Leave Session ({name})", "Force Resync", a separator, "Add Clip to Timeline…", and "Session State…"
 - **AND** "Create Session…" and "Join Session…" SHALL NOT appear
+
+#### Scenario: Force Resync is unavailable to the master
+
+- **WHEN** the plugin is in a session and this peer is the master
+- **THEN** "Force Resync" SHALL be in `DisabledMenuState`
+- **AND** selecting it on a non-master peer SHALL call `request_state()` on the sync manager
 
 ### Requirement: connect_to_session and disconnect_from_session methods
 
@@ -312,3 +342,26 @@ it is already showing what the host asked for, while showing something else.
 - **THEN** it SHALL record that fact and the reason
 - **AND** the record SHALL be observable without reading application logs
 
+### Requirement: A broadcast describes the view being displayed when it is sent
+The `view_mode` and `clip_guid` on an outbound playback broadcast SHALL describe the view OpenRV is displaying at the moment the message is built, not the last view the plugin recorded.
+
+Those two are updated by the view-change handler, and a frame-changed broadcast can be dispatched before that handler runs — the frame changes as part of the switch. A broadcast built from the recorded values therefore describes the view the application has already left, while carrying the new view's frame.
+
+This matters beyond the message itself: a peer that applies such a position moves its own playhead, which can present as a local selection on that peer and be reported back, undoing the switch that started it.
+
+#### Scenario: A view switch does not broadcast the previous view
+
+- **WHEN** OpenRV switches to an isolated clip and a frame-changed broadcast is dispatched during the switch
+- **THEN** the broadcast SHALL NOT report the previously displayed view mode
+- **AND** the reported view SHALL match the view node OpenRV is displaying
+
+#### Scenario: The displayed view is observable in the log
+
+- **WHEN** a playback broadcast is sent
+- **THEN** the log line SHALL record both the displayed view and the broadcast view mode
+- **AND** a disagreement between them SHALL be visible without attaching a debugger
+
+#### Scenario: A settled view still broadcasts normally
+
+- **WHEN** OpenRV is displaying a view it has finished switching to and the user scrubs
+- **THEN** the broadcast SHALL carry that view's mode and clip guid as before

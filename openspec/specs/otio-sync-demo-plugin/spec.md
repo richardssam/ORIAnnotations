@@ -1,15 +1,16 @@
-## ADDED Requirements
+# OTIO Sync Demo Plugin Specification
 
+## Purpose
+Define the user-facing surface of the ORI Sync demo plugins in OpenRV and xStudio — the session menus, the startup bootstrap of a shared tracked timeline, and clip insertion — as distinct from the sync protocol those actions drive.
+## Requirements
 ### Requirement: OTIO Sync menu is present in the RV menu bar
 
-The plugin SHALL register an "OTIO Sync" top-level menu in OpenRV. The menu contents SHALL be dynamic, reflecting connection state (see `ori-session-management` spec). The static "Add Clip to Timeline…" and "Sync Status" items SHALL remain present in both states.
+The plugin SHALL register an "OTIO Sync" top-level menu in OpenRV. The menu contents SHALL be dynamic, reflecting connection state (see `ori-session-management` spec). The static "Add Clip to Timeline…" and "Session State…" items SHALL remain present in both states.
 
 #### Scenario: Menu appears on startup
 
 - **WHEN** OpenRV starts with the `ori_sync` plugin loaded
 - **THEN** an "OTIO Sync" menu SHALL be visible in the RV menu bar
-
----
 
 ### Requirement: Plugin bootstraps a shared tracked timeline on startup
 
@@ -78,3 +79,4 @@ The plugin SHALL, when `receive_and_apply_all` returns a count greater than zero
 #### Scenario: Remote clip appears in receiver
 - **WHEN** Instance B receives an `insert_child` delta from Instance A
 - **THEN** the clip SHALL be inserted into Instance B's OTIO timeline AND loaded into Instance B's RV viewer
+
