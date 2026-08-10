@@ -224,6 +224,41 @@ class PlaybackSyncController:
                     pass
         return ("sequence", view, tl_guid)
 
+    def _displayed_timeline_guid(self):
+        """Return the timeline guid naming the view RV is currently displaying.
+
+        A broadcast frame is expressed relative to the displayed view — a
+        timecode source starts at 96899, an OTIO sequence at 0, a normal view
+        at 1 — so this guid is the only thing that tells a peer which
+        coordinate space the position belongs to.  It is the isolated clip's
+        own timeline in source mode, the sequence's timeline in sequence mode,
+        and ``None`` when what we are showing has no timeline shared with the
+        session.
+
+        ``None`` is a real answer, not a failure to look one up.  Substituting
+        ``active_timeline_guid`` was the defect this replaces: it labelled a
+        clip-local position with the *sequence's* guid, which passed the
+        receiver's timeline check and moved its sequence playhead to a frame
+        from a different space.
+
+        Source mode resolves through :attr:`_cur_clip_guid` — the clip this
+        peer is claiming to show in the same message, so ``clip_guid`` and
+        ``timeline_guid`` always describe the same thing, and an isolation we
+        could not resolve (``_forget_current_clip``) yields no guid rather than
+        a wrong one.  It deliberately does not use :meth:`_displayed_view`'s
+        third element: that branch looks ``_clip_timelines`` up by RV node name
+        while the map is keyed by clip guid, so it never resolves.  Harmless
+        there (the apply path only reads it for sequence views) but not here.
+        """
+        mode, _node, tl_guid = self._displayed_view()
+        if mode == "source":
+            clip_guid = self._cur_clip_guid
+            if not clip_guid:
+                return None
+            clip_tls = getattr(self.plugin.sync_manager, "_clip_timelines", {}) or {}
+            return clip_tls.get(clip_guid)
+        return tl_guid
+
     def _report_mirror_failure(self, detail):
         """Record that the host's reported view could not be shown.
 
@@ -249,12 +284,16 @@ class PlaybackSyncController:
         except AttributeError:
             playback_mode = "loop"
 
-        view = rv.commands.viewNode()
-        timeline_guid = self.plugin.sequence._rv_node_to_timeline_guid.get(view) or self.plugin.sync_manager.active_timeline_guid
+        displayed_mode, view, _ = self._displayed_view()
+        timeline_guid = self._displayed_timeline_guid()
         base = self._frame_base()
+        # `displayed` is what RV is actually showing; `mode` is what we are
+        # broadcasting.  Logging both is what makes a mislabelled position
+        # visible in a log rather than only in a peer's playhead.
         _log(
             f"SEND playback playing={playing} frame={current_frame} base={base}"
-            f" fps={fps} view={view} tl={timeline_guid}"
+            f" fps={fps} view={view} tl={timeline_guid or '-'}"
+            f" displayed={displayed_mode}"
             f" mode={self._cur_view_mode} clip={(self._cur_clip_guid or '')[:8]}"
         )
         state = {

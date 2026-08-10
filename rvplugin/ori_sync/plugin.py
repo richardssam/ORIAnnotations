@@ -639,14 +639,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         The manager only tracks the session-wide view, so the Session State
         panel asks the host directly to tell whether we have diverged from it.
 
-        Resolved through ``_displayed_view()`` — the same reader the apply path
-        uses — because it answers for a source group (the isolated clip's own
-        timeline) as well as a sequence.  Falling back to
+        Resolved through ``_displayed_timeline_guid()``, the same reader the
+        playback broadcast uses, so the panel reports divergence on exactly the
+        view identity peers are told about.  Falling back to
         ``active_timeline_guid`` here would make the local view equal the shared
         one by construction, and the panel could never report a split.
         """
-        _mode, _node, tl_guid = self.playback._displayed_view()
-        return (tl_guid, self.playback._cur_clip_guid)
+        return (
+            self.playback._displayed_timeline_guid(),
+            self.playback._cur_clip_guid,
+        )
 
     def do_show_session_state(self, event=None):
         if not self.sync_manager:
