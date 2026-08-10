@@ -40,6 +40,7 @@ Before modifying specific components, **you MUST read the corresponding constrai
 - **OpenRV Plugin**: [docs/openrv_constraints.md](docs/openrv_constraints.md)
 - **xStudio Plugin**: [docs/xstudio_constraints.md](docs/xstudio_constraints.md)
 - **Sync Viewer**: [docs/sync_viewer_constraints.md](docs/sync_viewer_constraints.md)
+- **Running & writing tests**: [docs/testing.md](docs/testing.md) — two suites on two interpreters (`./run_tests_core.sh`, `./run_tests_xstudio.sh`), the `rv` stub collision that makes tests pass alone and fail in a full run, and the one known flaky test.
 - **Debugging & Diagnostics**: [debug/README.md](debug/README.md)
 
 ---
