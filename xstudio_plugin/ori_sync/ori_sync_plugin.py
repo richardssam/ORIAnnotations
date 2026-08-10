@@ -41,7 +41,10 @@ timeout" for the full rule.
 """
 
 # utils performs the sys.path / OTIO_PLUGIN_MANIFEST_PATH setup as a side-effect.
-from .utils import _log, _log_exc, _parse_ori_session, _uri_to_posix_path, QML_FOLDER, SESSION_DIALOG_QML  # noqa: E402
+from .utils import (  # noqa: E402
+    _log, _log_exc, _parse_ori_session, _uri_to_posix_path,
+    QML_FOLDER, SESSION_DIALOG_QML, SESSION_STATE_PANEL_QML,
+)
 from .media_map import MediaMapController  # noqa: E402
 from .timeline_build import TimelineBuildController  # noqa: E402
 from .display_sync import DisplaySyncController  # noqa: E402
@@ -69,6 +72,7 @@ from otio_sync_core.authority import (  # noqa: E402
 )
 from otio_sync_core.manager import STATE_DISCOVERING, STATE_SYNCED, SyncManager  # noqa: E402
 from otio_sync_core.rabbitmq_network import RabbitMQNetwork, resolve_host  # noqa: E402
+from otio_sync_core.session_state import session_state_snapshot  # noqa: E402
 from xstudio.plugin import PluginBase  # noqa: E402
 
 #: Horizon (seconds) after a remote apply within which claim_lease() is a
@@ -120,6 +124,17 @@ class ORISyncPlugin(PluginBase):
 
         self.status_attr = self.add_attribute("Status", "Disconnected")
         self.status_attr.expose_in_ui_attrs_group("ori_sync_conn")
+
+        # Session State panel feed: the JSON projection from
+        # otio_sync_core.session_state, pushed from the poll thread.  An
+        # attribute rather than a python_callback because python_callback
+        # blocks xStudio's Qt main thread (see do_session_connect) — a panel
+        # polling it at 2Hz would block the UI 2Hz forever.  QML binds to this
+        # reactively and nothing crosses a thread boundary at read time.
+        self.session_state_attr = self.add_attribute("Session State", "{}")
+        self.session_state_attr.expose_in_ui_attrs_group("ori_sync_state")
+        self._last_session_state_json = "{}"
+        self._last_session_state_push = 0.0
 
         # Every xStudio event group this plugin has joined, keyed by the
         # group-owning actor's address string:
@@ -174,23 +189,37 @@ class ORISyncPlugin(PluginBase):
         self.insert_menu_item(
             "main menu bar",
             "Create Session...",
-            "Session|Connect",
+            "Session",
             0.1,
             callback=self._menu_create_session,
         )
         self.insert_menu_item(
             "main menu bar",
             "Join Session...",
-            "Session|Connect",
+            "Session",
             0.2,
             callback=self._menu_join_session,
         )
         self.insert_menu_item(
             "main menu bar",
             "Leave Session",
-            "Session|Connect",
+            "Session",
             0.3,
             callback=self._menu_leave_session,
+        )
+        self.insert_menu_item(
+            "main menu bar",
+            "Session State...",
+            "Session",
+            0.4,
+            callback=self._menu_show_session_state,
+        )
+        self.insert_menu_item(
+            "main menu bar",
+            "Resync Session",
+            "Session",
+            0.5,
+            callback=self._menu_resync_session,
         )
 
         # Place the top-level "Session" menu just before "Help" (which xStudio
@@ -518,6 +547,40 @@ class ORISyncPlugin(PluginBase):
             return
         self._cmd_queue.put(("leave_session", {}))
 
+    def _menu_resync_session(self, *args, **kwargs) -> None:
+        if self.manager and not self.manager.is_master:
+            _log("Forcing resync from master...")
+            self.manager.request_state()
+
+    def _menu_show_session_state(self, *args, **kwargs) -> None:
+        """Open the Session State panel.
+
+        The panel reads the ``Session State`` attribute, so it shows whatever
+        the last poll pushed even when opened while disconnected.
+        """
+        self.create_qml_item(SESSION_STATE_PANEL_QML)
+
+    def _push_session_state(self) -> None:
+        """Publish the session-state projection for the panel to bind to.
+
+        Shares :func:`session_state_snapshot` with the OpenRV panel so the two
+        applications cannot disagree about who is in the session, who holds
+        which lease, or who is host.  Read-only: this never writes to the
+        manager.
+        """
+        try:
+            snapshot = (
+                session_state_snapshot(self.manager) if self.manager else {}
+            )
+            payload = json.dumps(snapshot)
+        except Exception:
+            _log_exc("session state push failed")
+            return
+        if payload == self._last_session_state_json:
+            return
+        self._last_session_state_json = payload
+        self.session_state_attr.set_value(payload)
+
     def do_session_connect(self, data) -> list:
         """Called from QML SessionDialog via python_callback.
 
@@ -672,6 +735,15 @@ class ORISyncPlugin(PluginBase):
                     with _timed("fullstate_write"):
                         self._write_fullstate_file()
                     self._last_fullstate_write = now
+
+                # 6.3. Session State panel feed (0.5s, matching the OpenRV
+                # panel's poll period).  Only pushed when it actually changed:
+                # an unchanged set_value would wake every QML binding on it
+                # twice a second for nothing.
+                if now - self._last_session_state_push >= 0.5:
+                    with _timed("session_state_push"):
+                        self._push_session_state()
+                    self._last_session_state_push = now
 
                 # 6.5. Periodic structure scan (1.0s interval)
                 if now - self.structure._last_structure_scan >= 1.0:

@@ -179,3 +179,4 @@ def bounded_timeout(connection, timeout_ms: int):
 
 QML_FOLDER = "qml/ORISyncPlugin.1"
 SESSION_DIALOG_QML = "SessionDialog {}"
+SESSION_STATE_PANEL_QML = "SessionStatePanel {}"

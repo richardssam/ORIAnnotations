@@ -45,6 +45,10 @@ zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/protocol_messages.py \
     otio_sync_core/proxy.py \
     otio_sync_core/state_projection.py \
-    otio_sync_core/inspection.py
+    otio_sync_core/inspection.py \
+    otio_sync_core/session_state.py \
+    otio_sync_core/ui_model.py \
+    otio_sync_core/qml/OtioSyncStyle.qml \
+    otio_sync_core/qml/SessionStatePanel.qml
 
 echo "Built otiosyncdemo-1.2.rvpkg"

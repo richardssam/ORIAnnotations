@@ -164,10 +164,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 (self.MENU_TITLE, [
                     (f"Leave Session ({self._current_session_name})", self.do_leave_session, None,
                      lambda: rv.commands.NeutralMenuState),
+                    ("Force Resync", self.do_resync, None,
+                     lambda: rv.commands.DisabledMenuState if self.sync_manager and self.sync_manager.is_master else rv.commands.NeutralMenuState),
                     ("_", None),
                     ("Add Clip to Timeline...", self.do_add_clip, None,
                      lambda: rv.commands.NeutralMenuState),
-                    ("Sync Status", self.do_show_status, None,
+                    ("Session State...", self.do_show_session_state, None,
                      lambda: rv.commands.NeutralMenuState),
                 ])
             ]
@@ -180,7 +182,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 ("_", None),
                 ("Add Clip to Timeline...", self.do_add_clip, None,
                  lambda: rv.commands.DisabledMenuState),
-                ("Sync Status", self.do_show_status, None,
+                ("Session State...", self.do_show_session_state, None,
                  lambda: rv.commands.NeutralMenuState),
             ])
         ]
@@ -607,8 +609,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         if event: event.reject()
 
     def do_leave_session(self, event=None):
-        """Disconnect from the active session."""
+        """Disconnect and return to local-only operation."""
+        _log("User requested: Leave Session")
         self.disconnect_from_session()
+        if event: event.reject()
+        
+    def do_resync(self, event=None):
+        """Force a full state sync from the master."""
+        if self.sync_manager and not self.sync_manager.is_master:
+            _log("Forcing resync from master...")
+            self.sync_manager.request_state()
         if event: event.reject()
 
     def do_add_clip(self, event=None):
@@ -623,10 +633,78 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         self.sequence.add_clip_from_path(path)
         if event: event.reject()
 
-    def do_show_status(self, event=None):
-        if self.sync_manager:
-            role = "MASTER" if self.sync_manager.is_master else "CLIENT"
-            _log(f"Session: {self.sync_manager.session_id} | Role: {role} | Status: {self.sync_manager.status}")
+    def _local_view(self):
+        """What *this* RV is showing, as ``(timeline_guid, clip_guid)``.
+
+        The manager only tracks the session-wide view, so the Session State
+        panel asks the host directly to tell whether we have diverged from it.
+
+        Resolved through ``_displayed_view()`` — the same reader the apply path
+        uses — because it answers for a source group (the isolated clip's own
+        timeline) as well as a sequence.  Falling back to
+        ``active_timeline_guid`` here would make the local view equal the shared
+        one by construction, and the panel could never report a split.
+        """
+        _mode, _node, tl_guid = self.playback._displayed_view()
+        return (tl_guid, self.playback._cur_clip_guid)
+
+    def do_show_session_state(self, event=None):
+        if not self.sync_manager:
+            if event: event.reject()
+            return
+            
+        try:
+            from PySide6.QtQuick import QQuickView
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QColor
+            from PySide6.QtQml import QQmlEngine
+        except ImportError:
+            _log("PySide6 not available for UI")
+            if event: event.reject()
+            return
+            
+        import otio_sync_core
+        from otio_sync_core.ui_model import SessionStateModel, PeerListModel
+        
+        if not hasattr(self, "_state_view"):
+            self._state_view = QQuickView()
+            self._state_view.setTitle(f"Session State ({self.sync_manager.session_id})")
+            self._state_view.resize(400, 500)
+            self._state_view.setResizeMode(QQuickView.SizeRootObjectToView)
+            
+            # Setup models
+            self._session_model = SessionStateModel(
+                self.sync_manager, local_view_provider=self._local_view
+            )
+            self._peer_model = PeerListModel(self.sync_manager)
+            
+            self._state_view.rootContext().setContextProperty("sessionState", self._session_model)
+            self._state_view.rootContext().setContextProperty("peerModel", self._peer_model)
+            
+            # Add path to qmldir
+            # Add path to PySide6 QML modules (e.g. QtQuick.Controls)
+            import PySide6
+            pyside_qml = os.path.join(os.path.dirname(PySide6.__file__), "Qt", "qml")
+            if os.path.exists(pyside_qml):
+                self._state_view.engine().addImportPath(pyside_qml)
+                
+            qml_path = os.path.join(os.path.dirname(otio_sync_core.__file__), "qml")
+            
+            qml_file = os.path.join(qml_path, "SessionStatePanel.qml")
+            self._state_view.setSource(QUrl.fromLocalFile(qml_file))
+            
+            for err in self._state_view.errors():
+                _log(f"QML Error: {err.toString()}")
+            
+            # Optional: handle engine quitting if needed
+            def _cleanup():
+                if hasattr(self, "_state_view"):
+                    del self._state_view
+            self._state_view.engine().quit.connect(_cleanup)
+            
+        self._state_view.show()
+        self._state_view.raise_()
+        
         if event: event.reject()
 
     def deactivate(self):
