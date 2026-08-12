@@ -571,7 +571,7 @@ class TestRunner:
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
                            "is_host", "host_guid", "view_mirror_error",
-                           "view_outcome",
+                           "view_outcome", "display_name",
                            "unresolved_patches", "unpublished_parents",
                            "media_count", "broadcast_ownership"}
             s1 = {k: v for k, v in base_state.items() if k not in ignore_keys}

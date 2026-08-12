@@ -63,6 +63,28 @@ XsWindow {
             }
         }
 
+        // ── You (Identity) ─────────────────────────────────────────────
+        XsText {
+            text: "You:"
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+        }
+
+        XsTextField {
+            id: youField
+            Layout.fillWidth: true
+            Layout.preferredHeight: rowHeight
+            text: ""
+            property string defaultYou: ""
+            Component.onCompleted: {
+                var def = python_callback("get_default_identity", {}) || ""
+                text = def
+                defaultYou = def
+            }
+            onAccepted: {
+                if (nameField.text.trim() !== "") connectButton.clicked()
+            }
+        }
+
         // ── Spacer ─────────────────────────────────────────────────────
         Item { Layout.fillHeight: true; Layout.columnSpan: 2 }
 
@@ -94,6 +116,7 @@ XsWindow {
                         {
                             "host": hostField.text.trim() || "localhost",
                             "name": nameField.text.trim(),
+                            "you": youField.text.trim() !== youField.defaultYou ? youField.text.trim() : null,
                             "mode": dialog.mode
                         }
                     )

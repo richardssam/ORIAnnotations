@@ -179,18 +179,28 @@ XsWindow {
                             }
 
                             XsText {
-                                text: modelData.app + (modelData.is_self ? " (You)" : "")
+                                text: modelData.display_name + (modelData.is_self ? " (You)" : "")
                                 horizontalAlignment: Text.AlignLeft
                                 color: XsStyleSheet.primaryTextColor
                             }
 
                             XsText {
-                                text: (modelData.is_master ? "Master / " : "") + modelData.role
+                                text: (modelData.is_master ? "Master / " : "") + modelData.role + " (" + modelData.app + ")"
                                 horizontalAlignment: Text.AlignLeft
                                 color: XsStyleSheet.secondaryTextColor
                             }
 
                             Item { Layout.fillWidth: true }
+                        }
+
+                        XsText {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignLeft
+                            visible: panel.debugMode
+                            color: XsStyleSheet.hintColor
+                            text: "Identity: " + (modelData.user ? modelData.user : "-") + "@" + (modelData.host ? modelData.host : "-")
+                                  + (modelData.source ? " (" + modelData.source + ")" : "")
                         }
 
                         XsText {

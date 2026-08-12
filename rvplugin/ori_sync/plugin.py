@@ -194,7 +194,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log(f"_rebuild_menu failed: {e}")
 
-    def connect_to_session(self, host, session_name):
+    def connect_to_session(self, host, session_name, identity_override=None):
         """Create a SyncManager and join the named session."""
         if not SyncManager or not RabbitMQNetwork:
             _log("SyncManager/RabbitMQNetwork not available — cannot connect")
@@ -213,7 +213,20 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         # app_name ranks this peer for host election: xStudio is the preferred
         # visibility authority, so RV hosts only an RV-only session.
-        self.sync_manager = SyncManager(session_id=session_name, app_name="openrv")
+        
+        identity_arg = None
+        if identity_override:
+            try:
+                from otio_sync_core.identity import identity_from_override
+                identity_arg = identity_from_override(identity_override)
+            except Exception as e:
+                _log(f"Failed to process identity override: {e}")
+                
+        self.sync_manager = SyncManager(
+            session_id=session_name,
+            app_name="openrv",
+            identity_override=identity_arg
+        )
         # Expose the manager to the in-process sync_test inspector (it reads
         # manager.export_state() for /full_state and the active timeline name).
         try:
@@ -588,10 +601,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name = session_dialog("Create Session")
+        host, name, identity = session_dialog("Create Session")
         if name:
             self._pending_create_check = True
-            self.connect_to_session(host, name)
+            self.connect_to_session(host, name, identity)
         if event: event.reject()
 
     def do_join_session(self, event=None):
@@ -603,9 +616,9 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name = session_dialog("Join Session")
+        host, name, identity = session_dialog("Join Session")
         if name:
-            self.connect_to_session(host, name)
+            self.connect_to_session(host, name, identity)
         if event: event.reject()
 
     def do_leave_session(self, event=None):

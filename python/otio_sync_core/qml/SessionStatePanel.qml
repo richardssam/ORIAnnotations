@@ -133,7 +133,7 @@ Rectangle {
                         }
                         Text {
                             id: peerName
-                            text: appName + (isSelf ? " (You)" : "")
+                            text: displayName + (isSelf ? " (You)" : "")
                             color: uiStyle.textColor
                             font.family: uiStyle.fontFamily
                             font.pixelSize: uiStyle.fontSize
@@ -142,7 +142,7 @@ Rectangle {
                         }
                     }
                     Text {
-                        text: (isMaster ? "Master / " : "") + role
+                        text: (isMaster ? "Master / " : "") + role + " (" + appName + ")"
                         color: uiStyle.secondaryTextColor
                         font.family: uiStyle.fontFamily
                         font.pixelSize: uiStyle.fontSize - 2
@@ -159,6 +159,13 @@ Rectangle {
                     
                     Text {
                         text: "GUID: " + guid
+                        color: uiStyle.textColor
+                        opacity: 0.7
+                        font.family: uiStyle.fontFamily
+                        font.pixelSize: uiStyle.fontSize - 4
+                    }
+                    Text {
+                        text: "Identity: " + (user ? user : "-") + "@" + (host ? host : "-") + (source ? " (" + source + ")" : "")
                         color: uiStyle.textColor
                         opacity: 0.7
                         font.family: uiStyle.fontFamily

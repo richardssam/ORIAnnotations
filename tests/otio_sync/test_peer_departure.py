@@ -303,8 +303,8 @@ def test_the_roster_carries_no_liveness_stamp():
 
     assert roster
     for entry in roster.values():
+        assert set(entry).issuperset({"app", "capabilities"})
         assert "last_seen" not in entry
-        assert set(entry) == {"app", "capabilities"}
 
 
 def test_an_adopted_peer_is_stamped_locally_and_not_immediately_aged():

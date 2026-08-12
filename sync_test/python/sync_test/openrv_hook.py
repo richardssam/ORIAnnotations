@@ -24,6 +24,7 @@ def get_openrv_state():
         # know which peer was allowed to.
         "is_host": None,
         "host_guid": None,
+        "display_name": None,
         # Non-null when the host reported a view this peer could not show. A
         # follower mirrors rather than approximates, so this is how a mirror
         # failure becomes visible instead of looking like agreement.
@@ -59,6 +60,14 @@ def get_openrv_state():
                 state["unpublished_parents"] = list(
                     getattr(_mgr_for_master, "unpublished_parents", []) or []
                 )
+                
+                try:
+                    from otio_sync_core.session_state import display_name
+                    peer = _mgr_for_master._peers.get(_mgr_for_master.self_guid)
+                    state["display_name"] = display_name(peer) if peer else None
+                except Exception:
+                    pass
+                
                 state["broadcast_ownership"] = dict(
                     getattr(_mgr_for_master, "ownership_snapshot", {}) or {}
                 )

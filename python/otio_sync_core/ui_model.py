@@ -138,6 +138,10 @@ class PeerListModel(QAbstractListModel):
     HoldsDisplayLeaseRole = Qt.UserRole + 7
     HoldsStructureLeaseRole = Qt.UserRole + 8
     IsMasterRole = Qt.UserRole + 9
+    DisplayNameRole = Qt.UserRole + 10
+    UserRole = Qt.UserRole + 11
+    HostRole = Qt.UserRole + 12
+    SourceRole = Qt.UserRole + 13
 
     #: QML role name → snapshot peer key.
     _FIELDS = {
@@ -150,6 +154,10 @@ class PeerListModel(QAbstractListModel):
         HoldsPositionLeaseRole: "holds_position_lease",
         HoldsDisplayLeaseRole: "holds_display_lease",
         HoldsStructureLeaseRole: "holds_structure_lease",
+        DisplayNameRole: "display_name",
+        UserRole: "user",
+        HostRole: "host",
+        SourceRole: "source",
     }
 
     def __init__(self, manager, parent=None):
@@ -172,6 +180,10 @@ class PeerListModel(QAbstractListModel):
             self.HoldsDisplayLeaseRole: b"holdsDisplayLease",
             self.HoldsStructureLeaseRole: b"holdsStructureLease",
             self.IsMasterRole: b"isMaster",
+            self.DisplayNameRole: b"displayName",
+            self.UserRole: b"user",
+            self.HostRole: b"host",
+            self.SourceRole: b"source",
         }
 
     def _poll_peers(self):

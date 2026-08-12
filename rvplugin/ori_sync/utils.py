@@ -125,7 +125,7 @@ def session_dialog(title):
     :func:`_media_path` and :func:`_clip_effective_range`.
 
     :param title: Dialog window title (e.g. "Create Session").
-    :returns: ``(host, name)`` or ``(None, None)`` on cancel.
+    :returns: ``(host, name, identity_override)`` or ``(None, None, None)`` on cancel.
     :rtype: tuple
     """
     try:
@@ -135,17 +135,28 @@ def session_dialog(title):
             from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
         except ImportError:
             _log("PySide not available — cannot show session dialog")
-            return None, None
+            return None, None, None
 
     default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
+    
+    try:
+        from otio_sync_core.identity import resolve_identity
+        from otio_sync_core.session_state import display_name
+        # Build a synthetic peer dict that display_name expects (it needs an "identity" sub-dict)
+        default_you = display_name({"identity": resolve_identity()})
+    except Exception:
+        default_you = ""
+        
     dlg = QDialog()
     dlg.setWindowTitle(title)
     dlg.setMinimumWidth(360)
     layout = QFormLayout(dlg)
     host_edit = QLineEdit(default_host)
     name_edit = QLineEdit()
+    you_edit = QLineEdit(default_you)
     layout.addRow(QLabel("MQ Host:"), host_edit)
     layout.addRow(QLabel("Session Name:"), name_edit)
+    layout.addRow(QLabel("You:"), you_edit)
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     buttons.accepted.connect(dlg.accept)
     buttons.rejected.connect(dlg.reject)
@@ -153,12 +164,15 @@ def session_dialog(title):
     name_edit.returnPressed.connect(dlg.accept)
     layout.addRow(buttons)
     if dlg.exec_() != QDialog.Accepted:
-        return None, None
+        return None, None, None
     host = host_edit.text().strip() or default_host
     name = name_edit.text().strip()
+    you = you_edit.text().strip()
     if not name:
-        return None, None
-    return host, name
+        return None, None, None
+    
+    override = you if you != default_you else None
+    return host, name, override
 
 
 def _media_path(url: str) -> str:

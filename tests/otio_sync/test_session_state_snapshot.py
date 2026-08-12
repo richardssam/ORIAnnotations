@@ -180,3 +180,51 @@ def test_snapshot_carries_the_shared_view():
 
     assert snap["active_timeline_guid"] == "tl-1"
     assert snap["selected_clip_guid"] == "clip-1"
+
+
+def test_snapshot_derives_display_name_with_fallback():
+    mgr = _manager()
+    
+    # 1. Full name
+    mgr._peers["peer-name"] = {
+        "app": "xstudio",
+        "identity": {"user": "alice", "first_name": "Alice", "last_name": "Smith", "host": "host1", "source": "local"}
+    }
+    # 2. First name only
+    mgr._peers["peer-first"] = {
+        "app": "openrv",
+        "identity": {"user": "bob", "first_name": "Bob", "host": "host2", "source": "local"}
+    }
+    # 3. Account only
+    mgr._peers["peer-account"] = {
+        "app": "openrv",
+        "identity": {"user": "charlie", "host": "host3", "source": "local"}
+    }
+    # 4. Neither (no identity at all)
+    mgr._peers["peer-none"] = {
+        "app": "xstudio",
+    }
+    # 5. Empty identity (should act like no identity)
+    mgr._peers["peer-empty"] = {
+        "app": "openrv",
+        "identity": {}
+    }
+    
+    snap = session_state_snapshot(mgr)
+    by_guid = {p["guid"]: p for p in snap["peers"]}
+    
+    # Verify fallback chain
+    assert by_guid["peer-name"]["display_name"] == "Alice Smith"
+    assert by_guid["peer-first"]["display_name"] == "Bob"
+    assert by_guid["peer-account"]["display_name"] == "charlie"
+    assert by_guid["peer-none"]["display_name"] == "xstudio"
+    assert by_guid["peer-empty"]["display_name"] == "openrv"
+    
+    # Verify fields are exposed
+    assert by_guid["peer-name"]["user"] == "alice"
+    assert by_guid["peer-name"]["host"] == "host1"
+    assert by_guid["peer-name"]["source"] == "local"
+    
+    assert by_guid["peer-none"]["user"] == ""
+    assert by_guid["peer-none"]["host"] == ""
+    assert by_guid["peer-none"]["source"] == ""

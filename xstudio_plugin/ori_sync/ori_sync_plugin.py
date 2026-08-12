@@ -282,12 +282,13 @@ class ORISyncPlugin(PluginBase):
 
     # ── connection lifecycle ───────────────────────────────────────────────────
 
-    def connect_to_session(self, host: str | None = None, session_name: str | None = None) -> None:
+    def connect_to_session(self, host: str | None = None, session_name: str | None = None, identity_override: str | None = None) -> None:
         """Connect to RabbitMQ and join the sync session.
 
         :param host: RabbitMQ hostname; falls back to ``mq_host_attr`` if ``None``.
         :param session_name: Session / exchange name; falls back to ``session_id_attr``
             if ``None``.
+        :param identity_override: Optional user-supplied identity string.
         """
         if host is None:
             host = self.mq_host_attr.value()
@@ -317,6 +318,14 @@ class ORISyncPlugin(PluginBase):
             session_id=session_name,
             self_guid=str(self.uuid),
         )
+        identity_arg = None
+        if identity_override:
+            try:
+                from otio_sync_core.identity import identity_from_override
+                identity_arg = identity_from_override(identity_override)
+            except Exception as e:
+                _log(f"Failed to process identity override: {e}")
+                
         self.manager = SyncManager(
             session_id=session_name,
             self_guid=str(self.uuid),
@@ -324,6 +333,7 @@ class ORISyncPlugin(PluginBase):
             # Ranks this peer top for host election, so xStudio holds visibility
             # authority whenever it is in the session.
             app_name="xstudio",
+            identity_override=identity_arg,
         )
         self.manager.on_playback_changed(self.playback.apply_playback_state)
         self.manager.on_status_changed(
@@ -596,21 +606,31 @@ class ORISyncPlugin(PluginBase):
         """
         host = (data.get("host") or "").strip() or os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
         name = (data.get("name") or "").strip()
+        you = (data.get("you") or "").strip()
         if not name:
             return [False, "Session name cannot be empty."]
         threading.Thread(
             target=self._session_connect_worker,
-            args=(host, name),
+            args=(host, name, you),
             daemon=True,
         ).start()
         return [True, "Connecting…"]
 
-    def _session_connect_worker(self, host: str, name: str) -> None:
+    def _session_connect_worker(self, host: str, name: str, identity_override: str) -> None:
         """Background thread that calls connect_to_session safely off the poll thread."""
         try:
-            self.connect_to_session(host, name)
+            self.connect_to_session(host, name, identity_override or None)
         except Exception:
             _log_exc("session connect worker failed")
+
+    def get_default_identity(self, data) -> str:
+        """Called from QML to pre-fill the You field."""
+        try:
+            from otio_sync_core.identity import resolve_identity
+            from otio_sync_core.session_state import display_name
+            return display_name({"identity": resolve_identity()})
+        except Exception:
+            return ""
 
     # ── discovery ──────────────────────────────────────────────────────────────
 

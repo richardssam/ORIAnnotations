@@ -33,6 +33,7 @@ cd python
 zip ../rvplugin/ori_sync/otiosyncdemo-1.2.rvpkg \
     otio_sync_core/__init__.py \
     otio_sync_core/authority.py \
+    otio_sync_core/identity.py \
     otio_sync_core/color.py \
     otio_sync_core/coords.py \
     otio_sync_core/shapes.py \

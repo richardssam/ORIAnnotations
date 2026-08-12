@@ -19,6 +19,7 @@ from typing import Any, Callable
 import opentimelineio as otio
 
 from . import authority
+from . import identity
 from .network import SyncNetworkProtocol
 from .proxy import OTIOSyncProxy
 from .patcher import OTIOPatcher, _otio_to_dict, _dict_to_otio
@@ -254,6 +255,7 @@ class SyncManager:
         network: SyncNetworkProtocol | None = None,
         app_name: str = "",
         capabilities: "list[str] | None" = None,
+        identity_override: "dict[str, str] | None" = None,
     ) -> None:
         self.session_id = session_id
         self.self_guid: str = self_guid or str(uuid.uuid4())
@@ -300,18 +302,36 @@ class SyncManager:
         #: GUID of the elected host, or ``None`` before the first election.
         self.host_guid: str | None = None
         #: Peer table feeding host election:
-        #: ``{guid: {"app", "capabilities", "last_seen"}}``.
+        #: ``{guid: {"app", "capabilities", "last_seen", "identity"}}``.
         #: Seeded with this peer so a solo session still elects a host.
         #:
         #: ``last_seen`` is a *local* monotonic-ish stamp taken when this peer
         #: heard from that one; it never crosses the wire, so no clock sync is
         #: needed.  This peer's own entry is exempt from aging (see
         #: :meth:`_age_out_peers`).
+
+        # Truthy, not ``is not None``: ``identity_from_override("")`` returns an
+        # empty dict for a blank field, and a blank field means "no override",
+        # not "this peer has no identity".  Both call sites happen to guard
+        # before calling, but the trap is one word wide.
+        self.identity: dict[str, str] = {}
+        if identity_override:
+            self.identity = dict(identity_override)
+        else:
+            try:
+                self.identity = identity.resolve_identity()
+            except Exception as e:
+                # Never fatal to a session start: a peer with no identity is a
+                # full participant that other peers label by app and GUID.
+                _log(f"Failed to resolve identity: {e}")
+                self.identity = {}
+
         self._peers: dict[str, dict[str, Any]] = {
             self.self_guid: {
                 "app": self.app_name,
                 "capabilities": list(self.capabilities),
                 "last_seen": time.time(),
+                "identity": dict(self.identity),
             }
         }
         #: When this peer last broadcast its own announcement.  Drives the
@@ -1221,6 +1241,7 @@ class SyncManager:
             peer_guid=self.self_guid,
             app=self.app_name,
             capabilities=list(self.capabilities),
+            identity=dict(self.identity) if self.identity else None,
         ))
 
     def on_host_changed(
@@ -1306,13 +1327,20 @@ class SyncManager:
 
         :returns: ``{guid: {"app", "capabilities"}}``.
         """
-        return {
-            guid: {
+        roster = {}
+        for guid, peer in self._peers.items():
+            entry = {
                 "app": peer.get("app", ""),
                 "capabilities": list(peer.get("capabilities") or []),
             }
-            for guid, peer in self._peers.items()
-        }
+            if "identity" in peer:
+                # Copied for the same reason ``capabilities`` is: this roster
+                # is handed to the in-process inspector by ``export_state()``,
+                # not only serialised onto the wire, so a caller that edits it
+                # must not reach the peer table.
+                entry["identity"] = dict(peer["identity"])
+            roster[guid] = entry
+        return roster
 
     def adopt_peers(self, peers: "dict[str, dict[str, Any]] | None") -> None:
         """Merge a snapshot's peer roster into the local peer table.
@@ -1326,6 +1354,17 @@ class SyncManager:
         Liveness is stamped locally on adoption, for the reason in
         :meth:`_peer_roster`.
 
+        A peer this table already knows is **not** rebuilt from the roster.  The
+        sender's view of it is second-hand and may be older than the
+        announcement this peer heard directly: rewriting the entry would blank
+        ``capabilities`` from a partial roster — taking that peer out of host
+        election — and would restamp ``last_seen`` from another machine's view
+        of who is present, which is the same "someone else's clock decides our
+        liveness" that :meth:`_peer_roster` omits the stamp to avoid.  Only an
+        identity the local entry is missing is filled in, since that is the one
+        field a joiner cannot obtain any other way until the peer next
+        announces.
+
         :param peers: Roster from the snapshot, or ``None`` when absent.
         """
         if not peers:
@@ -1333,13 +1372,26 @@ class SyncManager:
         now = time.time()
         learned = 0
         for guid, peer in peers.items():
-            if guid == self.self_guid or guid in self._peers:
+            if guid == self.self_guid:
                 continue
-            self._peers[guid] = {
+
+            norm_identity = identity.normalise(peer.get("identity"))
+
+            known = self._peers.get(guid)
+            if known is not None:
+                # Known peer: fill a missing identity, touch nothing else.
+                if norm_identity and "identity" not in known:
+                    known["identity"] = norm_identity
+                continue
+
+            entry = {
                 "app": peer.get("app", ""),
                 "capabilities": list(peer.get("capabilities") or []),
                 "last_seen": now,
             }
+            if norm_identity:
+                entry["identity"] = norm_identity
+            self._peers[guid] = entry
             learned += 1
         if learned:
             _log(f"adopt_peers: learned {learned} peer(s) ({len(self._peers)} total)")
@@ -1797,6 +1849,7 @@ class SyncManager:
         ).to_payload()
         payload["is_master"] = self.is_master
         payload["is_host"] = self.is_host
+        payload["self_guid"] = self.self_guid
         # Structural patches this peer could not apply. Carried for the same
         # reason as the flags above — harness visibility — and because a peer
         # that dropped patches is precisely one whose reported state should not
@@ -2708,6 +2761,13 @@ class SyncManager:
         guid = msg.peer_guid or source
         known = self._peers.get(guid)
         entry = {"app": msg.app, "capabilities": list(msg.capabilities)}
+        
+        norm_identity = identity.normalise(msg.identity)
+        if norm_identity:
+            entry["identity"] = norm_identity
+        elif known and "identity" in known:
+            entry["identity"] = known["identity"]
+            
         # Every announcement refreshes liveness, including a periodic heartbeat
         # that changes nothing — stamping only on change would let every peer
         # age out while announcing.  `last_seen` is deliberately excluded from

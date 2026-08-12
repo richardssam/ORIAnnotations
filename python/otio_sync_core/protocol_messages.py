@@ -263,13 +263,28 @@ class PeerAnnounce(ProtocolMessage):
         default_factory=list,
         doc='Roles this peer can hold, e.g. ["visibility"].',
     )
+    identity: "dict | None" = doc_field(
+        default=None,
+        doc="Who is on the other end: {user, first_name, last_name, host, "
+            "source}. Every field is optional and the whole section is omitted "
+            "when the peer has no identity — a peer without one is a full "
+            "participant, labelled by app and GUID. Self-declared and "
+            "**unverified**, on the same terms as `app`: it identifies "
+            "cooperating participants, it does not authenticate them. "
+            "`source` records where it came from (`local`, `override`, or a "
+            "future authenticated provider). The displayed name is derived "
+            "from these fields by the receiver and is not transmitted.",
+    )
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "peer_guid": self.peer_guid,
             "app": self.app,
             "capabilities": list(self.capabilities),
         }
+        if self.identity is not None:
+            payload["identity"] = dict(self.identity)
+        return payload
 
     @classmethod
     def from_payload(cls, data: dict[str, Any]) -> "PeerAnnounce":
@@ -277,6 +292,7 @@ class PeerAnnounce(ProtocolMessage):
             peer_guid=data.get("peer_guid"),
             app=data.get("app") or "",
             capabilities=list(data.get("capabilities") or []),
+            identity=data.get("identity"),
         )
 
 
@@ -364,11 +380,15 @@ class StateSnapshot(ProtocolMessage):
     )
     peers: dict = doc_field(
         default_factory=dict,
-        doc="Peers present at snapshot time, as {guid: {app, capabilities}}, so "
+        doc="Peers present at snapshot time, as {guid: {app, capabilities, identity}}, so "
             "a joiner learns the peer set without every peer answering its "
             "announcement. Not the only discovery path: a joiner that receives "
             "no snapshot learns peers from their periodic announcements. "
-            "Carries no liveness stamp — that is the receiver's own clock.",
+            "Carries no liveness stamp — that is the receiver's own clock. "
+            "`identity` is the same optional section PEER_ANNOUNCE carries, on "
+            "the same terms — self-declared and **unverified** — and is present "
+            "here so a peer that has gone quiet can still be named by a joiner "
+            "that has never heard it announce.",
     )
     broadcast_ownership: "dict | None" = doc_field(
         default=None,

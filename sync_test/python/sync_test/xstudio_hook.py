@@ -47,6 +47,7 @@ def get_xstudio_state(port=14441):
         # assert which peer was allowed to change what everyone looks at.
         "is_host": None,
         "host_guid": None,
+        "display_name": None,
         # Per-channel write-lease state ({"position"|"display"|"structure":
         # {"owner_guid", "remaining_ms"}}), omitted per-channel when free.
         # Differs between peers by construction, like is_host/host_guid.
@@ -95,6 +96,22 @@ def get_xstudio_state(port=14441):
                 state["unresolved_patches"] = list(full.get("unresolved_patches") or [])
                 state["unpublished_parents"] = list(full.get("unpublished_parents") or [])
                 state["broadcast_ownership"] = dict(full.get("broadcast_ownership") or {})
+                
+                # Derive display name for local peer
+                try:
+                    import sys, os
+                    lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../python"))
+                    if lib_path not in sys.path:
+                        sys.path.insert(0, lib_path)
+                    from otio_sync_core.session_state import display_name
+                    
+                    self_guid = full.get("self_guid")
+                    if self_guid and full.get("peers"):
+                        peer = full["peers"].get(self_guid)
+                        state["display_name"] = display_name(peer) if peer else None
+                except Exception:
+                    pass
+                    
             # The synced timeline's name, resolved through the shared sync GUID.
             # This is the only container name that means the same thing on every
             # peer: the viewed-container name below reports the *timeline* when a

@@ -58,6 +58,13 @@ async def _lifespan(app: FastAPI):  # noqa: ARG001
         # own to impose, and an RV-only session with a viewer attached would
         # otherwise be able to elect the viewer and leave nobody driving.
         capabilities=[],
+        identity_override={
+            "first_name": "Sync Viewer",
+            "last_name": "",
+            "user": "sync_viewer",
+            "host": "localhost",
+            "source": "local",
+        },
     )
     _manager.start_session()
     print(

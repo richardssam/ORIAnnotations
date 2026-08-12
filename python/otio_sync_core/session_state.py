@@ -19,7 +19,7 @@ from typing import Any
 
 from . import authority
 
-__all__ = ["session_state_snapshot", "peer_role"]
+__all__ = ["session_state_snapshot", "peer_role", "display_name"]
 
 
 def peer_role(peer: "dict[str, Any]") -> str:
@@ -32,6 +32,26 @@ def peer_role(peer: "dict[str, Any]") -> str:
     :rtype: str
     """
     return "Host" if authority.is_host_capable(peer) else "Client"
+
+
+def display_name(peer: "dict[str, Any]") -> str:
+    """Derive the display name for a peer.
+    
+    Rule: "First Last" -> user -> app
+    """
+    ident = peer.get("identity")
+    if ident:
+        first = ident.get("first_name", "")
+        last = ident.get("last_name", "")
+        full = f"{first} {last}".strip()
+        if full:
+            return full
+            
+        user = ident.get("user", "")
+        if user:
+            return user
+            
+    return peer.get("app") or "Unknown"
 
 
 def session_state_snapshot(manager) -> "dict[str, Any]":
@@ -62,6 +82,7 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
     for guid, peer in sorted(
         manager._peers.items(), key=lambda kv: (kv[0] != self_guid, kv[0])
     ):
+        ident = peer.get("identity") or {}
         peers.append(
             {
                 "guid": guid,
@@ -73,6 +94,10 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
                 "holds_position_lease": lease_owners[authority.CHANNEL_POSITION] == guid,
                 "holds_display_lease": lease_owners[authority.CHANNEL_DISPLAY] == guid,
                 "holds_structure_lease": lease_owners[authority.CHANNEL_STRUCTURE] == guid,
+                "display_name": display_name(peer),
+                "user": ident.get("user", ""),
+                "host": ident.get("host", ""),
+                "source": ident.get("source", ""),
             }
         )
 
