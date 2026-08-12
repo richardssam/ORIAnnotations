@@ -52,10 +52,23 @@
 
 - [x] 9.1 Run `./run_tests_core.sh` and `./run_tests_xstudio.sh` (two interpreters — use the repo `python`, not `python3.11`).
 - [x] 9.2 Live two-app check: connect OpenRV and xStudio, confirm each names the other in its panel, that Debug Mode reveals account and machine, and that an overridden identity on one side appears on the other marked as user-entered.
-- [x] 9.3 Mixed-version check: connect a peer whose identity fields are stripped (run one side with the fields removed from its announce, or an older build) and confirm it still lists as application + GUID rather than blank.
-- [x] 9.4 Late-joiner check: let one peer go quiet past a heartbeat, join a third peer, and confirm the quiet peer is named from the roster without waiting for its next announcement — the defect §3.3 exists to prevent.
+- [x] 9.3 Mixed-version check — **waived, not run.** No older builds are in play, so there is no peer that omits the fields. The degradation path is covered by unit tests instead (`test_peer_with_no_identity_is_still_added`, and `test_peer_without_app_name_is_labelled_unknown` for the projection). Re-run this if a session ever has to interoperate with a build predating the identity fields.
+- [x] 9.4 Late-joiner check: let one peer go quiet past a heartbeat, join a third peer, and confirm the quiet peer is named from the roster without waiting for its next announcement — the defect §3.3 exists to prevent. **Passed.** Still valid after the review fixes: those changed only `adopt_peers`' already-known-peer branch, and this scenario goes through the newly-learned branch.
 
 ## 10. Follow-ups (decide, do not silently defer)
 
 - [x] 10.1 `sync_viewer`: give it a fixed identity (display name "Sync Viewer", `source="local"`) so an observer is labelled rather than anonymous, consistent with its existing `capabilities=[]` declaration.
 - [x] 10.2 Leave `email` uncarried — it is added with the authenticated provider that would populate it (design.md Open Questions). Record the decision rather than adding an always-empty field.
+
+## 11. Review follow-ups (applied 2026-08-12)
+
+- [x] 11.1 `adopt_peers` merges rather than replaces: a peer already in the table has only a *missing* identity filled in. Rewriting the entry blanked `capabilities` from a partial roster — taking that peer out of host election — and restamped `last_seen` from another machine's view of who is present.
+- [x] 11.2 `identity.normalise` judges emptiness on the identifying fields only. `source` is provenance and is always stamped, so a peer whose user and host both failed to resolve normalised to a present-but-blank identity that then overwrote a good one.
+- [x] 11.3 `test_identity.py` moved from `python/tests/` (never collected — `run_tests_core.sh` runs `tests/otio_sync/`) and given the same `sys.path` bootstrap its siblings use, so it does not depend on another module having run first.
+- [x] 11.4 `pwd` imported lazily: it is POSIX-only, `manager` imports `identity` unconditionally, and `__init__` swallows `ImportError` — a module-scope import would leave the plugin connected and inert rather than failing loudly.
+- [x] 11.5 `resolve_identity()` no longer mutates `local_identity()`'s return value (surfaced by 11.3 — benign today, breaks the moment a provider caches).
+- [x] 11.6 `SyncManager(identity_override={})` no longer suppresses identity; `_peer_roster()` copies the identity dict as it already copies `capabilities`.
+- [x] 11.7 Protocol docs state the fields are **unverified** as well as self-declared, on both `PEER_ANNOUNCE` and the `STATE_SNAPSHOT` roster; regenerated.
+- [x] 11.8 Package rebuilt and reinstalled after the above; both the `.rvpkg` and the installed copy carry the fixes.
+
+Accepted and not fixed: the "Unknown" dialog pre-fill when nothing resolves; the RV panel delegate height (`rowHeight * 3`, now ~8px of headroom with a third debug row); pylint noise in `identity.py` (broad excepts, f-string logging).
