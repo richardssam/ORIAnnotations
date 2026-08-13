@@ -207,34 +207,63 @@ def is_host_capable(peer: Mapping[str, Any]) -> bool:
 
 
 def elect_host_guid(
-    peers: Mapping[str, Mapping[str, Any]], default_role: "str | None" = None
+    peers: Mapping[str, Mapping[str, Any]],
+    default_role: "str | None" = None,
+    master_guid: "str | None" = None,
 ) -> "str | None":
     """Return the GUID of the peer that should hold visibility authority.
 
-    A pure function of the peer table, so two peers evaluating the same set of
-    peers always reach the same host — the property that makes simultaneous
-    election safe without a claim protocol.  Ordering is: preferred application
-    first, then GUID ascending as a deterministic tie-break (the same rule
-    ``session-roles`` D2 uses for claims).
+    Ordering is: preferred application first, then **the master**, then GUID
+    ascending as a final deterministic tie-break (the same rule ``session-roles``
+    D2 uses for claims).
+
+    A pure function of its arguments, so two peers evaluating the same session
+    always reach the same host — the property that makes simultaneous election
+    safe without a claim protocol.  *master_guid* preserves that property in a
+    way an "incumbent host" preference does not: peers already agree on who the
+    master is (``I_AM_MASTER``), whereas two peers that each self-elected while
+    alone hold *different* incumbents and would never converge.
+
+    Without a tie-break better than the GUID, the seat lands on a coin flip
+    between two peers of the same application, and a joiner takes visibility
+    authority from the session that was already running.  Observed 2026-08-13
+    16:36:45: an established host handed the seat to a joining xStudio one second
+    after it connected (``elect_host: cd424a82 → 933a7c1c``), after which the
+    peer the user was actually driving had ``view_mode``/``clip_guid`` stripped
+    from every message it sent.  Scrubbing still propagated, because position is
+    a separate lease the active user wins — so the session followed that user's
+    playhead onto a shot they could not change, and nothing in either UI said
+    why.
+
+    The master preference breaks ties only; it never outranks a better-qualified
+    application.  A joining xStudio still takes visibility from an OpenRV-only
+    session even when the OpenRV peer is master, because :data:`HOST_PREFERENCE`
+    encodes what an application can *do*, which is a reason.  A GUID is not.
 
     Candidates are filtered by **role as well as capability** (``session-roles``
     D4): a peer whose role forbids emitting visibility would hold the authority
     while unable to exercise it.  A peer carrying no role resolves to
     *default_role*, so a session that never opted into a role policy elects
-    exactly as it did before roles existed.
+    exactly as it did before roles existed.  A master that is not an eligible
+    candidate — its role forbids visibility, or it has left — is simply not
+    preferred; the ordering below it still applies.
 
     :param peers: ``{guid: {"app": str, "capabilities": [...], "role": str}}``,
         including this peer's own entry.
     :param default_role: The session's declared default role, applied to any
         entry carrying none.  ``None`` means :data:`DEFAULT_ROLE`.  Passed in
         rather than read from manager state so this stays a pure function.
+    :param master_guid: The session master, preferred among equally-ranked
+        candidates.  ``None`` elects exactly as it did before this preference.
     :returns: Elected host GUID, or ``None`` when no peer is eligible.
     :rtype: str or None
     """
     candidates = host_candidates(peers, default_role)
     if not candidates:
         return None
-    return min(candidates)[1]
+    # False sorts before True, so `guid != master_guid` puts the master first
+    # within its rank without disturbing the app ordering above it.
+    return min(candidates, key=lambda c: (c[0], c[1] != master_guid, c[1]))[1]
 
 
 # ---------------------------------------------------------------------------

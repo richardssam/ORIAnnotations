@@ -1363,7 +1363,15 @@ class SyncManager:
         :returns: The elected host GUID, or ``None`` when no peer is capable.
         :rtype: str or None
         """
-        elected = authority.elect_host_guid(self._peers, self._default_role)
+        # The master is passed so a peer joining an established session cannot
+        # take visibility authority from it on a GUID coin flip.  Deliberately
+        # the master and not the incumbent host: peers already agree on the
+        # master, so election stays a pure function and converges without a
+        # claim protocol, whereas two peers that each self-elected while alone
+        # hold different incumbents and would both believe themselves host.
+        elected = authority.elect_host_guid(
+            self._peers, self._default_role, master_guid=self.master_guid
+        )
         if elected is None and self._peers:
             # Not silent: a session with no eligible driver has a view nobody
             # may change, and the requirement this filter has to answer is that
@@ -3244,8 +3252,20 @@ class SyncManager:
                 )
                 self.broadcast_master_response()
                 return None
+        master_changed = self.master_guid != msg.master_guid
         self.master_guid = msg.master_guid
         self._last_who_is_master_time = None
+        if master_changed:
+            # The master breaks the host tie-break, so learning one changes the
+            # answer.  Without this the seat keeps whatever the GUID ordering
+            # produced before the master was known, and only a later
+            # announcement would correct it — for two peers that have already
+            # exchanged announcements, nothing ever would.
+            #
+            # Direct, not enqueued: apply_patch runs inside tick on the poll
+            # thread, the same reasoning _h_peer_announce records for its own
+            # election call.
+            self.elect_host()
         if self.status == STATE_DISCOVERING:
             return ("master_found", self.master_guid)
         return None

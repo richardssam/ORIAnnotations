@@ -630,3 +630,92 @@ def test_a_role_arriving_between_enqueue_and_drain_is_honoured():
     mgr._drain_host_elections()
 
     assert mgr.host_guid == "guid-xs"
+
+
+# ---------------------------------------------------------------------------
+# The master breaks the tie between equally-ranked peers
+# ---------------------------------------------------------------------------
+#
+# GUIDs are random per launch, so without a better tie-break the visibility seat
+# lands on a coin flip between two peers of the same application — and a joiner
+# takes it from the session that was already running. Observed 2026-08-13
+# 16:36:45, two xStudios:
+#
+#   host   16:36:35.888  elect_host: none → cd424a82 (self=HOST, peers=1)
+#   host   16:36:45.278  elect_host: cd424a82 → 933a7c1c (self=follower, peers=2)
+#   host   16:36:49.428  broadcast_playback_state: visibility stripped (not host)
+#
+# The peer the user was driving kept the position lease, so scrubbing still
+# propagated — the session followed their playhead onto a shot they could no
+# longer change, with nothing in either UI explaining it.
+#
+# The master is used rather than the incumbent host deliberately: peers agree on
+# the master, so election stays a pure function. Two peers that each self-elected
+# while alone hold *different* incumbents and would both believe themselves host.
+
+
+def test_the_master_keeps_visibility_when_a_same_app_peer_joins():
+    host = _manager("guid-zz-master", "xstudio")
+    host.start_session()
+    host.elect_self_as_master()
+    assert host.is_host is True
+
+    # Lower GUID: it would win the raw tie-break, which is the bug.
+    joiner = _manager("guid-aa-joiner", "xstudio")
+    joiner.start_session()
+    _deliver(joiner, host)
+
+    assert host.host_guid == "guid-zz-master"
+    assert host.is_host is True, "a joiner took visibility from the running session"
+
+
+def test_a_preferred_app_still_outranks_the_master():
+    """The master breaks ties; it does not outrank capability. HOST_PREFERENCE
+    encodes what an application can do, which is a reason to move the seat."""
+    rv = _manager("guid-rv", "openrv")
+    rv.start_session()
+    rv.elect_self_as_master()
+
+    xs = _manager("guid-xs", "xstudio")
+    xs.start_session()
+    _deliver(xs, rv)
+
+    assert rv.host_guid == "guid-xs"
+    assert rv.is_host is False
+
+
+def test_both_peers_agree_on_the_master_elected_host():
+    """The property that lets peers elect simultaneously with no claim protocol.
+    An incumbent-based rule would fail exactly here."""
+    a = _manager("guid-aa", "xstudio")
+    b = _manager("guid-zz", "xstudio")
+    a.start_session()
+    b.start_session()
+    b.elect_self_as_master()
+
+    _deliver(b, a)
+    _deliver(a, b)
+
+    assert a.host_guid == b.host_guid
+    assert a.host_guid == "guid-zz", "the master should hold the seat"
+
+
+def test_no_master_elects_exactly_as_before():
+    """Every session that never establishes a master — and every existing
+    caller passing no master — must be unaffected."""
+    peers = {
+        "guid-bb": {"app": "xstudio", "capabilities": ["visibility"]},
+        "guid-aa": {"app": "xstudio", "capabilities": ["visibility"]},
+    }
+    assert authority.elect_host_guid(peers) == "guid-aa"
+    assert authority.elect_host_guid(peers, None, master_guid=None) == "guid-aa"
+
+
+def test_an_ineligible_master_is_not_preferred():
+    """A master whose role forbids visibility must not hold the seat it cannot
+    use — the filter runs first, and the ordering below it still applies."""
+    peers = {
+        "guid-zz": {"app": "xstudio", "capabilities": ["visibility"], "role": "viewer"},
+        "guid-aa": {"app": "xstudio", "capabilities": ["visibility"], "role": "driver"},
+    }
+    assert authority.elect_host_guid(peers, master_guid="guid-zz") == "guid-aa"
