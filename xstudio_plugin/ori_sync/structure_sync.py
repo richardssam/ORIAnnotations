@@ -102,6 +102,9 @@ class StructureSyncController:
         # On each poll tick we retry send_state_snapshot until it succeeds.
         self._pending_snapshot_requesters: list[str] = []
         self._last_structure_scan: float = 0.0
+        #: Signature of the last structure census logged, so the once-a-second
+        #: scan reports only when what it can see actually changes.
+        self._last_scan_census: str = ""
         # Monotonic deadline before which xStudio events caused by our own
         # structural mutations (reorders, timeline teardown) are not
         # re-broadcast.  Read by playback via
@@ -127,6 +130,7 @@ class StructureSyncController:
         self._test_container_group_key = None
         self._pending_snapshot_requesters.clear()
         self._last_structure_scan = 0.0
+        self._last_scan_census = ""
         self._structural_mutation_suppress_until = 0.0
 
     # ── timeline item event subscription ──────────────────────────────
@@ -866,7 +870,16 @@ class StructureSyncController:
         try:
             playlists = self.plugin.connection.api.session.playlists
         except Exception:
+            # Previously a silent return, which is indistinguishable in a log
+            # from a scan that ran and found nothing new — and those two have
+            # opposite diagnoses.
+            self._log_scan_census(["session.playlists: UNREADABLE"])
             return
+
+        # Per-pass census of what the scan can actually see and what it did with
+        # it (see :meth:`_log_scan_census`).  Built unconditionally; logged only
+        # when it changes, so a steady session costs one line.
+        census: list[str] = []
 
         known_pl_uuids: set[str] = set()
         for pl, _ in self.plugin._sync_playlists.values():
@@ -879,18 +892,34 @@ class StructureSyncController:
             try:
                 pl_uuid = str(playlist.uuid)
             except Exception:
+                census.append("playlist: UNREADABLE uuid")
                 continue
 
+            _pl_name = getattr(playlist, "name", "?")
             try:
-                containers = playlist.containers
+                # Materialised once: ``containers`` is a property, so a second
+                # access is either another round trip to a busy actor or — if it
+                # ever returns a generator — an empty list, because the
+                # comprehension below has already consumed it.
+                containers = list(playlist.containers)
             except Exception:
                 _log_exc(
                     f"poll_new_playlists: cannot get containers for"
-                    f" {getattr(playlist, 'name', '?')!r}"
+                    f" {_pl_name!r}"
                 )
+                census.append(f"{_pl_name!r}({pl_uuid[:8]}): containers UNREADABLE")
                 continue
 
             timelines = [c for c in containers if isinstance(c, Timeline)]
+            # Non-Timeline containers are counted, not named: a sequence that
+            # the scan cannot see at all is the case worth distinguishing, and
+            # "the playlist has 3 containers but 0 of them are Timelines" says
+            # something quite different from "the playlist has none".
+            _other = len(containers) - len(timelines)
+            census.append(
+                f"{_pl_name!r}({pl_uuid[:8]}): {len(timelines)} timeline(s),"
+                f" {_other} other container(s)"
+            )
             if timelines:
                 # If this playlist was previously registered as flat, clean up the flat entry
                 if pl_uuid in self._xs_flat_playlists:
@@ -920,11 +949,25 @@ class StructureSyncController:
                 }
                 for xs_tl in timelines:
                     tl_guid = str(xs_tl.uuid)
-                    if tl_guid in self.plugin._sync_playlists or tl_guid in synced_xs_uuids:
+                    if tl_guid in self.plugin._sync_playlists:
+                        census.append(f"  {tl_guid[:8]}: skipped (already published)")
+                        continue
+                    if tl_guid in synced_xs_uuids:
+                        census.append(
+                            f"  {tl_guid[:8]}: skipped (adopted from a remote peer)"
+                        )
                         continue
                     tl = self.plugin.builder.build_single_sequence_otio(playlist, xs_tl)
                     if tl is None:
+                        # Silent until now, and the one outcome that leaves a
+                        # sequence permanently unpublished while the scan keeps
+                        # running — every pass retries and fails the same way.
+                        census.append(
+                            f"  {tl_guid[:8]}: NOT PUBLISHED — build_single_sequence_otio"
+                            " returned None"
+                        )
                         continue
+                    census.append(f"  {tl_guid[:8]}: publishing (new sequence)")
 
                     # Stamp the playlist bin URIs so peers can populate their
                     # bin with the same media when they receive ADD_TIMELINE.
@@ -972,17 +1015,52 @@ class StructureSyncController:
                     )
             else:
                 if pl_uuid in known_pl_uuids:
+                    census.append("  flat: skipped (already published)")
                     continue
                 tl = self.plugin.builder.build_otio_from_playlist_media(playlist)
                 if tl is None:
+                    census.append(
+                        "  flat: NOT PUBLISHED — build_otio_from_playlist_media"
+                        " returned None"
+                    )
                     continue
                 tl_guid = tl.metadata.get("sync", {}).get("guid", "")
                 if not tl_guid:
+                    census.append("  flat: NOT PUBLISHED — built timeline carries no sync guid")
                     continue
                 self.plugin.manager.register_timeline(tl)
                 self.plugin.claim_lease(CHANNEL_STRUCTURE)
                 self.plugin.manager.broadcast_add_timeline(tl_guid)
+                census.append(f"  flat {tl_guid[:8]}: publishing (new playlist)")
                 _log(f"New flat playlist {playlist.name!r} → broadcast")
+
+        self._log_scan_census(census)
+
+    def _log_scan_census(self, census: "list[str]") -> None:
+        """Log what the structure scan saw, but only when it changes.
+
+        The scan runs once a second for the life of a session, so a census on
+        every pass would be unreadable and a census on *no* pass is what left a
+        real failure invisible: on 2026-08-12 a double-clicked sequence was
+        broadcast under an unpublished local uuid for 13 s, and the log could not
+        say whether the scan had seen that Timeline and rejected it or had never
+        seen it at all — which have opposite diagnoses. Logging on change gives
+        one line for a steady session and one at the moment something starts
+        being skipped.
+
+        Read it against ``[VIEW] viewing Timeline … which is NOT a published
+        sync timeline``: that names the container the viewport is on, and this
+        says whether the scan can see it.
+
+        :param census: One entry per playlist, with indented entries per
+            container.
+        """
+        signature = "\n".join(census)
+        if signature == self._last_scan_census:
+            return
+        self._last_scan_census = signature
+        body = "\n".join(f"    {line}" for line in census) or "    (no playlists)"
+        _log(f"[SCAN] structure census changed:\n{body}")
 
     def poll_playlist_renames(self) -> None:
         """Detect and broadcast playlist or timeline name changes.

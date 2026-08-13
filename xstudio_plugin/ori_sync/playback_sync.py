@@ -19,7 +19,7 @@ from xstudio.core import (
     get_global_playhead_events_atom, viewport_atom, active_viewport_atom,
 )
 from otio_sync_core.manager import STATE_SYNCED
-from otio_sync_core.authority import CHANNEL_POSITION
+from otio_sync_core.authority import CHANNEL_POSITION, POSITION_FIELDS
 from .utils import _log, _log_exc, bounded, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread playhead/viewport reads.  Generous
@@ -258,6 +258,10 @@ class PlaybackSyncController:
         self._selection_broadcast_suppress_until = 0.0
         self._viewport_container_is_playlist = False
         self._viewport_container_is_timeline = False
+        #: Container uuid of the last unpublished Timeline reported by
+        #: :meth:`get_local_viewed_timeline_guid`, so a steady wrong view logs
+        #: once rather than on every scrub broadcast.
+        self._unpublished_view_logged = None
 
     def _is_scan_through(
         self, *, is_seq_media: bool, is_playlist: bool, in_single_clip: bool
@@ -566,12 +570,36 @@ class PlaybackSyncController:
                         clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
                         if clip_tl_guid:
                             self.plugin.manager.active_timeline_guid = clip_tl_guid
+                    # Local bookkeeping above runs either way — this peer really
+                    # is viewing that clip now, whoever caused it.  Only the
+                    # *broadcast* is conditional.
                     _is_remote, _prov_note = self._provenance()
-                    self.broadcast_view_state(clip_guid, view_mode)
-                    _log(
-                        f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}"
-                        f"{_prov_note}"
-                    )
+                    if self._induced_by_remote_annotation():
+                        # An annotation must never change what the session is
+                        # looking at.  Applying a peer's stroke makes xStudio
+                        # *show* the annotated clip, which was being read as a
+                        # fresh local isolation — so this peer broadcast
+                        # ``mode=source`` with ``forcing frame=0``, the drawing
+                        # peer's playhead was reset mid-stroke, and the rest of
+                        # its live stroke arrived stamped frame 0 (2026-08-13
+                        # 11:21:08, reviewer annotating while the driver drove).
+                        #
+                        # The existing echo guards cannot catch it: they key on
+                        # a view message this peer applied, and this show_atom
+                        # came from an annotation.  Provenance is the only thing
+                        # that knows, and it already did — it was being logged
+                        # and then ignored.  Matches what the Pinned Source Mode
+                        # branches below already do with the same signal.
+                        _log(
+                            f"[SEL] → broadcast view-state clip {clip_guid[:8]}"
+                            f" mode={view_mode} suppressed (remote-induced){_prov_note}"
+                        )
+                    else:
+                        self.broadcast_view_state(clip_guid, view_mode)
+                        _log(
+                            f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}"
+                            f"{_prov_note}"
+                        )
                 return
 
             if self.plugin.annotation.reload_in_progress():
@@ -721,6 +749,54 @@ class PlaybackSyncController:
             f" {ctx['command_schema']}/{ctx['event']} {where} age={ctx['age']:.2f}s]"
         )
         return True, note
+
+    #: Message schema/event pairs that carry annotation content.  Applying one
+    #: makes xStudio *show* the annotated clip, which is why they are the ones
+    #: that must never be mistaken for a local view action.  ``INSERT_CHILD`` is
+    #: ambiguous — it also carries structural inserts — and is included
+    #: deliberately: a remote structural change is not a local view action
+    #: either, and the tight window below is what keeps that from over-reaching.
+    _ANNOTATION_INDUCERS = {
+        ("Annotation.1", "PARTIAL"),
+        ("OTIO_SESSION_1.0", "REPLACE_ANNOTATION_COMMANDS"),
+        ("OTIO_SESSION_1.0", "INSERT_CHILD"),
+    }
+
+    #: How long after an annotation apply returns a show_atom is still
+    #: attributable to it.  Deliberately far tighter than the manager's 5 s
+    #: settle window: that window exists to explain *display* changes that
+    #: trickle in late, and treating all 5 s of it as "not a local action" would
+    #: stop this peer broadcasting its own view changes for five seconds after
+    #: every stroke a peer drew.  The observed causal chain is 0.05–0.28 s
+    #: (2026-08-13 11:21:08), measured from when the apply *returned*, so it is
+    #: unaffected by a slow poll tick.
+    _ANNOTATION_VIEW_ECHO_S = 1.0
+
+    def _induced_by_remote_annotation(self) -> bool:
+        """Whether this moment is attributable to a remote *annotation* apply.
+
+        Narrower than :meth:`_provenance` in both axes, and both narrowings
+        matter.  By **schema**, because a remote playback message legitimately
+        changes this peer's view and the existing echo guards already handle
+        re-broadcasting that; an annotation never legitimately changes it.  By
+        **time**, because provenance stays true for 5 s and a view broadcast
+        suppressed on that basis would swallow genuine local view changes for
+        5 s after every peer's stroke — trading a wrong view for a missing one.
+
+        :rtype: bool
+        """
+        try:
+            ctx = self.plugin.manager.remote_apply_context() if self.plugin.manager else None
+        except Exception:
+            return False
+        if not ctx:
+            return False
+        if (ctx.get("command_schema"), ctx.get("event")) not in self._ANNOTATION_INDUCERS:
+            return False
+        if ctx.get("in_apply"):
+            return True
+        settling_for = ctx.get("settling_for")
+        return settling_for is not None and settling_for <= self._ANNOTATION_VIEW_ECHO_S
 
     def _read_pinned_source_mode_fresh(self) -> "bool | None":
         """Read Pinned Source Mode now, from a live playhead (bounded).
@@ -1646,6 +1722,22 @@ class PlaybackSyncController:
             for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
                 if xs_tl and str(xs_tl.uuid) == container_uuid:
                     return tl_guid
+            # Unresolved: this peer is viewing a Timeline the session has never
+            # been told about, so the uuid returned here is meaningful only
+            # locally.  Every peer that receives it as ``timeline_guid`` has
+            # nothing to match it against — OpenRV logs "MIRROR FAILED … not
+            # guessing" and keeps its previous view, which reads as the session
+            # simply not following (2026-08-12: a double-clicked sequence took
+            # 13 s to appear, and only because the host switched back to a
+            # published one).  Logged once per container rather than per
+            # broadcast: this is called on every scrub.
+            if container_uuid != self._unpublished_view_logged:
+                self._unpublished_view_logged = container_uuid
+                _log(
+                    f"[VIEW] viewing Timeline {container_uuid[:8]} which is NOT a"
+                    " published sync timeline — peers cannot mirror it."
+                    f" Known sync timelines: {sorted(g[:8] for g in self.plugin._sync_playlists)}"
+                )
             return container_uuid
         else:
             # Viewing a Playlist (or Subset/ContactSheet).
@@ -1879,6 +1971,22 @@ class PlaybackSyncController:
         # seek (frame) when mismatched; do not silently drop playing=True.
         if _tl_mismatch and not state.get("playing", False):
             _log("RECV playback state: mismatched timeline_guid — ignoring (not playing)")
+            return
+
+        # A message carrying no position field group at all is not an assertion
+        # of frame 0 — it is a sender that was not permitted to assert position
+        # and had the group stripped in core (its role, or the position lease it
+        # does not hold).  Reading the absence as a value is how a *suppressed*
+        # message moved this peer: `current_time.get("value", 0)` turns "said
+        # nothing" into "seek to the start", which is precisely the jump the
+        # OpenRV plugin already guards against with the same rule.  The view
+        # block above is already correct in the same way — it only acts when
+        # `view_mode` is present.
+        if not any(field in state for field in POSITION_FIELDS):
+            _log(
+                "RECV playback state: no position fields (stripped by sender) —"
+                " view applied, position left alone"
+            )
             return
 
         playing = state.get("playing", False)
