@@ -1421,25 +1421,15 @@ class PlaybackSyncController:
 
     # ── playback state ─────────────────────────────────────────────────
 
-    def _get_playback_mode(self) -> str:
-        """Return the wire playback_mode ("play-once"/"loop"/"ping-pong") for the active playhead.
+    def _read_playhead_loop_mode(self) -> str:
+        """Read the active playhead's native "Loop Mode" as a wire value.
 
-        Deliberately does NOT update ``_last_known_playback_mode`` — every new
-        clip's playhead defaults to the engine's raw "Play Once" regardless of
-        the user's real preference, so a passive read here would "poison" the
-        cache with that default the moment it's used to build a broadcast.
-        ``_last_known_playback_mode`` is only updated from genuine signals: a
-        local "Loop Mode" attribute-changed event, or a value applied from a
-        peer (see ``on_playhead_attribute_changed`` / ``apply_playback_state``).
+        The raw, momentary truth about *one playhead*, which is not the same
+        thing as the session's playback mode — see :meth:`_get_playback_mode`.
+        Only :meth:`_on_loop_mode_changed` should use this: it fires on a real
+        attribute change, outside the apply-suppression window, which is the one
+        moment the raw value is known to be the user's own choice.
         """
-        # In single-clip review mode we force Loop (see broadcast_view_state).
-        # At each clip boundary a freshly-acquired clip playhead momentarily
-        # reads the engine's Play Once default before carry-over sets Loop; a
-        # position broadcast firing in that window would send Play Once and make
-        # RV stop-and-revert at the clip end.  Report Loop directly whenever we
-        # are isolated on a clip so that transient never leaves this peer.
-        if self._last_pinned_source_mode is False:
-            return "loop"
         ph = self.plugin.active_playhead
         if not ph:
             return "play-once"
@@ -1448,6 +1438,49 @@ class PlaybackSyncController:
             return _LOOP_MODE_TO_WIRE.get(mode, "play-once")
         except Exception:
             return "play-once"
+
+    def _get_playback_mode(self) -> str:
+        """Return the wire playback_mode ("play-once"/"loop"/"ping-pong") to broadcast.
+
+        **Prefers ``_last_known_playback_mode`` over reading the playhead**, and
+        never updates it. xStudio gives every clip its own ``Playhead`` whose
+        native "Loop Mode" resets to the engine's "Play Once" default rather than
+        inheriting the session's mode, so the raw attribute is only the user's
+        actual preference once carry-over has run *and* that asynchronous write
+        has landed. Between those points — a newly-acquired playhead, a write
+        still in flight, an ``active_playhead`` reference lagging a viewport swap
+        — it reads "Play Once" no matter what the user chose. The cache has no
+        such window: it changes only on genuine signals (a local "Loop Mode"
+        event, or a value applied from a peer).
+
+        Reading through that gap was survivable while the value stayed local. It
+        is not survivable on the wire, because applying a peer's mode writes the
+        cache, so one bad read becomes permanent for the whole session:
+
+            host   12:41:51.594  broadcast (mid-scrub, sequence mode) → play-once
+            client 12:41:51.682  RECV playback: set Loop Mode=Play Once
+            host   12:41:53.450  RECV playback: set Loop Mode=Play Once   ← echoed back
+            host   12:43:02.774  [SEL] carried over Loop Mode=Play Once   ← now permanent
+
+        Neither user touched a loop control. The transient misread round-tripped,
+        both caches latched it, and from then on carry-over pushed Play Once onto
+        every new playhead — the session had silently changed its own mode.
+
+        The same oscillation was found and fixed once before for clip isolation
+        (see ``apply_playback_state``, which refuses a peer's "play-once" while
+        pinned to a source). That fix was scoped to single-clip review; sequence
+        mode had no equivalent, which is where this recurred.
+        """
+        # In single-clip review mode we force Loop (see broadcast_view_state):
+        # short shots must loop to be reviewable, so the clip's mode is this
+        # peer's to assert regardless of what any playhead or cache says.
+        if self._last_pinned_source_mode is False:
+            return "loop"
+        if self._last_known_playback_mode:
+            return self._last_known_playback_mode
+        # Nothing genuine observed yet (startup, before the first Loop Mode
+        # event or applied peer value) — the playhead is all there is.
+        return self._read_playhead_loop_mode()
 
     def _carry_over_playback_mode(self, ph) -> None:
         """Apply the last-known playback mode onto a newly-acquired playhead.
@@ -1485,7 +1518,12 @@ class PlaybackSyncController:
         ph = self.plugin.active_playhead
         if not ph:
             return
-        wire_mode = self._get_playback_mode()
+        # The raw read, not _get_playback_mode() — that now answers *from* the
+        # cache, so asking it here would compare the cache against itself and
+        # the user's own mode change could never enter it.  Reaching this line
+        # means a real attribute change fired outside the apply-suppression
+        # window, which is precisely when the playhead's value is the user's.
+        wire_mode = self._read_playhead_loop_mode()
         self._last_known_playback_mode = wire_mode
         if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
             return
@@ -2051,7 +2089,20 @@ class PlaybackSyncController:
                     target_loop_mode = None
                 if target_loop_mode is not None:
                     try:
-                        if str(ph.get_attribute("Loop Mode")).strip() != target_loop_mode:
+                        # Compare against what we believe the playhead is set to,
+                        # not a read-back.  `set_attribute` is asynchronous, so a
+                        # read here lands inside the window where the previous
+                        # write has not taken effect and reports the old value —
+                        # the guard then never suppresses anything.  Measured
+                        # 2026-08-13: 64 writes for 60 applied frames, one per
+                        # message, where 1 was required.
+                        #
+                        # The cost was not the writes.  Each one re-armed
+                        # `_loop_mode_apply_suppress_until` for 0.4 s, and at
+                        # scrub rates those windows overlap continuously — so for
+                        # as long as a peer scrubbed, this peer's own Loop Mode
+                        # changes were read as our echo and silently discarded.
+                        if self._last_known_playback_mode != playback_mode:
                             self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
                             ph.set_attribute("Loop Mode", target_loop_mode)
                             _log(f"RECV playback: set Loop Mode={target_loop_mode} (playback_mode={playback_mode})")
