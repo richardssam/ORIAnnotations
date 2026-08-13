@@ -31,7 +31,13 @@ class AppSpawner:
         os.makedirs(self.logs_dir, exist_ok=True)
         self.base_dir = base_dir
 
-    def launch(self, app_name, http_port, session_file=None):
+    def launch(self, app_name, http_port, session_file=None, env_extra=None):
+        """Launch one app instance and its inspector.
+
+        :param env_extra: Extra environment for this instance only, applied
+            last so a test can declare per-peer settings (a session role, an
+            identity) that differ between two instances of the same app.
+        """
         log_path = os.path.join(self.logs_dir, f"{app_name}_{http_port}.log")
         log_file = open(log_path, 'w')
         self.log_files.append(log_file)
@@ -76,6 +82,7 @@ class AppSpawner:
             except OSError:
                 pass
             env["ORI_FULLSTATE_FILE"] = fullstate_path
+            env.update(env_extra or {})
 
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             self.processes.append((app_name, p))
@@ -153,10 +160,11 @@ class AppSpawner:
             # comparisons. Pin both apps to the same known config.
             repo_root = os.path.abspath(os.path.join(self.base_dir, ".."))
             env["OCIO"] = os.path.join(repo_root, "test_media", "config.ocio")
+            env.update(env_extra or {})
 
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             self.processes.append((app_name, p))
-            
+
         else:
             raise ValueError(f"Unknown app: {app_name}")
 

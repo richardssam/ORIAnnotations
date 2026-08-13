@@ -659,3 +659,53 @@ tests:
     apps:
       - "openrv"
       - "xstudio"
+  - name: "managed_session_roles"
+    description: >
+      A managed session with a declared role policy: xStudio drives, OpenRV is
+      a viewer. Asserts the viewer's local scrub reaches nobody — neither the
+      frame the driver sees nor, by the claim gate, the position lease — while
+      the driver's own seek still propagates normally. Both halves matter: a
+      test that only checked the viewer was suppressed would pass equally well
+      against a session that had stopped syncing altogether.
+
+      Roles become one identity-keyed policy shared by both peers (see the
+      runner's `roles` handling), not a per-peer default, because a joiner
+      adopts the session's policy from the master rather than keeping its own.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "viewer"
+    roles:
+      - "driver"
+      - "viewer"
+    users:
+      - "session_driver"
+      - "session_viewer"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      # Prove the policy actually took effect before asserting on what it
+      # prevents; otherwise the suppression assertions below are vacuous.
+      - action: "expect_role"
+        app: "xstudio"
+        role: "driver"
+      - action: "expect_role"
+        app: "openrv"
+        role: "viewer"
+      # The driver moves and the viewer must follow: role restricts sending,
+      # never receiving.
+      - action: "set_frame"
+        frame: 40
+      # The viewer moves and nobody follows.
+      - action: "expect_no_propagation"
+        app: "openrv"
+        command: {action: "set_frame", frame: 90}
+        settle: 5.0
+      # And the driver is still in charge afterwards — the viewer's scrub must
+      # not have taken the position lease it could never confirm (D8).
+      - action: "set_frame"
+        frame: 55
+    apps:
+      - "xstudio"
+      - "openrv"

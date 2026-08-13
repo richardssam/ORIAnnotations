@@ -47,6 +47,13 @@ def get_xstudio_state(port=14441):
         # assert which peer was allowed to change what everyone looks at.
         "is_host": None,
         "host_guid": None,
+        # Session role of this peer, and whether the session currently has any
+        # peer eligible to be host. Reported beside is_host because they answer
+        # different questions: role is what this participant may ever emit,
+        # is_host is who chooses what everyone looks at. Both differ between
+        # peers by construction, hence the runner's ignore_keys.
+        "role": None,
+        "driverless": None,
         "display_name": None,
         # Per-channel write-lease state ({"position"|"display"|"structure":
         # {"owner_guid", "remaining_ms"}}), omitted per-channel when free.
@@ -93,6 +100,8 @@ def get_xstudio_state(port=14441):
                 if "is_host" in full:
                     state["is_host"] = full["is_host"]
                 state["host_guid"] = full.get("host_guid")
+                state["role"] = full.get("role")
+                state["driverless"] = full.get("driverless")
                 state["unresolved_patches"] = list(full.get("unresolved_patches") or [])
                 state["unpublished_parents"] = list(full.get("unpublished_parents") or [])
                 state["broadcast_ownership"] = dict(full.get("broadcast_ownership") or {})

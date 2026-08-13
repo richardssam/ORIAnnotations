@@ -570,7 +570,8 @@ class TestRunner:
             ignore_keys = {"playing", "media_path", "media_exists", "frame",
                            "view_mode",
                            "annotations", "annotation_count", "is_master",
-                           "is_host", "host_guid", "view_mirror_error",
+                           "is_host", "host_guid", "role", "driverless",
+                           "view_mirror_error",
                            "view_outcome", "display_name",
                            "unresolved_patches", "unpublished_parents",
                            "media_count", "broadcast_ownership"}
@@ -1420,12 +1421,37 @@ class TestRunner:
             free_ports = _find_free_ports(len(apps))
             # ``fixtures`` is a parallel list to ``apps``; entry may be None.
             fixtures = test_data.get("fixtures", [])
+            # ``roles`` is a second parallel list naming each peer's session
+            # role, for tests of a managed session. Absent means the permissive
+            # default — no policy at all, i.e. exactly today's behaviour.
+            #
+            # It becomes ONE session policy that every peer is given, keyed on
+            # identity, plus a distinct identity per peer: role memory is
+            # identity-keyed by design, and a per-peer *default* would not
+            # survive the first snapshot, since a joiner adopts the session's
+            # policy from the master rather than keeping its own.
+            roles = test_data.get("roles", [])
+            users = test_data.get("users", []) or [f"peer{i}" for i in range(len(apps))]
+            role_env = {}
+            if roles:
+                memory = ",".join(
+                    f"{users[i]}={role}"
+                    for i, role in enumerate(roles)
+                    if role and i < len(users)
+                )
+                role_env = {
+                    "ORI_SESSION_DEFAULT_ROLE": test_data.get("default_role", "viewer"),
+                    "ORI_SESSION_PEER_ROLES": memory,
+                }
             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
             for i, (app_name, port) in enumerate(zip(apps, free_ports)):
                 fixture = fixtures[i] if i < len(fixtures) else None
                 if fixture and not os.path.isabs(fixture):
                     fixture = os.path.join(repo_root, fixture)
-                spawner.launch(app_name, port, session_file=fixture)
+                env_extra = dict(role_env)
+                if role_env and i < len(users) and users[i]:
+                    env_extra["ORI_SYNC_USER"] = users[i]
+                spawner.launch(app_name, port, session_file=fixture, env_extra=env_extra)
                 app_ports.append((app_name, port))
 
             logging.info("Apps launched. Waiting for all apps to connect...")
@@ -1628,6 +1654,56 @@ class TestRunner:
                             )
                             failed = True
                             break
+                        continue
+
+                    # Runner-level for the same reason as the two above: the
+                    # subject is what the *other* peers did not do, which no
+                    # single app can report about itself.
+                    if action == "expect_role":
+                        target = cmd.get("app")
+                        expected = cmd.get("role")
+                        port = next((p for n, p in app_ports if n == target), None)
+                        observed = (self.fetch_state(port) or {}).get("role") if port else None
+                        logging.info(f"  -> {target} role: {observed} (expected {expected})")
+                        if observed != expected:
+                            logging.error(
+                                f"expect_role: {target} reports role {observed!r}, "
+                                f"expected {expected!r}. A test that asserts what a "
+                                "restricted peer cannot do asserts nothing if the "
+                                "peer was never restricted."
+                            )
+                            failed = True
+                            break
+                        continue
+
+                    # The assertion a role test actually needs: a restricted
+                    # peer's local interaction must leave everyone else where
+                    # they were. Asserting only that the peer moved locally
+                    # would pass just as well with no role enforcement at all.
+                    if action == "expect_no_propagation":
+                        target = cmd.get("app")
+                        inner = dict(cmd.get("command") or {})
+                        others = [(n, p) for n, p in app_ports if n != target]
+                        before = {n: (self.fetch_state(p) or {}).get("frame") for n, p in others}
+                        port = next((p for n, p in app_ports if n == target), None)
+                        if port is None:
+                            logging.error(f"expect_no_propagation: no app named {target!r}")
+                            failed = True
+                            break
+                        logging.info(f"  -> {target} (restricted) sends {inner}")
+                        self.send_command(port, inner)
+                        time.sleep(float(cmd.get("settle", 4.0)))
+                        after = {n: (self.fetch_state(p) or {}).get("frame") for n, p in others}
+                        moved = [n for n in before if before[n] != after[n]]
+                        if moved:
+                            logging.error(
+                                f"expect_no_propagation: {moved} followed {target}'s "
+                                f"input ({before} -> {after}). Its role forbids the "
+                                "field group, so nothing should have left it."
+                            )
+                            failed = True
+                            break
+                        logging.info(f"  -> peers unmoved: {after}")
                         continue
 
                     # Implicit gate. Deliberately automatic rather than left to

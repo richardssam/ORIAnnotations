@@ -24,6 +24,13 @@ def get_openrv_state():
         # know which peer was allowed to.
         "is_host": None,
         "host_guid": None,
+        # Session role of this peer, and whether the session currently has any
+        # peer eligible to be host. Reported beside is_host because they answer
+        # different questions: role is what this participant may ever emit,
+        # is_host is who chooses what everyone looks at. Both differ between
+        # peers by construction, hence the runner's ignore_keys.
+        "role": None,
+        "driverless": None,
         "display_name": None,
         # Non-null when the host reported a view this peer could not show. A
         # follower mirrors rather than approximates, so this is how a mirror
@@ -54,6 +61,11 @@ def get_openrv_state():
                 state["is_master"] = bool(_mgr_for_master.is_master)
                 state["is_host"] = bool(getattr(_mgr_for_master, "is_host", False))
                 state["host_guid"] = getattr(_mgr_for_master, "host_guid", None)
+                state["role"] = getattr(_mgr_for_master, "self_role", None)
+                try:
+                    state["driverless"] = not _mgr_for_master.has_eligible_driver()
+                except Exception:
+                    pass
                 state["unresolved_patches"] = list(
                     getattr(_mgr_for_master, "unresolved_patches", []) or []
                 )
