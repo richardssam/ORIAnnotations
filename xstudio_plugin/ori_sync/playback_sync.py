@@ -985,12 +985,41 @@ class PlaybackSyncController:
             _log_exc("_reacquire_active_playhead: failed")
 
     def on_playhead_attribute_changed(self, attr, role) -> None:
-        """Fires when playhead position, play state, or loop mode changes."""
-        if attr.name == "Loop Mode":
+        """Fires when playhead position, play state, or loop mode changes.
+
+        Runs on xStudio's **message-dispatch thread**, not the poll thread, which
+        constrains it in two ways the poll-thread methods are not.
+
+        ``attr.name`` is not a local field: each read is a synchronous
+        ``request_receive`` round-trip to the attribute's actor, bounded by the
+        connection's 100 s default.  It is therefore read *once* here and passed
+        down.  Reading it per use cost three round-trips per event — and this
+        event fires once per rendered frame while scrubbing.
+
+        The read is also bounded and guarded, because a stale playhead actor
+        raises out of this frame into xStudio's ``message_handler`` and takes the
+        dispatcher's handler with it.  Observed 2026-08-13 12:25:10: a peer's
+        playhead went stale mid-scrub, this callback raised ``TimeoutError``, and
+        the peer spent the next three minutes heartbeating normally while unable
+        to read its own playhead — still holding the session's host seat, since
+        liveness is measured by the poll thread's heartbeat and says nothing
+        about whether the actor layer beneath it still answers.
+        """
+        try:
+            with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                attr_name = attr.name
+        except Exception:
+            # Not _log_exc: a stale playhead during teardown or a viewport swap
+            # is routine, and a per-frame traceback would bury the log it is
+            # meant to help read.  _reacquire_active_playhead recovers it.
+            _log("on_playhead_attribute_changed: could not read attribute name")
+            return
+
+        if attr_name == "Loop Mode":
             self._on_loop_mode_changed()
             return
 
-        if attr.name not in ("Logical Frame", "playing"):
+        if attr_name not in ("Logical Frame", "playing"):
             return
 
         if not self.plugin.active_playhead:
@@ -1077,7 +1106,7 @@ class PlaybackSyncController:
         # Enqueue the broadcast command to be processed asynchronously
         _log(
             f"Event: queuing playback state broadcast frame={frame} playing={playing} "
-            f"(source_attr={attr.name})"
+            f"(source_attr={attr_name})"
         )
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
