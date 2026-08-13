@@ -1475,7 +1475,13 @@ class AnnotationSyncController:
                     f"SEND annotation clear: clip={clip_guid[:8]} "
                     f"deleted={len(clip_deleted_uuids)} survivors={len(survivors)}"
                 )
-                manager.broadcast_replace_annotation_commands(clip_guid, survivors)
+                # ``destructive`` states what this call *is* — a clear that
+                # removes other participants' annotations, not an edit to this
+                # peer's own. The plugin declares its intent; the core decides
+                # whether this peer's role allows it.
+                manager.broadcast_replace_annotation_commands(
+                    clip_guid, survivors, destructive=True
+                )
         except Exception as e:
             _log_exc(f"Failed to broadcast annotation clear: {e}")
         finally:

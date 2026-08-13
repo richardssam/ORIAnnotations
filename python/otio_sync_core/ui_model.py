@@ -39,6 +39,8 @@ class SessionStateModel(QObject):
     isHostChanged = Signal()
     isDebugChanged = Signal()
     splitViewChanged = Signal()
+    roleChanged = Signal()
+    driverlessChanged = Signal()
 
     def __init__(self, manager, local_view_provider=None, parent=None):
         super().__init__(parent)
@@ -66,6 +68,10 @@ class SessionStateModel(QObject):
             self.masterGuidChanged.emit()
         if self._snapshot["is_host"] != previous["is_host"]:
             self.isHostChanged.emit()
+        if self._snapshot["self_role"] != previous["self_role"]:
+            self.roleChanged.emit()
+        if self._snapshot["driverless"] != previous["driverless"]:
+            self.driverlessChanged.emit()
 
         is_split = self._compute_split_view()
         if is_split != self._is_split:
@@ -114,6 +120,25 @@ class SessionStateModel(QObject):
     @Property(bool, notify=splitViewChanged)
     def isSplitView(self):
         return self._is_split
+
+    @Property(str, notify=roleChanged)
+    def selfRole(self):
+        """This peer's session role — what it may emit, not what it is driving."""
+        return self._snapshot["self_role"]
+
+    @Property(str, notify=roleChanged)
+    def defaultRole(self):
+        """The role this session gives a participant it does not recognise."""
+        return self._snapshot["default_role"]
+
+    @Property(bool, notify=driverlessChanged)
+    def isDriverless(self):
+        """Whether no peer is eligible to be host, so nobody may change the view.
+
+        Reported, not merely inferable from a greyed-out menu item: a session
+        whose view is frozen has to say why, and the panel is where it says it.
+        """
+        return self._snapshot["driverless"]
 
     @Property(bool, notify=isDebugChanged)
     def isDebug(self):

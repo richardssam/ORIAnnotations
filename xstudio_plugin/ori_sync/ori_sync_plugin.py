@@ -221,6 +221,14 @@ class ORISyncPlugin(PluginBase):
             0.5,
             callback=self._menu_resync_session,
         )
+        # "Become Controller" is a direct child of "Session", beside the other
+        # session items rather than nested — it is a session-level recovery, not
+        # a sub-mode — and it is offered *only* in the driverless condition. An
+        # always-available self-elevation would make a restrictive session
+        # policy advisory. xStudio's menu API has no disabled state, so
+        # "disabled" is expressed as absence, toggled by
+        # :meth:`_sync_become_controller_item` when the condition changes.
+        self._become_controller_item = None
 
         # Place the top-level "Session" menu just before "Help" (which xStudio
         # fixes at position 100 on the main menu bar).  The position must be a
@@ -562,6 +570,26 @@ class ORISyncPlugin(PluginBase):
             _log("Forcing resync from master...")
             self.manager.request_state()
 
+    def _menu_become_controller(self, *args, **kwargs) -> None:
+        """Self-elevate to ``driver`` to recover a session that has no driver.
+
+        Sets the role and nothing else: host follows from the next election,
+        which is a pure function of the peer table.  The eligibility gate lives
+        in the shared core (``elect_role_to_driver`` refuses while an eligible
+        driver exists), not here — a plugin that decided for itself when the
+        recovery was available would be the drift this module structure exists
+        to prevent, and would let one application relax a session's policy.
+        """
+        if self.manager is None:
+            return
+        try:
+            if self.manager.elect_role_to_driver():
+                _log("Become Controller: this peer is now a driver")
+            else:
+                _log("Become Controller: refused — session already has a driver")
+        except Exception:
+            _log_exc("Become Controller failed")
+
     def _menu_show_session_state(self, *args, **kwargs) -> None:
         """Open the Session State panel.
 
@@ -590,6 +618,38 @@ class ORISyncPlugin(PluginBase):
             return
         self._last_session_state_json = payload
         self.session_state_attr.set_value(payload)
+        self._sync_become_controller_item(bool(snapshot.get("driverless")))
+
+    def _sync_become_controller_item(self, driverless: bool) -> None:
+        """Offer "Become Controller" only while the session has no eligible driver.
+
+        The condition itself comes from the shared core through the same
+        projection the panel reads, so the menu and the panel cannot disagree
+        about whether the session is driverless.  Only the *affordance* is
+        toggled here; the report is the panel's, and the gate is the core's —
+        ``elect_role_to_driver`` refuses regardless of what this menu shows.
+
+        Called from the state push (i.e. only when the projection changed), not
+        per poll, so a session spends no time inserting and removing a menu item
+        nobody asked for.
+        """
+        try:
+            if driverless and self._become_controller_item is None:
+                self._become_controller_item = self.insert_menu_item(
+                    "main menu bar",
+                    "Become Controller",
+                    "Session",
+                    0.6,
+                    callback=self._menu_become_controller,
+                )
+            elif not driverless and self._become_controller_item is not None:
+                self.remove_menu_item(self._become_controller_item)
+                self._become_controller_item = None
+        except Exception:
+            # A menu that failed to update must never take the poll thread with
+            # it: the recovery is still reachable, and the panel still reports
+            # the condition.
+            _log_exc("Become Controller menu update failed")
 
     def do_session_connect(self, data) -> list:
         """Called from QML SessionDialog via python_callback.

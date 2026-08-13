@@ -114,6 +114,32 @@ XsWindow {
                     }
                 }
 
+                // Session role of this peer: a third axis, not a restatement of
+                // master or host. It says what this participant may ever emit.
+                XsText {
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    horizontalAlignment: Text.AlignLeft
+                    color: XsStyleSheet.secondaryTextColor
+                    visible: panel.state.self_role !== undefined
+                    text: "Your role: " + panel.state.self_role
+                          + " (session default: " + panel.state.default_role + ")"
+                }
+
+                // The driverless condition is reported here rather than left to
+                // be inferred from a menu item that is simply absent: a session
+                // whose view nobody may change has to explain itself.
+                XsText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignLeft
+                    color: "#f59e0b"  // same warning amber as JOINING in statusColour
+                    font.bold: true
+                    visible: panel.state.driverless === true
+                    text: "No eligible driver — nobody can change what the session is "
+                          + "looking at. Session ▸ Become Controller to take it on."
+                }
+
                 XsText {
                     Layout.fillWidth: true
                     elide: Text.ElideRight

@@ -91,6 +91,32 @@ Rectangle {
                 font.family: uiStyle.fontFamily
                 font.pixelSize: uiStyle.fontSize - 2
             }
+
+            // Session role of this peer. A third axis, not a restatement of
+            // master or host: role is what this participant may ever emit.
+            Text {
+                text: "Your role: " + sessionState.selfRole
+                      + " (session default: " + sessionState.defaultRole + ")"
+                color: uiStyle.textColor
+                font.family: uiStyle.fontFamily
+                font.pixelSize: uiStyle.fontSize - 2
+            }
+
+            // The driverless condition is *reported*, not merely inferable from
+            // a disabled menu item: a session whose view nobody may change has
+            // to explain itself, which is the whole reason this state is
+            // surfaced at all.
+            Text {
+                visible: sessionState.isDriverless
+                text: "No eligible driver — nobody can change what the session "
+                      + "is looking at. OTIO Sync ▸ Become Controller to take it on."
+                color: uiStyle.warningColor
+                wrapMode: Text.WordWrap
+                width: parent.width
+                font.family: uiStyle.fontFamily
+                font.pixelSize: uiStyle.fontSize - 2
+                font.bold: true
+            }
         }
     }
 

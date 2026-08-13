@@ -171,6 +171,8 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                      lambda: rv.commands.NeutralMenuState),
                     ("Session State...", self.do_show_session_state, None,
                      lambda: rv.commands.NeutralMenuState),
+                    ("Become Controller", self.do_become_controller, None,
+                     self._become_controller_state),
                 ])
             ]
         return [
@@ -186,6 +188,40 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                  lambda: rv.commands.NeutralMenuState),
             ])
         ]
+
+    def _become_controller_state(self):
+        """Enable "Become Controller" only in the driverless condition.
+
+        The eligibility question is answered by the shared sync core, never
+        recomputed here: an always-available control would make a restrictive
+        session policy advisory, and two applications each deciding what
+        "driverless" means is how they have drifted before.
+        """
+        try:
+            if self.sync_manager and not self.sync_manager.has_eligible_driver():
+                return rv.commands.NeutralMenuState
+        except Exception as e:
+            _log(f"_become_controller_state failed: {e}")
+        return rv.commands.DisabledMenuState
+
+    def do_become_controller(self, event=None):
+        """Self-elevate to ``driver`` to recover a session that has no driver.
+
+        Sets the role and stops there — host is not claimed, it follows from the
+        next election, which is a pure function of the peer table.  The core
+        refuses the call outright while an eligible driver exists, so this is
+        not the gate, only the affordance.
+        """
+        if not self.sync_manager:
+            return
+        try:
+            if self.sync_manager.elect_role_to_driver():
+                _log("Become Controller: this peer is now a driver")
+            else:
+                _log("Become Controller: refused — session already has a driver")
+        except Exception as e:
+            _log(f"do_become_controller failed: {e}")
+        self._rebuild_menu()
 
     def _rebuild_menu(self):
         """Rebuild the OTIO Sync menu to reflect current connection state."""

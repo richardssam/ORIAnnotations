@@ -562,7 +562,15 @@ class AnnotationSyncController:
                     f"flush_pending_annotations: bookmark {bm_uuid_str[:8]} disappeared"
                     f" — broadcasting clear at frame={frame} clip={clip_guid[:8]}"
                 )
-                self.plugin.manager.broadcast_replace_annotation_commands(ann_clip_guid, [])
+                # An *empty* replacement is a clear, not an edit: annotation
+                # clips are merged per clip-and-frame across peers, so emptying
+                # one removes whatever other participants drew on that frame
+                # too. The plugin states what the call is; the core decides
+                # whether this peer's role allows it. The replacements further
+                # down carry surviving content and are ordinary edits.
+                self.plugin.manager.broadcast_replace_annotation_commands(
+                    ann_clip_guid, [], destructive=True
+                )
             except Exception:
                 _log_exc("flush_pending_annotations: failed to broadcast clear for disappeared bookmark")
 
