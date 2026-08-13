@@ -208,6 +208,13 @@ class PlaybackSyncController:
         self._viewport_container_is_playlist: bool = False
         self._viewport_container_is_timeline: bool = False
 
+        #: Container uuid of the last unpublished Timeline reported by
+        #: :meth:`get_local_viewed_timeline_guid`, so a steady wrong view logs
+        #: once rather than on every scrub broadcast.  Initialised here as well
+        #: as in :meth:`reset`: the read is on a path reachable before the first
+        #: connect, where a missing attribute would raise instead of logging.
+        self._unpublished_view_logged: str | None = None
+
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
         # Detach, never leave — see subscribe_container_selection.
@@ -1789,14 +1796,46 @@ class PlaybackSyncController:
             for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
                 if xs_tl and str(xs_tl.uuid) == container_uuid:
                     return tl_guid
-            # Unresolved: this peer is viewing a Timeline the session has never
-            # been told about, so the uuid returned here is meaningful only
-            # locally.  Every peer that receives it as ``timeline_guid`` has
+            # A flat playlist's *own* timeline.  xStudio gives every Playlist an
+            # internal Timeline with its own container uuid, and the viewport
+            # reports that Timeline — not the Playlist — once playback starts.
+            # The content is published, under the Playlist's guid; only the uuid
+            # in hand is the wrong one of the two the same content answers to.
+            #
+            # This is the whole of the "double-clicked sequence never reaches
+            # peers" bug (2026-08-12, 2026-08-13 13:51:42). It looked like a
+            # publishing failure, and the structure scan was instrumented on the
+            # theory that it could not see the container. The census settled it:
+            # `'Added Media'(53c1596d): 0 timeline(s)` is correct — a playlist's
+            # own timeline is not one of its child containers, and nothing was
+            # ever missing from the session. Only this resolution was wrong.
+            #
+            # The Playlist branch below already maps the flat case; it simply had
+            # no counterpart here, so a viewer that had started playback fell
+            # through to the raw uuid.
+            for tl_guid, (pl, xs_tl) in self.plugin._sync_playlists.items():
+                if xs_tl is not None:
+                    continue  # sequence timelines are matched by uuid above
+                try:
+                    with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
+                        tl_obj = Timeline(
+                            self.plugin.connection, result.actor, result.uuid
+                        )
+                        parent = tl_obj.parent_playlist
+                    if parent is not None and str(parent.uuid) == str(pl.uuid):
+                        return tl_guid
+                except Exception:
+                    # A stale or busy actor here must not cost us the fallback
+                    # below; it is a resolution we would rather have than a
+                    # blocked poll thread.
+                    break
+
+            # Genuinely unpublished: this peer is viewing a Timeline the session
+            # has never been told about, so the uuid returned here is meaningful
+            # only locally.  Every peer that receives it as ``timeline_guid`` has
             # nothing to match it against — OpenRV logs "MIRROR FAILED … not
             # guessing" and keeps its previous view, which reads as the session
-            # simply not following (2026-08-12: a double-clicked sequence took
-            # 13 s to appear, and only because the host switched back to a
-            # published one).  Logged once per container rather than per
+            # simply not following.  Logged once per container rather than per
             # broadcast: this is called on every scrub.
             if container_uuid != self._unpublished_view_logged:
                 self._unpublished_view_logged = container_uuid
