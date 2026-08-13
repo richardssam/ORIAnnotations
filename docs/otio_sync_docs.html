@@ -293,6 +293,31 @@ definitions.</p>
 </tbody>
 </table>
 <hr />
+<h2>Who may send what</h2>
+<p>Not every peer may emit every message, and the rules are worth reading before
+implementing against this protocol — none of them are visible in a message's
+shape.</p>
+<p>Two of them are properties of the <em>session</em>, carried on <code>STATE_SNAPSHOT</code>: the
+elected <strong>host</strong> is the only peer whose playback message may carry the
+<code>view_mode</code>/<code>clip_guid</code> field group (what everyone is looking at), and the
+per-category <strong>write leases</strong> in <code>broadcast_ownership</code> decide which peer is
+currently driving position, display, or structure.</p>
+<p>The third is a property of the <em>participant</em>: a peer's <strong>session role</strong> —
+<code>driver</code>, <code>reviewer</code>, or <code>viewer</code> — carried as a field on <code>PEER_ANNOUNCE</code> and on
+each entry of the <code>STATE_SNAPSHOT</code> peer roster, with the session's policy in that
+message's <code>session_roles</code> section. Role is a ceiling; the other two are gates. A
+driver has permission to emit visibility; only the host actually does.</p>
+<p><strong>Role is enforced by the sender, and is not validated on receipt.</strong> A receiving
+peer applies a message without checking what role its sender declared, and no
+broker-side filtering is involved. An implementer should not assume messages
+have been filtered by the sender's role: this gates accidents in a cooperating
+session, it is not access control. Consistent with that, an <em>absent</em> role — from
+a peer running older code, or an entry learned before its owner announced —
+means the session's <strong>default role</strong>, never the most restrictive one, and an
+absent <code>session_roles</code> section means &quot;no policy declared&quot; rather than an empty
+policy. A session that declares nothing behaves exactly as one predating roles:
+every peer may emit everything.</p>
+<hr />
 <h2>How a message is wrapped and sent</h2>
 <p>When the manager broadcasts a message it calls <code>_send_message()</code>
 (<a href="../python/otio_sync_core/manager.py"><code>manager.py</code></a>), which wraps the typed
@@ -2410,7 +2435,12 @@ msg = StateRequest(target_guid=<span class="py-string">'peer-master-001'</span>,
                     <tr>
                         <td><code>peers</code><span class="required-badge">Optional</span></td>
                         <td><span class="type-badge">dict</span></td>
-                        <td>Peers present at snapshot time, as {guid: {app, capabilities, identity}}, so a joiner learns the peer set without every peer answering its announcement. Not the only discovery path: a joiner that receives no snapshot learns peers from their periodic announcements. Carries no liveness stamp — that is the receiver's own clock. `identity` is the same optional section PEER_ANNOUNCE carries, on the same terms — self-declared and **unverified** — and is present here so a peer that has gone quiet can still be named by a joiner that has never heard it announce.</td>
+                        <td>Peers present at snapshot time, as {guid: {app, capabilities, role, identity}}, so a joiner learns the peer set without every peer answering its announcement. Not the only discovery path: a joiner that receives no snapshot learns peers from their periodic announcements. Carries no liveness stamp — that is the receiver's own clock. `identity` is the same optional section PEER_ANNOUNCE carries, on the same terms — self-declared and **unverified** — and is present here so a peer that has gone quiet can still be named by a joiner that has never heard it announce. `role` is carried for the same reason and on the same terms as it is on PEER_ANNOUNCE — host eligibility is evaluated against this table, and a peer that has gone quiet is known to a joiner only through this roster, so a role omitted here would make that peer look role-less until its next heartbeat. An absent role means the session's default role.</td>
+                    </tr>
+                    <tr>
+                        <td><code>session_roles</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">'dict | None'</span></td>
+                        <td>Session role policy at snapshot time, as {"default_role": str, "peer_roles": {user: role}}. `default_role` is what a participant the session does not recognise is given; `peer_roles` is the session's memory of who has held a role, keyed on the identity's `user` rather than on peer GUID — a driver who drops and rejoins has a new GUID, which is the only case that memory exists for. **Omitted when the session declares no policy**, exactly as a free channel is omitted from `broadcast_ownership` and an unset host is omitted from `host_guid`: an absent section means "no declared policy", not an empty one, so a peer predating this field cannot clear a session's policy by relaying state. Policy lives for the session only and is not persisted anywhere.</td>
                     </tr>
                     <tr>
                         <td><code>broadcast_ownership</code><span class="required-badge">Optional</span></td>
@@ -2844,6 +2874,11 @@ protocol whose message count grew with the size of the session.</div>
                         <td><code>capabilities</code><span class="required-badge">Optional</span></td>
                         <td><span class="type-badge">list</span></td>
                         <td>Roles this peer can hold, e.g. ["visibility"].</td>
+                    </tr>
+                    <tr>
+                        <td><code>role</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">'str | None'</span></td>
+                        <td>Session role of the announcing peer: `driver`, `reviewer`, or `viewer` — what this participant is permitted to emit at all, which is a different question from who holds the canonical state (master), who chooses what the session looks at (host), or who is broadcasting a category right now (the write leases). Omitted when the peer declares none, and an absent role means **the session's default role**, not the most restrictive one: a peer running code that predates roles must not read as ineligible, or one old peer would make a session with drivers in it look driverless. Self-declared on the same terms as `app`, and enforced by the *sender*: a receiving peer applies a message without checking the sender's role.</td>
                     </tr>
                     <tr>
                         <td><code>identity</code><span class="required-badge">Optional</span></td>

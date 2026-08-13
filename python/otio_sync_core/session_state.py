@@ -22,16 +22,27 @@ from . import authority
 __all__ = ["session_state_snapshot", "peer_role", "display_name"]
 
 
-def peer_role(peer: "dict[str, Any]") -> str:
-    """Return the display role for one peer-table entry.
+def peer_role(peer: "dict[str, Any]", default_role: "str | None" = None) -> str:
+    """Return the session role for one peer-table entry.
 
-    Placeholder until the ``session-roles`` change lands: visibility capability
-    is the only role signal the protocol currently carries.
+    The *session* role — ``driver`` / ``reviewer`` / ``viewer`` — which is what
+    this participant is permitted to emit at all.  Master and host are separate
+    axes and stay the separate ``is_master`` / ``is_host`` flags they already
+    are: a session may have several drivers and exactly one host, and a change
+    of master changes nobody's role.
 
-    :param peer: Peer entry, i.e. ``{"app": str, "capabilities": [...]}``.
+    Derived here rather than in either panel, for the same reason
+    :func:`display_name` is: two hosts formatting the same half-known state
+    independently is how they drifted before.
+
+    An entry carrying no role resolves to the session default, never to the most
+    restrictive role.
+
+    :param peer: Peer entry, i.e. ``{"app": str, "capabilities": [...], "role": str}``.
+    :param default_role: The session's declared default role.
     :rtype: str
     """
-    return "Host" if authority.is_host_capable(peer) else "Client"
+    return authority.peer_role(peer, default_role)
 
 
 def display_name(peer: "dict[str, Any]") -> str:
@@ -70,6 +81,7 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
     self_guid = manager.self_guid
     master_guid = manager.master_guid
     host_guid = manager.host_guid
+    default_role = getattr(manager, "default_role", None)
 
     # Resolve lease owners once rather than per peer — three dict reads instead
     # of three per row, and every row then agrees on the same instant.
@@ -87,7 +99,7 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
             {
                 "guid": guid,
                 "app": peer.get("app") or "Unknown",
-                "role": peer_role(peer),
+                "role": peer_role(peer, default_role),
                 "is_self": guid == self_guid,
                 "is_master": guid == master_guid,
                 "is_host": guid == host_guid,
@@ -109,6 +121,13 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
         "master_app": (manager._peers.get(master_guid) or {}).get("app") or "",
         "is_master": manager.is_master,
         "is_host": manager.is_host,
+        "self_role": getattr(manager, "self_role", authority.DEFAULT_ROLE),
+        "default_role": default_role or authority.DEFAULT_ROLE,
+        # Reported, not merely inferable from a menu item being disabled: a
+        # session whose view nobody may change has to say so, and the panel is
+        # where it says it.  Derived once here so both hosts report the same
+        # condition rather than each deciding what "driverless" means.
+        "driverless": not authority.has_eligible_driver(manager._peers, default_role),
         "active_timeline_guid": manager.active_timeline_guid,
         "selected_clip_guid": manager.selected_clip_guid,
         "peers": peers,

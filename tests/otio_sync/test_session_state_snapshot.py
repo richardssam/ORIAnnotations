@@ -131,10 +131,54 @@ def test_free_lease_is_held_by_nobody():
         assert peer["holds_structure_lease"] is False
 
 
-def test_role_follows_visibility_capability():
-    assert peer_role({"app": "xstudio", "capabilities": ["visibility"]}) == "Host"
-    assert peer_role({"app": "openrv", "capabilities": []}) == "Client"
-    assert peer_role({}) == "Client"
+def test_role_is_the_session_role_not_the_host_flag():
+    """``role`` carries driver/reviewer/viewer; host stays its own flag."""
+    assert peer_role({"app": "xstudio", "capabilities": ["visibility"], "role": "reviewer"}) == "reviewer"
+    assert peer_role({"app": "openrv", "capabilities": [], "role": "viewer"}) == "viewer"
+
+
+def test_absent_role_resolves_to_the_session_default_not_the_strictest():
+    # Unknown is never the restrictive value: a peer running older code must
+    # not read as the most restricted participant in the session.
+    assert peer_role({}) == authority.DRIVER
+    assert peer_role({}, authority.VIEWER) == authority.VIEWER
+    assert peer_role({"role": "nonsense"}, authority.VIEWER) == authority.DRIVER
+
+
+def test_snapshot_reports_role_and_driverless_state():
+    mgr = _manager()
+    snap = session_state_snapshot(mgr)
+
+    assert snap["self_role"] == authority.DRIVER
+    assert snap["default_role"] == authority.DRIVER
+    assert snap["driverless"] is False
+    assert snap["peers"][0]["role"] == authority.DRIVER
+    # Role is not host: a driver that is not the elected host is still a driver.
+    assert snap["peers"][0]["is_host"] is False
+
+
+def test_snapshot_reports_a_driverless_session():
+    """The condition is reported, not merely inferable from a disabled menu."""
+    mgr = _manager()
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+
+    snap = session_state_snapshot(mgr)
+
+    assert snap["self_role"] == authority.VIEWER
+    assert snap["driverless"] is True
+
+
+def test_snapshot_role_agrees_with_host_eligibility():
+    """One derivation: the panel cannot claim a driver the election cannot find."""
+    mgr = _manager()
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+    _add_peer(mgr, "peer-a")
+    mgr._peers["peer-a"]["role"] = authority.DRIVER
+
+    assert session_state_snapshot(mgr)["driverless"] is False
+    assert authority.elect_host_guid(mgr._peers, mgr.default_role) == "peer-a"
 
 
 def test_peer_without_app_name_is_labelled_unknown():

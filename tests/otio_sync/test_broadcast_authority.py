@@ -313,6 +313,28 @@ def test_no_plugin_gates_a_broadcast_on_being_host():
         )
 
 
+def test_no_plugin_gates_a_broadcast_on_its_own_role():
+    """Role is enforced in core too, for the same reason and by the same rule.
+
+    A plugin may declare what a call *is* — ``destructive=True`` on a clear —
+    but never what it is allowed to do.  Where a plugin genuinely needs its role
+    (labelling a row, enabling the driverless recovery item) it asks one shared
+    predicate, exactly as it does for ``owns_visibility()``.
+    """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    for rel in _BROADCASTING_MODULES:
+        path = os.path.join(repo_root, rel)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            source = fh.read()
+        for forbidden in ("self_role", "role_permits", "ROLE_PERMISSIONS"):
+            assert forbidden not in source, (
+                f"{rel} tests its own role before broadcasting. Role belongs in "
+                "SyncManager.broadcast_* and SyncManager.claim_category()."
+            )
+
+
 def test_suppressed_broadcast_still_reaches_the_network():
     """Suppression removes fields; it does not drop the peer's position update."""
     rv = _synced("guid-rv", "openrv", is_host=False)

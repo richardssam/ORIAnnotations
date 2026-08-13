@@ -246,6 +246,13 @@ class SyncManager:
     :param capabilities: Roles this peer can hold; defaults to
         ``["visibility"]``.  Pass ``[]`` for a peer that must never host (the
         sync viewer, a recorder).
+    :param default_role: Session role given to a participant the session does
+        not recognise.  Defaults to the environment (``ORI_SESSION_DEFAULT_ROLE``)
+        and then to ``driver``, which reproduces pre-roles behaviour exactly.
+    :param peer_roles: The session's memory of who holds which role,
+        ``{user: role}``, keyed on the identity's ``user`` so a reconnecting
+        driver is recognised as the same person under a new GUID.  Merged over
+        anything ``ORI_SESSION_PEER_ROLES`` declares.
     """
 
     def __init__(
@@ -256,6 +263,8 @@ class SyncManager:
         app_name: str = "",
         capabilities: "list[str] | None" = None,
         identity_override: "dict[str, str] | None" = None,
+        default_role: "str | None" = None,
+        peer_roles: "dict[str, str] | None" = None,
     ) -> None:
         self.session_id = session_id
         self.self_guid: str = self_guid or str(uuid.uuid4())
@@ -275,7 +284,10 @@ class SyncManager:
         # Register internal callback to broadcast property changes
         @self.patcher.on_property_changed
         def _on_local_property_changed(target_uuid: str, path: str, value: Any) -> None:
-            if not self._is_syncing and self.network:
+            # The single emission point for SET_PROPERTY, and therefore the
+            # place role gates it: the property is set locally either way, only
+            # the broadcast is withheld.
+            if not self._is_syncing and self.network and self._role_permits(authority.STRUCTURE):
                 self._send_message(
                     SetProperty(
                         target_uuid=target_uuid,
@@ -326,14 +338,43 @@ class SyncManager:
                 _log(f"Failed to resolve identity: {e}")
                 self.identity = {}
 
+        #: Session role policy (``session-roles``).  ``_default_role`` is the
+        #: role given to a participant the session does not recognise;
+        #: ``_peer_roles`` is the session's memory of who has held what, keyed
+        #: on ``identity["user"]`` rather than on peer GUID — a driver who drops
+        #: and rejoins has a *new* GUID, which is the only case that memory
+        #: exists for.  Both are session-scoped and die with the session.
+        #:
+        #: Falls back to the environment when the caller declares nothing, so a
+        #: session can be started with a policy without a UI — and so the two
+        #: host applications resolve it in one place rather than each reading
+        #: their own variable.
+        env_default_role, env_peer_roles = authority.role_policy_from_env()
+        self._default_role: str = authority.normalise_role(
+            default_role if default_role is not None else env_default_role
+        )
+        self._peer_roles: dict[str, str] = dict(env_peer_roles)
+        self._peer_roles.update({
+            user: authority.normalise_role(role)
+            for user, role in (peer_roles or {}).items()
+            if user
+        })
+        #: This peer's own role.  Written only by :meth:`resolve_own_role`.
+        self._self_role: str = authority.DEFAULT_ROLE
+
         self._peers: dict[str, dict[str, Any]] = {
             self.self_guid: {
                 "app": self.app_name,
                 "capabilities": list(self.capabilities),
                 "last_seen": time.time(),
                 "identity": dict(self.identity),
+                "role": self._self_role,
             }
         }
+        # Resolve before anything can broadcast: a peer that emitted under the
+        # default while its remembered role said otherwise would have leaked
+        # exactly what the policy was declared to prevent.
+        self.resolve_own_role()
         #: When this peer last broadcast its own announcement.  Drives the
         #: liveness heartbeat in :meth:`tick`.
         self._last_announce_time: float = 0.0
@@ -680,6 +721,12 @@ class SyncManager:
                 f" — not synced (status={self.status})"
             )
             return authority.SUPPRESSED
+        # Role gate follows the *lease* gate's exemption exactly, and for the
+        # same reason: a clip timeline is an announcement, not a mutation (see
+        # :meth:`broadcast_clip_timeline`).  A reviewer that could not announce
+        # one would have its own annotations fail to bind on every peer.
+        if lease_gated and self._role_blocks("broadcast_add_timeline"):
+            return authority.SUPPRESSED
         if lease_gated and not self._owns_channel(authority.CHANNEL_STRUCTURE):
             owner = self._leases[authority.CHANNEL_STRUCTURE].owner_guid
             _log(
@@ -765,6 +812,8 @@ class SyncManager:
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if self._role_blocks("broadcast_timeline_rename"):
+            return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             return authority.SUPPRESSED
         tl = self._timelines.get(tl_guid)
@@ -800,6 +849,8 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if self._role_blocks("broadcast_remove_timeline"):
+            return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             return authority.SUPPRESSED
         if self._remove_timeline_local(tl_guid) is None:
@@ -831,6 +882,8 @@ class SyncManager:
         :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
+            return authority.SUPPRESSED
+        if self._role_blocks("broadcast_replace_timeline"):
             return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             return authority.SUPPRESSED
@@ -1190,6 +1243,16 @@ class SyncManager:
         itself.  Used by all self-election paths — the hosts' discovery and
         state-request timeouts, and the master-failover check in :meth:`tick`.
 
+        **Always elects, so a session always has a master.**  The driver
+        preference (``session-roles`` D4) is a *ranking*, not a deferral: it is
+        applied where a ranking can actually decide something — between two
+        peers that both claimed mastership (:meth:`_h_i_am_master`, via
+        :func:`~otio_sync_core.authority.master_rank`) — and never by making
+        this operation decline.  Declining here would introduce exactly the
+        wall-clock window three previous changes have spent their time removing,
+        and would leave a session masterless whenever the preferred peer was not
+        watching; and every caller here treats the call as having elected.
+
         The order matters.  :attr:`is_master` and :attr:`master_guid` are set
         *before* the status transition, because ``_set_status(STATE_SYNCED)``
         fires the :meth:`on_synced` callbacks and those callbacks branch on
@@ -1241,6 +1304,7 @@ class SyncManager:
             peer_guid=self.self_guid,
             app=self.app_name,
             capabilities=list(self.capabilities),
+            role=self._self_role,
             identity=dict(self.identity) if self.identity else None,
         ))
 
@@ -1299,7 +1363,18 @@ class SyncManager:
         :returns: The elected host GUID, or ``None`` when no peer is capable.
         :rtype: str or None
         """
-        elected = authority.elect_host_guid(self._peers)
+        elected = authority.elect_host_guid(self._peers, self._default_role)
+        if elected is None and self._peers:
+            # Not silent: a session with no eligible driver has a view nobody
+            # may change, and the requirement this filter has to answer is that
+            # such a state reports itself rather than simply freezing.  The
+            # panel surfaces it too (``driverless``); this is the log half.
+            self._log_field_strip(
+                "role:driverless",
+                len(self._peers),
+                f"elect_host: no eligible driver among {len(self._peers)} peer(s)"
+                f" (default_role={self._default_role}) — session is driverless",
+            )
         if elected == self.host_guid:
             return elected
         previous = self.host_guid
@@ -1325,7 +1400,7 @@ class SyncManager:
         machine's clock on the wire and require skew handling to interpret, for
         no gain — the receiver stamps its own on adoption.
 
-        :returns: ``{guid: {"app", "capabilities"}}``.
+        :returns: ``{guid: {"app", "capabilities", "role"}}``.
         """
         roster = {}
         for guid, peer in self._peers.items():
@@ -1333,6 +1408,12 @@ class SyncManager:
                 "app": peer.get("app", ""),
                 "capabilities": list(peer.get("capabilities") or []),
             }
+            # Omitted when unknown rather than filled in with this peer's idea
+            # of the default: a joiner resolves absence against the policy it
+            # adopts from the same snapshot, and writing a value here would
+            # freeze one peer's reading of the policy into another's table.
+            if peer.get("role"):
+                entry["role"] = peer["role"]
             if "identity" in peer:
                 # Copied for the same reason ``capabilities`` is: this roster
                 # is handed to the in-process inspector by ``export_state()``,
@@ -1379,9 +1460,14 @@ class SyncManager:
 
             known = self._peers.get(guid)
             if known is not None:
-                # Known peer: fill a missing identity, touch nothing else.
+                # Known peer: fill a missing identity or role, touch nothing
+                # else.  Filling rather than overwriting for the same reason as
+                # identity: what this peer heard the announcer say about itself
+                # outranks what a third party remembers of it.
                 if norm_identity and "identity" not in known:
                     known["identity"] = norm_identity
+                if peer.get("role") and not known.get("role"):
+                    known["role"] = authority.normalise_role(peer["role"])
                 continue
 
             entry = {
@@ -1389,6 +1475,12 @@ class SyncManager:
                 "capabilities": list(peer.get("capabilities") or []),
                 "last_seen": now,
             }
+            # Absent means "unknown", and unknown resolves to the session
+            # default *at read time* (``authority.peer_role``).  Writing a
+            # default in here instead would shadow the real role the peer's own
+            # next announcement carries.
+            if peer.get("role"):
+                entry["role"] = authority.normalise_role(peer["role"])
             if norm_identity:
                 entry["identity"] = norm_identity
             self._peers[guid] = entry
@@ -1443,6 +1535,236 @@ class SyncManager:
         :rtype: bool
         """
         return self.is_host or not authority.enforcement_enabled()
+
+    # ------------------------------------------------------------------
+    # Session roles (what this participant may ever emit)
+    # ------------------------------------------------------------------
+
+    @property
+    def self_role(self) -> str:
+        """This peer's session role — ``driver``, ``reviewer``, or ``viewer``.
+
+        Read-only: a role comes from the session's policy (see
+        :meth:`resolve_own_role`) or, in the one deadlock case, from
+        :meth:`elect_role_to_driver`.  Assigning it directly would put a peer's
+        declared role out of step with the policy every other peer applies.
+
+        :rtype: str
+        """
+        return self._self_role
+
+    @property
+    def default_role(self) -> str:
+        """The role this session gives a participant it does not recognise.
+
+        :rtype: str
+        """
+        return self._default_role
+
+    def role_for_peer(self, peer_guid: str) -> str:
+        """Return a peer's session role, resolving an absent one to the default.
+
+        :param peer_guid: GUID of the peer to look up.
+        :returns: One of :data:`~otio_sync_core.authority.ROLES`.
+        :rtype: str
+        """
+        peer = self._peers.get(peer_guid)
+        if peer is None:
+            return authority.normalise_role(self._default_role)
+        return authority.peer_role(peer, self._default_role)
+
+    def resolve_own_role(self) -> str:
+        """Re-derive this peer's role from the session policy and apply it.
+
+        Assignment order (D3): the session's memory of this *participant*
+        first, the session default second.  The memory is keyed on
+        ``identity["user"]``, so a driver who drops and rejoins is recognised as
+        the same person rather than as a new GUID — the case the mechanism
+        exists for, and the one GUID-keyed memory cannot serve.
+
+        Called at construction, before any broadcast can leave, and again
+        whenever policy arrives (:meth:`adopt_role_policy`).  It does **not**
+        announce: an announcement is the caller's decision, because the
+        constructor has no network yet and the policy path re-announces only
+        when the role actually moved.
+
+        :returns: The resolved role.
+        :rtype: str
+        """
+        user = (self.identity or {}).get("user") or ""
+        remembered = self._peer_roles.get(user) if user else None
+        role = authority.normalise_role(remembered or self._default_role)
+        self._self_role = role
+        entry = self._peers.get(self.self_guid)
+        if entry is not None:
+            entry["role"] = role
+        return role
+
+    def role_policy(self) -> "dict[str, Any] | None":
+        """Return the session's role policy in wire form, or ``None`` when none is declared.
+
+        "Declared" means the session differs from the permissive default in some
+        way a joiner needs to know: a stricter default role, or a memory of who
+        has held one.  A session that matches the pre-roles behaviour exactly
+        sends nothing, which is what keeps :class:`StateSnapshot` compatible
+        with peers predating roles — the same omit-when-unset convention
+        ``host_guid`` and the ownership section already use.
+
+        :returns: ``{"default_role": str, "peer_roles": {user: role}}``, or
+            ``None``.
+        :rtype: dict or None
+        """
+        if self._default_role == authority.DEFAULT_ROLE and not self._peer_roles:
+            return None
+        return {
+            "default_role": self._default_role,
+            "peer_roles": dict(self._peer_roles),
+        }
+
+    def adopt_role_policy(self, policy: "dict[str, Any] | None") -> None:
+        """Adopt role policy learned from a ``STATE_SNAPSHOT``.
+
+        The single named adoption operation, mirroring :meth:`adopt_host` and
+        :meth:`adopt_ownership` — and sharing their compatibility convention: an
+        absent or empty policy is **ignored**, never read as an empty one.  A
+        peer running code that predates roles sends no section, and treating
+        that as "this session has no policy" would let it clear a screening's
+        policy simply by relaying state.
+
+        Re-resolves this peer's own role afterwards, since the policy may name
+        it, and re-announces only if that moved it — a role change propagates by
+        the same path as joining (D5), so ``PEER_ANNOUNCE`` stays the single
+        write path into every peer's table.
+
+        :param policy: The snapshot's ``session_roles`` section, or ``None``.
+        """
+        if not policy:
+            return
+        changed = False
+        incoming_default = policy.get("default_role")
+        if incoming_default:
+            norm = authority.normalise_role(incoming_default)
+            if norm != self._default_role:
+                self._default_role = norm
+                changed = True
+        for user, role in (policy.get("peer_roles") or {}).items():
+            if not user:
+                continue
+            norm = authority.normalise_role(role)
+            if self._peer_roles.get(user) != norm:
+                self._peer_roles[user] = norm
+                changed = True
+        if not changed:
+            return
+        _log(
+            f"adopt_role_policy: default={self._default_role}"
+            f" remembered={len(self._peer_roles)}"
+        )
+        before = self._self_role
+        self.resolve_own_role()
+        if self._self_role != before:
+            _log(f"role: {before} → {self._self_role} (session policy)")
+            self.announce_peer()
+        # The default role decides how a role-less peer resolves, so adopting a
+        # policy can change who is eligible for host.  Enqueued rather than run
+        # here: host state has a single writer, and this may be reached from a
+        # thread that is not it.
+        self.request_host_election("role-policy")
+
+    def has_eligible_driver(self) -> bool:
+        """Return whether any peer in the table could be elected host.
+
+        The one predicate behind both hosts' "Become Controller" gating and the
+        panel's driverless indicator, so the action can never be offered in a
+        state the election disagrees about.  ``False`` is exactly the condition
+        :meth:`elect_role_to_driver` exists to exit.
+
+        :rtype: bool
+        """
+        return authority.has_eligible_driver(self._peers, self._default_role)
+
+    def elect_role_to_driver(self) -> bool:
+        """Self-elevate to ``driver`` to recover a session that has no driver (D7).
+
+        The designed exit from the one deadlock restricting host election to
+        drivers makes reachable: no driver present, therefore no peer eligible
+        for host, therefore a view nobody may change.
+
+        It sets this peer's role and **stops there**.  Host is not claimed:
+        election is a pure function of the peer table, so the moment a driver
+        exists the next election resolves onto it.  One user action, no second
+        mechanism, and the determinism that makes simultaneous election safe is
+        untouched — two peers elevating at once simply both become drivers, and
+        every peer converges on the same host.
+
+        Refused while an eligible driver exists.  That gate is what keeps the
+        role model from being decorative — an always-available self-elevation
+        would make a restrictive default advisory — and it lives here rather
+        than in either plugin so neither can relax it independently.
+
+        :returns: ``True`` when the role was granted, ``False`` when refused.
+        :rtype: bool
+        """
+        if self.has_eligible_driver():
+            _log("elect_role_to_driver: refused — session already has an eligible driver")
+            return False
+        # Remembered against this participant, not against this GUID, so the
+        # recovery survives the reconnect that so often follows it.  The session
+        # *default* is deliberately not touched: one person got out of a
+        # deadlock, which is not a decision to let every future joiner drive.
+        user = (self.identity or {}).get("user") or ""
+        if user:
+            self._peer_roles[user] = authority.DRIVER
+        self._self_role = authority.DRIVER
+        entry = self._peers.get(self.self_guid)
+        if entry is not None:
+            entry["role"] = authority.DRIVER
+        _log("elect_role_to_driver: self-elevated to driver (driverless session)")
+        self.announce_peer()
+        self.request_host_election("role-self-elevation")
+        return True
+
+    def _role_permits(self, group: "str | None", *, destructive: bool = False) -> bool:
+        """Return whether this peer's role permits emitting *group*.
+
+        Folds the kill switch into the predicate so no call site has to
+        remember it: a disabled switch must revert enforcement completely.
+
+        :param group: A role permission group, or ``None`` for an ungated
+            broadcast.
+        :param destructive: See
+            :func:`~otio_sync_core.authority.role_permits`.
+        :rtype: bool
+        """
+        if not authority.role_enforcement_enabled():
+            return True
+        return authority.role_permits(self._self_role, group, destructive=destructive)
+
+    def _role_blocks(self, method_name: str, *, destructive: bool = False) -> bool:
+        """Return whether this peer's role forbids the broadcast *method_name*, and log it.
+
+        The single role gate for the non-playback categories — structure and
+        annotation — so each ``broadcast_*`` carries one line rather than its
+        own copy of the decision.  The playback message is enforced by field
+        group instead (:meth:`_enforce_role`), because its authority boundary
+        runs *inside* the message.
+
+        :param method_name: Name of the calling ``broadcast_*`` method.
+        :param destructive: Whether this call destroys other participants' work
+            rather than adding to it.  See
+            :func:`~otio_sync_core.authority.role_permits`.
+        :rtype: bool
+        """
+        group = authority.role_group_for(method_name)
+        if self._role_permits(group, destructive=destructive):
+            return False
+        self._log_field_strip(
+            f"role:{group}",
+            (self._self_role, method_name, destructive),
+            f"{method_name}: suppressed — role {self._self_role!r} may not emit"
+            f" {group}{' (destructive)' if destructive else ''}",
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Broadcast Ownership (write leases: position, display, structure)
@@ -1595,12 +1917,38 @@ class SyncManager:
         enforcement "completely" (design.md D5) includes not flooding the
         session with claims nobody is going to honour.
 
+        Refused outright when this peer's **role** forbids broadcasting the
+        channel (D8), beside the kill-switch no-op and for the same reason: a
+        mechanism that may not be used must not leave a claim state machine
+        running.  This gate is not tidiness.  Plugins claim unconditionally from
+        every input-driven path — they must, since they never test authority —
+        and non-drivers keep interacting locally by design, so without it a
+        viewer's scrub takes the position lease from a driver and can then never
+        confirm it (confirmation happens only when a broadcast in that category
+        goes out, and role has stripped it).  ``resolve_claim`` prefers the
+        *earlier* claim, so the driver's fresh one loses to the viewer's stale
+        one for the lease's full duration — up to a second of dead position sync
+        every time a viewer touches its playhead, in a session designed to have
+        twenty-five of them.
+
+        A refusal is **not** a release: the current owner keeps the channel.
+        Releasing would let a non-driver's local activity take a lease *away*
+        from a driver, which is the same defect with its sign reversed.
+
         :param channel: One of :data:`authority.LEASE_CHANNELS`.
         :raises ValueError: If *channel* is not a recognised lease channel.
         """
         if channel not in authority.LEASE_CHANNELS:
             raise ValueError(f"unknown lease channel: {channel!r}")
         if not authority.ownership_enforcement_enabled():
+            return
+        if not self._role_permits(channel):
+            self._log_field_strip(
+                f"role:claim:{channel}",
+                (self._self_role, channel),
+                f"claim_category: refused {channel} — role {self._self_role!r}"
+                " may not broadcast it",
+            )
             return
         claim_ts = time.time()
         self._apply_claim(channel, claim_ts, self.self_guid)
@@ -1759,6 +2107,14 @@ class SyncManager:
         broadcast visibility, a departed host that stayed elected would leave
         the session's view frozen with no peer permitted to change it.
 
+        The session's **role memory is deliberately not touched.**  The peer
+        table records who is present; ``_peer_roles`` records what the session
+        decided about a *participant*, and it is keyed on identity precisely so
+        that it outlives the GUID.  Forgetting a role here would break the one
+        case identity-keyed memory exists for: a driver who drops and rejoins
+        would come back as whatever the default is, locked out of the session
+        they are running.
+
         :param peer_guid: GUID of the peer to forget.
         """
         if self._peers.pop(peer_guid, None) is None:
@@ -1806,6 +2162,7 @@ class SyncManager:
             display_state=self.display_state or None,
             host_guid=self.host_guid,
             peers=self._peer_roster(),
+            session_roles=self.role_policy(),
             broadcast_ownership=self._lease_wire_section() or None,
         ))
         # A snapshot publishes every timeline it carries, as surely as an
@@ -1845,11 +2202,20 @@ class SyncManager:
             display_state=self.display_state or None,
             host_guid=self.host_guid,
             peers=self._peer_roster(),
+            session_roles=self.role_policy(),
             broadcast_ownership=self._lease_wire_section() or None,
         ).to_payload()
         payload["is_master"] = self.is_master
         payload["is_host"] = self.is_host
         payload["self_guid"] = self.self_guid
+        # Role state, on the same "harness visibility" terms as the flags above
+        # (host-owned-visibility §2.4): a test asserting that a viewer emitted
+        # nothing needs to see that it was a viewer, and one asserting the
+        # driverless recovery needs the condition itself rather than a guess
+        # reconstructed from the roster.
+        payload["role"] = self._self_role
+        payload["default_role"] = self._default_role
+        payload["driverless"] = not self.has_eligible_driver()
         # Structural patches this peer could not apply. Carried for the same
         # reason as the flags above — harness visibility — and because a peer
         # that dropped patches is precisely one whose reported state should not
@@ -1910,17 +2276,38 @@ class SyncManager:
         parent_uuid: str,
         child_obj: otio.core.SerializableObject,
         index: int = -1,
+        *,
+        group: str = authority.STRUCTURE,
     ) -> None:
         """Insert *child_obj* into the parent container and broadcast the change.
 
         A GUID is assigned to *child_obj* if it does not already have one.
         Use ``index=-1`` to append.
 
+        The insert always happens locally; only the *broadcast* is subject to
+        role, which is the local-interaction model this change chose
+        deliberately — a restricted peer keeps working, its edits simply do not
+        leave it.
+
         :param parent_uuid: GUID of the parent container (Track or Stack).
         :param child_obj: OTIO object to insert.
         :param index: Position at which to insert; ``-1`` appends.
+        :param group: Role permission group this insert belongs to.  Defaults to
+            :data:`~otio_sync_core.authority.STRUCTURE`; the annotation paths
+            pass :data:`~otio_sync_core.authority.ANNOTATION`, because an
+            annotation clip inserted into an Annotations track is an annotation
+            by every measure except the message that carries it — and a reviewer
+            may emit one while it may not reshape the timeline.
         """
         msg = self.patcher.insert_child(parent_uuid, child_obj, index)
+
+        if msg and not self._role_permits(group):
+            self._log_field_strip(
+                f"role:{group}",
+                (self._self_role, "insert_child", group),
+                f"insert_child: suppressed — role {self._self_role!r} may not emit {group}",
+            )
+            return
 
         if not self._is_syncing and self.network and msg:
             _log(
@@ -1966,6 +2353,37 @@ class SyncManager:
             message = f"{message} — previous run repeated {repeats}x"
         self._strip_log_runs[category] = (key, 0)
         _log(message)
+
+    def _enforce_role(self, state: dict[str, Any], status: str) -> tuple[dict[str, Any], str]:
+        """Strip the playback field groups this peer's role may not emit.
+
+        The **first** of the three enforcement steps in
+        :meth:`broadcast_playback_state`, and first for a reason beyond cost
+        (D2): a lease is confirmed as a side effect of a broadcast in that
+        category going out, so evaluating category authority ahead of role would
+        let a role-blocked peer harden a lease it can never use — and
+        ``resolve_claim`` prefers the *earlier* claim, so the driver's fresh one
+        would then lose to it until it expired.
+
+        Shares the status contract with :meth:`_enforce_position`:
+        ``SUPPRESSED`` means "sent, with fields stripped", not "not sent".
+
+        :param state: Outgoing playback/view state dict.
+        :param status: The status so far.
+        :returns: ``(state_to_send, status)``.
+        """
+        if not authority.role_enforcement_enabled():
+            return state, status
+        out = authority.strip_role_fields(state, self._self_role)
+        if len(out) == len(state):
+            return state, status
+        self._log_field_strip(
+            f"role:{self._self_role}",
+            (self._self_role, tuple(sorted(set(state) - set(out)))),
+            "broadcast_playback_state: stripped fields not permitted to role"
+            f" {self._self_role!r} ({', '.join(sorted(set(state) - set(out)))})",
+        )
+        return out, authority.SUPPRESSED
 
     def _enforce_visibility(self, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
         """Strip visibility fields when this peer is not the host.
@@ -2058,8 +2476,33 @@ class SyncManager:
         inner = dict(state_dict)
         inner["sync_timestamp"] = time.time()
         inner["timeline_guid"] = timeline_guid or self.active_timeline_guid
+        inner, role_status = self._enforce_role(inner, authority.SENT)
+        if role_status == authority.SUPPRESSED and not (
+            authority.asserts_position(inner) or authority.asserts_visibility(inner)
+        ):
+            # Role emptied the message, so there is nothing left for this
+            # participant to say — and an empty playback message is not silence.
+            # It still carries ``timeline_guid``, which passive peers follow, and
+            # both hosts' receive paths read an *absent* ``current_time`` as
+            # ``current_time.get("value", 0)`` — an assertion of frame 0. A
+            # viewer's emptied message therefore drove the session to the start
+            # of the view (observed 2026-08-12, xStudio host jumping while an
+            # OpenRV viewer scrubbed). Both receive paths guard that now; this is
+            # the half that cannot drift between them.
+            #
+            # Deliberately narrower than "any emptied message": a *lease*-emptied
+            # one still goes out, which is ``broadcast-ownership``'s specified
+            # behaviour and not this change's to alter.
+            return authority.SUPPRESSED
         inner, status = self._enforce_visibility(inner)
-        inner, status = self._enforce_position(inner, status)
+        # Only reached when role permits position at all.  ``_enforce_position``
+        # confirms the position lease on the path where it owns the channel, and
+        # a broadcast the role check has already emptied must not harden a lease
+        # (D2) — so the role gate stands in front of the call, not inside it.
+        if self._role_permits(authority.POSITION):
+            inner, status = self._enforce_position(inner, status)
+        if role_status == authority.SUPPRESSED:
+            status = role_status
         self._send_message(PlaybackSettingsSet.from_payload(inner))
         return status
 
@@ -2439,6 +2882,11 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return
+        # Returns ``None`` rather than a status, keeping this method's existing
+        # exception to the SENT/SUPPRESSED contract: callers want the annotation
+        # clip's GUID, and there is no clip when nothing was committed.
+        if self._role_blocks("broadcast_add_annotation"):
+            return
         if annotation_track_guid not in self._object_map:
             _log(f"broadcast_add_annotation: annotation track {annotation_track_guid} not found")
             return
@@ -2478,9 +2926,13 @@ class SyncManager:
                         duration=otio.opentime.RationalTime(frame - track_end, fps),
                     )
                 )
-                self.insert_child(annotation_track_guid, gap)
+                self.insert_child(
+                    annotation_track_guid, gap, group=authority.ANNOTATION
+                )
             ann_clip = self._make_annotation_clip(clip_guid, clip_local_time, otio_events)
-            self.insert_child(annotation_track_guid, ann_clip)
+            self.insert_child(
+                annotation_track_guid, ann_clip, group=authority.ANNOTATION
+            )
             return ann_clip.metadata.get("sync", {}).get("guid")
 
     def broadcast_partial_annotation(
@@ -2505,6 +2957,8 @@ class SyncManager:
         """
         if not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        if self._role_blocks("broadcast_partial_annotation"):
+            return authority.SUPPRESSED
         self._send_message(PartialAnnotation(
             clip_guid=clip_guid,
             frame=frame,
@@ -2517,6 +2971,8 @@ class SyncManager:
         self,
         annotation_clip_guid: str,
         events: list,
+        *,
+        destructive: bool = False,
     ) -> str:
         """Replace all annotation_commands on an existing clip and broadcast to peers.
 
@@ -2529,10 +2985,23 @@ class SyncManager:
         :param annotation_clip_guid: Sync GUID of the annotation clip to update.
         :param events: Full replacement list of SyncEvent objects (strokes +
             captions) representing the current annotation state.
+        :param destructive: ``True`` when this call *removes* other
+            participants' work — a clear-all rather than an edit.  Destructive
+            annotation operations are driver-only, and this flag is how the
+            distinction reaches the role check: the category table is keyed on
+            method name, and a clear shares this method with ordinary stroke
+            edits, so no category could express the row.  The caller declares
+            **what the call is**, which is not the same as testing what it is
+            allowed to do — the same distinction that lets a plugin call
+            :meth:`claim_category` on user input while never testing authority.
         :returns: ``SENT``, or ``SUPPRESSED`` when there was nothing to send.
         :rtype: str
         """
         if not self.network or self.status != STATE_SYNCED:
+            return authority.SUPPRESSED
+        if self._role_blocks(
+            "broadcast_replace_annotation_commands", destructive=destructive
+        ):
             return authority.SUPPRESSED
         clip = self._object_map.get(annotation_clip_guid)
         if clip is None:
@@ -2578,6 +3047,8 @@ class SyncManager:
         if self.status != STATE_SYNCED:
             _log(f"broadcast_move_child: skipped (status={self.status})")
             return authority.SUPPRESSED
+        if self._role_blocks("broadcast_move_child"):
+            return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             _log("broadcast_move_child: skipped (structure lease not held)")
             return authority.SUPPRESSED
@@ -2600,6 +3071,8 @@ class SyncManager:
         :rtype: str
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
+            return authority.SUPPRESSED
+        if self._role_blocks("broadcast_remove_child"):
             return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             return authority.SUPPRESSED
@@ -2749,6 +3222,28 @@ class SyncManager:
     def _h_i_am_master(
         self, msg: IAmMaster, data: dict[str, Any], source: str
     ) -> "tuple[str, Any] | None":
+        claimant = msg.master_guid
+        if self.is_master and claimant and claimant != self.self_guid:
+            # Where two peers claim mastership, prefer a driver: the master
+            # holds the session's canonical state and needs full broadcast
+            # capability to serve it.  A *preference*, evaluated on the peer
+            # table as it stands and with no new wall clock — a session with no
+            # driver still gets a master, and a peer promoted on that basis is
+            # master for state sync only, its role unchanged.  Inert while every
+            # peer is a driver, which is the ranking's own tie.
+            mine = authority.master_rank(
+                self._peers.get(self.self_guid) or {}, self._default_role
+            )
+            theirs = authority.master_rank(
+                self._peers.get(claimant) or {}, self._default_role
+            )
+            if mine < theirs:
+                _log(
+                    f"I_AM_MASTER from {claimant[:8]} declined —"
+                    " this peer is a driver and it is not"
+                )
+                self.broadcast_master_response()
+                return None
         self.master_guid = msg.master_guid
         self._last_who_is_master_time = None
         if self.status == STATE_DISCOVERING:
@@ -2761,7 +3256,16 @@ class SyncManager:
         guid = msg.peer_guid or source
         known = self._peers.get(guid)
         entry = {"app": msg.app, "capabilities": list(msg.capabilities)}
-        
+
+        # A peer that declares no role stays role-less in the table, resolving
+        # to the session default wherever it is read.  Carrying the omission
+        # through is what lets a later announcement from a peer that has since
+        # learned its role take effect.
+        if msg.role:
+            entry["role"] = authority.normalise_role(msg.role)
+        elif known and known.get("role"):
+            entry["role"] = known["role"]
+
         norm_identity = identity.normalise(msg.identity)
         if norm_identity:
             entry["identity"] = norm_identity
@@ -3214,6 +3718,11 @@ class SyncManager:
             # table, so adopting the host against a table that does not yet
             # contain it would be a needless disagreement.
             self.adopt_peers(snapshot_data.get("peers"))
+            # Then the role policy, before the host: an absent role resolves
+            # against the *session's* default, so a joiner that adopted a host
+            # while still holding its own default would be reading the table
+            # under a policy it is about to replace.
+            self.adopt_role_policy(snapshot_data.get("session_roles"))
             # Adopt the session's host before any local election runs, so a
             # joiner does not assume the role and fight the incumbent.
             self.adopt_host(snapshot_data.get("host_guid"))

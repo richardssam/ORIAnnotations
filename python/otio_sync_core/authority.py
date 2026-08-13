@@ -206,7 +206,9 @@ def is_host_capable(peer: Mapping[str, Any]) -> bool:
     return CAPABILITY_VISIBILITY in caps
 
 
-def elect_host_guid(peers: Mapping[str, Mapping[str, Any]]) -> "str | None":
+def elect_host_guid(
+    peers: Mapping[str, Mapping[str, Any]], default_role: "str | None" = None
+) -> "str | None":
     """Return the GUID of the peer that should hold visibility authority.
 
     A pure function of the peer table, so two peers evaluating the same set of
@@ -215,16 +217,21 @@ def elect_host_guid(peers: Mapping[str, Mapping[str, Any]]) -> "str | None":
     first, then GUID ascending as a deterministic tie-break (the same rule
     ``session-roles`` D2 uses for claims).
 
-    :param peers: ``{guid: {"app": str, "capabilities": [...]}}``, including
-        this peer's own entry.
-    :returns: Elected host GUID, or ``None`` when no peer is capable.
+    Candidates are filtered by **role as well as capability** (``session-roles``
+    D4): a peer whose role forbids emitting visibility would hold the authority
+    while unable to exercise it.  A peer carrying no role resolves to
+    *default_role*, so a session that never opted into a role policy elects
+    exactly as it did before roles existed.
+
+    :param peers: ``{guid: {"app": str, "capabilities": [...], "role": str}}``,
+        including this peer's own entry.
+    :param default_role: The session's declared default role, applied to any
+        entry carrying none.  ``None`` means :data:`DEFAULT_ROLE`.  Passed in
+        rather than read from manager state so this stays a pure function.
+    :returns: Elected host GUID, or ``None`` when no peer is eligible.
     :rtype: str or None
     """
-    candidates = [
-        (host_rank(p.get("app")), guid)
-        for guid, p in peers.items()
-        if is_host_capable(p)
-    ]
+    candidates = host_candidates(peers, default_role)
     if not candidates:
         return None
     return min(candidates)[1]
@@ -332,3 +339,277 @@ def ownership_enforcement_enabled() -> bool:
     :rtype: bool
     """
     return os.environ.get(OWNERSHIP_ENFORCEMENT_ENV, "1").strip().lower() not in _FALSEY
+
+
+# ---------------------------------------------------------------------------
+# Session roles (session-roles) — what a *participant* may ever emit
+# ---------------------------------------------------------------------------
+#
+# Role is the fourth authority axis, and it is not any of the other three:
+#
+#   master      who holds the canonical snapshot          (liveness/discovery)
+#   host        who chooses what everyone looks at        (elect_host_guid)
+#   lease owner who is emitting this category right now   (LEASE_CHANNELS)
+#   role        what this participant may emit at all     (here)
+#
+# Role is a **ceiling**, category authority is a **gate**, and a broadcast must
+# pass both.  A driver has permission to emit visibility; only the host actually
+# does.  The role check runs *first* — not only because it is the cheaper of the
+# two, but because a lease is confirmed as a side effect of a broadcast going
+# out (``_refresh_lease_confirmed``): evaluating the gate first would let a
+# role-blocked peer harden a lease it is not permitted to use.
+
+#: Full control: every field group, subject to category authority.  Only a
+#: driver is eligible for host.
+DRIVER = "driver"
+#: May annotate and move within what is shown; may not change *what* is shown,
+#: modify session content, or clear other participants' annotations.
+REVIEWER = "reviewer"
+#: Passive observer: receives everything, emits nothing session-visible.
+VIEWER = "viewer"
+
+#: Every role, most-permitted first.
+ROLES: tuple[str, ...] = (DRIVER, REVIEWER, VIEWER)
+
+#: The role a session assigns to a participant it does not recognise, when it
+#: declares no policy of its own.  Deliberately the *permissive* one: it
+#: reproduces pre-roles behaviour exactly, so the mechanism is inert until a
+#: session opts in — and it is also the rollback, needing no rebuild.  A defect
+#: in role evaluation therefore fails towards "behaves like today" rather than
+#: towards "nobody may drive and nothing says why".
+DEFAULT_ROLE = DRIVER
+
+#: Display state as a *role* group.  Deliberately distinct from the ``position``
+#: category it sits under for lease purposes: every role may emit display state
+#: (it is per-peer presentation, not a session event — host-owned-visibility
+#: §7.1), while ``position`` stops at reviewer.  Same string as
+#: :data:`CHANNEL_DISPLAY` because it is the same channel; a separate name
+#: because the two tables answer different questions.
+DISPLAY = CHANNEL_DISPLAY
+
+#: Role → the field groups that role may emit.
+#:
+#: Keyed on the :data:`BROADCAST_CATEGORIES` vocabulary plus :data:`DISPLAY`.
+#: The rows are field *groups*, not message types: the visibility boundary runs
+#: inside ``PLAYBACK_SETTINGS_1.0``, so a table keyed on message type could not
+#: express "a reviewer may scrub but not change the shot" — which is the whole
+#: of the reviewer tier.
+ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
+    DRIVER: frozenset({VISIBILITY, POSITION, DISPLAY, ANNOTATION, STRUCTURE}),
+    REVIEWER: frozenset({POSITION, DISPLAY, ANNOTATION}),
+    VIEWER: frozenset({DISPLAY}),
+}
+
+#: ``SyncManager`` broadcast method name → role permission group.
+#:
+#: Identical to :data:`BROADCAST_CATEGORIES` but for display state, which is
+#: categorised ``position`` for lease purposes and is its own group here (see
+#: :data:`DISPLAY`).  Kept as a derived table rather than a second hand-written
+#: one so a new broadcast method cannot be gated by one and not the other.
+ROLE_GROUPS: dict[str, str] = {
+    **BROADCAST_CATEGORIES,
+    "broadcast_display_state": DISPLAY,
+}
+
+
+def role_group_for(method_name: str) -> "str | None":
+    """Return the role permission group of a ``broadcast_*`` method.
+
+    :param method_name: Name of the :class:`~otio_sync_core.manager.SyncManager`
+        broadcast method (e.g. ``"broadcast_display_state"``).
+    :returns: A key of :data:`ROLE_PERMISSIONS`' value sets, or ``None`` for an
+        ungated broadcast (session plumbing carries no user intent).
+    :rtype: str or None
+    """
+    return ROLE_GROUPS.get(method_name)
+
+
+def normalise_role(role: "str | None") -> str:
+    """Return a recognised role, resolving anything unknown permissively.
+
+    An unrecognised or absent role resolves to :data:`DEFAULT_ROLE`, **never**
+    to the most restrictive role.  A peer running code that predates roles, an
+    entry adopted from an older peer's roster, or a typo in a policy must not
+    silently lock someone out — and a filter that read absence as "not a driver"
+    would report a session with drivers in it as driverless.  Unknown is never
+    the restrictive value (the ``xs_flat_playlist`` ``media_exists`` default got
+    this wrong once already).
+
+    :param role: A role name, or ``None``.
+    :rtype: str
+    """
+    name = (role or "").strip().lower()
+    return name if name in ROLE_PERMISSIONS else DEFAULT_ROLE
+
+
+def role_permits(role: "str | None", group: "str | None", *, destructive: bool = False) -> bool:
+    """Return whether *role* may emit the field group *group*.
+
+    The single predicate behind both enforcement points — the broadcast guard
+    and the lease claim gate — so the two cannot disagree about what a role
+    means.
+
+    :param role: The emitting peer's session role; unknown resolves to
+        :data:`DEFAULT_ROLE` (see :func:`normalise_role`).
+    :param group: A role permission group (:func:`role_group_for`), or ``None``
+        for an ungated broadcast, which every role may emit.
+    :param destructive: Whether the call destroys other participants' work
+        rather than adding to it — a clear-all-paint rather than a stroke.  Only
+        meaningful for :data:`ANNOTATION`, where it resolves driver-only: this
+        is the one row where role is finer-grained than the category, and it
+        cannot be expressed as a category because the category table is keyed on
+        *method name* and the clear path shares a method with ordinary edits.
+        The caller declares its own **intent**, which is not the same as testing
+        its own **authority** (the latter belongs to core alone).
+    :rtype: bool
+    """
+    if group is None:
+        return True
+    resolved = normalise_role(role)
+    if destructive and group == ANNOTATION:
+        return resolved == DRIVER
+    return group in ROLE_PERMISSIONS[resolved]
+
+
+def strip_role_fields(state: Mapping[str, Any], role: "str | None") -> dict[str, Any]:
+    """Return *state* with every field group *role* may not emit removed.
+
+    The role-layer counterpart to :func:`strip_visibility_fields` and
+    :func:`strip_position_fields`, and it strips through them rather than
+    reimplementing the field lists — so a group gained by one is gained by all
+    three.  Whole groups only: a message that dropped ``view_mode`` but kept
+    ``clip_guid`` would still be asserting what the session looks at.
+
+    :param state: Outgoing playback/view state dict.
+    :param role: The emitting peer's session role.
+    :returns: A new dict carrying only the field groups *role* may emit.
+    :rtype: dict
+    """
+    out = dict(state)
+    if not role_permits(role, VISIBILITY):
+        out = strip_visibility_fields(out)
+    if not role_permits(role, POSITION):
+        out = strip_position_fields(out)
+    return out
+
+
+#: Environment variable that disables role enforcement at runtime.
+ROLE_ENFORCEMENT_ENV = "ORI_SESSION_ROLES"
+
+
+def role_enforcement_enabled() -> bool:
+    """Return whether session roles are enforced on outgoing broadcasts.
+
+    Enabled by default, and the default *policy* (``default_role: driver``) is
+    the real off switch: a session that has not opted in behaves exactly as it
+    did before roles existed, with nothing stripped and no claim refused.  This
+    variable exists for the narrower job of bisecting a suspected role bug in a
+    session that *has* opted in, without re-declaring its policy.  Read per call
+    rather than cached at import, exactly like :func:`enforcement_enabled` and
+    :func:`ownership_enforcement_enabled`, so it can be flipped in a running
+    interpreter.
+
+    :rtype: bool
+    """
+    return os.environ.get(ROLE_ENFORCEMENT_ENV, "1").strip().lower() not in _FALSEY
+
+
+#: Environment variables declaring a session's role policy at start-up.
+#:
+#: The policy has no UI in this change (editing it is ``session-role-
+#: administration``), and it is resolved here rather than in either plugin for
+#: the same reason identity is: one implementation, so the two applications
+#: cannot declare different policies for the same session.
+ROLE_DEFAULT_ENV = "ORI_SESSION_DEFAULT_ROLE"
+ROLE_MEMORY_ENV = "ORI_SESSION_PEER_ROLES"
+
+
+def role_policy_from_env() -> "tuple[str | None, dict[str, str]]":
+    """Return ``(default_role, peer_roles)`` declared in the environment.
+
+    ``ORI_SESSION_PEER_ROLES`` is ``user=role`` pairs separated by commas, e.g.
+    ``"alice=driver,bob=reviewer"``.  An unparseable entry is skipped rather
+    than raising: a malformed policy must not stop a session starting, and an
+    unrecognised role resolves permissively anyway (:func:`normalise_role`).
+
+    :returns: ``(default_role or None, {user: role})``.
+    :rtype: tuple
+    """
+    default_role = (os.environ.get(ROLE_DEFAULT_ENV) or "").strip() or None
+    peer_roles: dict[str, str] = {}
+    for pair in (os.environ.get(ROLE_MEMORY_ENV) or "").split(","):
+        user, _, role = pair.partition("=")
+        user, role = user.strip(), role.strip()
+        if user and role:
+            peer_roles[user] = normalise_role(role)
+    return default_role, peer_roles
+
+
+def peer_role(peer: Mapping[str, Any], default_role: "str | None" = None) -> str:
+    """Return a peer-table entry's session role, resolving absence to the default.
+
+    :param peer: Peer entry, i.e. ``{"app", "capabilities", "role", ...}``.
+    :param default_role: The session's declared default; ``None`` means
+        :data:`DEFAULT_ROLE`.
+    :rtype: str
+    """
+    role = peer.get("role")
+    if not role:
+        return normalise_role(default_role)
+    return normalise_role(role)
+
+
+def host_candidates(
+    peers: Mapping[str, Mapping[str, Any]], default_role: "str | None" = None
+) -> "list[tuple[int, str]]":
+    """Return ``(rank, guid)`` for every peer eligible to hold visibility authority.
+
+    Eligibility is capability **and** role: a peer that may not emit visibility
+    must not be elected to the one seat that decides it, or the session's shot
+    freezes with nothing reporting why.  Shared by :func:`elect_host_guid` and
+    :func:`has_eligible_driver` so the election and the driverless indicator are
+    answers to the same question and cannot disagree.
+
+    :param peers: ``{guid: {"app", "capabilities", "role"}}``.
+    :param default_role: Session default, applied to any entry carrying no role.
+    :rtype: list
+    """
+    return [
+        (host_rank(p.get("app")), guid)
+        for guid, p in peers.items()
+        if is_host_capable(p) and role_permits(peer_role(p, default_role), VISIBILITY)
+    ]
+
+
+def has_eligible_driver(
+    peers: Mapping[str, Mapping[str, Any]], default_role: "str | None" = None
+) -> bool:
+    """Return whether any peer in the table could be elected host.
+
+    The single predicate behind both hosts' "Become Controller" gating and the
+    session panel's driverless indicator, so neither computes it locally and the
+    action cannot be offered in a state the election disagrees about.  ``False``
+    is exactly the condition that self-elevation exists to exit.
+
+    :param peers: ``{guid: {"app", "capabilities", "role"}}``.
+    :param default_role: Session default, applied to any entry carrying no role.
+    :rtype: bool
+    """
+    return bool(host_candidates(peers, default_role))
+
+
+def master_rank(peer: Mapping[str, Any], default_role: "str | None" = None) -> int:
+    """Return a peer's master-election preference rank (lower is better).
+
+    A *preference*, never a restriction: the master holds the session's
+    canonical state and needs full broadcast capability to serve it, so a driver
+    is the natural master — but a session with no driver still needs one, and a
+    peer promoted on that basis is master for state synchronisation only and
+    does not thereby acquire the ``driver`` role.
+
+    :param peer: Peer entry, i.e. ``{"app", "capabilities", "role"}``.
+    :param default_role: Session default, applied to an entry carrying no role.
+    :returns: ``0`` for a driver, ``1`` otherwise.
+    :rtype: int
+    """
+    return 0 if peer_role(peer, default_role) == DRIVER else 1

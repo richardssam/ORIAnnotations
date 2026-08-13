@@ -51,6 +51,10 @@ Where a role forbids a field group, that group SHALL be stripped from the outgoi
 
 Stripping SHALL remove a whole field group. A message that retained the clip identity while dropping the view mode would still be asserting what the session looks at.
 
+Where role stripping leaves a message carrying **no** permitted field group at all, that message SHALL NOT be emitted. An emptied playback message is not silence: it still carries the timeline it was sent about, which passive peers follow, and a receiver that reads an absent position field as a value reads the absence as an assertion of the first frame. Emitting it therefore lets a participant drive the very thing its role forbids. This applies to a message emptied by **role**; a message emptied by a category lease is the existing ownership behaviour and is unchanged.
+
+Receiving peers SHALL treat an absent field group as *no assertion*, not as a default value. This is a property of every enforcement axis, not only role — a field group is absent precisely when its sender was not permitted to assert it.
+
 Display state SHALL be permitted to every role including viewer, because it is per-peer presentation rather than a session event. This is a statement about role only; display state remains subject to its own category lease.
 
 #### Scenario: A reviewer may scrub but may not change the shot
@@ -74,6 +78,18 @@ Display state SHALL be permitted to every role including viewer, because it is p
 - **WHEN** a reviewer initiates an operation that clears annotations belonging to other participants
 - **THEN** that operation SHALL be suppressed
 - **AND** ordinary annotation strokes from the same reviewer SHALL continue to be emitted
+
+#### Scenario: A message emptied by role is not emitted
+
+- **WHEN** role stripping removes every field group from an outgoing playback message
+- **THEN** no message SHALL be emitted
+- **AND** no peer SHALL change its position or its view as a result
+
+#### Scenario: An absent field group is not read as a value
+
+- **WHEN** a peer receives a playback message carrying no position field group
+- **THEN** it SHALL leave its own position and play state unchanged
+- **AND** SHALL NOT interpret the absence as an assertion of the first frame
 
 #### Scenario: A field group is stripped whole
 

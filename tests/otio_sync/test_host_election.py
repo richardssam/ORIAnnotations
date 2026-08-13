@@ -446,3 +446,187 @@ def _timeline():
     tl = otio.schema.Timeline(name="seq")
     tl.metadata["sync"] = {"guid": "tl"}
     return tl
+
+
+# ---------------------------------------------------------------------------
+# Role filtering (session-roles D4)
+# ---------------------------------------------------------------------------
+
+
+def _peer(app="openrv", role=None, caps=("visibility",)):
+    entry = {"app": app, "capabilities": list(caps)}
+    if role is not None:
+        entry["role"] = role
+    return entry
+
+
+def test_a_viewer_on_the_preferred_app_loses_to_a_driver_on_another():
+    """Role is a filter, not a rank: a non-driver is not a candidate at all.
+
+    A non-driver host would hold visibility authority while its role forbade it
+    from emitting visibility — the session's shot frozen with nothing saying why.
+    """
+    peers = {
+        "guid-xs": _peer("xstudio", authority.VIEWER),
+        "guid-rv": _peer("openrv", authority.DRIVER),
+    }
+
+    assert authority.elect_host_guid(peers, authority.VIEWER) == "guid-rv"
+
+
+def test_application_preference_still_decides_among_drivers():
+    peers = {
+        "guid-xs": _peer("xstudio", authority.DRIVER),
+        "guid-rv": _peer("openrv", authority.DRIVER),
+    }
+
+    assert authority.elect_host_guid(peers, authority.VIEWER) == "guid-xs"
+
+
+def test_an_unknown_role_stays_eligible_under_a_permissive_default():
+    """A peer running code that predates roles is not quietly excluded."""
+    peers = {"guid-rv": _peer("openrv", role=None)}
+
+    assert authority.elect_host_guid(peers) == "guid-rv"
+    assert authority.elect_host_guid(peers, authority.DRIVER) == "guid-rv"
+
+
+def test_an_unknown_role_follows_a_restrictive_default():
+    peers = {"guid-rv": _peer("openrv", role=None)}
+
+    assert authority.elect_host_guid(peers, authority.VIEWER) is None
+
+
+def test_a_table_with_no_drivers_elects_no_host_and_reports_it():
+    peers = {
+        "guid-xs": _peer("xstudio", authority.VIEWER),
+        "guid-rv": _peer("openrv", authority.REVIEWER),
+    }
+
+    assert authority.elect_host_guid(peers, authority.VIEWER) is None
+    assert authority.has_eligible_driver(peers, authority.VIEWER) is False
+
+
+def test_the_driverless_predicate_and_the_election_cannot_disagree():
+    """One derivation behind the indicator and the election."""
+    for role in (None,) + authority.ROLES:
+        peers = {"guid-rv": _peer("openrv", role)}
+        for default in authority.ROLES:
+            elected = authority.elect_host_guid(peers, default)
+            assert authority.has_eligible_driver(peers, default) is (elected is not None)
+
+
+def test_a_capable_driver_that_cannot_host_is_not_an_eligible_driver():
+    """The sync viewer declares no capabilities specifically so an observer can
+    never be elected; a driver role does not override that."""
+    peers = {"guid-viewer": _peer("openrv", authority.DRIVER, caps=())}
+
+    assert authority.has_eligible_driver(peers, authority.DRIVER) is False
+
+
+def test_manager_election_uses_the_session_default():
+    mgr = _manager("guid-rv", "openrv")
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+
+    assert mgr.elect_host() is None
+    assert mgr.is_host is False
+    assert mgr.has_eligible_driver() is False
+
+
+# ---------------------------------------------------------------------------
+# Driverless recovery (session-roles D7)
+# ---------------------------------------------------------------------------
+
+
+def test_self_elevation_grants_the_role_and_lets_election_do_the_rest():
+    mgr = _manager("guid-rv", "openrv")
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+    mgr.elect_host()
+    assert mgr.host_guid is None
+
+    assert mgr.elect_role_to_driver() is True
+
+    assert mgr.self_role == authority.DRIVER
+    # Host is *not* assigned by the action; it follows from the next election.
+    assert mgr.is_host is False
+    assert mgr.elect_host() == "guid-rv"
+    assert mgr.is_host is True
+
+
+def test_self_elevation_re_announces_so_peers_observe_the_new_role():
+    mgr = _manager("guid-rv", "openrv")
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+    before = len(_announcements(mgr.network))
+
+    mgr.elect_role_to_driver()
+
+    announcements = _announcements(mgr.network)
+    assert len(announcements) == before + 1
+    assert announcements[-1]["payload"]["command"]["payload"]["role"] == authority.DRIVER
+
+
+def test_self_elevation_is_refused_while_an_eligible_driver_exists():
+    """The gate that keeps a restrictive policy from being advisory — and it
+    lives in core, so neither plugin can relax it independently."""
+    mgr = _manager("guid-rv", "openrv")
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+    mgr._peers["guid-xs"] = _peer("xstudio", authority.DRIVER)
+
+    assert mgr.elect_role_to_driver() is False
+    assert mgr.self_role == authority.VIEWER
+
+
+def test_simultaneous_self_elevation_converges_on_one_host():
+    """Convergence, not contention: both become drivers and every peer computes
+    the same host from the same table."""
+    rv = _manager("guid-rv", "openrv")
+    xs = _manager("guid-xs", "xstudio")
+    for mgr in (rv, xs):
+        mgr._default_role = authority.VIEWER
+        mgr.resolve_own_role()
+        mgr._peers["guid-rv" if mgr is xs else "guid-xs"] = _peer(
+            "openrv" if mgr is xs else "xstudio", authority.VIEWER
+        )
+
+    assert rv.elect_role_to_driver() is True
+    assert xs.elect_role_to_driver() is True
+    _deliver(rv, xs)
+    _deliver(xs, rv)
+
+    assert rv.elect_host() == xs.elect_host() == "guid-xs"
+
+
+def test_self_elevation_remembers_the_participant_not_the_guid():
+    """The recovery survives the reconnect that so often follows it."""
+    mgr = SyncManager(
+        session_id="s", self_guid="guid-a", network=FakeNetwork(), app_name="openrv",
+        identity_override={"user": "alice"}, default_role=authority.VIEWER,
+    )
+
+    mgr.elect_role_to_driver()
+
+    assert mgr.role_policy()["peer_roles"]["alice"] == authority.DRIVER
+    # The session default is untouched: one person left a deadlock, which is not
+    # a decision to let every future joiner drive.
+    assert mgr.default_role == authority.VIEWER
+
+
+def test_a_role_arriving_between_enqueue_and_drain_is_honoured():
+    """Eligibility is evaluated at drain time, which is the whole point of the
+    queue: a driver that announced during queue latency is accounted for by the
+    election its own request triggered."""
+    mgr = _manager("guid-rv", "openrv")
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+    mgr.status = STATE_SYNCED
+
+    mgr.request_host_election("thread")
+    # Announcement lands after the request was enqueued, before it is drained.
+    mgr._peers["guid-xs"] = _peer("xstudio", authority.DRIVER)
+    mgr._drain_host_elections()
+
+    assert mgr.host_guid == "guid-xs"

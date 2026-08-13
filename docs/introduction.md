@@ -43,6 +43,37 @@ Examples grouped by family:
 
 ---
 
+## Who may send what
+
+Not every peer may emit every message, and the rules are worth reading before
+implementing against this protocol — none of them are visible in a message's
+shape.
+
+Two of them are properties of the *session*, carried on `STATE_SNAPSHOT`: the
+elected **host** is the only peer whose playback message may carry the
+`view_mode`/`clip_guid` field group (what everyone is looking at), and the
+per-category **write leases** in `broadcast_ownership` decide which peer is
+currently driving position, display, or structure.
+
+The third is a property of the *participant*: a peer's **session role** —
+`driver`, `reviewer`, or `viewer` — carried as a field on `PEER_ANNOUNCE` and on
+each entry of the `STATE_SNAPSHOT` peer roster, with the session's policy in that
+message's `session_roles` section. Role is a ceiling; the other two are gates. A
+driver has permission to emit visibility; only the host actually does.
+
+**Role is enforced by the sender, and is not validated on receipt.** A receiving
+peer applies a message without checking what role its sender declared, and no
+broker-side filtering is involved. An implementer should not assume messages
+have been filtered by the sender's role: this gates accidents in a cooperating
+session, it is not access control. Consistent with that, an *absent* role — from
+a peer running older code, or an entry learned before its owner announced —
+means the session's **default role**, never the most restrictive one, and an
+absent `session_roles` section means "no policy declared" rather than an empty
+policy. A session that declares nothing behaves exactly as one predating roles:
+every peer may emit everything.
+
+---
+
 ## How a message is wrapped and sent
 
 When the manager broadcasts a message it calls `_send_message()`

@@ -263,6 +263,21 @@ class PeerAnnounce(ProtocolMessage):
         default_factory=list,
         doc='Roles this peer can hold, e.g. ["visibility"].',
     )
+    role: "str | None" = doc_field(
+        default=None,
+        doc="Session role of the announcing peer: `driver`, `reviewer`, or "
+            "`viewer` — what this participant is permitted to emit at all, "
+            "which is a different question from who holds the canonical state "
+            "(master), who chooses what the session looks at (host), or who is "
+            "broadcasting a category right now (the write leases). Omitted when "
+            "the peer declares none, and an absent role means **the session's "
+            "default role**, not the most restrictive one: a peer running code "
+            "that predates roles must not read as ineligible, or one old peer "
+            "would make a session with drivers in it look driverless. "
+            "Self-declared on the same terms as `app`, and enforced by the "
+            "*sender*: a receiving peer applies a message without checking the "
+            "sender's role.",
+    )
     identity: "dict | None" = doc_field(
         default=None,
         doc="Who is on the other end: {user, first_name, last_name, host, "
@@ -282,6 +297,8 @@ class PeerAnnounce(ProtocolMessage):
             "app": self.app,
             "capabilities": list(self.capabilities),
         }
+        if self.role:
+            payload["role"] = self.role
         if self.identity is not None:
             payload["identity"] = dict(self.identity)
         return payload
@@ -292,6 +309,7 @@ class PeerAnnounce(ProtocolMessage):
             peer_guid=data.get("peer_guid"),
             app=data.get("app") or "",
             capabilities=list(data.get("capabilities") or []),
+            role=data.get("role"),
             identity=data.get("identity"),
         )
 
@@ -380,7 +398,7 @@ class StateSnapshot(ProtocolMessage):
     )
     peers: dict = doc_field(
         default_factory=dict,
-        doc="Peers present at snapshot time, as {guid: {app, capabilities, identity}}, so "
+        doc="Peers present at snapshot time, as {guid: {app, capabilities, role, identity}}, so "
             "a joiner learns the peer set without every peer answering its "
             "announcement. Not the only discovery path: a joiner that receives "
             "no snapshot learns peers from their periodic announcements. "
@@ -388,7 +406,27 @@ class StateSnapshot(ProtocolMessage):
             "`identity` is the same optional section PEER_ANNOUNCE carries, on "
             "the same terms — self-declared and **unverified** — and is present "
             "here so a peer that has gone quiet can still be named by a joiner "
-            "that has never heard it announce.",
+            "that has never heard it announce. `role` is carried for the same "
+            "reason and on the same terms as it is on PEER_ANNOUNCE — host "
+            "eligibility is evaluated against this table, and a peer that has "
+            "gone quiet is known to a joiner only through this roster, so a "
+            "role omitted here would make that peer look role-less until its "
+            "next heartbeat. An absent role means the session's default role.",
+    )
+    session_roles: "dict | None" = doc_field(
+        default=None,
+        doc="Session role policy at snapshot time, as {\"default_role\": str, "
+            '"peer_roles": {user: role}}. `default_role` is what a participant '
+            "the session does not recognise is given; `peer_roles` is the "
+            "session's memory of who has held a role, keyed on the identity's "
+            "`user` rather than on peer GUID — a driver who drops and rejoins "
+            "has a new GUID, which is the only case that memory exists for. "
+            "**Omitted when the session declares no policy**, exactly as a "
+            "free channel is omitted from `broadcast_ownership` and an unset "
+            "host is omitted from `host_guid`: an absent section means \"no "
+            "declared policy\", not an empty one, so a peer predating this "
+            "field cannot clear a session's policy by relaying state. Policy "
+            "lives for the session only and is not persisted anywhere.",
     )
     broadcast_ownership: "dict | None" = doc_field(
         default=None,
@@ -415,6 +453,8 @@ class StateSnapshot(ProtocolMessage):
             payload["host_guid"] = self.host_guid
         if self.peers:
             payload["peers"] = {g: dict(p) for g, p in self.peers.items()}
+        if self.session_roles:
+            payload["session_roles"] = dict(self.session_roles)
         if self.broadcast_ownership:
             payload["broadcast_ownership"] = {
                 ch: dict(info) for ch, info in self.broadcast_ownership.items()
@@ -432,6 +472,7 @@ class StateSnapshot(ProtocolMessage):
             display_state=data.get("display_state"),
             host_guid=data.get("host_guid"),
             peers=dict(data.get("peers") or {}),
+            session_roles=data.get("session_roles"),
             broadcast_ownership=data.get("broadcast_ownership"),
         )
 
