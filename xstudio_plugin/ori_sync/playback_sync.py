@@ -2173,6 +2173,14 @@ class PlaybackSyncController:
                         time.monotonic() + _PLAYBACK_ECHO_GUARD_S
                     )
                     ph.position = frame
+                    # The sender logs every frame it broadcasts; without the
+                    # matching line here the decisive half of position sync is
+                    # invisible.  "Did the follower move?" was unanswerable from
+                    # a log pair on 2026-08-13 — every received scrub showed only
+                    # its Loop Mode side effect, so a peer that applied every
+                    # frame and one that silently dropped them all read
+                    # identically.  Same per-frame rate as the send-side line.
+                    _log(f"RECV playback: seek → frame={frame} playing={playing}")
         except Exception:
             # xStudio's UI uses the new live playhead; re-acquire it via the
             # global-playhead-events actor (which does NOT touch the dead actor).
