@@ -81,3 +81,27 @@ the previous build. New `otio_sync_core` modules must also be added by hand to
 the zip list in `rvplugin/ori_sync/makepackage.csh` — a module missing there
 makes the whole sync plugin silently inert, because `__init__.py` swallows the
 `ImportError`.
+
+## Reading a live soak: merge the peer logs
+
+A soak produces one log per peer, and every sync question is a question about
+two peers at the same instant. Grepping each file separately biases the answer
+towards whatever you thought to grep for — two of this repo's longest
+investigations were prolonged that way.
+
+```bash
+python debug/merge_sync_logs.py --view diverge rvplugin/ori_sync/xstudio_{host,client}.log
+python debug/merge_sync_logs.py --view state --since 15:03:00 <logs...>
+```
+
+`--view diverge` reports only the intervals where peers disagreed about what is
+on screen; `--view state` shows what each peer believed, side by side;
+`--view wire` correlates each send with the peers that received it. Works on
+xStudio and OpenRV logs, and on a mixed pair. See
+[debug/README.md](../debug/README.md) for the full set.
+
+**A missing log line is not evidence of a missing action.** Until 2026-08-13
+xStudio logged every frame it *broadcast* and nothing about applying one, so a
+peer that followed every frame and one that silently dropped them all produced
+identical logs. Before concluding a peer did nothing, confirm the thing it
+would have done is actually logged.
