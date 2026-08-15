@@ -22,6 +22,7 @@ from otio_sync_core.manager import STATE_SYNCED
 from otio_sync_core.authority import (
     CHANNEL_POSITION, POSITION_FIELDS, CHANNEL_VISIBILITY, position_frame,
 )
+from otio_sync_core.join_confirmation import NOT_CONFIRMED
 from .utils import _log, _log_exc, bounded, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread playhead/viewport reads.  Generous
@@ -1714,7 +1715,141 @@ class PlaybackSyncController:
     #: stops retrying rather than logging forever.
     _JOIN_PLAYBACK_MAX_ATTEMPTS = 20
 
-    def apply_join_playback_state(self, attempt: int = 0) -> None:
+    #: How many poll ticks the post-join confirmation will wait for a deferred
+    #: seek (:meth:`apply_pending_seek`) to settle before giving up and
+    #: recording "not confirmed".  A separate budget from
+    #: ``_JOIN_PLAYBACK_MAX_ATTEMPTS``, which governs waiting for the playhead
+    #: to exist in the first place — this one governs waiting for a seek that
+    #: *has* been issued to actually land.  Generous relative to the deferred
+    #: seek's own settle window (``_PLAYHEAD_SETTLE_S`` = 0.3 s): one extra
+    #: poll tick costs nothing, and checking against a playhead the view
+    #: switch has not finished with would manufacture a false mismatch on the
+    #: exact frame this capability exists to get right (design D3).
+    _JOIN_CONFIRM_MAX_ATTEMPTS = 20
+
+    def _sequence_timeline_for_clip(self, clip_guid: "str | None") -> "str | None":
+        """The sequence timeline that actually contains *clip_guid*, or ``None``.
+
+        Mirrors the scan :meth:`on_global_playhead_event` uses to resolve a
+        real ``show_atom`` to its owning sequence, so post-join confirmation
+        reads the same clip→timeline association the display path derives it
+        from, rather than a second implementation that could drift from it.
+        """
+        manager = self.plugin.manager
+        if not manager or not clip_guid:
+            return None
+        for tg, tl in manager.timelines.items():
+            if tl.metadata.get("clip_timeline_for") or tl.metadata.get("xs_flat_playlist"):
+                continue
+            for track in tl.tracks:
+                if track.kind != otio.schema.TrackKind.Video:
+                    continue
+                if any(
+                    getattr(c, "metadata", {}).get("sync", {}).get("guid") == clip_guid
+                    for c in track
+                    if isinstance(c, otio.schema.Clip)
+                ):
+                    return tg
+        return None
+
+    def confirm_join_state(self, attempt: int = 0, generation: "int | None" = None) -> None:
+        """Confirm this join's adopted state against the snapshot it was sent.
+
+        Queued from the point :meth:`apply_join_playback_state` successfully
+        applies, so it inherits that call's settling (design D3) rather than
+        guessing at one independently.  Re-queues itself while a deferred seek
+        is still outstanding — checking before it lands would compare against
+        a playhead the view switch has not finished with, which is precisely
+        the bug (a seek dying with the playhead its own switch just replaced)
+        this capability exists to catch, not manufacture a false report of.
+
+        The "actual" side is built from what this peer is actually displaying,
+        not from ``manager.export_state()`` alone: the manager's own
+        ``active_timeline_guid``/``playback_state`` are written directly from
+        received messages (including the retained join snapshot itself), so
+        comparing them against that same snapshot would confirm the manager
+        against itself (design's first risk; see task 2's investigation).
+        Frame and play state come from the live playhead
+        (:meth:`current_playback_state`); the active timeline is re-resolved
+        from ``_last_viewed_clip_guid`` — set only by a genuine ``show_atom``,
+        never by an applied message — through the same clip→sequence
+        association the display path uses.  Structure (``timelines``) and
+        display settings are read live too, for the same reason.
+
+        :param attempt: How many times this has already been re-queued.
+        :param generation: ``manager.join_generation`` as of when this check
+            was first scheduled, or ``None`` to check unconditionally (used by
+            tests and any direct call). If a *later* ``STATE_SNAPSHOT`` has
+            since superseded the one this check was scheduled for, the check
+            is stale and silently abandoned rather than reporting on the wrong
+            join — observed live 2026-08-15 20:55: a second snapshot landed on
+            an already-synced peer before a deferred check ran, and the check
+            went on to confirm against that second snapshot instead, masking a
+            real mismatch in the join it was actually scheduled to confirm.
+        """
+        manager = self.plugin.manager
+        if not manager:
+            return
+        if generation is not None and manager.join_generation != generation:
+            _log(
+                "[JOIN-CONFIRM] abandoning — superseded by a later join"
+                f" (generation {generation} -> {manager.join_generation})"
+            )
+            return
+        live = self.current_playback_state()
+        # Wait for the same things apply_join_playback_state waits for, PLUS
+        # a genuine display-confirmed clip: _last_viewed_clip_guid is set only
+        # by a real show_atom (never by an applied message), and the switch
+        # this join just made can still be settling on the poll thread after
+        # the seek/playhead checks above already pass. Retrying here — rather
+        # than proceeding and quietly leaving playback_state/active_timeline_guid
+        # as manager.export_state()'s record — is what keeps this a display
+        # check: the record is set unconditionally by apply_snapshot from the
+        # very snapshot being confirmed against, so falling back to it
+        # confirms the manager against itself regardless of what actually
+        # rendered (design D7's gap: live 2026-08-15 22:00, task 6.3's
+        # disabled-adoption reproduction still reported "confirmed" because
+        # this fallback used the record for both fields when nothing had
+        # been displayed yet).
+        if (
+            self._pending_seek_frame is not None
+            or self.plugin.active_playhead is None
+            or live is None
+            or self._last_viewed_clip_guid is None
+        ):
+            if attempt >= self._JOIN_CONFIRM_MAX_ATTEMPTS:
+                _log(
+                    "[JOIN-CONFIRM] giving up — no display-confirmed clip/frame"
+                    f" after {attempt} attempts"
+                )
+                manager.record_join_confirmation(NOT_CONFIRMED)
+                return
+            self.plugin._cmd_queue.put((
+                "confirm_join_state", {"attempt": attempt + 1, "generation": generation}
+            ))
+            return
+
+        actual = dict(manager.export_state())
+        playback = dict(actual.get("playback_state") or {})
+        playback["current_time"] = live["current_time"]
+        playback["playing"] = live["playing"]
+        actual["playback_state"] = playback
+        # Always taken from the display resolution now, never left as
+        # export_state()'s record — a clip that resolves to no tracked
+        # sequence (e.g. an isolated bin clip) legitimately has no active
+        # sequence timeline, so `None` here is the correct answer, not a
+        # reason to fall back to the record's guess.
+        actual["active_timeline_guid"] = self._sequence_timeline_for_clip(
+            self._last_viewed_clip_guid
+        )
+        try:
+            actual["display_state"] = self.plugin.display.read_xs_display_state()
+        except Exception:
+            _log_exc("confirm_join_state: could not read live display state")
+
+        manager.confirm_join(actual)
+
+    def apply_join_playback_state(self, attempt: int = 0, generation: "int | None" = None) -> None:
         """Adopt the session's view after this peer's own session build.
 
         The manager applies a snapshot's ``playback_state`` once, on receipt,
@@ -1730,9 +1865,19 @@ class PlaybackSyncController:
         so a joiner waiting for media does not hold the poll thread.
 
         :param attempt: How many times this has already been re-queued.
+        :param generation: ``manager.join_generation`` captured on the first
+            call (``attempt == 0``) and threaded through every re-queue, so a
+            later ``STATE_SNAPSHOT`` landing mid-wait is detected rather than
+            this call reporting "not confirmed" against a join that has since
+            been superseded (see :meth:`confirm_join_state`).
         """
         manager = self.plugin.manager
         if not manager or not manager.playback_state:
+            return
+        if generation is None:
+            generation = manager.join_generation
+        elif manager.join_generation != generation:
+            _log("[JOIN] abandoning — superseded by a later join before a playhead existed")
             return
         if self.plugin.active_playhead is None:
             if attempt >= self._JOIN_PLAYBACK_MAX_ATTEMPTS:
@@ -1740,8 +1885,13 @@ class PlaybackSyncController:
                     "[JOIN] giving up adopting the session's view —"
                     f" no playhead after {attempt} attempts"
                 )
+                # This join never reached a checkable state — distinct from
+                # both a match and a mismatch (design D3).
+                manager.record_join_confirmation(NOT_CONFIRMED)
                 return
-            self.plugin._cmd_queue.put(("apply_join_playback", {"attempt": attempt + 1}))
+            self.plugin._cmd_queue.put((
+                "apply_join_playback", {"attempt": attempt + 1, "generation": generation}
+            ))
             return
         state = manager.playback_state
         _log(
@@ -1754,6 +1904,11 @@ class PlaybackSyncController:
         # message — this is the session telling us what to look at, and the only
         # thing unusual about it is when it arrives.
         self.apply_playback_state(state)
+        # Confirm what actually landed against what was sent, once it has had
+        # a chance to settle (design D3) — post-join-state-confirmation.
+        self.plugin._cmd_queue.put((
+            "confirm_join_state", {"attempt": 0, "generation": generation}
+        ))
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def current_playback_state(self) -> dict | None:

@@ -91,6 +91,32 @@ the on-screen source, and the playhead acquisition independently, and the
 observed spreads (1.6 s to the show_atom, 0.4 s more to the playhead) vary with
 media load.
 
+**Found live, 2026-08-15 20:55:** deferring the check at all — even by one
+event-loop turn (`QTimer.singleShot(0, ...)` on OpenRV) or one poll tick
+(re-queued on xStudio while a seek settles) — opens a window in which a
+*second* `STATE_SNAPSHOT` can land on this peer before the deferred check
+runs. `apply_snapshot` always overwrites `_pending_join_snapshot`, so the
+check, once it finally runs, silently compares the display against whichever
+snapshot is sitting there *then* — which may not be the one whose settling it
+was scheduled to verify. Observed: a joiner's rebuild transiently showed the
+wrong sequence, a second snapshot arrived before the deferred check fired, and
+the check went on to report "confirmed" against that second snapshot —
+masking the very mismatch this capability exists to catch, in the join it was
+actually checking.
+
+Fixed by pinning: the host integration captures `manager.join_generation`
+(bumped on every `apply_snapshot`) at the moment it schedules the check, and
+the check compares that captured value against the manager's current
+generation before doing anything else — comparing, requeuing, or giving up.
+A mismatch means a later join has superseded this one, and the check
+abandons outright (records nothing) rather than reporting on the wrong join.
+This does not make the superseding join's *own* build get checked — if it
+never reaches its own `_on_synced`/settle point (as it did not here — no
+rebuild fired for the second snapshot on this occasion), no confirmation is
+recorded for it either. Recording nothing is the correct failure mode here
+(design D5): an absent report costs a missing indicator; a wrong one costs a
+false sense of having checked.
+
 ### D4 — Frame comparison is conditional on the snapshot's own play state
 
 `diff_states` already carries `frame_tolerance` and `compare_frame` because "a
@@ -128,6 +154,110 @@ The outcome (confirmed / mismatched / not confirmed, plus the differences) is
 recorded on the manager and exposed through `session_state_snapshot`, so both
 panels read the same fact rather than each deriving it — the rule
 `session-state-ui` already sets for role, master, host and the leases.
+
+### D7 — Task 2's finding: which fields `export_state()` derives from the record, and what to do about it
+
+Established by reading both plugins' assignment sites for `active_timeline_guid`
+and `playback_state`, not by inspection of `export_state()` alone:
+
+- **`playback_state.current_time` (frame) is always record-only.** Every write
+  site — `manager._h_playback_set`, `manager.receive_and_apply_all`'s
+  snapshot-receipt branch, `manager.apply_snapshot` — assigns the field
+  directly from a received message. Neither host integration writes the
+  physical playhead's position back into it after applying one. For a joiner
+  specifically, `apply_snapshot` sets it from the retained snapshot itself, and
+  nothing ever updates it again — so comparing `export_state()`'s frame against
+  the snapshot's frame would compare the snapshot against a copy of itself,
+  confirming nothing, in exactly the scenario (bug 2/3 in the proposal) this
+  capability exists to catch.
+
+- **`active_timeline_guid` is dual-written, on both hosts.** It is set
+  directly from a received message's intent (`manager.apply_snapshot`,
+  `manager._h_playback_set`'s `tl_guid`) **and** from a display-confirmed
+  event once one actually fires (xStudio: the real `show_atom` handler in
+  `on_global_playhead_event`, gated "whoever caused it"; OpenRV:
+  `on_view_changed`, gated on `not self.plugin._rv_updating`). Because both
+  writers share one attribute, its value cannot by itself distinguish
+  "intended and later confirmed" from "intended and never confirmed" — which
+  is the exact distinction this capability exists to draw.
+
+- **`timelines` (structure) and most of `display_state` are safe as record.**
+  Structure is the manager's own maintained OTIO tree, not view state; the
+  compared display keys (`channel`, `annotations_visible`, after
+  `_DROPPED_DISPLAY_KEYS` removes `pan`/`zoom`/`exposure`) are written back
+  synchronously from a live readback wherever they are applied
+  (xStudio `apply_display_state`, OpenRV `_apply_display_state`), so the
+  record/display gap that matters is narrower there. Still read live where a
+  live read is one call away (see below), since nothing is gained by not.
+
+**Decision (per the gate in 2.2/2.3): source, not "not confirmable".** Both
+hosts already have exactly the live-read primitives this needs, because
+`broadcast_playback_state`'s own outgoing message is built the same way:
+
+- xStudio: `PlaybackSyncController.current_playback_state()` for frame/playing
+  (reads `active_playhead.position` live), and a new
+  `_sequence_timeline_for_clip(_last_viewed_clip_guid)` for the active
+  timeline — `_last_viewed_clip_guid` is set only inside the real `show_atom`
+  handler, never from an applied message, so it carries none of
+  `active_timeline_guid`'s ambiguity. `read_xs_display_state()` for display.
+- OpenRV: a new `PlaybackSyncController.current_playback_state()` (mirrors
+  xStudio's, built from `rv.commands` the same way `_broadcast_playback`
+  already is) for frame/playing, and `_displayed_timeline_guid()` — already
+  display-sourced, per D1's investigation — for the active timeline.
+  `_read_rv_display_state()` for display.
+
+The confirmation therefore starts from `manager.export_state()` for structure,
+and overwrites just `active_timeline_guid` and `playback_state.current_time`/
+`playing` with these live reads before projecting. This is not the "checks
+less than the session's own definition of agreement" the spec warns against —
+`project_state` still runs over the full shape — it is sourcing two fields of
+that shape from the display instead of the record, which is what the spec's
+"derived from what it is actually displaying" requirement asks for.
+
+**Gate (2.3) verdict: does not apply.** Not every compared field comes from
+the record — frame and active-timeline identity, the two fields the three
+motivating bugs actually broke, are display-sourced. The check is not
+confirming the manager against itself.
+
+### D8 — Never fall back to the record when the display isn't ready yet
+
+**Found live, 2026-08-15 22:00, via task 6.3's disabled-adoption reproduction.**
+Disabling `apply_playback_state` on the xStudio side should have made the
+confirmation report a mismatch — the joiner never adopted anything. It
+reported `confirmed` instead.
+
+Cause: the initial implementation of D7's live-sourcing built the "actual"
+payload by starting from `manager.export_state()` and *conditionally*
+overwriting `active_timeline_guid`/`playback_state.current_time` only when a
+live value was available (`if seq_tl_guid: ...`, `if live is not None: ...`).
+When no real `show_atom` had fired yet — exactly the disabled-adoption case,
+where nothing was displayed, or the more ordinary case of the confirmation
+running before the join's own view switch has produced its confirming
+`show_atom` — those conditions were false, and the code silently proceeded
+with `export_state()`'s own value for that field. But that value is the
+*record*: written by `apply_snapshot` directly from the very snapshot the
+confirmation was about to compare against. Comparing it against itself always
+matches, which is precisely the self-confirmation the task 2 gate (D7) exists
+to rule out — reintroduced by a fallback the gate didn't anticipate.
+
+Fixed by treating "no live value yet" as "not settled yet", not as "assume
+the record": both hosts now require a genuine live reading before proceeding
+at all —
+
+- xStudio: `current_playback_state()` must succeed *and*
+  `_last_viewed_clip_guid` must be non-``None`` (a real `show_atom` has fired
+  since connecting). Missing either re-queues, using the same
+  `_JOIN_CONFIRM_MAX_ATTEMPTS` budget already in place for the deferred-seek
+  wait — one more condition on the same wait, not a new mechanism.
+- Both hosts: once a live reading *is* available, `active_timeline_guid` is
+  now always taken from it, including when the display-side resolution
+  legitimately comes back empty (e.g. an isolated clip that belongs to no
+  tracked sequence) — that is a real answer ("no active sequence timeline"),
+  not a reason to fall back to the record's guess.
+
+Where xStudio's retry budget still runs out, the outcome is `NOT_CONFIRMED` —
+the same "never became checkable" case D3 already covers, now covering one
+more way of never becoming checkable.
 
 ## Risks / Trade-offs
 

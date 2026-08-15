@@ -854,7 +854,13 @@ class ORISyncPlugin(PluginBase):
             if cmd == "load_timelines":
                 self.builder.do_load_timelines()
             elif cmd == "apply_join_playback":
-                self.playback.apply_join_playback_state(payload.get("attempt", 0))
+                self.playback.apply_join_playback_state(
+                    payload.get("attempt", 0), payload.get("generation")
+                )
+            elif cmd == "confirm_join_state":
+                self.playback.confirm_join_state(
+                    payload.get("attempt", 0), payload.get("generation")
+                )
             elif cmd == "self_elect":
                 # Discovery timed out with no master.  Registration and election
                 # both run here rather than on the timeout thread: they mutate

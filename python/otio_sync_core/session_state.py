@@ -152,4 +152,10 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
         "active_timeline_guid": manager.active_timeline_guid,
         "selected_clip_guid": manager.selected_clip_guid,
         "peers": peers,
+        # Post-join state confirmation (post-join-state-confirmation, design
+        # D6): whether this peer's joined state was confirmed against the
+        # snapshot it was sent.  ``None`` before this peer has ever joined a
+        # session — distinct from a recorded outcome, so a panel can tell "not
+        # checked yet" apart from any of the three checked outcomes.
+        "join_confirmation": getattr(manager, "join_confirmation", None),
     }

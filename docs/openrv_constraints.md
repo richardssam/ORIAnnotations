@@ -168,3 +168,29 @@ Both are required together: multi-stroke, multi-frame "Clear All Frames on Timel
 RV's "Show Drawings" toggle is `<RVPaint node>.paint.show` — scoped to one media source, not the whole session. It's synced as a single `annotations_visible` field in the shared `display_settings` blob (same broadcast path as exposure/channel), and on receive is applied to **every** `RVPaint` node, not just the one that changed — this is a deliberate scope-widening to match xStudio's own toggle, which is session-wide, not per-source. See `annotation-lifecycle-sync` capability spec for the accepted tradeoff.
 
 Reading the *current* value back (`_read_annotations_visible`) must resolve the specific currently-viewed `RVPaint` node via `rv.commands.metaEvaluateClosestByType(rv.commands.frame(), "RVPaint")` — the same resolution `_find_paint_node_for_media` uses elsewhere — rather than scanning `nodesOfType("RVPaint")` for "any node that has the property set." Once a remote peer's broadcast has been applied session-wide (every node gets `.paint.show` written), multiple nodes can hold different values simultaneously; picking an arbitrary one that happens to have the property set can silently read a stale value instead of the node the local user is actually toggling, making `_broadcast_display_state`'s change-detection never fire.
+
+## Post-join state confirmation reads the display, not the manager's record
+
+After a join, `_on_synced` rebuilds the RV session and applies the snapshot's
+playback state synchronously (`rebuild_rv_session`, `_apply_playback`,
+`color.apply_all()`). `PlaybackSyncController.confirm_join_state` then compares
+what this peer ended up displaying against that same snapshot, using the
+shared `project_state`/`diff_states` pair — but it must not build the
+"actual" side from `sync_manager.playback_state`/`active_timeline_guid`.
+Those are written directly from the received snapshot itself
+(`SyncManager.apply_snapshot`), so comparing them against the snapshot
+confirms nothing — it is the manager against a copy of itself, in exactly the
+scenario (a view switch or seek that silently failed) this check exists to
+catch.
+
+The fields that matter are read live instead: `current_playback_state()`
+(`rv.commands.frame()`/`isPlaying()`/`playMode()`) for frame and play state,
+and `_displayed_timeline_guid()` — already display-sourced, since it resolves
+`rv.commands.viewNode()` — for the active timeline. See
+`openspec/changes/post-join-state-confirmation/design.md` D7 for the full
+investigation (both `manager.active_timeline_guid` write sites, which one is
+record vs. display-confirmed).
+
+This check is **report-only**: it never requests state, broadcasts, or
+changes this peer's own view. A wrong report costs a wrong indicator in the
+Session State panel, never a wrong session.

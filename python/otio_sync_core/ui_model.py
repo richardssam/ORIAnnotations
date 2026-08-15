@@ -43,6 +43,7 @@ class SessionStateModel(QObject):
     driverlessChanged = Signal()
     selfHoldsVisibilityChanged = Signal()
     mayHoldVisibilityChanged = Signal()
+    joinConfirmationChanged = Signal()
 
     def __init__(self, manager, local_view_provider=None, parent=None):
         super().__init__(parent)
@@ -78,6 +79,8 @@ class SessionStateModel(QObject):
             self.selfHoldsVisibilityChanged.emit()
         if self._snapshot["may_hold_visibility"] != previous["may_hold_visibility"]:
             self.mayHoldVisibilityChanged.emit()
+        if self._snapshot["join_confirmation"] != previous["join_confirmation"]:
+            self.joinConfirmationChanged.emit()
 
         is_split = self._compute_split_view()
         if is_split != self._is_split:
@@ -155,6 +158,23 @@ class SessionStateModel(QObject):
     def mayHoldVisibility(self):
         """Whether this peer's role permits it to claim visibility authority."""
         return self._snapshot["may_hold_visibility"]
+
+    @Property(str, notify=joinConfirmationChanged)
+    def joinConfirmationOutcome(self):
+        """``"confirmed"`` / ``"mismatched"`` / ``"not_confirmed"``, or ``""``.
+
+        Empty string — never one of the three outcomes — before this peer has
+        ever joined a session, so the panel can tell "not checked" apart from
+        any recorded outcome (session-state-ui).
+        """
+        jc = self._snapshot["join_confirmation"]
+        return jc["outcome"] if jc else ""
+
+    @Property(list, notify=joinConfirmationChanged)
+    def joinConfirmationDifferences(self):
+        """Itemised differences for a mismatch; empty for any other outcome."""
+        jc = self._snapshot["join_confirmation"]
+        return jc["differences"] if jc else []
 
     @Property(bool, notify=isDebugChanged)
     def isDebug(self):

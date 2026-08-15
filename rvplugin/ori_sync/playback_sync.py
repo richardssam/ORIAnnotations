@@ -37,6 +37,11 @@ except ImportError:
         except (TypeError, ValueError):
             return None
 
+try:
+    from otio_sync_core.join_confirmation import NOT_CONFIRMED
+except ImportError:
+    NOT_CONFIRMED = "not_confirmed"
+
 from utils import _log, _log_exc, _media_path, _clip_effective_range
 
 def _same_view(a, b):
@@ -333,6 +338,113 @@ class PlaybackSyncController:
         status = self.plugin.sync_manager.broadcast_playback_state(state)
         self._last_broadcast_frame = current_frame
         return status
+
+    def current_playback_state(self):
+        """Return this peer's own playback-state dict, read live — no broadcast.
+
+        Same fields and same sources :meth:`_broadcast_playback` puts on the
+        wire — ``rv.commands`` and :meth:`_displayed_view` — never a cached or
+        received value.  Used by post-join confirmation to build the "actual"
+        side of a comparison from what this peer is actually displaying,
+        mirroring xStudio's method of the same name (design's task 2): the
+        manager's own ``playback_state``/``active_timeline_guid`` are written
+        directly from received messages — including the retained join
+        snapshot itself — so comparing them against that snapshot would
+        confirm the manager against itself rather than the display.
+
+        Unlike :meth:`_broadcast_playback`, this claims no lease and sends
+        nothing — reading this peer's own state must not have side effects
+        (design D5).
+
+        :returns: The playback-state dict, or ``None`` if RV's own state
+            cannot currently be read.
+        """
+        try:
+            fps = rv.commands.fps()
+            current_frame = rv.commands.frame()
+            playing = rv.commands.isPlaying()
+            playback_mode = _PLAY_MODE_TO_WIRE.get(rv.commands.playMode(), "loop")
+        except Exception:
+            return None
+        displayed_mode, _view, _ = self._displayed_view()
+        base = self._frame_base()
+        return {
+            "playing": playing,
+            "current_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "value": float(current_frame - base),
+                "rate": float(fps),
+            },
+            "playback_mode": playback_mode,
+            "view_mode": displayed_mode,
+            "clip_guid": self._cur_clip_guid if displayed_mode == "source" else None,
+        }
+
+    def confirm_join_state(self, generation=None):
+        """Confirm this join's adopted state against the snapshot it was sent.
+
+        Scheduled once, via ``QTimer.singleShot(0, ...)``, from the end of the
+        join build in ``plugin._on_synced`` — after ``rebuild_rv_session``,
+        ``_apply_playback`` and ``color.apply_all()`` have all returned, so it
+        inherits that call's settling rather than guessing at one
+        independently (design D3). RV's own commands used to build the view
+        and apply the seek are synchronous, so — unlike xStudio, whose seek
+        can be deferred past a source-group replacement — there is no further
+        asynchronous settling to wait out here.
+
+        The "actual" side is built from what this peer is actually displaying
+        (:meth:`current_playback_state`, :meth:`_displayed_timeline_guid`),
+        not from ``sync_manager.export_state()`` alone — see
+        :meth:`current_playback_state`'s docstring for why.
+
+        Records :data:`~otio_sync_core.join_confirmation.NOT_CONFIRMED` if
+        RV's own state cannot be read at all (rather than a match or a
+        mismatch) — a peer that never became checkable has not passed a check.
+
+        :param generation: ``sync_manager.join_generation`` as of when
+            ``_on_synced`` scheduled this call, or ``None`` to check
+            unconditionally (used by tests and any direct call). The
+            ``singleShot(0, ...)`` deferral means a *second* ``STATE_SNAPSHOT``
+            can land on this already-synced peer before this callback actually
+            runs — observed live 2026-08-15 20:55, where it did, and this
+            callback went on to confirm against that second snapshot, masking
+            a real mismatch in the join it was scheduled to check. A mismatched
+            generation means exactly that has happened, so this check is
+            abandoned rather than reporting on the wrong join.
+        """
+        manager = self.plugin.sync_manager
+        if manager is None:
+            return
+        if generation is not None and manager.join_generation != generation:
+            _log(
+                "[JOIN-CONFIRM] abandoning — superseded by a later join"
+                f" (generation {generation} -> {manager.join_generation})"
+            )
+            return
+        live = self.current_playback_state()
+        if live is None:
+            manager.record_join_confirmation(NOT_CONFIRMED)
+            return
+        actual = dict(manager.export_state())
+        playback = dict(actual.get("playback_state") or {})
+        playback["current_time"] = live["current_time"]
+        playback["playing"] = live["playing"]
+        actual["playback_state"] = playback
+        # Always taken from the live resolution now, never left as
+        # export_state()'s record: a view with no resolvable timeline
+        # legitimately has no active sequence timeline, so `None` here is the
+        # correct answer, not a reason to fall back to the record's guess —
+        # the record is set unconditionally by apply_snapshot from the very
+        # snapshot being confirmed against, so falling back to it confirms
+        # the manager against itself regardless of what actually rendered
+        # (design D7's gap, found live 2026-08-15 22:00 via task 6.3's
+        # disabled-adoption reproduction on the xStudio side).
+        actual["active_timeline_guid"] = self._displayed_timeline_guid()
+        try:
+            actual["display_state"] = self.plugin.display._read_rv_display_state()
+        except Exception:
+            _log_exc("confirm_join_state: could not read live display state")
+        manager.confirm_join(actual)
 
     def broadcast_view_state(self, clip_guid, view_mode, asserts_view=True):
         """Broadcast an explicit view-state change (clip and/or mode switch).

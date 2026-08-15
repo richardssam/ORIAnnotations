@@ -335,6 +335,22 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self.color.apply_all()
                 finally:
                     self._rv_updating = False
+                # Confirm what actually landed against what was sent, once the
+                # build above has settled (design D3) — post-join-state-
+                # confirmation.  Deferred one event-loop turn so any
+                # RV-internal graph update still in flight from the build
+                # lands first, rather than checking against a mid-update view.
+                # The generation is captured now, synchronously, so that if a
+                # second STATE_SNAPSHOT lands on this peer before the deferred
+                # call actually runs, the check notices and abandons rather
+                # than silently confirming against the wrong join.
+                _join_generation = self.sync_manager.join_generation
+                if QtCore:
+                    QtCore.QTimer.singleShot(
+                        0, lambda: self.playback.confirm_join_state(_join_generation)
+                    )
+                else:
+                    self.playback.confirm_join_state(_join_generation)
             if self._pending_create_check:
                 self._pending_create_check = False
                 if not self.sync_manager.is_master:

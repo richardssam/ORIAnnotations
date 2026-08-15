@@ -69,6 +69,27 @@ XsWindow {
         return g ? String(g).substring(0, 8) : "-"
     }
 
+    // A mismatch is a fact about THIS peer's own state, not a session or peer
+    // error — the wording below is deliberate about that (session-state-ui).
+    function joinConfirmationText() {
+        var jc = panel.state.join_confirmation
+        if (!jc) return ""
+        if (jc.outcome === "confirmed") return "Join confirmed — this view matches what was sent."
+        if (jc.outcome === "mismatched") {
+            var diffs = jc.differences ? jc.differences : []
+            return "This view does not match what was sent: " + diffs.join("; ")
+        }
+        return "Join not confirmed — could not verify this view against what was sent."
+    }
+
+    function joinConfirmationColour() {
+        var jc = panel.state.join_confirmation
+        if (!jc) return XsStyleSheet.secondaryTextColor
+        if (jc.outcome === "confirmed") return "#22c55e"
+        if (jc.outcome === "mismatched") return "#ef4444"
+        return "#f59e0b"
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: XsStyleSheet.panelPadding * 2
@@ -161,6 +182,22 @@ XsWindow {
                     visible: panel.debugMode
                     text: "This peer: " + panel.shortGuid(panel.state.self_guid)
                           + (panel.state.is_host ? " — holds visibility authority" : "")
+                }
+
+                // Post-join state confirmation: whether this peer's joined
+                // state was confirmed against the snapshot it was sent.
+                // Absent entirely before this peer has ever joined a session
+                // (see panel.joinConfirmationText) — "not checked" and
+                // "checked and matching" must read as different facts, not
+                // collapse into one.
+                XsText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignLeft
+                    visible: panel.state.join_confirmation !== undefined
+                             && panel.state.join_confirmation !== null
+                    color: panel.joinConfirmationColour()
+                    text: panel.joinConfirmationText()
                 }
             }
         }

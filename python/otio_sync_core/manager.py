@@ -20,6 +20,7 @@ import opentimelineio as otio
 
 from . import authority
 from . import identity
+from . import join_confirmation
 from .network import SyncNetworkProtocol
 from .proxy import OTIOSyncProxy
 from .patcher import OTIOPatcher, _otio_to_dict, _dict_to_otio
@@ -444,6 +445,34 @@ class SyncManager:
         #: GUID of the clip most recently selected by a remote peer via a
         #: ``SELECTION`` broadcast.  ``None`` when the selection is cleared.
         self.selected_clip_guid: str | None = None
+
+        #: The ``STATE_SNAPSHOT`` payload this peer is currently joining with,
+        #: kept exactly as received (post-join-state-confirmation, design D2)
+        #: so a later confirmation compares against what was actually sent
+        #: rather than reconstructing an expectation from what was adopted.
+        #: Set in :meth:`apply_snapshot`; cleared by :meth:`record_join_confirmation`
+        #: once an outcome is recorded, so a later join starts from nothing.
+        self._pending_join_snapshot: dict[str, Any] | None = None
+        #: Outcome of the most recent post-join state confirmation:
+        #: ``{"outcome": CONFIRMED|MISMATCHED|NOT_CONFIRMED, "differences": [...]}``,
+        #: or ``None`` before this peer has ever joined a session (session-state-ui:
+        #: "a peer that never joined shows no outcome").
+        self.join_confirmation: dict[str, Any] | None = None
+        #: Bumped every time :meth:`apply_snapshot` retains a new join snapshot.
+        #: A host integration schedules its post-join confirmation to run once
+        #: the build settles, which is necessarily *after* ``apply_snapshot``
+        #: returns — if another ``STATE_SNAPSHOT`` lands on this (already
+        #: synced) peer before that deferred check runs, ``_pending_join_snapshot``
+        #: now belongs to a join the deferred check was never scheduled for.
+        #: Comparing the display against it anyway reports on the wrong join —
+        #: observed live 2026-08-15 20:55: a joiner's rebuild transiently showed
+        #: the wrong sequence, but a second snapshot landed before the deferred
+        #: check ran, which then quietly confirmed against *that* snapshot
+        #: instead — reporting "confirmed" for a join that was never checked.
+        #: A caller that captured the generation at scheduling time can tell
+        #: its check is stale and skip it, rather than mis-attribute the
+        #: outcome to the wrong join.
+        self.join_generation: int = 0
 
         #: Receive-side dispatch table: ``(command_schema, event)`` -> handler.
         #: Each handler takes ``(msg, data, source)`` and returns an
@@ -2303,6 +2332,73 @@ class SyncManager:
         payload["unpublished_parent_count"] = self.unpublished_parent_count
         return payload
 
+    def confirm_join(
+        self,
+        actual_state_payload: dict[str, Any],
+        *,
+        frame_tolerance: int = join_confirmation.DEFAULT_FRAME_TOLERANCE,
+    ) -> "str | None":
+        """Compare *actual_state_payload* against the snapshot this peer joined
+        with, and record the outcome (post-join-state-confirmation, design D1).
+
+        *actual_state_payload* must be ``StateSnapshot``-shaped like
+        :meth:`export_state`'s return value, but is deliberately a parameter
+        rather than a call to ``export_state()`` here: the host integration
+        must source it from what this peer is actually displaying, and
+        ``export_state()`` reads this manager's own record — which is exactly
+        where the record and the display can disagree (design's first risk).
+
+        A no-op — records nothing, returns ``None`` — when there is no
+        retained join snapshot: this peer has not just joined, or an outcome
+        was already recorded for the current join.  Makes no state request, no
+        broadcast, and no change to this peer's own state (design D5); it only
+        reads :attr:`_pending_join_snapshot` and writes :attr:`join_confirmation`.
+
+        :param actual_state_payload: This peer's own state, display-sourced.
+        :param frame_tolerance: Forwarded to
+            :func:`~otio_sync_core.join_confirmation.confirm_join_state`.
+        :returns: The recorded outcome, or ``None`` if there was nothing to
+            confirm against.
+        """
+        if self._pending_join_snapshot is None:
+            return None
+        outcome, differences = join_confirmation.confirm_join_state(
+            self._pending_join_snapshot,
+            actual_state_payload,
+            frame_tolerance=frame_tolerance,
+        )
+        self.record_join_confirmation(outcome, differences)
+        return outcome
+
+    def record_join_confirmation(
+        self, outcome: str, differences: "list[str] | None" = None
+    ) -> None:
+        """Record a post-join confirmation outcome and clear the retained snapshot.
+
+        Exposed separately from :meth:`confirm_join` so a host integration can
+        record :data:`~otio_sync_core.join_confirmation.NOT_CONFIRMED` directly
+        when the join adoption itself never reaches a checkable state (its
+        retry budget exhausted, or the build never settles) — a case
+        :meth:`confirm_join` cannot detect on its own, since it only knows how
+        to compare two states, not how to tell "not yet" from "never".
+
+        A no-op when there is no retained snapshot, so a stray or duplicate
+        call cannot overwrite an outcome already settled for this join.
+
+        :param outcome: One of :data:`~otio_sync_core.join_confirmation.CONFIRMED`,
+            :data:`~...MISMATCHED`, :data:`~...NOT_CONFIRMED`.
+        :param differences: Itemised differences for a mismatch; empty otherwise.
+        """
+        if self._pending_join_snapshot is None:
+            return
+        self._pending_join_snapshot = None
+        self.join_confirmation = {
+            "outcome": outcome,
+            "differences": list(differences or []),
+        }
+        detail = f": {'; '.join(self.join_confirmation['differences'])}" if differences else ""
+        _log(f"[JOIN-CONFIRM] {outcome}{detail}")
+
     def _send_message(self, msg: ProtocolMessage) -> None:
         """Wrap a typed :class:`ProtocolMessage` in the envelope and send it.
 
@@ -3796,6 +3892,17 @@ class SyncManager:
             of :meth:`receive_and_apply_all`.
         """
         timestamp: float = snapshot_data.get("snapshot_timestamp", 0)
+
+        # Retain the payload as received, for post-join-state-confirmation
+        # (design D2): a later confirmation must compare against what was
+        # actually sent, not against a copy of what this method is about to
+        # adopt from it — comparing a stored intention against itself confirms
+        # nothing.  Overwritten by a later join, since that one supersedes —
+        # and the generation bump lets an in-flight deferred check (scheduled
+        # against the snapshot this call is about to replace) notice that and
+        # decline to report on a join that is no longer this one.
+        self._pending_join_snapshot = snapshot_data
+        self.join_generation += 1
 
         self._is_syncing = True
         try:

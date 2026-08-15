@@ -71,6 +71,8 @@ class FakePlugin:
             claim_category=lambda *a, **k: None,
             owns_visibility=lambda *a, **k: True,
             remote_apply_context=lambda: None,
+            record_join_confirmation=lambda *a, **k: None,
+            join_generation=0,
         )
         self._sync_playlists: dict = {}
         self._cmd_queue = FakeQueue()
@@ -145,7 +147,9 @@ def test_join_adopt_retries_while_there_is_no_playhead():
     ctrl.apply_join_playback_state(attempt=0)
 
     assert applied == [], "nothing to apply to yet"
-    assert ctrl.plugin._cmd_queue.items == [("apply_join_playback", {"attempt": 1})]
+    assert ctrl.plugin._cmd_queue.items == [
+        ("apply_join_playback", {"attempt": 1, "generation": 0})
+    ]
 
 
 def test_join_adopt_applies_the_session_view_once_a_playhead_exists():
@@ -157,7 +161,11 @@ def test_join_adopt_applies_the_session_view_once_a_playhead_exists():
     ctrl.apply_join_playback_state(attempt=3)
 
     assert applied == [_SESSION_VIEW]
-    assert ctrl.plugin._cmd_queue.items == [], "no further retry once applied"
+    # No further *retry* of the adoption itself — but the apply queues the
+    # post-join confirmation, which is a new step, not a retry (design D3).
+    assert ctrl.plugin._cmd_queue.items == [
+        ("confirm_join_state", {"attempt": 0, "generation": 0})
+    ]
 
 
 def test_join_adopt_gives_up_rather_than_retrying_forever():

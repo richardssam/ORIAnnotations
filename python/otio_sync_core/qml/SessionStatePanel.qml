@@ -128,6 +128,32 @@ Rectangle {
                 font.pixelSize: uiStyle.fontSize - 2
                 font.bold: true
             }
+
+            // Post-join state confirmation: whether this peer's joined state
+            // was confirmed against the snapshot it was sent.  Absent (empty
+            // outcome string) before this peer has ever joined a session — a
+            // mismatch is reported as a fact about THIS peer's own state, not
+            // as a session or peer error (session-state-ui).
+            Text {
+                visible: sessionState.joinConfirmationOutcome !== ""
+                text: {
+                    if (sessionState.joinConfirmationOutcome === "confirmed")
+                        return "Join confirmed — this view matches what was sent."
+                    if (sessionState.joinConfirmationOutcome === "mismatched")
+                        return "This view does not match what was sent: "
+                               + sessionState.joinConfirmationDifferences.join("; ")
+                    return "Join not confirmed — could not verify this view against what was sent."
+                }
+                color: {
+                    if (sessionState.joinConfirmationOutcome === "confirmed") return uiStyle.syncedColor
+                    if (sessionState.joinConfirmationOutcome === "mismatched") return uiStyle.warningColor
+                    return uiStyle.joiningColor
+                }
+                wrapMode: Text.WordWrap
+                width: parent.width
+                font.family: uiStyle.fontFamily
+                font.pixelSize: uiStyle.fontSize - 2
+            }
         }
     }
 

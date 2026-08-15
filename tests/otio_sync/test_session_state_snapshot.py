@@ -215,6 +215,29 @@ def test_snapshot_survives_a_json_round_trip():
     assert json.loads(json.dumps(snap)) == snap
 
 
+def test_snapshot_reports_no_join_confirmation_before_ever_joining():
+    """A peer that never joined shows no outcome (session-state-ui)."""
+    snap = session_state_snapshot(_manager())
+    assert snap["join_confirmation"] is None
+
+
+@pytest.mark.parametrize(
+    "outcome,differences",
+    [
+        ("confirmed", []),
+        ("mismatched", ["frame mismatch: expected ~10, got 999 (tolerance 5)"]),
+        ("not_confirmed", []),
+    ],
+)
+def test_snapshot_reports_the_join_confirmation_outcome(outcome, differences):
+    mgr = _manager()
+    mgr.join_confirmation = {"outcome": outcome, "differences": differences}
+
+    snap = session_state_snapshot(mgr)
+
+    assert snap["join_confirmation"] == {"outcome": outcome, "differences": differences}
+
+
 def test_snapshot_carries_the_shared_view():
     mgr = _manager()
     mgr.active_timeline_guid = "tl-1"

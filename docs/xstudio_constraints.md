@@ -350,3 +350,37 @@ Detect this as **disappearance**, not as a clear event: record the `(clip_guid, 
 ### The empty-REPLACE trap (same shape as RV's)
 
 `refresh_annotation_bookmark` (the receive side for both `annotation_commands_added` and `annotation_commands_replaced`) early-returns when the *derived* `pen_strokes`/`captions` are both empty — but that early return also swallows a genuine full clear, since a fully-cleared clip derives to the exact same empty lists. Check the **incoming** `annotation_commands` list itself: if it's empty, call `bm.set_annotation(strokes=[], captions=[])` unconditionally instead of returning early. A non-empty incoming list that merely fails to decode into strokes/captions is not the same thing and should still return without touching the bookmark.
+
+## Post-join state confirmation reads the display, not the manager's record
+
+`PlaybackSyncController.confirm_join_state` runs after `apply_join_playback_state`
+adopts the session's view, comparing what this peer ended up displaying
+against the snapshot it was sent (shared `project_state`/`diff_states`). It
+must not build the "actual" side from `manager.active_timeline_guid` /
+`manager.playback_state` — both are written directly from the received
+snapshot (`SyncManager.apply_snapshot`), so comparing them against that same
+snapshot confirms nothing: it is the manager against a copy of itself, in
+exactly the scenario (a view switch or seek that silently failed) this check
+exists to catch.
+
+The fields that matter are read live instead:
+
+- **Frame/playing** — `current_playback_state()`, which reads
+  `active_playhead.position`/`.playing` fresh, never a cached or received
+  value.
+- **Active timeline** — resolved from `_last_viewed_clip_guid`, set *only*
+  inside the real `show_atom` handler (`on_global_playhead_event`), never by
+  an applied message. `manager.active_timeline_guid` itself is dual-written
+  (both from the snapshot's intent and from that same real `show_atom`), so
+  by itself it cannot tell "intended and later confirmed" from "intended and
+  never confirmed" — the exact distinction this check exists to draw.
+
+See `openspec/changes/post-join-state-confirmation/design.md` D7 for the full
+write-site inventory. The check re-queues itself (bounded by
+`_JOIN_CONFIRM_MAX_ATTEMPTS`) while a deferred seek (`_pending_seek_frame`) is
+still outstanding, so it never checks against a playhead the view switch has
+not finished with — and records "not confirmed", not a false mismatch, if
+that never settles.
+
+Report-only: no state request, no broadcast, no local change. A wrong report
+costs a wrong indicator in the Session State panel, never a wrong session.
