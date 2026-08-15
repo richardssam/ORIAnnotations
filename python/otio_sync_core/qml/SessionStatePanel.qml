@@ -102,6 +102,17 @@ Rectangle {
                 font.pixelSize: uiStyle.fontSize - 2
             }
 
+            Text {
+                text: {
+                    if (sessionState.selfHoldsVisibility) return "I am driving the view"
+                    if (sessionState.mayHoldVisibility) return "I could drive it"
+                    return "changing the view is not available to me"
+                }
+                color: sessionState.selfHoldsVisibility ? uiStyle.syncedColor : uiStyle.textColor
+                font.family: uiStyle.fontFamily
+                font.pixelSize: uiStyle.fontSize - 2
+            }
+
             // The driverless condition is *reported*, not merely inferable from
             // a disabled menu item: a session whose view nobody may change has
             // to explain itself, which is the whole reason this state is
@@ -201,12 +212,13 @@ Rectangle {
                         text: "Leases: " + 
                               (holdsPositionLease ? "[Position] " : "") + 
                               (holdsDisplayLease ? "[Display] " : "") + 
-                              (holdsStructureLease ? "[Structure]" : "")
+                              (holdsStructureLease ? "[Structure] " : "") +
+                              (holdsVisibility ? "[Visibility]" : "")
                         color: uiStyle.textColor
                         opacity: 0.7
                         font.family: uiStyle.fontFamily
                         font.pixelSize: uiStyle.fontSize - 4
-                        visible: holdsPositionLease || holdsDisplayLease || holdsStructureLease
+                        visible: holdsPositionLease || holdsDisplayLease || holdsStructureLease || holdsVisibility
                     }
                 }
             }

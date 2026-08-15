@@ -71,7 +71,10 @@ class FakePlugin:
     def __init__(self) -> None:
         self.connection = FakeConnection()
         self.manager = types.SimpleNamespace(
-            status=STATE_SYNCED, active_timeline_guid="tl-1"
+            status=STATE_SYNCED,
+            active_timeline_guid="tl-1",
+            claim_category=lambda *a, **k: None,
+            owns_visibility=lambda *a, **k: True,
         )
         self._sync_playlists: dict = {}
         self._cmd_queue = FakeQueue()
@@ -185,17 +188,17 @@ def _ctrl_with(ctx):
 
 def test_a_live_stroke_apply_suppresses_a_view_broadcast():
     ctrl = _ctrl_with(_ctx("Annotation.1", "PARTIAL"))
-    assert ctrl._induced_by_remote_annotation() is True
+    assert ctrl._induced_by_remote_apply() is True
 
 
 def test_a_committed_annotation_apply_suppresses_too():
     ctrl = _ctrl_with(_ctx("OTIO_SESSION_1.0", "INSERT_CHILD"))
-    assert ctrl._induced_by_remote_annotation() is True
+    assert ctrl._induced_by_remote_apply() is True
 
 
 def test_still_inside_the_apply_counts():
     ctrl = _ctrl_with(_ctx("Annotation.1", "PARTIAL", settling_for=None, in_apply=True))
-    assert ctrl._induced_by_remote_annotation() is True
+    assert ctrl._induced_by_remote_apply() is True
 
 
 def test_a_playback_apply_does_not_suppress():
@@ -203,19 +206,53 @@ def test_a_playback_apply_does_not_suppress():
     existing echo guards own that case, and swallowing it here would stop a
     genuine local view change from ever reaching the session."""
     ctrl = _ctrl_with(_ctx("PLAYBACK_SETTINGS_1.0", "SET"))
-    assert ctrl._induced_by_remote_annotation() is False
+    assert ctrl._induced_by_remote_apply() is False
 
 
 def test_an_old_annotation_apply_does_not_suppress():
     """Provenance stays true for 5 s. The causal chain is sub-second, and the
     difference decides whether a user's own double-click propagates."""
     ctrl = _ctrl_with(_ctx("Annotation.1", "PARTIAL", settling_for=2.5))
-    assert ctrl._induced_by_remote_annotation() is False
+    assert ctrl._induced_by_remote_apply() is False
+
+
+def test_applying_a_session_snapshot_suppresses_a_view_broadcast():
+    """Joining a session is not a user action.
+
+    The 2026-08-15 09:07 regression: a peer joined a session whose host was on a
+    later clip mid-shot. Building the session put the snapshot's *first* timeline
+    on screen, the show_atom was read as a fresh local isolation, and the joiner
+    broadcast mode=source with frame 0 — dragging the host onto the first clip at
+    frame 1. Nothing about joining may change what the session is viewing.
+    """
+    ctrl = _ctrl_with(_ctx("LiveSession.1", "STATE_SNAPSHOT", settling_for=1.63))
+    assert ctrl._induced_by_remote_apply() is True
+
+
+def test_a_snapshot_gets_a_longer_window_than_an_annotation():
+    """A session build trails its apply by far more than a stroke does.
+
+    1.63 s was observed live — past the annotation window, well inside the
+    snapshot one. If both used the annotation's, this would not be suppressed.
+    """
+    settling = 2.5  # past the annotation window, inside the snapshot one
+    snapshot = _ctrl_with(_ctx("LiveSession.1", "STATE_SNAPSHOT", settling_for=settling))
+    annotation = _ctrl_with(_ctx("Annotation.1", "PARTIAL", settling_for=settling))
+
+    assert snapshot._induced_by_remote_apply() is True
+    assert annotation._induced_by_remote_apply() is False
+
+
+def test_a_long_stale_snapshot_still_expires():
+    """A window, not a licence — a user who joins and then picks a clip must
+    eventually be able to."""
+    ctrl = _ctrl_with(_ctx("LiveSession.1", "STATE_SNAPSHOT", settling_for=9.0))
+    assert ctrl._induced_by_remote_apply() is False
 
 
 def test_no_remote_context_means_a_local_action():
     ctrl = _ctrl_with(None)
-    assert ctrl._induced_by_remote_annotation() is False
+    assert ctrl._induced_by_remote_apply() is False
 
 
 def test_an_unreadable_context_is_treated_as_local():
@@ -230,4 +267,4 @@ def test_an_unreadable_context_is_treated_as_local():
     ctrl = PlaybackSyncController(FakePlugin())
     ctrl.plugin.manager = Boom()
 
-    assert ctrl._induced_by_remote_annotation() is False
+    assert ctrl._induced_by_remote_apply() is False

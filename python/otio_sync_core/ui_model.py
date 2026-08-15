@@ -41,6 +41,8 @@ class SessionStateModel(QObject):
     splitViewChanged = Signal()
     roleChanged = Signal()
     driverlessChanged = Signal()
+    selfHoldsVisibilityChanged = Signal()
+    mayHoldVisibilityChanged = Signal()
 
     def __init__(self, manager, local_view_provider=None, parent=None):
         super().__init__(parent)
@@ -72,6 +74,10 @@ class SessionStateModel(QObject):
             self.roleChanged.emit()
         if self._snapshot["driverless"] != previous["driverless"]:
             self.driverlessChanged.emit()
+        if self._snapshot["self_holds_visibility"] != previous["self_holds_visibility"]:
+            self.selfHoldsVisibilityChanged.emit()
+        if self._snapshot["may_hold_visibility"] != previous["may_hold_visibility"]:
+            self.mayHoldVisibilityChanged.emit()
 
         is_split = self._compute_split_view()
         if is_split != self._is_split:
@@ -140,6 +146,16 @@ class SessionStateModel(QObject):
         """
         return self._snapshot["driverless"]
 
+    @Property(bool, notify=selfHoldsVisibilityChanged)
+    def selfHoldsVisibility(self):
+        """Whether this peer currently holds visibility authority (effective holder)."""
+        return self._snapshot["self_holds_visibility"]
+
+    @Property(bool, notify=mayHoldVisibilityChanged)
+    def mayHoldVisibility(self):
+        """Whether this peer's role permits it to claim visibility authority."""
+        return self._snapshot["may_hold_visibility"]
+
     @Property(bool, notify=isDebugChanged)
     def isDebug(self):
         return self._is_debug
@@ -167,6 +183,7 @@ class PeerListModel(QAbstractListModel):
     UserRole = Qt.UserRole + 11
     HostRole = Qt.UserRole + 12
     SourceRole = Qt.UserRole + 13
+    HoldsVisibilityRole = Qt.UserRole + 14
 
     #: QML role name → snapshot peer key.
     _FIELDS = {
@@ -179,6 +196,7 @@ class PeerListModel(QAbstractListModel):
         HoldsPositionLeaseRole: "holds_position_lease",
         HoldsDisplayLeaseRole: "holds_display_lease",
         HoldsStructureLeaseRole: "holds_structure_lease",
+        HoldsVisibilityRole: "holds_visibility",
         DisplayNameRole: "display_name",
         UserRole: "user",
         HostRole: "host",
@@ -204,6 +222,7 @@ class PeerListModel(QAbstractListModel):
             self.HoldsPositionLeaseRole: b"holdsPositionLease",
             self.HoldsDisplayLeaseRole: b"holdsDisplayLease",
             self.HoldsStructureLeaseRole: b"holdsStructureLease",
+            self.HoldsVisibilityRole: b"holdsVisibility",
             self.IsMasterRole: b"isMaster",
             self.DisplayNameRole: b"displayName",
             self.UserRole: b"user",

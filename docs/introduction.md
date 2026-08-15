@@ -50,16 +50,15 @@ implementing against this protocol — none of them are visible in a message's
 shape.
 
 Two of them are properties of the *session*, carried on `STATE_SNAPSHOT`: the
-elected **host** is the only peer whose playback message may carry the
-`view_mode`/`clip_guid` field group (what everyone is looking at), and the
 per-category **write leases** in `broadcast_ownership` decide which peer is
-currently driving position, display, or structure.
+currently driving visibility, position, display, or structure. If no peer holds
+the visibility lease, it falls back to the elected **host**.
 
 The third is a property of the *participant*: a peer's **session role** —
 `driver`, `reviewer`, or `viewer` — carried as a field on `PEER_ANNOUNCE` and on
 each entry of the `STATE_SNAPSHOT` peer roster, with the session's policy in that
 message's `session_roles` section. Role is a ceiling; the other two are gates. A
-driver has permission to emit visibility; only the host actually does.
+driver has permission to emit visibility; the peer holding the visibility lease (or the elected host if the lease is unclaimed) is the one permitted to broadcast it.
 
 **Role is enforced by the sender, and is not validated on receipt.** A receiving
 peer applies a message without checking what role its sender declared, and no

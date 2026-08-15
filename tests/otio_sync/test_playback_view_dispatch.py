@@ -119,6 +119,7 @@ class _FakeManager:
         self._object_map = {g: _make_clip(u) for g, u in _CLIP_MEDIA.items()}
         self._clip_timelines = {}
         self.announced = []
+        self.claimed = []
 
     def get_or_create_clip_timeline(self, clip_guid):
         return self._clip_timelines.setdefault(clip_guid, f"cliptl-{clip_guid}")
@@ -129,6 +130,9 @@ class _FakeManager:
             return "SUPPRESSED"
         self.announced.append(tl_guid)
         return "SENT"
+
+    def claim_category(self, channel):
+        self.claimed.append(channel)
 
 
 class _FakePlugin:
@@ -605,6 +609,50 @@ class AmbiguousTimelineNodeTest(_FakeRvMixin, unittest.TestCase):
     def test_native_entry_is_still_used_when_there_is_no_otio_root(self):
         self.ctrl._switch_to_sequence_view("tl1")
         self.assertEqual(_display.node, "seq1")
+
+
+class VisibilityClaimIsForViewChangesOnlyTest(_FakeRvMixin, unittest.TestCase):
+    """Only a view *switch* claims the visibility lease.
+
+    RV's native selection is a loop/highlight concept, not a view switch — its
+    own ``on_selection_changed`` comment says so.  Claiming visibility for it
+    would mean that merely highlighting a clip took the category and pulled the
+    whole session onto that shot: ``clip_guid`` is a visibility field, so once
+    the lease is held it stops being stripped and goes out as an assertion of
+    what everyone should be looking at.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.plugin = _FakePlugin()
+        self.ctrl = PlaybackSyncController(self.plugin)
+        self.ctrl._broadcast_playback = lambda: "SENT"
+
+    def _claims(self):
+        return self.plugin.sync_manager.claimed
+
+    def test_a_view_switch_claims_visibility(self):
+        self.ctrl.broadcast_view_state("clipA", "source")
+        self.assertEqual(self._claims(), ["visibility"])
+
+    def test_a_highlight_only_selection_does_not_claim_visibility(self):
+        self.ctrl.broadcast_view_state("clipA", "source", asserts_view=False)
+        self.assertEqual(self._claims(), [])
+
+    def test_a_highlight_still_records_the_local_view(self):
+        """Withholding the claim must not change the local bookkeeping."""
+        self.ctrl.broadcast_view_state("clipA", "source", asserts_view=False)
+        self.assertEqual(self.ctrl._cur_clip_guid, "clipA")
+        self.assertEqual(self.ctrl._cur_view_mode, "source")
+
+    def test_selection_change_event_does_not_claim_visibility(self):
+        """End to end through the event handler, not just the parameter."""
+        _fake_cmds.selection = lambda: ["sourceGroup000000"]
+        try:
+            self.ctrl.on_selection_changed(types.SimpleNamespace(reject=lambda: None))
+        finally:
+            _fake_cmds.selection = lambda: []
+        self.assertEqual(self._claims(), [])
 
 
 if __name__ == "__main__":

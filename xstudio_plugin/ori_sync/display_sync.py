@@ -17,6 +17,19 @@ from .utils import _log, _log_exc, bounded_timeout
 # 100 s default so a stale viewport actor fails fast instead of freezing.
 _DISPLAY_TIMEOUT_MS = 2000
 
+# How long after putting the snapshot's first timeline on screen a resulting
+# show_atom is still attributable to that call rather than to a user.
+#
+# Deliberately longer than apply_selection's 0.5 s for the same guard: that one
+# covers an in-session selection switch, where the show_atom follows promptly.
+# This one follows a session build, so the event trails media loading rather
+# than a selection change — measured at 585 ms on 2026-08-15, which 0.5 s would
+# have missed by 85 ms. The cost of being generous is that a user who joins and
+# immediately picks a clip has that first pick suppressed; the cost of being
+# tight is that joining moves every other peer, which is the failure this
+# exists to prevent.
+_ON_SCREEN_SOURCE_ECHO_S = 3.0
+
 def _parse_vec(val) -> list[float]:
     """Parse an Imath vector from JSON, skipping JSONStore type headers if present."""
     if not val:
@@ -111,18 +124,55 @@ class DisplaySyncController:
 
     # ── viewport ──────────────────────────────────────────────────────────────
 
+    def _apply_pending_on_screen_source(self) -> None:
+        """Show the timeline the session build parked here, without asserting it.
+
+        Joining a session is not a user action, and nothing about it may change
+        what the session is looking at.  This call puts the *first* timeline of
+        the snapshot on screen so the joiner has something to display —
+        ``do_load_timelines`` sets ``_pending_on_screen_source`` to
+        ``first_xs_timeline`` — and xStudio then fires a ``show_atom`` for it,
+        which the selection handler reads as a fresh local isolation.
+
+        Observed 2026-08-15 09:07:37: a peer joined a session whose host was on
+        a later clip, mid-shot.  The joiner applied the deferred source at
+        :09:07:36.952, the ``show_atom`` arrived 585 ms later, and the joiner
+        broadcast ``mode=source`` with ``forcing frame=0`` for the first clip.
+        The host applied it and jumped to the first clip at frame 1 —
+        ``RECV selection: clip 'car_ACES_sRGB' ... source switch dispatched``.
+
+        The guard is the same one ``apply_selection`` arms for the same reason
+        (its own ``set_on_screen_source`` call).  It is armed here, at the call,
+        rather than inferred afterwards from provenance: this peer knows it just
+        set the source, and that is a fact rather than a deduction from a
+        5-second settling window that may already have expired.
+
+        A single helper rather than the two identical copies this replaced —
+        the guard belongs to the call, and two call sites is how one of them
+        ends up without it.
+        """
+        if self._pending_on_screen_source is None:
+            return
+        # Armed BEFORE the call: the show_atom can be dispatched from inside it.
+        self.plugin.playback.suppress_selection_broadcast(_ON_SCREEN_SOURCE_ECHO_S)
+        try:
+            self.plugin.connection.api.session.set_on_screen_source(
+                self._pending_on_screen_source
+            )
+            _log(
+                "Applied deferred on-screen source:"
+                f" {getattr(self._pending_on_screen_source, 'name', '?')}"
+                f" (broadcast suppressed {_ON_SCREEN_SOURCE_ECHO_S:.1f}s — joining"
+                " must not change what the session is viewing)"
+            )
+        except Exception:
+            pass
+        self._pending_on_screen_source = None
+
     def get_viewport(self) -> "Viewport | None":
         """Return a cached Viewport for the active xStudio window, or None on error."""
         if self._viewport is not None:
-            if self._pending_on_screen_source is not None:
-                try:
-                    self.plugin.connection.api.session.set_on_screen_source(
-                        self._pending_on_screen_source
-                    )
-                    _log(f"Applied deferred on-screen source: {getattr(self._pending_on_screen_source, 'name', '?')}")
-                except Exception:
-                    pass
-                self._pending_on_screen_source = None
+            self._apply_pending_on_screen_source()
             return self._viewport
         try:
             self._viewport = Viewport(self.plugin.connection, active_viewport=True)
@@ -133,15 +183,7 @@ class DisplaySyncController:
                 _log(f"get_viewport: {e}")
                 self._last_viewport_error_log_time = now
             return self._viewport
-        if self._pending_on_screen_source is not None:
-            try:
-                self.plugin.connection.api.session.set_on_screen_source(
-                    self._pending_on_screen_source
-                )
-                _log(f"Applied deferred on-screen source: {getattr(self._pending_on_screen_source, 'name', '?')}")
-            except Exception:
-                pass
-            self._pending_on_screen_source = None
+        self._apply_pending_on_screen_source()
         return self._viewport
 
     # ── read ──────────────────────────────────────────────────────────────────

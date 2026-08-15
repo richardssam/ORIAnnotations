@@ -306,6 +306,34 @@ def test_a_reviewer_may_claim_position_but_not_structure():
     assert mgr._leases[authority.CHANNEL_STRUCTURE].owner_guid is None
 
 
+def test_a_reviewer_may_not_claim_visibility():
+    mgr = _manager(authority.REVIEWER)
+
+    mgr.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert mgr._leases[authority.CHANNEL_VISIBILITY].owner_guid is None
+
+
+def test_a_refused_visibility_claim_does_not_release_the_current_owner():
+    mgr = _manager(authority.REVIEWER)
+    mgr._apply_claim(authority.CHANNEL_VISIBILITY, 1.0, "driver-guid")
+
+    mgr.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert mgr._leases[authority.CHANNEL_VISIBILITY].owner_guid == "driver-guid"
+    assert _events(mgr, pm.ClaimOwnership.EVENT) == []
+
+
+def test_claim_visibility_noops_under_ownership_kill_switch(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "0")
+    mgr = _manager(authority.DRIVER)
+
+    mgr.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert mgr._leases[authority.CHANNEL_VISIBILITY].owner_guid is None
+    assert _events(mgr, pm.ClaimOwnership.EVENT) == []
+
+
 def test_a_role_stripped_broadcast_never_confirms_a_lease():
     """The specific reason role is evaluated before category authority.
 

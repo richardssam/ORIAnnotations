@@ -79,7 +79,10 @@ class FakePlugin:
     def __init__(self) -> None:
         self.connection = FakeConnection()
         self.manager = types.SimpleNamespace(
-            status=STATE_SYNCED, active_timeline_guid="tl-1"
+            status=STATE_SYNCED,
+            active_timeline_guid="tl-1",
+            claim_category=lambda *a, **k: None,
+            owns_visibility=lambda *a, **k: True,
         )
         self._sync_playlists: dict = {}
         self._cmd_queue = FakeQueue()

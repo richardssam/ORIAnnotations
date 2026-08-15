@@ -31,13 +31,19 @@ class AppSpawner:
         os.makedirs(self.logs_dir, exist_ok=True)
         self.base_dir = base_dir
 
-    def launch(self, app_name, http_port, session_file=None, env_extra=None):
+    def launch(self, app_name, http_port, session_file=None, env_extra=None,
+               peer_name=None):
         """Launch one app instance and its inspector.
 
         :param env_extra: Extra environment for this instance only, applied
             last so a test can declare per-peer settings (a session role, an
             identity) that differ between two instances of the same app.
+        :param peer_name: How the runner addresses this instance. Defaults
+            to *app_name*, which is right until a test launches two peers of
+            the same type — then the type no longer identifies one of them,
+            and :meth:`terminate_app` could only ever reach the first.
         """
+        peer_name = peer_name or app_name
         log_path = os.path.join(self.logs_dir, f"{app_name}_{http_port}.log")
         log_file = open(log_path, 'w')
         self.log_files.append(log_file)
@@ -85,7 +91,7 @@ class AppSpawner:
             env.update(env_extra or {})
 
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
-            self.processes.append((app_name, p))
+            self.processes.append((peer_name, p))
             
             # Read log file to find xstudio's dynamically allocated API port
             xstudio_api_port = "14441"
@@ -163,7 +169,7 @@ class AppSpawner:
             env.update(env_extra or {})
 
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
-            self.processes.append((app_name, p))
+            self.processes.append((peer_name, p))
 
         else:
             raise ValueError(f"Unknown app: {app_name}")
@@ -188,7 +194,9 @@ class AppSpawner:
         the survivors must fall back to ageing the peer out. That is the path a
         crash takes, and the one that cannot be covered any other way.
 
-        :param app_name: Name as passed to :meth:`launch`, e.g. ``"openrv"``.
+        :param app_name: The peer name passed to :meth:`launch` — the app
+            type (``"openrv"``) for a single-instance peer, otherwise
+            whatever distinguishes it (``"openrv#1"``).
         :returns: ``True`` if a process was terminated.
         """
         remaining = []

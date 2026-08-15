@@ -24,6 +24,13 @@ from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
 
 _MEDIA_NAME_TIMEOUT_MS = 2000
 
+# Bound for the identity (uuid) reads the deletion poll makes against playlist
+# and timeline actors.  Those reads target actors that may be mid-teardown by
+# definition — that is what the poll is looking for — and an unbounded one costs
+# the connection's 100 s default, during which no other structure poll runs at
+# all.  An identity read that cannot answer in this long is not going to.
+_IDENTITY_TIMEOUT_MS = 2000
+
 # Fan-out label for the viewed-container handler.  There is only ever one of it,
 # so unlike the per-timeline item handlers it needs no guid in the name.
 _VIEWED_LABEL = "viewed-container"
@@ -1200,10 +1207,14 @@ class StructureSyncController:
         enumerated = False
         for playlist in playlists:
             try:
-                live_uuids.add(str(playlist.uuid))
-                for c in playlist.containers:
-                    if isinstance(c, Timeline):
-                        live_uuids.add(str(c.uuid))
+                # Bounded for the same reason as the stored-actor read below: a
+                # playlist being torn down while this pass walks it blocks the
+                # whole enumeration on the 100 s default.
+                with bounded_timeout(self.plugin.connection, _IDENTITY_TIMEOUT_MS):
+                    live_uuids.add(str(playlist.uuid))
+                    for c in playlist.containers:
+                        if isinstance(c, Timeline):
+                            live_uuids.add(str(c.uuid))
                 enumerated = True
             except Exception:
                 continue
@@ -1212,10 +1223,34 @@ class StructureSyncController:
             return
 
         for tl_guid, (pl, xs_tl) in list(self.plugin._sync_playlists.items()):
+            # Reading the identity of the STORED actor is the one thing this
+            # method's contract says it does not do — "liveness is judged from
+            # the live enumeration (not by poking the stored, possibly-dead
+            # actor) so a deleted playlist's actor read cannot freeze the poll
+            # thread".  It has to poke it anyway, because the tracked entry knows
+            # its sync guid and not its native uuid, and the two sets are
+            # compared by native uuid.  So bound it: the actor whose identity we
+            # are asking for is, in the case that matters, the one that has just
+            # been deleted.
+            #
+            # Observed 2026-08-14 21:11:34: this poll blocked for 58.2 s.  The
+            # poll thread runs its passes in series, so poll_new_playlists could
+            # not run either, and a sequence created on this peer during the
+            # stall was not detected — let alone broadcast — for about a minute.
             try:
-                native = str(xs_tl.uuid) if xs_tl is not None else str(pl.uuid)
+                with bounded_timeout(self.plugin.connection, _IDENTITY_TIMEOUT_MS):
+                    native = str(xs_tl.uuid) if xs_tl is not None else str(pl.uuid)
             except Exception:
-                native = None
+                # A timed-out read is NOT evidence of deletion: treat it as
+                # "still present" and re-check next pass.  Inferring removal from
+                # a read that did not answer would broadcast REMOVE_TIMELINE for
+                # a live timeline, which is far worse than noticing a real
+                # deletion one pass late.
+                _log(
+                    f"poll_deleted_playlists: identity read timed out for"
+                    f" {tl_guid[:8]} — treating as live, re-checking next pass"
+                )
+                continue
             if native is not None and native in live_uuids:
                 continue  # still present
             self._purge_local_playlist_entry(tl_guid)

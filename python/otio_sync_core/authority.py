@@ -211,7 +211,10 @@ def elect_host_guid(
     default_role: "str | None" = None,
     master_guid: "str | None" = None,
 ) -> "str | None":
-    """Return the GUID of the peer that should hold visibility authority.
+    """Return the GUID of the peer that should hold visibility authority when no peer has claimed it.
+
+    Election decides visibility when no peer has claimed it, and continues to
+    supply the role-eligibility filter and the driverless indicator.
 
     Ordering is: preferred application first, then **the master**, then GUID
     ascending as a final deterministic tie-break (the same rule ``session-roles``
@@ -279,20 +282,53 @@ CHANNEL_POSITION = "position"
 CHANNEL_DISPLAY = "display"
 #: Timeline add/remove/replace/rename and structural child mutations.
 CHANNEL_STRUCTURE = "structure"
+#: Which clip or sequence is shown, and in which mode — its own lease channel.
+#: Same string as :data:`VISIBILITY`, and ``authority.DISPLAY``-style deliberate
+#: aliasing applies (one channel, three tables asking different questions).
+CHANNEL_VISIBILITY = "visibility"
 
-#: Every channel that takes a write lease. ``visibility`` and ``annotation``
-#: are deliberately absent: visibility is a static single writer (no
-#: contention to resolve) and annotation stays multi-writer by design.
-LEASE_CHANNELS: tuple[str, ...] = (CHANNEL_POSITION, CHANNEL_DISPLAY, CHANNEL_STRUCTURE)
+#: Every channel that takes a write lease. ``annotation`` is deliberately
+#: absent: annotation stays multi-writer by design.
+LEASE_CHANNELS: tuple[str, ...] = (
+    CHANNEL_POSITION,
+    CHANNEL_DISPLAY,
+    CHANNEL_STRUCTURE,
+    CHANNEL_VISIBILITY,
+)
 
 #: Seconds of broadcast silence after which an unrefreshed lease expires.
 #: Working defaults within the agreed 500ms-2s envelope (design.md D3/D8):
 #: display releases fastest (a stopped gesture has no clip-boundary gap to
 #: ride out), structure slowest (a remote rebuild can gap for hundreds of ms).
+#: Visibility is the longest because a wrong shot costs a media reload at both
+#: ends.
 LEASE_DURATIONS: dict[str, float] = {
     CHANNEL_DISPLAY: 0.5,
     CHANNEL_POSITION: 1.0,
     CHANNEL_STRUCTURE: 2.0,
+    CHANNEL_VISIBILITY: 3.0,
+}
+
+#: Seconds during which a challenger cannot preempt the incumbent holder.
+#: Bounded below by a user's multi-step selection (which must not be preempted)
+#: and above by responsiveness. Must be less than LEASE_DURATIONS[CHANNEL_VISIBILITY]
+#: so a lease doesn't expire while its holder is protected.
+#:
+#: Applied at the **claim site** (:func:`claim_withheld_by_holdoff`), never
+#: inside claim resolution.  A hold-off expressed as "within N seconds of" is a
+#: tolerance comparison, and a tolerance comparison is not transitive: folding
+#: three claims through it gives three different winners depending on arrival
+#: order, and peers fold in different orders because each applies its own claim
+#: before it sends it.  Withholding the claim instead keeps resolution a total
+#: order (:func:`_resolve_visibility`) while giving the same behaviour — a claim
+#: that is never made cannot be honoured.
+VISIBILITY_HOLDOFF = 1.5
+
+#: Channel -> seconds a challenger withholds a claim after the incumbent's.
+#: Only visibility damps its claims this way; the earlier-wins channels settle a
+#: burst by preferring whoever began, which needs no rate limit.
+CLAIM_HOLDOFFS: dict[str, float] = {
+    CHANNEL_VISIBILITY: VISIBILITY_HOLDOFF,
 }
 
 #: Fields of ``PLAYBACK_SETTINGS_1.0`` that assert **position** — the
@@ -324,26 +360,187 @@ def asserts_position(state: Mapping[str, Any]) -> bool:
     return any(state.get(f) is not None for f in POSITION_FIELDS)
 
 
-def resolve_claim(
-    current: "tuple[float, str] | None", incoming: "tuple[float, str]"
-) -> "tuple[float, str]":
-    """Return the winning ``(claim_ts, peer_guid)`` pair between two claims.
+def position_frame(state: Mapping[str, Any]) -> "float | None":
+    """Return the frame *state* asserts, or ``None`` if it asserts none.
 
-    Pure function of its two arguments, so every peer evaluating the same pair
-    of claims reaches the same winner without synchronized clocks (design.md
-    D2): tuple comparison is lexicographic, so the earlier ``claim_ts`` wins
-    and an exact tie breaks to the lower ``peer_guid`` — the same
-    ``min()``-over-a-deterministic-key shape as :func:`elect_host_guid`.
+    The single read of the protocol's position value, so "this message does not
+    say where to be" has one answer rather than one per call site.
 
-    :param current: The best claim known so far, or ``None`` when there isn't one.
-    :param incoming: The claim being weighed against it.
-    :returns: Whichever of *current* / *incoming* sorts first; *incoming* when
-        *current* is ``None``.
+    ``None`` covers three ways of saying nothing, deliberately not
+    distinguished — a receiver's response to all three is identical, and telling
+    them apart would only invite acting on the difference:
+
+    * the field group is absent (stripped by the sender's role or lease);
+    * ``current_time`` is present but is not a mapping;
+    * it is a mapping carrying no usable ``value``.
+
+    **Why this returns ``None`` rather than a sentinel frame.**  The hazard
+    being closed is ``current_time.get("value", 0)``, where a message that said
+    nothing became an assertion of frame 0 and jumped every peer to the start.
+    A numeric sentinel does not close it: the value is read into arithmetic —
+    ``+ frame_base`` in OpenRV, ``max(0, ...)`` in xStudio — so a ``-1`` becomes
+    the frame before the start on one host and is clamped straight back to 0 on
+    the other, which is the original bug with an extra step.  It would also have
+    to go on the wire, where a peer that predates the convention reads it as an
+    ordinary frame.  Absence already degrades safely, because a peer that does
+    not understand a field it never received cannot misread it.
+
+    :param state: A playback/view state dict as received.
+    :returns: The asserted frame, or ``None`` when the message asserts none.
+    :rtype: float or None
+    """
+    if not any(f in state for f in POSITION_FIELDS):
+        return None
+    current_time = state.get("current_time")
+    if not isinstance(current_time, Mapping):
+        return None
+    value = current_time.get("value")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_earlier(
+    current: tuple[float, str] | None, incoming: tuple[float, str]
+) -> tuple[float, str]:
+    """Resolve claims using earlier-wins (standard lease rule).
+
+    :param current: The current lease info as ``(claim_ts, guid)``, or ``None``.
+    :param incoming: The incoming claim info as ``(claim_ts, guid)``.
+    :returns: The winning ``(claim_ts, guid)`` pair.
     :rtype: tuple
     """
     if current is None:
         return incoming
     return min(current, incoming)
+
+
+_resolve_earlier.resolves_on_timestamps_alone = False
+
+
+def _resolve_visibility(
+    current: tuple[float, str] | None, incoming: tuple[float, str]
+) -> tuple[float, str]:
+    """Resolve two visibility claims using later-wins.
+
+    The mirror image of :func:`_resolve_earlier`, and a **total order** for the
+    same reason: ``min()`` over the key ``(-claim_ts, guid)`` prefers the later
+    ``claim_ts`` and breaks an exact tie to the lower ``peer_guid``, keeping the
+    house tie-break convention rather than inverting it along with the ordering.
+
+    Being a total order is not a stylistic match with the earlier-wins rule, it
+    is a correctness requirement.  A claim is resolved against whatever the lease
+    already holds, so a peer *folds* a sequence of claims — and each peer folds
+    in a different order, because ``claim_category`` applies this peer's own
+    claim before broadcasting it while every other peer sees it arrive among the
+    rest.  A fold only converges when the operation is associative, which a
+    pairwise "within ``VISIBILITY_HOLDOFF`` of each other" comparison is not:
+    three claims at 0.0/1.0/2.0s resolve to a different winner under each
+    rotation, and the peers that disagree both believe they hold the category
+    and both broadcast a view.  The hold-off lives at the claim site instead
+    (:func:`claim_withheld_by_holdoff`), where a suppressed claim is simply
+    absent from every peer's fold and there is nothing left to diverge about.
+
+    :param current: The current lease info as ``(claim_ts, guid)``, or ``None``.
+    :param incoming: The incoming claim info as ``(claim_ts, guid)``.
+    :returns: The winning ``(claim_ts, guid)`` pair.
+    :rtype: tuple
+    """
+    if current is None:
+        return incoming
+    return min(current, incoming, key=lambda c: (-c[0], c[1]))
+
+
+_resolve_visibility.resolves_on_timestamps_alone = True
+
+
+#: Table mapping each channel to its claim resolver function.
+CLAIM_RESOLVERS: dict[str, Any] = {
+    CHANNEL_POSITION: _resolve_earlier,
+    CHANNEL_DISPLAY: _resolve_earlier,
+    CHANNEL_STRUCTURE: _resolve_earlier,
+    CHANNEL_VISIBILITY: _resolve_visibility,
+}
+
+
+def resolve_claim(
+    current: tuple[float, str] | None,
+    incoming: tuple[float, str],
+    channel: str | None = None,
+) -> tuple[float, str]:
+    """Return the winning ``(claim_ts, peer_guid)`` pair between two claims.
+
+    Every resolver is a total order over ``(claim_ts, peer_guid)``, so a peer
+    folding a sequence of claims reaches the same winner whatever order they
+    arrive in (design.md D2).  For position/display/structure the earlier
+    ``claim_ts`` wins; for visibility the later one does.  Both break an exact
+    tie to the lower ``peer_guid``.
+
+    Ordering by ``claim_ts`` compares wall-clock stamps taken on different
+    machines, so a clock offset shifts who wins — the same exposure in both
+    directions, and unchanged by the visibility channel: under earlier-wins a
+    slow clock wins, under later-wins a fast one does.  What the ordering does
+    guarantee, and what convergence actually needs, is that every peer reaches
+    the *same* winner from the same set of claims. Offsets large enough to
+    matter here already break position sync.
+
+    :param current: The best claim known so far, or ``None`` when there isn't one.
+    :param incoming: The claim being weighed against it.
+    :param channel: The lease channel name, or ``None`` to default to earlier-wins.
+    :returns: Whichever of *current* / *incoming* wins.
+    :rtype: tuple
+    """
+    resolver = CLAIM_RESOLVERS.get(channel, _resolve_earlier)
+    return resolver(current, incoming)
+
+
+def claim_withheld_by_holdoff(
+    channel: str,
+    owner_guid: "str | None",
+    owner_claim_ts: "float | None",
+    self_guid: str,
+    now: float,
+) -> bool:
+    """Return whether a local claim on *channel* should be withheld.
+
+    The damping half of the visibility rule, and the reason
+    :func:`_resolve_visibility` can stay a plain total order.  A peer that is
+    actively asserting a view keeps re-claiming, pushing ``owner_claim_ts``
+    forward, so a challenger acting *during* that activity finds itself inside
+    the hold-off and does not claim at all — "'most recent' cannot be read as
+    'whoever spoke last in a burst'".  It also bounds hand-off to one swap per
+    :data:`VISIBILITY_HOLDOFF` per direction, which is what keeps two users
+    alternating from trading the shot at full speed, each swap costing a media
+    reload at both ends.
+
+    Deliberately a decision made by **one** peer about whether to emit, not a
+    rule every peer must reach the same answer to.  That is what makes the
+    clock-skew exposure here benign where it would not be inside resolution: a
+    skewed challenger withholds a claim it could have made, or makes one it
+    could have withheld, and either way every peer then folds the identical set
+    of claims that were actually sent.  The cost of being wrong is one delayed
+    hand-off, corrected by the user's next action.
+
+    :param channel: The lease channel being claimed.
+    :param owner_guid: GUID currently holding the lease, or ``None``.
+    :param owner_claim_ts: Wall-clock stamp of the holder's claim, or ``None``.
+    :param self_guid: This peer's GUID.
+    :param now: Current wall-clock time, in the same epoch as *owner_claim_ts*.
+    :returns: ``True`` when the claim should not be made.
+    :rtype: bool
+    """
+    holdoff = CLAIM_HOLDOFFS.get(channel)
+    if not holdoff:
+        return False
+    # Nothing to defer to, or we are the incumbent refreshing our own hold —
+    # re-claiming is how an active holder stays protected, so it is never
+    # withheld.
+    if owner_guid is None or owner_guid == self_guid or owner_claim_ts is None:
+        return False
+    return now < owner_claim_ts + holdoff
 
 
 #: Environment variable that disables ownership-lease enforcement at runtime.

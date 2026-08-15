@@ -311,6 +311,26 @@ class TimelineBuildController:
         if first_xs_timeline is not None:
             plugin.display._pending_on_screen_source = first_xs_timeline
 
+        # Re-apply the snapshot's playback state now the session exists to apply
+        # it to.
+        #
+        # The manager applies it once, on receipt — which for a joiner is before
+        # any of this has run.  Observed 2026-08-15 09:18:42.886: the joiner
+        # fired ``Event: playback_settings`` carrying the host's frame while its
+        # own log read ``get_viewport: No visible viewports`` and
+        # ``Deferring timeline loading — viewport not ready``; the timelines were
+        # not built for another second.  The state was applied to nothing and
+        # never revisited, so the joiner sat on whatever the build put on screen.
+        #
+        # OpenRV already does this — ``rebuild_rv_session()`` is followed by
+        # ``_apply_playback(sync_manager.playback_state)``.  xStudio builds on
+        # the poll thread instead, so the same re-apply has to be queued rather
+        # than run inline: the on-screen source above is not applied until the
+        # next ``get_viewport``, and seeking before that would target the
+        # playhead we are about to replace.
+        if plugin.manager and plugin.manager.playback_state:
+            plugin._cmd_queue.put(("apply_join_playback", {"attempt": 0}))
+
     # ── OTIO construction ─────────────────────────────────────────────────────
 
     def build_otio_timelines(self) -> list:

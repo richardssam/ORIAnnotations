@@ -272,3 +272,76 @@ def test_snapshot_derives_display_name_with_fallback():
     assert by_guid["peer-none"]["user"] == ""
     assert by_guid["peer-none"]["host"] == ""
     assert by_guid["peer-none"]["source"] == ""
+
+
+def test_snapshot_reports_visibility_holder():
+    mgr = _manager()
+    mgr._self_role = authority.DRIVER
+    _add_peer(mgr, "peer-driver", capabilities=("visibility",))
+    mgr._peers["peer-driver"]["role"] = authority.DRIVER
+    _add_peer(mgr, "peer-viewer", capabilities=("visibility",))
+    mgr._peers["peer-viewer"]["role"] = authority.VIEWER
+
+    # 1. No lease claimed: elected host is the effective holder
+    mgr.host_guid = "peer-driver"
+    mgr.is_host = False
+
+    snap = session_state_snapshot(mgr)
+    by_guid = {p["guid"]: p for p in snap["peers"]}
+
+    assert by_guid["peer-driver"]["holds_visibility"] is True
+    assert by_guid["self-guid"]["holds_visibility"] is False
+    assert by_guid["peer-viewer"]["holds_visibility"] is False
+    assert snap["self_holds_visibility"] is False
+    assert snap["may_hold_visibility"] is True
+
+    # 2. Lease claimed by self
+    mgr._leases[authority.CHANNEL_VISIBILITY].owner_guid = "self-guid"
+    snap = session_state_snapshot(mgr)
+    by_guid = {p["guid"]: p for p in snap["peers"]}
+
+    assert by_guid["self-guid"]["holds_visibility"] is True
+    assert by_guid["peer-driver"]["holds_visibility"] is False
+    assert snap["self_holds_visibility"] is True
+
+    # 3. Role validation check
+    assert by_guid["peer-driver"]["role"] == authority.DRIVER
+    assert by_guid["peer-viewer"]["role"] == authority.VIEWER
+
+
+def test_snapshot_reports_a_role_that_may_never_hold_the_view():
+    """A viewer is shown as unable to take the view, not merely as not holding it."""
+    mgr = _manager()
+    mgr._self_role = authority.VIEWER
+
+    snap = session_state_snapshot(mgr)
+
+    assert snap["may_hold_visibility"] is False
+    assert snap["self_holds_visibility"] is False
+
+
+def test_snapshot_does_not_report_an_expired_lease_as_held(monkeypatch):
+    """Expiry is lazy, so the projection must settle it like every other reader.
+
+    The panel is the surface whose whole job is to say who holds the view; a
+    stale holder there is the failure this capability exists to remove, wearing
+    a different hat.
+    """
+    import time as time_module
+
+    now_mono = [100.0]
+    monkeypatch.setattr(time_module, "monotonic", lambda: now_mono[0])
+
+    mgr = _manager()
+    _add_peer(mgr, "peer-driver")
+    mgr.host_guid = "peer-driver"
+    mgr.claim_category(authority.CHANNEL_VISIBILITY)
+    assert session_state_snapshot(mgr)["self_holds_visibility"] is True
+
+    now_mono[0] += authority.LEASE_DURATIONS[authority.CHANNEL_VISIBILITY] + 0.1
+    snap = session_state_snapshot(mgr)
+
+    assert snap["self_holds_visibility"] is False
+    # Unclaimed falls back to the elected host, not to nobody.
+    by_guid = {p["guid"]: p for p in snap["peers"]}
+    assert by_guid["peer-driver"]["holds_visibility"] is True

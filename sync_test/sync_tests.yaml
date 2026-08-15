@@ -709,3 +709,266 @@ tests:
     apps:
       - "xstudio"
       - "openrv"
+
+  - name: "contended_visibility_selection"
+    description: >
+      Two drivers assert *different* views at the same instant, repeatedly.
+      Companion to contended_position_scrub / contended_structure_add_media
+      for the visibility channel, and the one exercise a single operator
+      cannot perform: alt-tabbing between two apps costs 6-10s per swap, and
+      the hold-off it tests is 1.5s (measured 2026-08-15 — the closest
+      hand-driven pair in a 67s session was 1.58s, just outside).
+
+      Each repeat fires two set_selections naming *different* clips, one per
+      peer, from separate threads. Both peers therefore claim visibility
+      inside each other's hold-off window, which is the condition the claim
+      resolver's total order and CLAIM_HOLDOFFS exist for.
+
+      What it asserts is convergence, not who wins: the lease is contended by
+      design, so demanding a particular winner would encode the tie-break's
+      current direction as a requirement. Split ownership is the failure.
+
+      The risk this covers is view thrash — a hold-off set too low lets the
+      view swap on every claim, and each swap costs a media reload on both
+      peers. A run that passes convergence but leaves the logs full of
+      alternating view_mode broadcasts has found that, so read the merged log
+      (debug/merge_sync_logs.py) as well as the exit status.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "driver"
+    users:
+      - "driver_xs"
+      - "driver_rv"
+    commands:
+      # Four clips, not two. With two, the peers converge on one of them each
+      # round, so the next round asks one peer for the clip it is already
+      # showing — a no-op that broadcasts nothing. Only the other peer ever
+      # claims, and the run produces a single owner (observed: 16 rounds, one
+      # owner, caught by expect_ownership_contested). Rotating four means
+      # neither peer is ever asked for the clip currently on screen.
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/laser_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/warp_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "xstudio"
+        role: "driver"
+      - action: "expect_role"
+        app: "openrv"
+        role: "driver"
+      # Eight alternations at 1s. The pacing is load-bearing, not cosmetic:
+      # unpaced, concurrent_commands fires every ~90ms, which is faster than
+      # peers learn each other's claims over the wire — so each self-grants
+      # locally, both believe they own visibility, and nothing is ever
+      # refused. Measured on the first run of this scenario: 16 alternations,
+      # 20 view broadcasts, zero refusals. 1s is inside the 3s lease and
+      # outside the 1.5s hold-off, so each swap meets a live lease held by
+      # the other peer, which is the condition under test.
+      # The two peers are always two steps apart in the rotation, so each
+      # round moves both of them and neither request is ever satisfied by
+      # what the previous round converged on.
+      - action: "repeat"
+        times: 4
+        commands:
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              xstudio: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+              openrv: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              xstudio: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+              openrv: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              xstudio: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+              openrv: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              xstudio: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
+              openrv: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+      # Must come before the convergence check: convergence is trivially true
+      # for a run in which only one peer ever claimed, so without this the
+      # scenario passes whether or not it contended.
+      - action: "expect_ownership_contested"
+        channel: "visibility"
+      - action: "expect_ownership_convergence"
+        channel: "visibility"
+        timeout: 15.0
+    apps:
+      - "xstudio"
+      - "openrv"
+
+  - name: "contended_visibility_selection_rv"
+    description: >
+      contended_visibility_selection with two OpenRV peers instead of one of
+      each. Same rotation, same assertions; the difference is the instrument.
+
+      A mixed pair cannot answer the hold-off question. OpenRV's view-change
+      events are synchronous — it claims the instant setViewNode runs — while
+      xStudio's selection poll coalesces and usually never observes its own
+      intermediate selection before OpenRV has overwritten it. Measured on the
+      mixed run: 15 OpenRV view broadcasts against xStudio's 2, and the
+      hold-off never fired. Two OpenRV peers claim symmetrically and fast,
+      which is the only way two claims land inside each other's 1.5s window.
+
+      Also varies which peer is elected host between runs: an OpenRV-only
+      session breaks the election tie on a per-launch GUID, so this does not
+      quietly test one direction of the tie-break every time.
+
+      Peers are named rather than typed, because `apps` alone cannot address
+      two instances of one application — see the `names` handling in runner.py.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "driver"
+    users:
+      - "driver_rv_a"
+      - "driver_rv_b"
+    names:
+      - "rv_a"
+      - "rv_b"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/graphic_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/laser_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/warp_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "rv_a"
+        role: "driver"
+      - action: "expect_role"
+        app: "rv_b"
+        role: "driver"
+      - action: "repeat"
+        times: 4
+        commands:
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              rv_a: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+              rv_b: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              rv_a: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+              rv_b: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              rv_a: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+              rv_b: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+          - action: "concurrent_commands"
+            settle: 1.0
+            by_app:
+              rv_a: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
+              rv_b: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+      - action: "expect_ownership_contested"
+        channel: "visibility"
+      - action: "expect_ownership_convergence"
+        channel: "visibility"
+        timeout: 15.0
+    apps:
+      - "openrv"
+      - "openrv"
+
+  - name: "two_drivers_visibility_lease"
+    description: >
+      Two drivers: both peers are 'driver'. The non-host peer (OpenRV, since
+      xStudio outranks it for elected host) selects a clip, claims visibility,
+      and the host peer follows its selection. Asserts that visibility authority
+      can be leased to a non-host driver.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "driver"
+    users:
+      - "driver_xs"
+      - "driver_rv"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "xstudio"
+        role: "driver"
+      - action: "expect_role"
+        app: "openrv"
+        role: "driver"
+      # xStudio is elected host. OpenRV is non-host.
+      # OpenRV selects the clip and sets a frame inside it.
+      - action: "concurrent_commands"
+        by_app:
+          openrv: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+      - action: "concurrent_commands"
+        by_app:
+          openrv: {action: "set_frame", frame: 45}
+    apps:
+      - "xstudio"
+      - "openrv"
+
+  - name: "reviewer_visibility_suppression"
+    description: >
+      A reviewer peer (OpenRV) selects a clip locally. Since the reviewer role
+      forbids visibility changes, its selection must not propagate to the driver
+      (xStudio) — the exact suppression required by the role model.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "reviewer"
+    users:
+      - "driver_xs"
+      - "reviewer_rv"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded_notc/car_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "xstudio"
+        role: "driver"
+      - action: "expect_role"
+        app: "openrv"
+        role: "reviewer"
+      # Explicitly set selection to Default Sequence first to ensure selection settles
+      - action: "set_selection"
+        name: "Default Sequence"
+      # Prepare xStudio's frame position
+      - action: "set_frame"
+        frame: 30
+      # The reviewer (OpenRV) changes selection locally and it must not propagate to the driver (xStudio).
+      - action: "expect_no_propagation"
+        app: "openrv"
+        command: {action: "set_selection", name: "car_ACES_sRGB.mov"}
+        settle: 4.0
+      # Return OpenRV's selection to Default Sequence so final coherence check passes
+      - action: "concurrent_commands"
+        by_app:
+          openrv: {action: "set_selection", name: "Default Sequence"}
+    apps:
+      - "xstudio"
+      - "openrv"

@@ -1340,6 +1340,9 @@ class SyncManager:
     def elect_host(self) -> "str | None":
         """Re-evaluate the host from the peer table and apply the result.
 
+        Election decides visibility when no peer has claimed it, and continues to
+        supply the role-eligibility filter and the driverless indicator.
+
         The single host-election operation: it owns every field the transition
         touches, so no call site assembles the sequence itself.  Callers MUST
         NOT elect by assigning :attr:`host_guid` or :attr:`is_host` directly.
@@ -1532,17 +1535,27 @@ class SyncManager:
         message, and acting on that guess is what started playback on every peer
         and reset a playhead over a seek that had just landed.
 
-        This is **not** the broadcast gate — that lives in ``broadcast_*`` and no
-        plugin consults it.  It is the one shared predicate the two plugins use
-        for their *local* intent branches (xStudio's auto-play on a Pinned Source
-        Mode transition, its frame-0 reset on a new isolation), so the answer
-        cannot drift between them and honours the same kill switch.  It replaces
-        the per-plugin "was a peer driving in the last N ms?" time windows, which
-        is the mechanism that kept failing.
+        Under the leased visibility model, the predicate matches the broadcast gate:
+
+        - If the visibility kill switch is off, everyone owns visibility (True).
+        - If the ownership-lease kill switch is off, it reverts to the elected host seat (is_host).
+        - Otherwise, it is owned if this peer holds the visibility lease, or if the
+          lease is unclaimed (None) and this peer is the elected host.
 
         :rtype: bool
         """
-        return self.is_host or not authority.enforcement_enabled()
+        if not authority.enforcement_enabled():
+            return True
+        if not authority.ownership_enforcement_enabled():
+            return self.is_host
+
+        self._settle_lease_expiry(authority.CHANNEL_VISIBILITY)
+        lease_owner = self._leases[authority.CHANNEL_VISIBILITY].owner_guid
+        if lease_owner == self.self_guid:
+            return True
+        if lease_owner is None and self.is_host:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Session roles (what this participant may ever emit)
@@ -1872,9 +1885,14 @@ class SyncManager:
             self._refresh_lease(channel)
             return
 
-        if lease.owner_guid is not None and lease.confirmed:
+        resolver = authority.CLAIM_RESOLVERS.get(channel, authority._resolve_earlier)
+        resolves_on_timestamps_alone = getattr(resolver, "resolves_on_timestamps_alone", False)
+
+        if not resolves_on_timestamps_alone and lease.owner_guid is not None and lease.confirmed:
             # Actively held: never preempted, only queued (owner holds until idle).
-            lease.pending_claimant = authority.resolve_claim(lease.pending_claimant, candidate)
+            lease.pending_claimant = authority.resolve_claim(
+                lease.pending_claimant, candidate, channel
+            )
             return
 
         # Free, or only provisionally claimed (not yet confirmed by real
@@ -1884,9 +1902,9 @@ class SyncManager:
         # so two peers racing to claim a free channel converge on the same
         # winner regardless of which claim each sees first.
         current = (lease.claim_ts, lease.owner_guid) if lease.owner_guid is not None else None
-        best = authority.resolve_claim(current, candidate)
+        best = authority.resolve_claim(current, candidate, channel)
         if lease.pending_claimant is not None:
-            best = authority.resolve_claim(best, lease.pending_claimant)
+            best = authority.resolve_claim(best, lease.pending_claimant, channel)
         lease.pending_claimant = None
         if current is not None and best == current:
             return
@@ -1959,6 +1977,23 @@ class SyncManager:
             )
             return
         claim_ts = time.time()
+        # Damping, for the channels that ask for it (visibility): defer to a
+        # holder that is still actively asserting, rather than preempting it
+        # mid-action.  Withheld here rather than resolved away later so that
+        # every peer folds the same set of claims — see
+        # :func:`authority.claim_withheld_by_holdoff`.  Withholding is not a
+        # release, on the same grounds as the role refusal above.
+        self._settle_lease_expiry(channel)
+        lease = self._leases[channel]
+        if authority.claim_withheld_by_holdoff(
+            channel, lease.owner_guid, lease.claim_ts, self.self_guid, claim_ts
+        ):
+            _log(
+                f"claim_category: withheld {channel} — {(lease.owner_guid or '-')[:8]}"
+                f" claimed {claim_ts - (lease.claim_ts or claim_ts):.2f}s ago"
+                f" (hold-off {authority.CLAIM_HOLDOFFS[channel]:.2f}s)"
+            )
+            return
         self._apply_claim(channel, claim_ts, self.self_guid)
         self._send_message(
             ClaimOwnership(category=channel, peer_guid=self.self_guid, claim_ts=claim_ts)
@@ -2128,7 +2163,38 @@ class SyncManager:
         if self._peers.pop(peer_guid, None) is None:
             return
         _log(f"drop_peer: {peer_guid[:8]} ({len(self._peers)} remaining)")
+        self._release_peer_leases(peer_guid)
         self.elect_host()
+
+    def _release_peer_leases(self, peer_guid: str) -> None:
+        """Free every lease held by a departed peer, and forget its queued claims.
+
+        Re-electing alone is not enough now that visibility is leased.  Election
+        only decides the category while **no peer has claimed it**, so a departed
+        holder's lease would go on naming an absent peer until it expired,
+        leaving the session's view frozen for up to
+        ``LEASE_DURATIONS[CHANNEL_VISIBILITY]`` with no peer permitted to change
+        it — the exact failure re-election exists here to prevent, arriving by a
+        different route.
+
+        Applied to every channel rather than visibility alone: a departed peer
+        cannot be driving any of them, and a structure or position lease held by
+        an absent peer blocks the same way for as long as it lasts.
+
+        :param peer_guid: GUID of the peer that has left.
+        """
+        for channel in authority.LEASE_CHANNELS:
+            lease = self._leases[channel]
+            if lease.pending_claimant is not None and lease.pending_claimant[1] == peer_guid:
+                lease.pending_claimant = None
+            if lease.owner_guid != peer_guid:
+                continue
+            # Promote through the normal expiry path rather than clearing the
+            # owner here, so a queued claimant is granted by the same rule that
+            # would have granted it at expiry.
+            lease.deadline = 0.0
+            self._settle_lease_expiry(channel)
+            _log(f"lease[{channel}]: released — holder {peer_guid[:8]} departed")
 
     def request_state(self) -> None:
         """Send a ``STATE_REQUEST`` to the master and enter ``STATE_JOINING``.
@@ -2394,7 +2460,7 @@ class SyncManager:
         return out, authority.SUPPRESSED
 
     def _enforce_visibility(self, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
-        """Strip visibility fields when this peer is not the host.
+        """Strip visibility fields when this peer does not hold the visibility lease.
 
         **The** enforcement point for the visibility category, deliberately in
         one place rather than at each call site: the failure this guards against
@@ -2402,24 +2468,46 @@ class SyncManager:
         which still asserts what the session should look at.  Stripping the
         whole field group together makes that mistake unavailable.
 
+        Deliberately do NOT call ``_refresh_lease_confirmed`` from here.
+        The playback message restates ``view_mode``/``clip_guid`` on every send,
+        so a lease refreshed by its own heartbeat would never expire.
+
         :param state: Outgoing playback/view state dict.
         :returns: ``(state_to_send, status)`` where *status* is
             :data:`~otio_sync_core.authority.SENT` when the message goes out
             intact, or :data:`~otio_sync_core.authority.SUPPRESSED` when
             visibility fields were removed from it.
         """
-        if self.is_host or not authority.enforcement_enabled():
+        if not authority.enforcement_enabled():
             return state, authority.SENT
+
         if not authority.asserts_visibility(state):
             return state, authority.SENT
+
+        if not authority.ownership_enforcement_enabled():
+            if self.is_host:
+                return state, authority.SENT
+        else:
+            self._settle_lease_expiry(authority.CHANNEL_VISIBILITY)
+            lease_owner = self._leases[authority.CHANNEL_VISIBILITY].owner_guid
+            if lease_owner == self.self_guid:
+                return state, authority.SENT
+            if lease_owner is None and self.is_host:
+                return state, authority.SENT
+
         view_mode = state.get("view_mode")
         clip_guid = state.get("clip_guid")
+        self._settle_lease_expiry(authority.CHANNEL_VISIBILITY)
+        lease_owner = self._leases[authority.CHANNEL_VISIBILITY].owner_guid
+        effective_owner = lease_owner if (authority.ownership_enforcement_enabled() and lease_owner is not None) else self.host_guid
+        owner_str = (effective_owner or "unelected")[:8]
+
         self._log_field_strip(
             authority.VISIBILITY,
-            (view_mode, clip_guid, self.host_guid),
+            (view_mode, clip_guid, effective_owner),
             "broadcast_playback_state: stripped visibility fields"
             f" (mode={view_mode!r} clip={(clip_guid or '-')[:8]})"
-            f" — host is {(self.host_guid or 'unelected')[:8]}",
+            f" — owner is {owner_str}",
         )
         return authority.strip_visibility_fields(state), authority.SUPPRESSED
 

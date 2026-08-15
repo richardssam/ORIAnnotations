@@ -13,11 +13,29 @@ except ImportError:
     STATE_SYNCED = "synced"
 
 try:
-    from otio_sync_core.authority import SUPPRESSED, CHANNEL_POSITION, POSITION_FIELDS
+    from otio_sync_core.authority import (
+        SUPPRESSED, CHANNEL_POSITION, POSITION_FIELDS, CHANNEL_VISIBILITY,
+        position_frame,
+    )
 except ImportError:
     SUPPRESSED = "SUPPRESSED"
     CHANNEL_POSITION = "position"
     POSITION_FIELDS = ("current_time", "playing", "playback_mode")
+    CHANNEL_VISIBILITY = "visibility"
+
+    def position_frame(state):
+        if not any(f in state for f in POSITION_FIELDS):
+            return None
+        ct = state.get("current_time")
+        if not isinstance(ct, dict):
+            return None
+        value = ct.get("value")
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
 from utils import _log, _log_exc, _media_path, _clip_effective_range
 
@@ -316,7 +334,7 @@ class PlaybackSyncController:
         self._last_broadcast_frame = current_frame
         return status
 
-    def broadcast_view_state(self, clip_guid, view_mode):
+    def broadcast_view_state(self, clip_guid, view_mode, asserts_view=True):
         """Broadcast an explicit view-state change (clip and/or mode switch).
 
         This is the single source of a view-affecting broadcast: every local
@@ -326,17 +344,33 @@ class PlaybackSyncController:
         ``_cur_clip_guid`` via ``_broadcast_playback`` instead of duplicating
         this logic.
 
-        Visibility is host-owned, so this does **not** test whether RV may send
-        it: the manager strips ``view_mode``/``clip_guid`` from a follower's
+        Visibility is leased, so this does **not** test whether RV may send it:
+        the manager strips ``view_mode``/``clip_guid`` from a non-holder's
         message at the single core enforcement point and reports ``SUPPRESSED``,
         which is observed here only to log it.  Keeping the check out of the
         plugin is what stops the two applications drifting on it, and keeps the
         local view/position bookkeeping identical whichever role RV holds.
+
+        What the plugin *does* decide is whether the local event was a user
+        changing the shot, which is what :meth:`claim_category` needs and the
+        core cannot see.  *asserts_view* draws that line: RV's native selection
+        is a loop/highlight concept rather than a view switch (see
+        ``on_selection_changed``), so it passes ``False`` and rides whatever
+        lease this peer already holds instead of taking the category for a
+        highlight.  Claiming there would let merely highlighting a clip in the
+        session manager pull the whole session onto that shot.
+
+        :param clip_guid: GUID of the clip now being viewed, or ``None``.
+        :param view_mode: ``"sequence"`` or ``"source"``.
+        :param asserts_view: Whether this event is a user changing what is
+            shown, and so may claim the visibility lease.
         """
         if self.plugin._rv_updating or not self.plugin.sync_manager or self.plugin.sync_manager.status != STATE_SYNCED:
             return
         self._cur_view_mode = view_mode
         self._cur_clip_guid = clip_guid or None
+        if asserts_view:
+            self.plugin.sync_manager.claim_category(CHANNEL_VISIBILITY)
         if self._broadcast_playback() == SUPPRESSED:
             _log(
                 f"SEND view-state suppressed (not host): mode={view_mode}"
@@ -565,9 +599,15 @@ class PlaybackSyncController:
         # an OTIO sequence at 0, a normal view at 1).  Protocol value is a 0-based
         # offset into that view.
         base = self._frame_base()
-        target_frame = int(current_time.get("value", 0)) + base
+        # A present-but-unusable current_time asserts no more than an absent one
+        # (see authority.position_frame).  Reading it as 0 is what turned "said
+        # nothing" into "seek to the start"; the play state below still applies,
+        # because only the seek depended on the value.
+        _value = position_frame(data)
+        target_frame = None if _value is None else int(_value) + base
         _log(
-            f"RECV playback playing={playing} playback_mode={playback_mode} frame={target_frame} base={base}"
+            f"RECV playback playing={playing} playback_mode={playback_mode}"
+            f" frame={'-' if target_frame is None else target_frame} base={base}"
             f" value={current_time.get('value')} tl={timeline_guid} mode={view_mode}"
         )
 
@@ -584,7 +624,7 @@ class PlaybackSyncController:
                     _log(f"RECV playback: set playMode={target_play_mode} (playback_mode={playback_mode})")
             except Exception:
                 _log_exc("RECV playback: setPlayMode failed")
-            if rv.commands.frame() != target_frame:
+            if target_frame is not None and rv.commands.frame() != target_frame:
                 rv.commands.setFrame(target_frame)
             is_playing = rv.commands.isPlaying()
             if playing and not is_playing:
@@ -843,7 +883,11 @@ class PlaybackSyncController:
                     _clip_obj = self.plugin.sync_manager._object_map.get(clip_guid)
                     _clip_label = getattr(_clip_obj, "name", None) or clip_guid[:8]
                     _log(f"SEND view-state [selection-change]: clip '{_clip_label}' guid={clip_guid[:8]} node={node}")
-                    self.broadcast_view_state(clip_guid, self._cur_view_mode)
+                    # Highlight only, per the note above — not a view switch, so
+                    # it does not claim visibility.
+                    self.broadcast_view_state(
+                        clip_guid, self._cur_view_mode, asserts_view=False
+                    )
                     break
         event.reject()
 

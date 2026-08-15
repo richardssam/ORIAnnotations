@@ -78,13 +78,15 @@ class ScanThroughGuardTest(unittest.TestCase):
     """``_is_scan_through`` separates the playhead moving from the user choosing."""
 
     def setUp(self):
-        # __init__ wants a live plugin; the guard reads two attributes.
+        # __init__ wants a live plugin; the guard reads three attributes.
         self.ctl = playback_sync.PlaybackSyncController.__new__(
             playback_sync.PlaybackSyncController
         )
         self.ctl._last_polled_playing = True
         # Long ago, so the just-started race guard is not what answers.
         self.ctl._playing_started_at = time.monotonic() - 60.0
+        # Likewise long ago: the playhead is at rest unless a test says otherwise.
+        self.ctl._last_position_change_at = time.monotonic() - 60.0
 
     def guard(self, **kw):
         args = dict(is_seq_media=True, is_playlist=False, in_single_clip=False)
@@ -121,7 +123,8 @@ class ScanThroughGuardTest(unittest.TestCase):
         self.assertTrue(self.guard())
         self.assertFalse(self.guard(in_single_clip=True))
 
-    def test_not_playing_is_never_scan_through(self):
+    def test_a_settled_playhead_that_is_not_playing_is_not_scan_through(self):
+        """Nothing is moving, so a clip change is the user selecting one."""
         self.ctl._last_polled_playing = False
         self.assertFalse(self.guard())
 
@@ -130,6 +133,38 @@ class ScanThroughGuardTest(unittest.TestCase):
         session must not start out swallowing selections."""
         self.ctl._last_polled_playing = None
         self.assertFalse(self.guard())
+
+    # ── a scrub is scan-through too ────────────────────────────────────────
+
+    def test_a_paused_scrub_is_scan_through(self):
+        """The 2026-08-14 20:50 regression.
+
+        Dragging the playhead across a sequence changes the on-screen media
+        once per edit, exactly as playing it does — same events, same cause,
+        ``playing`` false.  The guard asked ``_last_polled_playing`` alone, so
+        every paused crossing escaped it and was taken for a user selection.
+        Downstream that read as a new clip isolation, which forced frame 0 and
+        jumped every peer to the start, over and over, mid-scrub.
+        """
+        self.ctl._last_polled_playing = False
+        self.ctl._last_position_change_at = time.monotonic()
+        self.assertTrue(self.guard())
+
+    def test_the_scrub_window_expires(self):
+        """A window, not a licence: a selection made after the drag settles is
+        still a selection."""
+        self.ctl._last_polled_playing = False
+        self.ctl._last_position_change_at = time.monotonic() - 5.0
+        self.assertFalse(self.guard())
+
+    def test_a_scrub_does_not_override_the_bin_click_escape(self):
+        """The escapes above the movement check still win — a bin click during a
+        scrub is the user picking media, not the sequence crossing an edit."""
+        self.ctl._last_polled_playing = False
+        self.ctl._last_position_change_at = time.monotonic()
+        self.assertFalse(self.guard(is_playlist=True))
+        self.assertFalse(self.guard(in_single_clip=True))
+        self.assertFalse(self.guard(is_seq_media=False))
 
     def test_first_event_after_play_starts_is_allowed_through(self):
         """Race guard: the poll can set playing before the show_atom for the

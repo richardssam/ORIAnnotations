@@ -957,6 +957,46 @@ class TestRunner:
         )
         return None
 
+    def _sample_ownership(self, app_ports):
+        """Record who each peer currently believes owns each leased channel.
+
+        Called around every contended command, because the evidence a
+        contention test needs is *transient*: by the time the commands finish
+        the lease has settled on one peer, and the end state of a run where two
+        peers fought is identical to one where only a single peer ever spoke.
+        Without a record taken while it was happening, a scenario that contends
+        with nobody passes exactly like one that contends properly — which is
+        what the first run of ``contended_visibility_selection`` did.
+
+        Accumulates into ``self._ownership_seen`` as
+        ``{channel: {owner_guid, ...}}``; :meth:`_ownership_was_contested`
+        reads it.
+        """
+        if not hasattr(self, "_ownership_seen"):
+            self._ownership_seen = {}
+        for _name, port in app_ports:
+            st = self.fetch_state(port)
+            if "error" in st:
+                continue
+            for channel, info in (st.get("broadcast_ownership") or {}).items():
+                owner = (info or {}).get("owner_guid")
+                if owner:
+                    self._ownership_seen.setdefault(channel, set()).add(owner)
+
+    def _ownership_was_contested(self, channel):
+        """Whether more than one peer was ever seen holding *channel*.
+
+        Deliberately weaker than "the hold-off fired": which peer wins and
+        whether a given claim was refused are both properties of the tie-break
+        that this is not trying to pin. What it does establish is that the
+        scenario actually produced a fight — the precondition every other
+        assertion about contention silently depends on.
+
+        :returns: ``(contested, owners_seen)``.
+        """
+        owners = (getattr(self, "_ownership_seen", {}) or {}).get(channel, set())
+        return len(owners) > 1, owners
+
     def _send_concurrent_commands(self, by_app_commands, app_ports):
         """Send one command to each named app at (as close to) the same instant.
 
@@ -1043,7 +1083,7 @@ class TestRunner:
         ("text", "openrv_to_xstudio"): annotation_assertions.expected_xstudio_font_size_from_rv_size,
     }
 
-    def _verify_annotation_geometry(self, app_ports, cfg):
+    def _verify_annotation_geometry(self, app_ports, cfg, app_type_by_name=None):
         """Verify a `draw_annotation` round-tripped to the peer within tolerance.
 
         `cfg` (from the test's `annotation_geometry` yaml block) names the
@@ -1056,6 +1096,9 @@ class TestRunner:
         """
         driver_name = cfg["driver"]
         peer_name = cfg["peer"]
+        # The assertions below differ by *application*, not by peer, and a
+        # two-of-a-kind test names its peers "xstudio#0"/"xstudio#1".
+        peer_app = (app_type_by_name or {}).get(peer_name, peer_name)
         kind = cfg.get("kind", "pen")
         nominal = float(cfg["nominal"])
         tolerance = float(cfg.get("tolerance", 1e-4))
@@ -1084,7 +1127,7 @@ class TestRunner:
             return False, f"{peer_name} reported no annotations before timeout"
 
         last = state["annotations"][-1]
-        if peer_name == "xstudio":
+        if peer_app == "xstudio":
             if kind == "text":
                 values = last.get("caption_font_size") or []
             else:
@@ -1108,7 +1151,7 @@ class TestRunner:
         # verification path (see design D5) — only exercised when the yaml
         # `annotation_geometry` block opts in with a `position` field.
         position_cfg = cfg.get("position")
-        if position_cfg is not None and kind == "text" and peer_name == "xstudio":
+        if position_cfg is not None and kind == "text" and peer_app == "xstudio":
             expected_pos = annotation_assertions.expected_xstudio_caption_position_from_rv_position(
                 tuple(float(v) for v in position_cfg)
             )
@@ -1265,6 +1308,36 @@ class TestRunner:
             return result
 
         apps = test_data['apps']
+        # Peer *names* are distinct from app *types*. The spawner needs the
+        # type ("xstudio" / "openrv"); everything that addresses a peer —
+        # concurrent_commands' by_app, expect_role, the ownership samplers, the
+        # log lines — needs a unique handle, and with two peers of the same
+        # type the type is not one. Two same-type peers silently collapsed into
+        # one entry in concurrent_commands' port_by_name lookup, so only one of
+        # them was ever driven.
+        #
+        # A type appearing once keeps its bare name, so every existing scenario
+        # and every "xstudio"/"openrv" reference in the YAML is unchanged.
+        peer_names = test_data.get('names')
+        if not peer_names:
+            _seen: dict[str, int] = {}
+            peer_names = []
+            for _app in apps:
+                if apps.count(_app) == 1:
+                    peer_names.append(_app)
+                else:
+                    peer_names.append(f"{_app}#{_seen.get(_app, 0)}")
+                    _seen[_app] = _seen.get(_app, 0) + 1
+        if len(peer_names) != len(apps):
+            raise ValueError(
+                f"{test_name}: 'names' has {len(peer_names)} entries for "
+                f"{len(apps)} apps — they must correspond one-to-one."
+            )
+        if len(set(peer_names)) != len(peer_names):
+            raise ValueError(f"{test_name}: peer names must be unique: {peer_names}")
+        #: Peer name -> app type, for the few places that genuinely branch on
+        #: the application rather than on which peer it is.
+        app_type_by_name = dict(zip(peer_names, apps))
         script_driven = script_driven or test_data.get('script_driven', False)
         recording = test_data.get('recording')
         recording_path = (
@@ -1332,7 +1405,41 @@ class TestRunner:
                             c["url"] = os.path.join(repo_root, c["url"])
                         return c
 
-                    for cmd in test_data['commands']:
+                    def _expand_repeats(cmd_list, _depth=0):
+                        """Flatten ``repeat`` blocks into a plain command list.
+
+                        Contention is a *sustained* property: one collision
+                        proves the tie-break runs, but whether a hold-off is
+                        sized right only shows up over repeated swaps, where a
+                        value set too low turns into view thrash. Writing that
+                        out by hand is a wall of duplicated YAML nobody will
+                        keep accurate, so a scenario says ``repeat`` and the
+                        expansion happens here — before URL resolution, so the
+                        body is resolved exactly like any other command.
+
+                        Nesting is allowed but bounded: a scenario that nests
+                        deeply is almost certainly a mistake, and an unbounded
+                        recursion here would hang the runner rather than fail
+                        it.
+                        """
+                        if _depth > 3:
+                            raise ValueError(
+                                "repeat: nested more than 3 deep — refusing to expand"
+                            )
+                        out = []
+                        for entry in cmd_list:
+                            if entry.get("action") != "repeat":
+                                out.append(entry)
+                                continue
+                            times = int(entry.get("times", 1))
+                            if times < 0:
+                                raise ValueError(f"repeat: times must be >= 0, got {times}")
+                            body = entry.get("commands") or []
+                            for _ in range(times):
+                                out.extend(_expand_repeats(body, _depth + 1))
+                        return out
+
+                    for cmd in _expand_repeats(test_data['commands']):
                         cmd = _resolve_url(cmd)
                         # concurrent_commands nests its per-app commands under
                         # by_app instead of at the top level, so the resolution
@@ -1451,8 +1558,14 @@ class TestRunner:
                 env_extra = dict(role_env)
                 if role_env and i < len(users) and users[i]:
                     env_extra["ORI_SYNC_USER"] = users[i]
-                spawner.launch(app_name, port, session_file=fixture, env_extra=env_extra)
-                app_ports.append((app_name, port))
+                # Launch by app type; address by peer name. The spawner already
+                # keys its logs on the port, so two peers of one type stay
+                # separable without anything further here.
+                spawner.launch(
+                    app_name, port, session_file=fixture, env_extra=env_extra,
+                    peer_name=peer_names[i],
+                )
+                app_ports.append((peer_names[i], port))
 
             logging.info("Apps launched. Waiting for all apps to connect...")
             if not self._wait_for_all_apps(app_ports, timeout=90.0):
@@ -1625,6 +1738,17 @@ class TestRunner:
                         by_app = cmd.get("by_app", {})
                         logging.info(f"  -> Sending concurrent commands: {by_app}")
                         results = self._send_concurrent_commands(by_app, app_ports)
+                        # Pace deliberately. The single-app path below sleeps
+                        # 1.0s between commands; this branch `continue`s past
+                        # it, so an unpaced repeat fires every ~90ms. That is
+                        # faster than peers learn each other's claims over the
+                        # wire, so each peer self-grants locally, both believe
+                        # they own the channel, and nothing is ever refused —
+                        # a contention test that contends with nobody.
+                        # Default to 1.0s to match the ordinary command path.
+                        self._sample_ownership(app_ports)
+                        time.sleep(float(cmd.get("settle", 1.0)))
+                        self._sample_ownership(app_ports)
                         for name, res in results.items():
                             if "error" in res:
                                 logging.error(
@@ -1638,6 +1762,27 @@ class TestRunner:
                     # Confirms the lease actually settles on one peer after a
                     # concurrent_commands contention, rather than staying
                     # split between two peers' local views forever.
+                    # Guards the contention scenarios against passing vacuously.
+                    # Convergence alone cannot do it: a run in which only one
+                    # peer ever claimed converges instantly and looks perfect.
+                    if action == "expect_ownership_contested":
+                        channel = cmd.get("channel", "visibility")
+                        contested, owners = self._ownership_was_contested(channel)
+                        if not contested:
+                            logging.error(
+                                f"Only {len(owners)} peer ever held the {channel} "
+                                f"lease ({[o[:8] for o in owners]}) — the scenario "
+                                "never produced contention, so anything it asserts "
+                                "about contention is vacuous."
+                            )
+                            failed = True
+                            break
+                        logging.info(
+                            f"  -> {channel} lease was contested: held by "
+                            f"{sorted(o[:8] for o in owners)} during the run"
+                        )
+                        continue
+
                     if action == "expect_ownership_convergence":
                         channel = cmd.get("channel", "position")
                         timeout = cmd.get("timeout", 15.0)
@@ -1684,16 +1829,17 @@ class TestRunner:
                         target = cmd.get("app")
                         inner = dict(cmd.get("command") or {})
                         others = [(n, p) for n, p in app_ports if n != target]
-                        before = {n: (self.fetch_state(p) or {}).get("frame") for n, p in others}
+                        check_key = "timeline" if inner.get("action") == "set_selection" else "frame"
+                        before = {n: (self.fetch_state(p) or {}).get(check_key) for n, p in others}
                         port = next((p for n, p in app_ports if n == target), None)
                         if port is None:
                             logging.error(f"expect_no_propagation: no app named {target!r}")
                             failed = True
                             break
-                        logging.info(f"  -> {target} (restricted) sends {inner}")
+                        logging.info(f"  -> {target} (restricted) sends {inner} (watching {check_key})")
                         self.send_command(port, inner)
                         time.sleep(float(cmd.get("settle", 4.0)))
-                        after = {n: (self.fetch_state(p) or {}).get("frame") for n, p in others}
+                        after = {n: (self.fetch_state(p) or {}).get(check_key) for n, p in others}
                         moved = [n for n in before if before[n] != after[n]]
                         if moved:
                             logging.error(
@@ -2049,7 +2195,9 @@ class TestRunner:
             # real codec constants (see `annotation_assertions`).
             annotation_geometry = test_data.get("annotation_geometry")
             if not failed and annotation_geometry:
-                ok, msg = self._verify_annotation_geometry(app_ports, annotation_geometry)
+                ok, msg = self._verify_annotation_geometry(
+                        app_ports, annotation_geometry, app_type_by_name
+                    )
                 if ok:
                     logging.info(f"✅ Annotation geometry round-trip verified: {annotation_geometry}")
                 else:
@@ -2253,7 +2401,9 @@ class TestRunner:
             # Save session states
             for name, port in app_ports:
                 try:
-                    ext = ".xst" if name == "xstudio" else ".rv"
+                    # Keyed on the app type, not the peer name: "xstudio#1"
+                    # would otherwise be saved as a .rv session.
+                    ext = ".xst" if app_type_by_name.get(name) == "xstudio" else ".rv"
                     session_file = os.path.join(spawner.logs_dir, f"{name}_{port}{ext}")
                     session_file = os.path.abspath(session_file)
                     res = self.send_command(port, {"action": "save_session", "filepath": session_file})

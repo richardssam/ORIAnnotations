@@ -342,3 +342,73 @@ def test_suppressed_broadcast_still_reaches_the_network():
     rv.broadcast_playback_state(_view_state())
 
     assert len(_playback_payloads(rv)) == 1
+
+
+def test_visibility_lease_holder_sends_intact(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "1")
+    rv = _synced("guid-rv", "openrv", is_host=False)
+
+    rv.claim_category(authority.CHANNEL_POSITION)
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    status = rv.broadcast_playback_state(_view_state())
+    assert status == authority.SENT
+    sent = _playback_payloads(rv)[-1]
+    assert sent["view_mode"] == "source"
+    assert sent["clip_guid"] == "clip-abc"
+
+
+def test_host_visibility_stripped_when_another_peer_holds_lease(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "1")
+    xs = _synced("guid-xs", "xstudio", is_host=True)
+
+    xs._apply_claim(authority.CHANNEL_VISIBILITY, 1.0, "someone-else")
+
+    status = xs.broadcast_playback_state(_view_state())
+    assert status == authority.SUPPRESSED
+    sent = _playback_payloads(xs)[-1]
+    assert "view_mode" not in sent
+    assert "clip_guid" not in sent
+
+
+def test_host_sends_visibility_when_nobody_claims(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "1")
+    xs = _synced("guid-xs", "xstudio", is_host=True)
+
+    xs.claim_category(authority.CHANNEL_POSITION)
+
+    status = xs.broadcast_playback_state(_view_state())
+    assert status == authority.SENT
+    sent = _playback_payloads(xs)[-1]
+    assert sent["view_mode"] == "source"
+
+
+def test_position_and_visibility_strip_independently(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "1")
+    rv = _synced("guid-rv", "openrv", is_host=False)
+
+    rv.claim_category(authority.CHANNEL_POSITION)
+
+    status = rv.broadcast_playback_state(_view_state())
+    assert status == authority.SUPPRESSED
+    sent = _playback_payloads(rv)[-1]
+    assert sent["playing"] is True
+    assert "current_time" in sent
+    assert "view_mode" not in sent
+    assert "clip_guid" not in sent
+
+
+def test_kill_switches_revert_leased_visibility(monkeypatch):
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "0")
+    rv = _synced("guid-rv", "openrv", is_host=False)
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+    status = rv.broadcast_playback_state(_view_state())
+    assert status == authority.SUPPRESSED
+
+    monkeypatch.setenv(authority.ENFORCEMENT_ENV, "0")
+    monkeypatch.setenv(authority.OWNERSHIP_ENFORCEMENT_ENV, "1")
+    rv.claim_category(authority.CHANNEL_POSITION)
+    status = rv.broadcast_playback_state(_view_state())
+    assert status == authority.SENT
+    sent = _playback_payloads(rv)[-1]
+    assert sent["view_mode"] == "source"

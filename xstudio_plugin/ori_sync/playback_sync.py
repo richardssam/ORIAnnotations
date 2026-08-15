@@ -19,7 +19,9 @@ from xstudio.core import (
     get_global_playhead_events_atom, viewport_atom, active_viewport_atom,
 )
 from otio_sync_core.manager import STATE_SYNCED
-from otio_sync_core.authority import CHANNEL_POSITION, POSITION_FIELDS
+from otio_sync_core.authority import (
+    CHANNEL_POSITION, POSITION_FIELDS, CHANNEL_VISIBILITY, position_frame,
+)
 from .utils import _log, _log_exc, bounded, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread playhead/viewport reads.  Generous
@@ -47,6 +49,21 @@ _SCRUB_BROADCAST_INTERVAL = 0.05
 # the race during rapid scrubbing; this rolling window covers the lag.  Refreshed
 # on every received message, so it only expires once the peer stops driving.
 _PLAYBACK_ECHO_GUARD_S = 0.4
+
+# How long to wait for a replaced playhead to settle before seeking it.  A source
+# switch fires two viewport_playhead_atom Form-2 events roughly 200 ms apart, each
+# updating active_playhead; seeking before the last one lands targets an actor
+# that is about to be replaced.
+_PLAYHEAD_SETTLE_S = 0.300
+
+# How long after the local playhead last moved this peer still counts as
+# scrubbing.  A clip change inside this window is the sequence crossing an edit,
+# not a user isolating a clip: an isolation is a discrete act and cannot happen
+# while the playhead is travelling.  Comfortably longer than the poll interval
+# that samples the position, so a gap between samples mid-drag does not read as
+# a stop, and short enough that a double-click straight after a scrub still
+# registers as the isolation it is.
+_SCRUB_SETTLE_S = 0.5
 
 # Programmatically highlighting the selected clip inside a sequence track (via a
 # raw item_selection_atom send) can crash xStudio: the send into a recently-rebuilt
@@ -139,6 +156,11 @@ class PlaybackSyncController:
         # exact guid and a longer window so the delayed show_atom is still caught.
         self._applied_clip_echo_guid: "str | None" = None
         self._applied_clip_echo_until: float = 0.0
+        # The view mode that went with _applied_clip_echo_guid.  Recorded so a
+        # *mode* transition can be echo-matched too: "returned to sequence view"
+        # carries no clip, so the guid alone cannot tell a peer's sequence
+        # message from the user pressing the same button here.
+        self._applied_view_mode: "str | None" = None
         # Scrub-broadcast throttle: xStudio fires a "Logical Frame" attribute
         # change per rendered frame while dragging the playhead (~60 Hz), far
         # faster than peers need to stay in sync.  Position-only updates are
@@ -160,7 +182,6 @@ class PlaybackSyncController:
         # applied it — unlike _last_applied_frame, which only tracks applies.
         # While a peer is driving, this is what that peer believes the position
         # to be, and so the only safe value for us to put on the wire.
-        self._last_received_frame: int | None = None
         self._last_polled_playing: bool | None = None
         # Monotonic deadline until which local playhead attribute_changed events
         # are NOT re-broadcast.  Armed on *receipt* of every remote playback
@@ -185,6 +206,11 @@ class PlaybackSyncController:
         # Used to allow the first show_atom after play-start to broadcast even
         # though _last_polled_playing is already True (race-condition guard).
         self._playing_started_at: float = 0.0
+        # Monotonic timestamp of when the local playhead last changed frame, by
+        # any means.  Distinct from _playing_started_at: a user dragging the
+        # playhead moves it continuously with playing=False, and that is still
+        # the playhead running through the sequence.
+        self._last_position_change_at: float = 0.0
 
         # Most recent show_atom media — tracked unconditionally so the PSM
         # True→False handler can broadcast mode=source even when the show_atom
@@ -244,6 +270,7 @@ class PlaybackSyncController:
         self._local_view_action_until = 0.0
         self._applied_clip_echo_guid = None
         self._applied_clip_echo_until = 0.0
+        self._applied_view_mode = None
         self._last_scrub_broadcast_at = 0.0
         self._pending_scrub_state = None
         self._pending_scrub_due = 0.0
@@ -254,10 +281,10 @@ class PlaybackSyncController:
         self._last_scanned_playhead_key = None
         self._last_polled_frame = None
         self._last_applied_frame = None
-        self._last_received_frame = None
         self._last_polled_playing = None
         self._playback_apply_suppress_until = 0.0
         self._playing_started_at = 0.0
+        self._last_position_change_at = 0.0
         self._last_show_atom_media = None
         self._last_show_atom_seq_tl_guid = None
         self._last_show_atom_at = 0.0
@@ -275,9 +302,10 @@ class PlaybackSyncController:
     ) -> bool:
         """Is this ``show_atom`` playback moving through a sequence, not a selection?
 
-        xStudio fires a ``show_atom`` whenever the on-screen media changes, and
-        a playing sequence changes it once per edit.  Those are not user
-        selections and must not be broadcast as view state.
+        xStudio fires a ``show_atom`` whenever the on-screen media changes, and a
+        sequence changes it once per edit — whether it is playing or the user is
+        dragging the playhead through it.  Those are not user selections and must
+        not be broadcast as view state.
 
         The four ways an event escapes the guard:
 
@@ -311,9 +339,15 @@ class PlaybackSyncController:
         """
         if not is_seq_media or is_playlist or in_single_clip:
             return False
-        if not self._last_polled_playing:
-            return False
-        return (time.monotonic() - self._playing_started_at) >= 0.3
+        # A scrub is scan-through too.  This used to ask ``_last_polled_playing``
+        # alone, which reads the docstring above too literally: a *playing*
+        # sequence changes the on-screen media once per edit, and so does one the
+        # user is dragging the playhead through — same events, same cause,
+        # ``playing`` false.  Every paused crossing therefore escaped the guard
+        # and was taken for a user selection (2026-08-14 20:50:44-47).
+        if self._last_polled_playing:
+            return (time.monotonic() - self._playing_started_at) >= 0.3
+        return (time.monotonic() - self._last_position_change_at) < _SCRUB_SETTLE_S
 
     def cached_viewed_timeline_guid(self, ttl: float = 0.5) -> str | None:
         """Return the viewed timeline guid, cached for *ttl* seconds.
@@ -398,7 +432,7 @@ class PlaybackSyncController:
                         if _media_name_hint:
                             break
 
-                _is_remote, _prov_note = self._provenance()
+                _, _prov_note = self._provenance()
                 _log(
                     f"[SEL] show_atom media-change: name={_media_name_hint!r}"
                     f" uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}"
@@ -580,8 +614,8 @@ class PlaybackSyncController:
                     # Local bookkeeping above runs either way — this peer really
                     # is viewing that clip now, whoever caused it.  Only the
                     # *broadcast* is conditional.
-                    _is_remote, _prov_note = self._provenance()
-                    if self._induced_by_remote_annotation():
+                    _, _prov_note = self._provenance()
+                    if self._induced_by_remote_apply():
                         # An annotation must never change what the session is
                         # looking at.  Applying a peer's stroke makes xStudio
                         # *show* the annotated clip, which was being read as a
@@ -711,7 +745,7 @@ class PlaybackSyncController:
             and (isinstance(event[1], source_atom) or isinstance(event[1], selection_changed_atom))
         ):
             return
-        _is_remote, _prov_note = self._provenance()
+        _, _prov_note = self._provenance()
         _log(
             f"[SEL] Selection event fired ({type(event[1]).__name__}) — queuing resolution"
             f"{_prov_note}"
@@ -736,13 +770,39 @@ class PlaybackSyncController:
         """Enqueue selection resolution to the poll thread command queue."""
         self.plugin._cmd_queue.put(("resolve_selection", None))
 
-    def _provenance(self) -> tuple[bool, str]:
-        """Return (is_remote_induced, log_suffix) for the current moment.
+    def suppress_selection_broadcast(self, seconds: float) -> None:
+        """Withhold selection/view broadcasts for *seconds*, for a change we caused.
 
-        is_remote_induced is True if this selection/change is attributable to a
-        recently applied remote message (within the settling window). The suffix
-        is empty when nothing a peer sent accounts for what just happened — the
-        ordinary case of a user acting on this machine.
+        The guard itself is this controller's state, but the calls that need it
+        are not all here: the display controller puts the snapshot's first
+        timeline on screen as the last step of a session build, and that emits
+        the same ``show_atom`` burst as a selection switch.  Exposing the arming
+        rather than the attribute keeps the window a decision of the code that
+        knows what it just did, instead of something a caller reaches in and
+        sets.
+
+        Extends rather than replaces an active window, so a shorter call cannot
+        cut a longer one short.
+
+        :param seconds: How long to withhold, from now.
+        """
+        self._selection_broadcast_suppress_until = max(
+            self._selection_broadcast_suppress_until, time.monotonic() + seconds
+        )
+
+    def _provenance(self) -> tuple[bool, str]:
+        """Return (a remote apply is in flight, log_suffix) for the current moment.
+
+        **Diagnostic, not a gate.** The suffix names whatever remote message is
+        currently in flight or settling, so a log line can be read back against
+        the peer that may have caused it.  The boolean is deliberately no longer
+        consulted by any decision: it is true for *any* remote message inside
+        the manager's 5 s settle window regardless of what that message was or
+        did, which made it wrong in the only situation that matters — two peers
+        driving, where the other peer is nearly always inside somebody's settle
+        window.  See :meth:`_view_assertion_is_echo`, which replaced it, and
+        keep the ``?`` in the log text: the note asks a question, it does not
+        answer one.
         """
         try:
             ctx = self.plugin.manager.remote_apply_context() if self.plugin.manager else None
@@ -757,17 +817,60 @@ class PlaybackSyncController:
         )
         return True, note
 
-    #: Message schema/event pairs that carry annotation content.  Applying one
-    #: makes xStudio *show* the annotated clip, which is why they are the ones
-    #: that must never be mistaken for a local view action.  ``INSERT_CHILD`` is
-    #: ambiguous — it also carries structural inserts — and is included
-    #: deliberately: a remote structural change is not a local view action
-    #: either, and the tight window below is what keeps that from over-reaching.
-    _ANNOTATION_INDUCERS = {
-        ("Annotation.1", "PARTIAL"),
-        ("OTIO_SESSION_1.0", "REPLACE_ANNOTATION_COMMANDS"),
-        ("OTIO_SESSION_1.0", "INSERT_CHILD"),
-    }
+    def _view_assertion_is_echo(
+        self, clip_guid: "str | None", view_mode: "str | None"
+    ) -> "tuple[bool, str]":
+        """Whether asserting *(clip_guid, view_mode)* would merely echo a peer.
+
+        Returns ``(is_echo, reason)``; the reason is for the log line, so a
+        suppression can be read back as *why* rather than just *that*.
+
+        This replaces gating these broadcasts on :meth:`_provenance`'s boolean,
+        which was wrong in a way that only shows up with two people driving.
+        ``_provenance()`` is true for **any** remote message inside the
+        manager's 5 s settle window, with no filter on what the message was or
+        what it did — so once a peer sent anything, this peer stopped asserting
+        its own view for up to five seconds.  Observed 2026-08-15 14:19:03-07:
+        three consecutive genuine local selections on the client were charged to
+        one of the host's ``PLAYBACK_SETTINGS_1.0/SET`` messages at ages 1.76 s,
+        3.59 s and 4.90 s, and two were suppressed outright.  Each was provably
+        local — the client reached ``seq_C``, ``seq_D`` and ``graphic`` *before*
+        the host did — so it was leading and being silenced for it.
+
+        A window cannot separate those from real echoes: the false positives sat
+        at 1.76 s and the true ones at 1.52-1.90 s.  The discriminator has to be
+        *what* is being asserted, not *when*:
+
+        - **In-apply** is a scope, not a guess: if we are literally inside a
+          remote apply, the change is that apply's.
+        - **The same view we were just told to adopt** is an echo, however late
+          it arrives — this is the existing ``_applied_clip_echo_*`` guard's
+          question, asked at the broadcast site instead of only at the
+          ``show_atom`` site.  A *different* clip is a local action by
+          definition: a peer's message cannot make this peer switch to a clip
+          the peer never mentioned.
+        - **The narrow inducer table** still covers the cases where a peer's
+          message moves the view without naming one (an annotation, a snapshot),
+          which is what :meth:`_induced_by_remote_apply` exists for.
+
+        :param clip_guid: The clip about to be asserted, or ``None``.
+        :param view_mode: ``"source"`` / ``"sequence"``, or ``None``.
+        :rtype: tuple[bool, str]
+        """
+        if self._induced_by_remote_apply():
+            return True, "remote-induced"
+        try:
+            ctx = self.plugin.manager.remote_apply_context() if self.plugin.manager else None
+        except Exception:
+            ctx = None
+        if ctx and ctx.get("in_apply"):
+            return True, "inside remote apply"
+        if time.monotonic() < self._applied_clip_echo_until and (
+            clip_guid == self._applied_clip_echo_guid
+            and view_mode == self._applied_view_mode
+        ):
+            return True, "echo of the view we were just sent"
+        return False, ""
 
     #: How long after an annotation apply returns a show_atom is still
     #: attributable to it.  Deliberately far tighter than the manager's 5 s
@@ -779,16 +882,47 @@ class PlaybackSyncController:
     #: unaffected by a slow poll tick.
     _ANNOTATION_VIEW_ECHO_S = 1.0
 
-    def _induced_by_remote_annotation(self) -> bool:
-        """Whether this moment is attributable to a remote *annotation* apply.
+    #: How long a show_atom remains attributable to applying a session snapshot.
+    #: A snapshot is a bulk session build — playlists, media, a deferred
+    #: on-screen source — so its show_atoms trail the apply by far more than an
+    #: annotation's do (1.63 s observed on 2026-08-15).  Generous because the
+    #: whole window sits inside joining, where this peer has no view to assert
+    #: anyway; the cost of over-reaching is a suppressed first click, and the
+    #: cost of under-reaching is moving every other peer.
+    _SNAPSHOT_VIEW_ECHO_S = 5.0
+
+    #: Remote applies that change what is *on screen* without being a view
+    #: instruction, mapped to how long that remains true.  A show_atom during
+    #: one of these windows is a consequence of the apply, not a user acting.
+    #:
+    #: ``INSERT_CHILD`` is ambiguous — it also carries structural inserts — and
+    #: is included deliberately: a remote structural change is not a local view
+    #: action either, and the tight window keeps that from over-reaching.
+    #:
+    #: ``STATE_SNAPSHOT`` is here because joining a session is not a user
+    #: action.  Without it, a peer joining a session whose host was mid-shot
+    #: broadcast the *first* clip at frame 0 and dragged the host onto it
+    #: (2026-08-15 09:07:37).  Playback messages are deliberately absent: those
+    #: legitimately change this peer's view, and the existing echo guards
+    #: already handle not re-broadcasting them.
+    _VIEW_INDUCERS = {
+        ("Annotation.1", "PARTIAL"): _ANNOTATION_VIEW_ECHO_S,
+        ("OTIO_SESSION_1.0", "REPLACE_ANNOTATION_COMMANDS"): _ANNOTATION_VIEW_ECHO_S,
+        ("OTIO_SESSION_1.0", "INSERT_CHILD"): _ANNOTATION_VIEW_ECHO_S,
+        ("LiveSession.1", "STATE_SNAPSHOT"): _SNAPSHOT_VIEW_ECHO_S,
+    }
+
+    def _induced_by_remote_apply(self) -> bool:
+        """Whether this moment is attributable to a remote apply that moved the view.
 
         Narrower than :meth:`_provenance` in both axes, and both narrowings
         matter.  By **schema**, because a remote playback message legitimately
         changes this peer's view and the existing echo guards already handle
-        re-broadcasting that; an annotation never legitimately changes it.  By
-        **time**, because provenance stays true for 5 s and a view broadcast
-        suppressed on that basis would swallow genuine local view changes for
-        5 s after every peer's stroke — trading a wrong view for a missing one.
+        re-broadcasting that.  By **time**, because provenance stays true for 5 s
+        and suppressing a view broadcast on that basis alone would swallow
+        genuine local view changes for 5 s after every peer's stroke — trading a
+        wrong view for a missing one.  Each inducer therefore carries its own
+        window, sized to the causal chain it actually starts.
 
         :rtype: bool
         """
@@ -798,12 +932,13 @@ class PlaybackSyncController:
             return False
         if not ctx:
             return False
-        if (ctx.get("command_schema"), ctx.get("event")) not in self._ANNOTATION_INDUCERS:
+        window = self._VIEW_INDUCERS.get((ctx.get("command_schema"), ctx.get("event")))
+        if window is None:
             return False
         if ctx.get("in_apply"):
             return True
         settling_for = ctx.get("settling_for")
-        return settling_for is not None and settling_for <= self._ANNOTATION_VIEW_ECHO_S
+        return settling_for is not None and settling_for <= window
 
     def _read_pinned_source_mode_fresh(self) -> "bool | None":
         """Read Pinned Source Mode now, from a live playhead (bounded).
@@ -1076,6 +1211,12 @@ class PlaybackSyncController:
                     return
 
         # Update cache to prevent redundant broadcasts
+        if frame != self._last_polled_frame:
+            # When the local playhead last moved, however it moved.  A scrub is
+            # a moving playhead with ``playing`` false, so anything that asks
+            # "is the playhead running through the sequence?" has to consult
+            # this and not ``playing`` alone.
+            self._last_position_change_at = time.monotonic()
         self._last_polled_playing = playing
         self._last_polled_frame = frame
 
@@ -1302,7 +1443,7 @@ class PlaybackSyncController:
                             # is polled, so it is observed well after the remote
                             # apply that may have caused it: this is the site the
                             # settle window exists for.
-                            _is_remote, _prov_note = self._provenance()
+                            _, _prov_note = self._provenance()
                             _log(
                                 f"[SEL] Pinned Source Mode:"
                                 f" {self._last_pinned_source_mode} → {psm}"
@@ -1314,8 +1455,9 @@ class PlaybackSyncController:
                                 seq_tl_guid = self.plugin.manager.sequence_timeline_guid
                                 if seq_tl_guid:
                                     self.plugin.manager.active_timeline_guid = seq_tl_guid
-                                if _is_remote:
-                                    _log("[SEL] → broadcast view-state suppressed (remote-induced)")
+                                _echo, _why = self._view_assertion_is_echo(None, "sequence")
+                                if _echo:
+                                    _log(f"[SEL] → broadcast view-state suppressed ({_why})")
                                 else:
                                     self.broadcast_view_state(None, "sequence")
                                     _log("[SEL] → broadcast view-state: sequence (returned to sequence view)")
@@ -1355,18 +1497,27 @@ class PlaybackSyncController:
                                         # This used to be decided by a time window — "is the
                                         # echo guard armed, i.e. was a peer driving in the
                                         # last N ms?" — which is a guess, and the mechanism
-                                        # that kept failing.  Under host-owned visibility the
-                                        # question is answerable rather than guessable: only
-                                        # the host's isolations are user-caused, because a
-                                        # follower's can only have come from applying someone
-                                        # else's message.  A follower therefore never claims
-                                        # the auto-play; override=None falls back to
-                                        # broadcast_view_state's default of playing=False —
+                                        # that kept failing.  Asking who holds the visibility
+                                        # lease is answerable rather than guessable: a peer
+                                        # that does not hold it is, by definition, not the one
+                                        # driving the view, so its isolation is far more
+                                        # likely to be the tail of an applied message than a
+                                        # user's own double-click.  A non-holder therefore
+                                        # never claims the auto-play; override=None falls back
+                                        # to broadcast_view_state's default of playing=False —
                                         # "do not assert play" — leaving the play state to
                                         # whoever is actually driving.
+                                        #
+                                        # Note this is a *claim* decision only.  It must not
+                                        # be copied into any branch that also changes what
+                                        # this peer displays: gating half of a two-part action
+                                        # on ownership is what made an isolation reset the
+                                        # local frame while announcing a different one
+                                        # (`lease-visibility-authority` 9.9).
                                         _may_claim = self.plugin.manager.owns_visibility()
-                                        if _is_remote:
-                                            _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} suppressed (remote-induced)")
+                                        _echo, _why = self._view_assertion_is_echo(_cg, "source")
+                                        if _echo:
+                                            _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} suppressed ({_why})")
                                         else:
                                             self.broadcast_view_state(
                                                 _cg, "source",
@@ -1376,7 +1527,8 @@ class PlaybackSyncController:
                                                 f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} "
                                                 "mode=source playing="
                                                 + ("True" if _may_claim
-                                                   else "(unforced — not host, so not a local isolation)")
+                                                   else "(unforced — visibility lease held elsewhere,"
+                                                        " so not a local isolation)")
                                             )
                                     else:
                                         _log(f"[SEL] PSM True→False: no clip_guid for {_media_h!r}")
@@ -1416,9 +1568,9 @@ class PlaybackSyncController:
                     _rctg = self.plugin.manager.get_or_create_clip_timeline(_rcg)
                     if _rctg:
                         self.plugin.manager.active_timeline_guid = _rctg
-                    _is_remote, _prov_note = self._provenance()
-                    if _is_remote:
-                        _log(f"[SEL] → reliable selection broadcast suppressed (remote-induced)")
+                    _echo, _why = self._view_assertion_is_echo(_rcg, "source")
+                    if _echo:
+                        _log(f"[SEL] → reliable selection broadcast suppressed ({_why})")
                     else:
                         self.broadcast_view_state(_rcg, "source")
                         _log(f"[SEL] → broadcast view-state clip {_rcg[:8]} mode=source (from selection, reliable)")
@@ -1554,9 +1706,75 @@ class PlaybackSyncController:
         _log(f"Event: queuing playback_mode broadcast mode={wire_mode} (source_attr=Loop Mode)")
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
+    #: How many poll ticks a joiner will wait for a playhead before giving up on
+    #: adopting the session's view.  The build sets an on-screen source that is
+    #: applied on a later tick and acquires a playhead after that, so the first
+    #: attempt is expected to fail; this is generous enough to cover a slow media
+    #: load and short enough that a joiner into a session it can never display
+    #: stops retrying rather than logging forever.
+    _JOIN_PLAYBACK_MAX_ATTEMPTS = 20
+
+    def apply_join_playback_state(self, attempt: int = 0) -> None:
+        """Adopt the session's view after this peer's own session build.
+
+        The manager applies a snapshot's ``playback_state`` once, on receipt,
+        which for a joiner is before its playlists, media, viewport or playhead
+        exist.  That apply lands on nothing and is never revisited, so the joiner
+        keeps whatever its build put on screen — the snapshot's *first* timeline
+        — while the host stays where it was.  Joining should adopt the session's
+        view, not merely avoid disturbing it.
+
+        Retries because the ordering is inherently deferred: ``do_load_timelines``
+        parks an on-screen source that ``get_viewport`` applies on a later tick,
+        and the playhead is acquired after that.  Re-queues rather than sleeping,
+        so a joiner waiting for media does not hold the poll thread.
+
+        :param attempt: How many times this has already been re-queued.
+        """
+        manager = self.plugin.manager
+        if not manager or not manager.playback_state:
+            return
+        if self.plugin.active_playhead is None:
+            if attempt >= self._JOIN_PLAYBACK_MAX_ATTEMPTS:
+                _log(
+                    "[JOIN] giving up adopting the session's view —"
+                    f" no playhead after {attempt} attempts"
+                )
+                return
+            self.plugin._cmd_queue.put(("apply_join_playback", {"attempt": attempt + 1}))
+            return
+        state = manager.playback_state
+        _log(
+            f"[JOIN] adopting the session's view (attempt {attempt}):"
+            f" mode={state.get('view_mode')} clip={(state.get('clip_guid') or '-')[:8]}"
+            f" frame={(state.get('current_time') or {}).get('value')}"
+        )
+        # Applied through the ordinary remote-apply path so the view switch, the
+        # seek and the echo guards all behave exactly as they do for a peer's
+        # message — this is the session telling us what to look at, and the only
+        # thing unusual about it is when it arrives.
+        self.apply_playback_state(state)
+
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def current_playback_state(self) -> dict | None:
-        """Return the local playback state dict for inclusion in a state snapshot."""
+        """Return the local playback state dict for inclusion in a state snapshot.
+
+        Carries the **view** as well as the position.  A snapshot that says only
+        "frame 48" tells a joiner where to be inside something it was never told
+        the identity of, so it lands on whatever its own session build happened
+        to put on screen — the first clip — at a frame borrowed from a different
+        one.  Observed 2026-08-15 09:18:42: the host was on frame 48 of an
+        isolated clip, the snapshot carried ``current_time`` and nothing else,
+        and the joiner sat on the first clip while the host stayed where it was.
+
+        These fields are the ones :meth:`broadcast_view_state` sets explicitly
+        and that ``_enforce_visibility`` strips from a peer that does not hold
+        the visibility lease.  Neither applies here: a snapshot is not a
+        broadcast asserting a view, it is an answer to "what is this session
+        looking at", and the peer answering is the master.  An idle host whose
+        visibility lease has lapsed is still the peer whose screen the joiner
+        must match.
+        """
         ph = self.plugin.active_playhead
         if not ph:
             return None
@@ -1577,6 +1795,8 @@ class PlaybackSyncController:
                     "rate": fps,
                 },
                 "playback_mode": self._get_playback_mode(),
+                "view_mode": self._cur_view_mode,
+                "clip_guid": self._cur_clip_guid,
             }
         except Exception:
             return None
@@ -1597,14 +1817,58 @@ class PlaybackSyncController:
         """
         if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
             return
+        # Nothing here asks whether this call was a local user action.  It always
+        # is: every caller gates on :meth:`_view_assertion_is_echo` before
+        # reaching this method, so that question is settled by the time we
+        # arrive.
+        #
+        # A second, independent guess used to be made here anyway — whether this
+        # peer held visibility on entry — as defence in depth behind that check.
+        # It was worse than nothing.  It answered "no" for the first clip any
+        # peer isolates (it cannot already hold a lease it is in the act of
+        # taking), and the isolation block below then reset the local playhead to
+        # 0 while announcing a different frame.  A guard that fires on the most
+        # ordinary case it will ever see is not defence in depth; it is a second
+        # failure mode wearing the costume of one.
+        self.plugin.manager.claim_category(CHANNEL_VISIBILITY)
         # A NEW single-clip isolation (source mode, clip differs from the one we
         # last broadcast) should start at the clip's FIRST frame — value 0 in the
         # isolated clip's 0-based frame space — rather than each peer restoring
         # its own last-viewed position within that clip (which is why RV and
         # xStudio ended up on different frames of the same clip).
-        _new_source_clip = (
-            view_mode == "source" and clip_guid and clip_guid != self._cur_clip_guid
+        #
+        # ...but only when the playhead is standing still.  An isolation is a
+        # discrete user act — a double-click — and cannot coincide with a
+        # playhead that is mid-move.  A clip change while the playhead is
+        # travelling is the opposite thing: the sequence crossing an edit.
+        #
+        # ``_is_scan_through`` is meant to catch that and does not, because it
+        # asks ``_last_polled_playing`` — and a user dragging the playhead is
+        # moving through the sequence with ``playing`` false.  Its docstring
+        # says as much without noticing: "a *playing* sequence changes it once
+        # per edit".  Scrubbing produces the identical show_atom stream and
+        # walks straight past the guard.
+        #
+        # Observed 2026-08-14 20:50:44-47: a paused scrub across a three-clip
+        # sequence, with a stale Pinned Source Mode making every crossing look
+        # like source mode.  Each crossing was taken for a new isolation and
+        # forced frame 0, so the peer received 0, 0, 208, 0, 0, 0, ... 227, 0
+        # and jumped to frame 1 over and over while the scrub was in progress.
+        _playhead_moving = (
+            time.monotonic() - self._last_position_change_at < _SCRUB_SETTLE_S
         )
+        _new_source_clip = (
+            view_mode == "source"
+            and clip_guid
+            and clip_guid != self._cur_clip_guid
+            and not _playhead_moving
+        )
+        if view_mode == "source" and clip_guid != self._cur_clip_guid and _playhead_moving:
+            _log(
+                f"[SEL] broadcast_view_state: clip → {(clip_guid or '-')[:8]} while the"
+                " playhead is moving — sequence crossing an edit, not an isolation:"
+                " keeping the scrub position"
+            )
         self._cur_view_mode = view_mode
         self._cur_clip_guid = clip_guid or None
         # This is a LOCAL user action — guard against in-flight remote messages
@@ -1614,82 +1878,63 @@ class PlaybackSyncController:
         if time.monotonic() >= self._selection_broadcast_suppress_until:
             self._local_view_action_until = time.monotonic() + 1.0
         state = self.current_playback_state()
-        if state is None:
+        _read_failed = state is None
+        if _read_failed:
             # Could not read the local playhead — it is missing, or a bounded
-            # read timed out against an actor torn down by a view switch. This
-            # message cannot omit current_time (a receiver reads it as
-            # current_time.get("value", 0), so an absent field IS frame 0) —
-            # the same constraint as the withhold-while-driven case below —
-            # so withhold to the best position we actually know rather than
-            # fabricating one: the driver's last-told position if a peer is
-            # driving, else our own last observed frame, and only 0 (with a
-            # distinct log) when neither is known.
-            _fallback_frame = (
-                self._last_received_frame
-                if self._last_received_frame is not None
-                else self._last_polled_frame
+            # read timed out against an actor torn down by a view switch.  We
+            # have no position to report, so this message reports none: the
+            # group is omitted below and every peer leaves its own position
+            # alone.  Substituting a remembered frame here is the same mistake
+            # as the withhold case below, with the same consequence — it puts a
+            # position on the wire that nothing is actually at.
+            _log(
+                "[SEL] broadcast_view_state: current_playback_state() unavailable"
+                " — announcing the view with no position"
+                f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
             )
-            if _fallback_frame is not None:
-                _log(
-                    "[SEL] broadcast_view_state: current_playback_state() unavailable"
-                    f" — withholding to last known frame={_fallback_frame}"
-                    f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
-                )
-                state = {
-                    "playing": False,
-                    "current_time": {
-                        "OTIO_SCHEMA": "RationalTime.1",
-                        "value": float(_fallback_frame),
-                        "rate": 24.0,
-                    },
-                    "playback_mode": self._get_playback_mode(),
-                }
-            else:
-                _log(
-                    "[SEL] broadcast_view_state: current_playback_state() unavailable"
-                    " and no known frame to withhold to — broadcasting FABRICATED frame=0"
-                    f" (view_mode={view_mode}, clip_guid={(clip_guid or '-')[:8]})"
-                )
-                state = {
-                    "playing": False,
-                    "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
-                    "playback_mode": self._get_playback_mode(),
-                }
+            state = {
+                "playing": False,
+                "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 24.0},
+                "playback_mode": self._get_playback_mode(),
+            }
         state["view_mode"] = view_mode
         state["clip_guid"] = clip_guid or None
         if playing_override is not None:
             state["playing"] = playing_override
 
-        # Withhold OUR position while a peer is driving playback.
+        # Withhold OUR position when we cannot vouch for it.
         #
         # This message exists to announce a view change; the position it
         # carries is incidental. But a view switch tears down and re-acquires
-        # the playhead, and a freshly acquired playhead reads 0 — so this path
-        # would broadcast a genuine-but-meaningless 0 shortly after a peer's
-        # seek landed, and the driver would apply it and lose the seek.
-        # Observed: RECV frame=61 -> playhead re-acquired 119ms later ->
-        # SEND frame=0 at 182ms, while a sibling path logged "suppressed
-        # (echo guard)" in the same millisecond. This was the last broadcast
-        # path not consulting the guard.
+        # the playhead, and a freshly acquired playhead reads a meaningless
+        # value — so this path would broadcast a genuine-but-meaningless
+        # position shortly after a seek landed, and a peer would apply it and
+        # lose the seek.  Observed: RECV frame=61 -> playhead re-acquired 119ms
+        # later -> SEND frame=0 at 182ms.
         #
-        # "Withhold" cannot mean omitting current_time: a receiver reads it as
-        # `current_time.get("value", 0)`, so an absent field IS frame 0 — the
-        # very bug. Instead send back the position the driver last told us,
-        # which is a no-op for them and leaves the message well-formed. With
-        # nothing received yet there is nothing to defer to, so fall through
-        # to our own reading.
-        if (
-            time.monotonic() < self._playback_apply_suppress_until
-            and self._last_received_frame is not None
-        ):
-            _own = state["current_time"]["value"]
-            if int(_own) != self._last_received_frame:
-                _log(
-                    "[SEL] broadcast_view_state: withholding own position"
-                    f" {_own:.0f} while a peer is driving — deferring to"
-                    f" driver's frame={self._last_received_frame}"
-                )
-            state["current_time"]["value"] = float(self._last_received_frame)
+        # Withholding means **omitting the position field group**, which is the
+        # one thing that asserts nothing.  It could not always: a receiver used
+        # to read `current_time.get("value", 0)`, so an absent field *was* frame
+        # 0.  That is no longer so — both plugins now treat an absent group as
+        # "the sender said nothing about position" and leave their own alone,
+        # because the position lease routinely strips it from a non-holder's
+        # message.  The receive-side rule this relies on is the
+        # ``POSITION_FIELDS`` check in ``apply_playback_state`` and its OpenRV
+        # counterpart.
+        #
+        # It must NOT mean substituting the last position a peer told us, which
+        # is what this did before.  That is a no-op for them only while they are
+        # still there and we have not moved since; neither holds once this peer
+        # scrubs.  Observed 2026-08-14 19:59:00.340: this peer scrubbed 16 -> 24
+        # -> 44 -> 108 -> 151 -> 160, received nothing throughout, then a
+        # remote-induced view change fired inside the echo-guard window and it
+        # broadcast ``frame=45`` — a value received before the scrub began. The
+        # peer applied 45, this one stayed at 160, and nothing re-aligned them:
+        # a view-announcement message had dragged the session backwards to a
+        # frame no one was on.
+        _withhold_position = (
+            _read_failed or time.monotonic() < self._playback_apply_suppress_until
+        )
         if _new_source_clip:
             # A new single-clip isolation: start at the clip's first frame AND
             # loop it.  Isolated clips are typically short shots being reviewed —
@@ -1706,28 +1951,40 @@ class PlaybackSyncController:
             # applies either way: an isolated clip should loop for review no
             # matter who isolated it.
             #
-            # Like that inference, this used to ask a time window whether a peer
-            # had been driving recently. It now asks who owns visibility: a
-            # follower's isolation cannot be a local user action, so it never
-            # resets the frame.
-            _local_isolation = self.plugin.manager.owns_visibility()
-            if not _local_isolation:
-                _log(
-                    "[SEL] broadcast_view_state: new source-clip isolation"
-                    f" {(clip_guid or '-')[:8]} — not host, so peer-driven: keeping frame"
-                    f" {state['current_time']['value']:.0f} (loop still applied)"
-                )
-            else:
-                # Logged to separate this DELIBERATE frame-0 from the fabricated
-                # one above: both leave as `value: 0.0` on the wire and are
-                # otherwise indistinguishable, but this one is correct behaviour
-                # while that one is a failed read.
-                _log(
-                    "[SEL] broadcast_view_state: new source-clip isolation"
-                    f" {(clip_guid or '-')[:8]} — forcing frame=0"
-                    f" (discarding position {state['current_time']['value']:.0f}) + loop"
-                )
-                state["current_time"]["value"] = 0.0
+            # The reset below (``ph.position = 0``) is UNCONDITIONAL, so what we
+            # broadcast has to be too.  This is the one invariant this block
+            # must hold: the frame we move to and the frame we announce are the
+            # same frame.
+            #
+            # It used to gate the announcement on a guess at whether the
+            # isolation was local — first a "was a peer driving recently?" time
+            # window, then whether this peer held the visibility lease on entry.
+            # Both could say "peer-driven" while the reset above ran anyway, and
+            # the peer that isolated the clip then moved to 0 and told everyone
+            # else a different number.
+            #
+            # Observed 2026-08-14 20:38:57: this peer isolated a clip, reset
+            # itself to 0, and broadcast ``frame=75`` — the position it had read
+            # before the switch — because it had not yet held visibility when it
+            # entered this method.  It sat at 1 (0, 1-based) while the session
+            # sat at 76, with nothing to re-align them.  The guess was wrong in
+            # the most ordinary case there is: the FIRST clip a peer isolates,
+            # since it cannot already hold a lease it is in the act of taking.
+            #
+            # No guess is needed.  Every caller of this method has already
+            # established that this is a local action — all four gate on
+            # :meth:`_view_assertion_is_echo` — so an isolation reaching here is
+            # local by construction, and an echo never arrives.
+            _log(
+                "[SEL] broadcast_view_state: new source-clip isolation"
+                f" {(clip_guid or '-')[:8]} — forcing frame=0"
+                f" (discarding position {state['current_time']['value']:.0f}) + loop"
+            )
+            state["current_time"]["value"] = 0.0
+            # Frame 0 here is an assertion, not a reading: the playhead is moved
+            # there a few lines below, so it is as true as any scrub and goes out
+            # even if the position we started from was untrustworthy.
+            _withhold_position = False
             state["playback_mode"] = "loop"
             # Make Loop the *remembered* mode.  Every time a clip playhead is
             # (re-)acquired — including at the loop boundary when the clip
@@ -1754,6 +2011,13 @@ class PlaybackSyncController:
                         ph.set_attribute("Loop Mode", "Loop")
             except Exception:
                 _log_exc("[SEL] reset isolated clip to first frame / loop failed")
+        if _withhold_position:
+            _dropped = state.get("current_time", {}).get("value")
+            state = {k: v for k, v in state.items() if k not in POSITION_FIELDS}
+            _log(
+                "[SEL] broadcast_view_state: position withheld —"
+                f" announcing view only (would have said frame={_dropped})"
+            )
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
     # ── viewport helpers ───────────────────────────────────────────────
@@ -1944,38 +2208,64 @@ class PlaybackSyncController:
         # Arm the echo guard on RECEIPT, ahead of every early return below —
         # not only where a seek is actually applied.
         #
-        # Receiving this message means a peer is driving playback, and that is
-        # true whether or not we go on to apply it.  Several paths deliberately
-        # drop it (mismatched timeline_guid while paused, a play-state-only
-        # update, a view switch that supersedes the seek), and each of those
-        # used to leave no guard armed at all.  Meanwhile the local playhead
-        # can still move for reasons of its own during that window — most
-        # often a selection change resetting it to the clip start.
-        # on_playhead_attribute_changed then sees a frame matching neither
-        # _last_applied_frame nor an active window, and broadcasts that stale
-        # position back to the driver, which applies it and loses the seek the
-        # user actually asked for.
+        # Several paths deliberately drop the message (mismatched timeline_guid
+        # while paused, a play-state-only update, a view switch that supersedes
+        # the seek), and each of those used to leave no guard armed at all.
+        # Meanwhile the local playhead can still move for reasons of its own
+        # during that window — most often a selection change resetting it to the
+        # clip start.  on_playhead_attribute_changed then sees a frame matching
+        # neither _last_applied_frame nor an active window, and broadcasts that
+        # stale position back to the driver, which applies it and loses the seek
+        # the user actually asked for.
         #
         # Observed as: peer seeks to 63 -> we drop the message on a timeline
         # mismatch -> we broadcast our stale 0 twelve times over ~800 ms ->
         # the driver snaps back to 0.
-        self._playback_apply_suppress_until = (
-            time.monotonic() + _PLAYBACK_ECHO_GUARD_S
-        )
+        #
+        # Armed only when the message ACTUALLY ASSERTS A POSITION.  This used to
+        # arm on any playback message, reasoning that receiving one means a peer
+        # is driving playback.  That is no longer so, and the difference is not
+        # academic: a message whose position group was stripped — by the
+        # sender's role, by the position lease it does not hold, or because it
+        # was announcing a view it could not vouch for a position for — says
+        # nothing whatever about position.  Arming on it means a peer that is
+        # explicitly NOT driving position silences the peer that is.
+        #
+        # Observed 2026-08-14 20:26:05: this peer held the position lease and
+        # was the one scrubbing.  It applied a position-stripped view
+        # announcement from the other peer, which armed this guard, and the next
+        # two scrubs it made were then suppressed as "a peer is driving
+        # playback" — frame 118 dropped at the throttle, frame 81 withheld in
+        # broadcast_view_state.  The last frame it managed to send was 197, so
+        # the session sat at 197 while this peer sat at 81, with nothing to
+        # re-align them.
+        if position_frame(state) is not None:
+            self._playback_apply_suppress_until = (
+                time.monotonic() + _PLAYBACK_ECHO_GUARD_S
+            )
         # Feeds claim_lease()'s horizon (design.md D4): an asynchronous
         # attribute_changed callback attributable to this apply must not be
         # allowed to claim the position lease the sending peer still holds.
+        #
+        # Deliberately NOT conditional on the message asserting a position,
+        # unlike the guard above.  The two answer different questions.  That one
+        # asks "is a peer driving position, so should I stay quiet?" — to which
+        # a stripped message answers no.  This one asks "might the playhead be
+        # about to move because of something I am applying?", and a view switch
+        # re-acquires the playhead and moves it whether or not the message that
+        # caused it carried a frame.  Attributing that move to the local user is
+        # the failure this stamp exists to prevent.
         self.plugin.stamp_remote_apply(CHANNEL_POSITION)
-        # Record the driver's position here too, ahead of the same early
-        # returns — broadcast_view_state needs it to avoid putting our own
-        # position on the wire while being driven, and by the time `frame` is
-        # parsed further down we may already have returned.
-        _incoming_ct = state.get("current_time") or {}
-        if "value" in _incoming_ct:
-            try:
-                self._last_received_frame = max(0, int(_incoming_ct["value"]))
-            except (TypeError, ValueError):
-                pass
+        # No record is kept of the driver's position here.  There used to be one
+        # (``_last_received_frame``), read by broadcast_view_state so it could
+        # send a peer's position back instead of its own while being driven.
+        # That substitution is gone: a remembered frame is a no-op for its
+        # sender only until either peer moves, and re-asserting it after this
+        # peer had scrubbed put the session on a frame nobody was on, with
+        # nothing to correct it.  A message with no trustworthy position now
+        # omits the field group instead, so there is nothing left to remember —
+        # and keeping the record anyway would be an invitation to wire it back
+        # into the next version of the same mistake.
 
         # 1. View switch (mode / active clip).  Switch the on-screen source only
         #    when it actually changes:
@@ -2098,7 +2388,16 @@ class PlaybackSyncController:
         playing = state.get("playing", False)
         current_time = state.get("current_time", {})
         # Protocol value is 0-based (RV sends frame-1; xStudio frames are 0-based).
-        frame = max(0, int(current_time.get("value", 0)))
+        #
+        # ``None`` when the message asserts no position — including the case the
+        # group-absence check above cannot see, where ``current_time`` is present
+        # but carries no usable value (authority.position_frame).  Reading that
+        # as 0 is what turned "said nothing" into "seek to the start".  Note the
+        # ``max(0, ...)`` clamp below is exactly why a negative sentinel could
+        # never have signalled this: it would arrive here and be clamped back to
+        # the frame 0 the sentinel existed to prevent.
+        _value = position_frame(state)
+        frame = None if _value is None else max(0, int(_value))
         playback_mode = state.get("playback_mode")
 
         ph = self.plugin.active_playhead
@@ -2160,7 +2459,7 @@ class PlaybackSyncController:
                 # Apply position if we are paused, or the play/pause state changed,
                 # but NOT when the timeline guid mismatched (the view switch has not
                 # finished landing — seeking on the wrong timeline would be wrong).
-                if (not playing or playing_changed) and not _tl_mismatch:
+                if (not playing or playing_changed) and not _tl_mismatch and frame is not None:
                     self._last_applied_frame = frame
                     self._last_polled_frame = frame
                     # Re-arm from *here* as well as on receipt above: everything
@@ -2184,11 +2483,31 @@ class PlaybackSyncController:
         except Exception:
             # xStudio's UI uses the new live playhead; re-acquire it via the
             # global-playhead-events actor (which does NOT touch the dead actor).
-            # This apply is skipped; the next PLAYBACK_SETTINGS message lands on
-            # the fresh playhead.
             _log("apply_playback_state: stale playhead — re-acquiring live playhead")
             self.plugin.active_playhead = None
             self._reacquire_active_playhead()
+            # Defer the seek rather than drop it.
+            #
+            # This used to be skipped outright, on the reasoning that "the next
+            # PLAYBACK_SETTINGS message lands on the fresh playhead".  That holds
+            # while a peer is driving and sending a stream of them.  It does not
+            # hold for the one apply that has no successor: a joiner adopting the
+            # session's view.  The switch to the session's clip is what destroys
+            # the playhead, so the seek that accompanies it is the seek most
+            # likely to hit this branch — and if the host is idle, nothing ever
+            # comes to correct it.
+            #
+            # Observed 2026-08-15 09:30:06.584, 2 ms after the joiner dispatched
+            # its own source switch: the clip was right and the frame was 0,
+            # because the frame the snapshot carried died with the old playhead.
+            #
+            # ``apply_pending_seek`` already exists for exactly this shape — it
+            # waits out the viewport_playhead_atom burst and seeks the settled
+            # actor — it was simply never armed from here.
+            if frame is not None:
+                self._pending_seek_frame = frame
+                self._pending_seek_deadline = time.monotonic() + _PLAYHEAD_SETTLE_S
+                _log(f"apply_playback_state: deferring seek → frame={frame}")
 
     # ── clip playhead lookup ──────────────────────────────────────────
 
@@ -2597,6 +2916,7 @@ class PlaybackSyncController:
                     self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
+                    self._applied_view_mode = view_mode
                     self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
                     _log(
                         f"RECV selection: set_on_screen_source (individual) → "
@@ -2633,6 +2953,7 @@ class PlaybackSyncController:
                     self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
+                    self._applied_view_mode = view_mode
                     self.plugin.connection.api.session.set_on_screen_source(playlist_xs_tl)
                     _log(
                         f"RECV selection: set_on_screen_source (sequence) → "
@@ -2640,7 +2961,7 @@ class PlaybackSyncController:
                     )
                     # Defer the seek until Form-2 events have settled (~200 ms).
                     self._pending_seek_frame = start_frame
-                    self._pending_seek_deadline = time.monotonic() + 0.300
+                    self._pending_seek_deadline = time.monotonic() + _PLAYHEAD_SETTLE_S
 
                     # Also select/highlight the clip inside the timeline track,
                     # in place (guarded against the actor-teardown crash — see
@@ -2653,6 +2974,7 @@ class PlaybackSyncController:
                     self._selection_broadcast_suppress_until = time.monotonic() + 0.5
                     self._applied_clip_echo_guid = clip_guid
                     self._applied_clip_echo_until = time.monotonic() + 3.0
+                    self._applied_view_mode = view_mode
                     self.plugin.connection.api.session.set_on_screen_source(playlist)
                     media, _ = self.plugin.media.media_for_sync_guid(clip_guid)
                     if media:

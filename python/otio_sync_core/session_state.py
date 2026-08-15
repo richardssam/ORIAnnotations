@@ -83,12 +83,27 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
     host_guid = manager.host_guid
     default_role = getattr(manager, "default_role", None)
 
-    # Resolve lease owners once rather than per peer — three dict reads instead
-    # of three per row, and every row then agrees on the same instant.
+    # Settle expiry before reading, as every other lease reader does
+    # (``_owns_channel``, ``_apply_claim``, ``_lease_wire_section``).  Expiry is
+    # lazy — applied on access, not on a timer — so a projection that skipped it
+    # would report an idle holder as still driving for as long as nothing else
+    # happened to touch the lease.  The panel is the one surface whose whole job
+    # is to say who holds the view, so it is the last place that may show a
+    # stale one.  ``_settle_lease_expiry`` is absent on the test doubles that
+    # stand in for a manager, hence the guard.
+    _settle = getattr(manager, "_settle_lease_expiry", None)
+    if callable(_settle):
+        for channel in authority.LEASE_CHANNELS:
+            _settle(channel)
+
+    # Resolve lease owners once rather than per peer — four dict reads instead
+    # of four per row, and every row then agrees on the same instant.
     lease_owners = {
         channel: getattr(manager._leases.get(channel), "owner_guid", None)
         for channel in authority.LEASE_CHANNELS
     }
+    visibility_owner = lease_owners[authority.CHANNEL_VISIBILITY]
+    effective_visibility_holder = visibility_owner if visibility_owner is not None else host_guid
 
     peers = []
     for guid, peer in sorted(
@@ -106,6 +121,7 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
                 "holds_position_lease": lease_owners[authority.CHANNEL_POSITION] == guid,
                 "holds_display_lease": lease_owners[authority.CHANNEL_DISPLAY] == guid,
                 "holds_structure_lease": lease_owners[authority.CHANNEL_STRUCTURE] == guid,
+                "holds_visibility": effective_visibility_holder == guid,
                 "display_name": display_name(peer),
                 "user": ident.get("user", ""),
                 "host": ident.get("host", ""),
@@ -122,6 +138,11 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
         "is_master": manager.is_master,
         "is_host": manager.is_host,
         "self_role": getattr(manager, "self_role", authority.DEFAULT_ROLE),
+        "self_holds_visibility": effective_visibility_holder == self_guid,
+        "may_hold_visibility": authority.role_permits(
+            getattr(manager, "self_role", authority.DEFAULT_ROLE),
+            authority.VISIBILITY,
+        ),
         "default_role": default_role or authority.DEFAULT_ROLE,
         # Reported, not merely inferable from a menu item being disabled: a
         # session whose view nobody may change has to say so, and the panel is

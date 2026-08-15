@@ -126,6 +126,19 @@ XsWindow {
                           + " (session default: " + panel.state.default_role + ")"
                 }
 
+                XsText {
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    horizontalAlignment: Text.AlignLeft
+                    color: panel.state.self_holds_visibility ? XsStyleSheet.accentColor : XsStyleSheet.secondaryTextColor
+                    visible: panel.state.self_holds_visibility !== undefined
+                    text: {
+                        if (panel.state.self_holds_visibility) return "I am driving the view"
+                        if (panel.state.may_hold_visibility) return "I could drive it"
+                        return "changing the view is not available to me"
+                    }
+                }
+
                 // The driverless condition is reported here rather than left to
                 // be inferred from a menu item that is simply absent: a session
                 // whose view nobody may change has to explain itself.
@@ -240,6 +253,7 @@ XsWindow {
                                 if (modelData.holds_position_lease) leases.push("Position")
                                 if (modelData.holds_display_lease) leases.push("Display")
                                 if (modelData.holds_structure_lease) leases.push("Structure")
+                                if (modelData.holds_visibility) leases.push("Visibility")
                                 return panel.shortGuid(modelData.guid) + "  —  "
                                        + (leases.length ? "leases: " + leases.join(", ")
                                                         : "no leases held")

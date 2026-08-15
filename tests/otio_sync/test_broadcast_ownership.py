@@ -92,7 +92,7 @@ def _playback_payloads(mgr):
 
 
 def test_lease_channels_are_position_display_structure():
-    assert set(authority.LEASE_CHANNELS) == {"position", "display", "structure"}
+    assert set(authority.LEASE_CHANNELS) == {"position", "display", "structure", "visibility"}
 
 
 def test_strip_position_fields_is_a_pure_function():
@@ -116,6 +116,122 @@ def test_resolve_claim_breaks_exact_ties_on_guid():
 
 def test_resolve_claim_with_no_current_returns_incoming():
     assert authority.resolve_claim(None, (5.0, "a")) == (5.0, "a")
+
+
+# ---------------------------------------------------------------------------
+# Reading the asserted position
+# ---------------------------------------------------------------------------
+
+
+def test_position_frame_reads_an_asserted_frame():
+    state = {"playing": False, "current_time": {"value": 61.0}, "playback_mode": "loop"}
+    assert authority.position_frame(state) == 61.0
+
+
+def test_position_frame_is_none_when_the_group_is_absent():
+    assert authority.position_frame({"view_mode": "sequence", "clip_guid": "c"}) is None
+
+
+@pytest.mark.parametrize(
+    "current_time",
+    [
+        {},                                   # present but empty
+        {"OTIO_SCHEMA": "RationalTime.1"},    # schema only, no value
+        {"value": None},                      # explicit null
+        {"value": "notanumber"},
+        {"value": True},                      # bool is an int in Python; not a frame
+        None,
+        "61.0",                               # not a mapping
+    ],
+    ids=["empty", "schema-only", "null", "nan", "bool", "none", "str"],
+)
+def test_position_frame_is_none_for_a_malformed_current_time(current_time):
+    """The hole the group-absence check cannot see.
+
+    ``current_time`` is passed through unvalidated by
+    ``PlaybackSettingsSet.from_payload``, so a message can carry the key while
+    saying nothing usable. Read with a ``0`` default that became "seek to the
+    start"; every one of these must now assert nothing at all.
+    """
+    state = {"playing": False, "current_time": current_time}
+    assert authority.position_frame(state) is None
+
+
+def test_position_frame_does_not_use_a_negative_sentinel():
+    """A negative value is data, not a signal.
+
+    Both hosts do arithmetic on this: OpenRV adds the view's frame base and
+    xStudio clamps with ``max(0, ...)``. A ``-1`` meaning "no position" would
+    therefore land as ``base - 1`` on one and as frame 0 — the very bug — on the
+    other. Absence is the only thing that survives both.
+    """
+    state = {"playing": False, "current_time": {"value": -1.0}}
+    assert authority.position_frame(state) == -1.0
+
+
+def test_resolve_visibility_later_wins():
+    current = (0.0, "a")
+    incoming = (1.5, "b")
+    winner = authority._resolve_visibility(current, incoming)
+    assert winner == incoming
+    assert authority._resolve_visibility(incoming, current) == incoming
+
+
+def test_resolve_visibility_later_wins_by_any_margin():
+    """No tolerance band in the ordering — damping is the claim site's job.
+
+    A "within N seconds" comparison here would not be transitive, and
+    ``_apply_claim`` folds a sequence of claims (see
+    ``test_resolve_visibility_is_order_independent``).
+    """
+    current = (0.0, "a")
+    incoming = (0.001, "b")
+    assert authority._resolve_visibility(current, incoming) == incoming
+    assert authority._resolve_visibility(incoming, current) == incoming
+
+
+@pytest.mark.parametrize("channel", list(authority.CLAIM_RESOLVERS))
+def test_resolve_claim_is_order_independent(channel):
+    """Every resolver must be a total order, not just commutative.
+
+    Each peer folds the same claims in a different order: ``claim_category``
+    applies this peer's own claim before broadcasting it, while every other peer
+    sees it arrive among the rest.  A fold that depends on order puts two peers
+    on different owners, and both then believe they may broadcast the category.
+
+    This is the regression test for a pairwise "within VISIBILITY_HOLDOFF"
+    visibility rule, under which 0.0/1.0/2.0s resolved to a different winner
+    under each rotation.
+    """
+    import itertools
+
+    claims = [(0.0, "aaa"), (1.0, "bbb"), (2.0, "ccc")]
+    winners = set()
+    for order in itertools.permutations(claims):
+        best = None
+        for claim in order:
+            best = authority.resolve_claim(best, claim, channel)
+        winners.add(best)
+
+    assert len(winners) == 1, f"{channel} resolution depends on arrival order: {winners}"
+
+
+def test_resolve_visibility_exact_timestamp_tie_breaks_to_lower_guid():
+    claim1 = (1.0, "b")
+    claim2 = (1.0, "a")
+    assert authority._resolve_visibility(claim1, claim2) == claim2
+    assert authority._resolve_visibility(claim2, claim1) == claim2
+
+
+def test_resolve_visibility_none_current_returns_incoming():
+    assert authority._resolve_visibility(None, (5.0, "a")) == (5.0, "a")
+
+
+def test_resolve_claim_delegates_by_category():
+    assert authority.resolve_claim((5.0, "b"), (2.0, "a"), authority.CHANNEL_POSITION) == (2.0, "a")
+    assert authority.resolve_claim((2.0, "a"), (5.0, "b"), authority.CHANNEL_POSITION) == (2.0, "a")
+
+    assert authority.resolve_claim((2.0, "a"), (5.0, "b"), authority.CHANNEL_VISIBILITY) == (5.0, "b")
 
 
 # ---------------------------------------------------------------------------
@@ -528,3 +644,192 @@ def test_state_snapshot_omits_ownership_when_every_channel_is_free():
     payload = pm.StateSnapshot(target_guid="j").to_payload()
 
     assert "broadcast_ownership" not in payload
+
+
+def test_visibility_lease_lifecycle(monkeypatch):
+    import time as time_module
+
+    now_wall = [1000.0]
+    now_mono = [100.0]
+    monkeypatch.setattr(time_module, "time", lambda: now_wall[0])
+    monkeypatch.setattr(time_module, "monotonic", lambda: now_mono[0])
+
+    a = _manager("a")
+    b = _manager("b")
+
+    a.claim_category(authority.CHANNEL_VISIBILITY)
+    assert a._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+    _deliver(a, b)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+
+    now_wall[0] += 1.0
+    now_mono[0] += 1.0
+
+    b.claim_category(authority.CHANNEL_VISIBILITY)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+    _deliver(b, a)
+    assert a._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+
+    now_wall[0] += 1.0
+    now_mono[0] += 1.0
+
+    b.claim_category(authority.CHANNEL_VISIBILITY)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "b"
+    _deliver(b, a)
+    assert a._leases[authority.CHANNEL_VISIBILITY].owner_guid == "b"
+
+
+def test_visibility_lease_expiry(monkeypatch):
+    import time as time_module
+
+    now_wall = [1000.0]
+    now_mono = [100.0]
+    monkeypatch.setattr(time_module, "time", lambda: now_wall[0])
+    monkeypatch.setattr(time_module, "monotonic", lambda: now_mono[0])
+
+    a = _manager("a")
+    b = _manager("b")
+
+    a.claim_category(authority.CHANNEL_VISIBILITY)
+    assert a._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+    _deliver(a, b)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+
+    now_wall[0] += 3.1
+    now_mono[0] += 3.1
+
+    assert a._owns_channel(authority.CHANNEL_VISIBILITY) is False
+    assert a._leases[authority.CHANNEL_VISIBILITY].owner_guid is None
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "a"
+    b._settle_lease_expiry(authority.CHANNEL_VISIBILITY)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid is None
+
+    b.claim_category(authority.CHANNEL_VISIBILITY)
+    assert b._leases[authority.CHANNEL_VISIBILITY].owner_guid == "b"
+
+
+def test_snapshot_reports_visibility_owner_and_remaining_time():
+    rv = _manager("rv")
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    section = rv._lease_wire_section()
+
+    assert section["visibility"]["owner_guid"] == "rv"
+    assert section["visibility"]["remaining_ms"] > 0
+
+
+def test_adopt_ownership_learns_remote_visibility_owner():
+    rv = _manager("rv")
+
+    rv.adopt_ownership({"visibility": {"owner_guid": "xs", "remaining_ms": 1500.0}})
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "xs"
+
+
+def test_old_peers_snapshot_omitting_visibility_does_not_clear_held_visibility_lease():
+    rv = _manager("rv")
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    rv.adopt_ownership({"position": {"owner_guid": "xs", "remaining_ms": 500.0}})
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "rv"
+
+
+def test_foreign_claim_ownership_for_visibility_is_applied():
+    rv = _manager("rv")
+
+    envelope = _claim_envelope("xs", authority.CHANNEL_VISIBILITY, 100.0)
+    rv.apply_patch(envelope)
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "xs"
+
+
+# ---------------------------------------------------------------------------
+# Claim-site hold-off (the damping half of the visibility rule)
+# ---------------------------------------------------------------------------
+
+
+def test_holdoff_withholds_a_challenge_to_an_active_visibility_holder():
+    """Inside the hold-off the claim is not made at all — not made and lost."""
+    rv = _manager("rv")
+    rv.apply_patch(_claim_envelope("xs", authority.CHANNEL_VISIBILITY, 100.0))
+    sent_before = len(rv.network.sent)
+
+    # 0.5s after xs claimed: inside VISIBILITY_HOLDOFF.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("time.time", lambda: 100.5)
+        rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "xs"
+    assert len(rv.network.sent) == sent_before, "withheld claim must not go on the wire"
+
+
+def test_holdoff_allows_a_challenge_once_the_holder_goes_idle():
+    rv = _manager("rv")
+    rv.apply_patch(_claim_envelope("xs", authority.CHANNEL_VISIBILITY, 100.0))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("time.time", lambda: 100.0 + authority.VISIBILITY_HOLDOFF + 0.01)
+        rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "rv"
+
+
+def test_holdoff_never_withholds_the_incumbents_own_refresh():
+    """Re-claiming is how an active holder stays protected."""
+    rv = _manager("rv")
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+    first_ts = rv._leases[authority.CHANNEL_VISIBILITY].claim_ts
+
+    rv.claim_category(authority.CHANNEL_VISIBILITY)
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "rv"
+    assert rv._leases[authority.CHANNEL_VISIBILITY].claim_ts >= first_ts
+
+
+def test_holdoff_does_not_apply_to_the_earlier_wins_channels():
+    """Only visibility damps its claims; position settles a burst by ordering."""
+    for channel in (authority.CHANNEL_POSITION, authority.CHANNEL_DISPLAY,
+                    authority.CHANNEL_STRUCTURE):
+        assert channel not in authority.CLAIM_HOLDOFFS
+        assert authority.claim_withheld_by_holdoff(channel, "xs", 100.0, "rv", 100.1) is False
+
+
+# ---------------------------------------------------------------------------
+# Departure
+# ---------------------------------------------------------------------------
+
+
+def test_dropping_a_peer_frees_the_lease_it_held():
+    """A departed holder must not keep the view frozen until its lease expires."""
+    rv = _manager("rv")
+    rv._peers["xs"] = {"app": "xstudio", "capabilities": ["visibility"]}
+    rv.apply_patch(_claim_envelope("xs", authority.CHANNEL_VISIBILITY, 100.0))
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "xs"
+
+    rv.drop_peer("xs")
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid is None
+
+
+def test_dropping_a_peer_frees_every_channel_it_held():
+    rv = _manager("rv")
+    rv._peers["xs"] = {"app": "xstudio", "capabilities": ["visibility"]}
+    for channel in authority.LEASE_CHANNELS:
+        rv.apply_patch(_claim_envelope("xs", channel, 100.0))
+
+    rv.drop_peer("xs")
+
+    for channel in authority.LEASE_CHANNELS:
+        assert rv._leases[channel].owner_guid is None, channel
+
+
+def test_dropping_a_peer_leaves_another_peers_lease_alone():
+    rv = _manager("rv")
+    rv._peers["xs"] = {"app": "xstudio", "capabilities": ["visibility"]}
+    rv._peers["gone"] = {"app": "openrv", "capabilities": ["visibility"]}
+    rv.apply_patch(_claim_envelope("xs", authority.CHANNEL_VISIBILITY, 100.0))
+
+    rv.drop_peer("gone")
+
+    assert rv._leases[authority.CHANNEL_VISIBILITY].owner_guid == "xs"
