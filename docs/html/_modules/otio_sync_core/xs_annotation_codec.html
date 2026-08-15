@@ -70,7 +70,25 @@
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">opentimelineio</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">otio</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">otio_sync_core</span><span class="w"> </span><span class="kn">import</span> <span class="n">coords</span><span class="p">,</span> <span class="n">shapes</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">otio_sync_core.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">sync_event_schema</span>
+
+<span class="c1"># --- xStudio unit conversions (owned here, NOT in coords) ------------------</span>
+
+<span class="c1">#: OTIO ``TextAnnotation.font_size`` → xStudio caption ``font_size`` multiplier.</span>
+<span class="c1">#:</span>
+<span class="c1">#: Paired with ``RV_FONT_SCALE`` in ``rv_annotation_codec`` — the two must be</span>
+<span class="c1">#: recalibrated together. When ``RV_FONT_SCALE`` was ``1080.0`` (both hosts&#39;</span>
+<span class="c1">#: native font-size units anchored to the same 1920x1080 reference frame),</span>
+<span class="c1">#: this was ``1.0``. ``RV_FONT_SCALE`` was later divided by an empirical 2.5</span>
+<span class="c1">#: (tuned against QPainter&#39;s real glyph output vs. a PIL testchart</span>
+<span class="c1">#: reference — see its docstring), which was never mirrored here. Re-verified</span>
+<span class="c1">#: empirically post-fix: rendering ``testchart_annotations.otio``&#39;s</span>
+<span class="c1">#: &quot;96pt Font Size Sample Text&quot; caption (``font_size=37.07``) into both hosts</span>
+<span class="c1">#: and measuring on-screen glyph height as a fraction of frame height gave a</span>
+<span class="c1">#: RV/xStudio ratio of ~2.54 with this at 1.0 — i.e. almost exactly</span>
+<span class="c1">#: proportional to the un-mirrored ``/2.5``, confirming 2.5 restores parity.</span>
+<span class="n">XS_FONT_SCALE</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">2.5</span>
 
 <span class="c1"># Lazily resolved — requires OTIO_PLUGIN_MANIFEST_PATH to be populated first.</span>
 <span class="n">_SyncEvent</span> <span class="o">=</span> <span class="kc">None</span>
@@ -214,9 +232,9 @@
             <span class="n">se</span><span class="o">.</span><span class="n">TextAnnotation</span><span class="p">(</span>
                 <span class="n">rgba</span><span class="o">=</span><span class="p">[</span><span class="n">r</span><span class="p">,</span> <span class="n">g</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">opacity</span><span class="p">],</span>
                 <span class="n">position</span><span class="o">=</span><span class="n">position</span><span class="p">,</span>
-                <span class="n">spacing</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+                <span class="n">spacing</span><span class="o">=</span><span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_SPACING</span><span class="p">,</span>
                 <span class="n">friendly_name</span><span class="o">=</span><span class="n">font_name</span><span class="p">,</span>
-                <span class="n">font_size</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">caption</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;font_size&quot;</span><span class="p">,</span> <span class="mf">50.0</span><span class="p">))</span> <span class="o">/</span> <span class="mf">2.5</span><span class="p">,</span>
+                <span class="n">font_size</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">caption</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;font_size&quot;</span><span class="p">,</span> <span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_FONT_SIZE</span><span class="p">))</span> <span class="o">/</span> <span class="n">XS_FONT_SCALE</span><span class="p">,</span>
                 <span class="n">font</span><span class="o">=</span><span class="n">font_name</span><span class="p">,</span>
                 <span class="n">text</span><span class="o">=</span><span class="n">caption</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">),</span>
                 <span class="n">rotation</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
@@ -258,7 +276,7 @@
 
     <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
     <span class="k">for</span> <span class="n">cmd</span> <span class="ow">in</span> <span class="n">commands</span><span class="p">:</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;rgba&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;points&quot;</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;rgba&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;points&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;min&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;start&quot;</span><span class="p">):</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">cmd</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">otio</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">write_to_string</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;otio_json&quot;</span><span class="p">))</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
@@ -266,7 +284,69 @@
 
         <span class="n">schema</span> <span class="o">=</span> <span class="n">sync_event_schema</span><span class="p">(</span><span class="n">cmd</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">schema</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;PaintStart&quot;</span><span class="p">):</span>
+        <span class="n">is_ellipse</span> <span class="o">=</span> <span class="n">schema</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;EllipseAnnotation&quot;</span><span class="p">)</span>
+        <span class="n">is_rect</span> <span class="o">=</span> <span class="n">schema</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;RectangleAnnotation&quot;</span><span class="p">)</span>
+        <span class="n">is_arrow</span> <span class="o">=</span> <span class="n">schema</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;ArrowAnnotation&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">is_ellipse</span> <span class="ow">or</span> <span class="n">is_rect</span> <span class="ow">or</span> <span class="n">is_arrow</span><span class="p">:</span>
+            <span class="n">rgba</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;rgba&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;rgba&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">rgba</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">rgba</span> <span class="o">=</span> <span class="p">[</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">]</span>
+            <span class="n">rgba</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span>
+            <span class="n">r_val</span> <span class="o">=</span> <span class="n">rgba</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="mf">1.0</span>
+            <span class="n">g_val</span> <span class="o">=</span> <span class="n">rgba</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="mf">1.0</span>
+            <span class="n">b_val</span> <span class="o">=</span> <span class="n">rgba</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">2</span> <span class="k">else</span> <span class="mf">1.0</span>
+            <span class="n">opacity</span> <span class="o">=</span> <span class="n">rgba</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">3</span> <span class="k">else</span> <span class="mf">1.0</span>
+            
+            <span class="n">size</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">)</span>
+            <span class="n">thickness</span> <span class="o">=</span> <span class="n">size</span> <span class="o">/</span> <span class="p">(</span><span class="mf">2.0</span> <span class="o">*</span> <span class="n">aspect_half</span><span class="p">)</span>
+            
+            <span class="c1"># Shape geometry → OTIO-norm polyline via the shared host-neutral</span>
+            <span class="c1"># tessellation helper (see otio_sync_core.shapes).</span>
+            <span class="n">pts_list</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">if</span> <span class="n">is_rect</span><span class="p">:</span>
+                <span class="n">min_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;min&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;min&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">max_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;max&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;max&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">pts_list</span> <span class="o">=</span> <span class="n">shapes</span><span class="o">.</span><span class="n">rect_polyline</span><span class="p">(</span><span class="n">min_val</span><span class="p">,</span> <span class="n">max_val</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">is_ellipse</span><span class="p">:</span>
+                <span class="n">min_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;min&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;min&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">max_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;max&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;max&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">pts_list</span> <span class="o">=</span> <span class="n">shapes</span><span class="o">.</span><span class="n">ellipse_polyline</span><span class="p">(</span><span class="n">min_val</span><span class="p">,</span> <span class="n">max_val</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">is_arrow</span><span class="p">:</span>
+                <span class="n">start_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;start&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;start&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">end_val</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;end&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;end&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span>
+                <span class="n">pts_list</span> <span class="o">=</span> <span class="n">shapes</span><span class="o">.</span><span class="n">arrow_polyline</span><span class="p">(</span><span class="n">start_val</span><span class="p">,</span> <span class="n">end_val</span><span class="p">)</span>
+
+            <span class="n">raw_pts</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="ow">in</span> <span class="n">pts_list</span><span class="p">:</span>
+                <span class="n">raw_pts</span><span class="o">.</span><span class="n">extend</span><span class="p">([</span>
+                    <span class="n">x</span> <span class="o">/</span> <span class="n">aspect_half</span><span class="p">,</span>
+                    <span class="o">-</span><span class="n">y</span> <span class="o">/</span> <span class="n">aspect_half</span><span class="p">,</span>
+                    <span class="mf">1.0</span><span class="p">,</span>  <span class="c1"># pressure</span>
+                    <span class="mf">1.0</span><span class="p">,</span>  <span class="c1"># opacity</span>
+                <span class="p">])</span>
+                
+            <span class="n">stroke_uuid</span> <span class="o">=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;uuid&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;uuid&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">stroke_uuid</span><span class="p">:</span>
+                <span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
+                <span class="n">stroke_uuid</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">())</span>
+                
+            <span class="n">pen_strokes</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                <span class="s2">&quot;colour&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">r_val</span><span class="p">,</span> <span class="n">g_val</span><span class="p">,</span> <span class="n">b_val</span><span class="p">],</span>
+                <span class="s2">&quot;r&quot;</span><span class="p">:</span> <span class="n">r_val</span><span class="p">,</span>
+                <span class="s2">&quot;g&quot;</span><span class="p">:</span> <span class="n">g_val</span><span class="p">,</span>
+                <span class="s2">&quot;b&quot;</span><span class="p">:</span> <span class="n">b_val</span><span class="p">,</span>
+                <span class="s2">&quot;opacity&quot;</span><span class="p">:</span> <span class="n">opacity</span><span class="p">,</span>
+                <span class="s2">&quot;thickness&quot;</span><span class="p">:</span> <span class="n">thickness</span><span class="p">,</span>
+                <span class="s2">&quot;softness&quot;</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">,</span>
+                <span class="s2">&quot;size_sensitivity&quot;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span>
+                <span class="s2">&quot;opacity_sensitivity&quot;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span>
+                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Brush&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;is_erase_stroke&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                <span class="s2">&quot;points&quot;</span><span class="p">:</span> <span class="n">raw_pts</span><span class="p">,</span>
+                <span class="s2">&quot;uuid&quot;</span><span class="p">:</span> <span class="n">stroke_uuid</span>
+            <span class="p">})</span>
+        <span class="k">elif</span> <span class="n">schema</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;PaintStart&quot;</span><span class="p">):</span>
             <span class="c1"># Tolerate both live OTIO schemadef objects and raw deserialised dicts.</span>
             <span class="n">rgba</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="s2">&quot;rgba&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">rgba</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
@@ -406,7 +486,16 @@
         <span class="n">position</span> <span class="o">=</span> <span class="n">_get</span><span class="p">(</span><span class="s2">&quot;position&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">])</span> <span class="ow">or</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">]</span>
         <span class="n">text</span> <span class="o">=</span> <span class="n">_get</span><span class="p">(</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span>
         <span class="n">font</span> <span class="o">=</span> <span class="n">_get</span><span class="p">(</span><span class="s2">&quot;font&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span>
-        <span class="n">font_size</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_get</span><span class="p">(</span><span class="s2">&quot;font_size&quot;</span><span class="p">,</span> <span class="mf">50.0</span><span class="p">)</span> <span class="ow">or</span> <span class="mf">50.0</span><span class="p">)</span>
+        <span class="n">font_size</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_get</span><span class="p">(</span><span class="s2">&quot;font_size&quot;</span><span class="p">,</span> <span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_FONT_SIZE</span><span class="p">)</span> <span class="ow">or</span> <span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_FONT_SIZE</span><span class="p">)</span>
+        <span class="c1"># xStudio has no per-caption scale field (see &quot;TextAnnotation Scale</span>
+        <span class="c1"># Round-Trip&quot; in otio-annotation-sync), so a host that DOES have one</span>
+        <span class="c1"># (RV, whose interactive text tool resizes via this field rather than</span>
+        <span class="c1"># `size` — its drag-to-resize handle drives `scale`, not `font_size`)</span>
+        <span class="c1"># must have that multiplier folded into font_size here, or it is</span>
+        <span class="c1"># silently dropped and the caption renders at the host&#39;s on-screen</span>
+        <span class="c1"># size as if scale were always 1.0 — verified empirically to produce</span>
+        <span class="c1"># a ~10x size mismatch for a real RV-drawn caption with scale=0.1.</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_get</span><span class="p">(</span><span class="s2">&quot;scale&quot;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="ow">or</span> <span class="mf">1.0</span><span class="p">)</span>
         <span class="n">uuid_val</span> <span class="o">=</span> <span class="n">_get</span><span class="p">(</span><span class="s2">&quot;uuid&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span>
 
         <span class="c1"># xStudio requires a valid font name to render text; default to one of its built-ins</span>
@@ -421,7 +510,7 @@
             <span class="s2">&quot;opacity&quot;</span><span class="p">:</span> <span class="n">rgba</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rgba</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">3</span> <span class="k">else</span> <span class="mf">1.0</span><span class="p">,</span>
             <span class="s2">&quot;position&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;vec2&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">x_xs</span><span class="p">,</span> <span class="n">y_xs</span><span class="p">],</span>
             <span class="s2">&quot;font_name&quot;</span><span class="p">:</span> <span class="n">font</span><span class="p">,</span>
-            <span class="s2">&quot;font_size&quot;</span><span class="p">:</span> <span class="n">font_size</span> <span class="o">*</span> <span class="mf">2.5</span><span class="p">,</span>
+            <span class="s2">&quot;font_size&quot;</span><span class="p">:</span> <span class="n">font_size</span> <span class="o">*</span> <span class="n">scale</span> <span class="o">*</span> <span class="n">XS_FONT_SCALE</span><span class="p">,</span>
             <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="n">text</span><span class="p">,</span>
             <span class="s2">&quot;wrap_width&quot;</span><span class="p">:</span> <span class="mf">1.5</span><span class="p">,</span>
             <span class="s2">&quot;justification&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
@@ -432,6 +521,62 @@
             <span class="n">cap_dict</span><span class="p">[</span><span class="s2">&quot;uuid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">uuid_val</span>
         <span class="n">captions</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cap_dict</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">captions</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># D9 common contract entry points (host-agnostic tooling; see design.md)</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="n">HOST_ID</span> <span class="o">=</span> <span class="s2">&quot;xstudio&quot;</span>
+
+<span class="c1">#: SyncEvent kinds xStudio renders natively. Shapes (ellipse/rect/arrow) are</span>
+<span class="c1">#: NOT in this set — xStudio has no shape primitives, so</span>
+<span class="c1">#: :func:`sync_events_to_xs_strokes` already tessellates them into stroke</span>
+<span class="c1">#: polylines via :mod:`otio_sync_core.shapes` before this point is reached.</span>
+<span class="n">SUPPORTED_KINDS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">&quot;pen&quot;</span><span class="p">,</span> <span class="s2">&quot;erase&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">})</span>
+
+
+<div class="viewcode-block" id="from_sync_events">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.xs_annotation_codec.from_sync_events">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">from_sync_events</span><span class="p">(</span><span class="n">events</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Hub → host: SyncEvents → xStudio&#39;s native ``{&quot;strokes&quot;, &quot;captions&quot;}`` dict.</span>
+
+<span class="sd">    The dict shape matches ``Bookmark.set_annotation(strokes=..., captions=...)``</span>
+<span class="sd">    — xStudio&#39;s single-handoff API — so callers can pass the result straight</span>
+<span class="sd">    through without unpacking.</span>
+
+<span class="sd">    :param events: SyncEvent objects (or serialised dicts) for one frame.</span>
+<span class="sd">    :param ctx: Optional context; ``ctx[&quot;aspect_half&quot;]`` overrides the default.</span>
+<span class="sd">    :returns: ``{&quot;strokes&quot;: [...], &quot;captions&quot;: [...]}``.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">aspect_half</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;aspect_half&quot;</span><span class="p">,</span> <span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_ASPECT_HALF</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;strokes&quot;</span><span class="p">:</span> <span class="n">sync_events_to_xs_strokes</span><span class="p">(</span><span class="n">events</span><span class="p">,</span> <span class="n">aspect_half</span><span class="p">),</span>
+        <span class="s2">&quot;captions&quot;</span><span class="p">:</span> <span class="n">sync_events_to_xs_captions</span><span class="p">(</span><span class="n">events</span><span class="p">,</span> <span class="n">aspect_half</span><span class="p">),</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="to_sync_events">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.xs_annotation_codec.to_sync_events">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">to_sync_events</span><span class="p">(</span><span class="n">native</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Host → hub: xStudio&#39;s native ``{&quot;strokes&quot;, &quot;captions&quot;}`` dict → SyncEvents.</span>
+
+<span class="sd">    :param native: ``{&quot;strokes&quot;: [...], &quot;captions&quot;: [...]}`` as read from</span>
+<span class="sd">        ``Bookmark.annotation_data[&quot;Data&quot;]``.</span>
+<span class="sd">    :param ctx: Optional context; ``ctx[&quot;aspect_half&quot;]`` overrides the default,</span>
+<span class="sd">        ``ctx[&quot;uuid_list&quot;]``/``ctx[&quot;existing_uuids&quot;]`` thread through to the</span>
+<span class="sd">        underlying stroke/caption converters for stable-uuid partial rebroadcasts.</span>
+<span class="sd">    :returns: Flat list of SyncEvent objects (strokes then captions).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">aspect_half</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;aspect_half&quot;</span><span class="p">,</span> <span class="n">coords</span><span class="o">.</span><span class="n">DEFAULT_ASPECT_HALF</span><span class="p">)</span>
+    <span class="n">uuid_list</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;uuid_list&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">ctx</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">existing_uuids</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;existing_uuids&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">ctx</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="p">(</span>
+        <span class="n">xs_strokes_to_sync_events</span><span class="p">(</span><span class="n">native</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;strokes&quot;</span><span class="p">,</span> <span class="p">[]),</span> <span class="n">aspect_half</span><span class="p">,</span> <span class="n">uuid_list</span><span class="o">=</span><span class="n">uuid_list</span><span class="p">)</span>
+        <span class="o">+</span> <span class="n">xs_captions_to_sync_events</span><span class="p">(</span><span class="n">native</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;captions&quot;</span><span class="p">,</span> <span class="p">[]),</span> <span class="n">aspect_half</span><span class="p">,</span> <span class="n">existing_uuids</span><span class="o">=</span><span class="n">existing_uuids</span><span class="p">)</span>
+    <span class="p">)</span></div>
 
 </pre></div>
 

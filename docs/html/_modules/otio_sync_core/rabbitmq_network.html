@@ -43,7 +43,9 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">queue</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
@@ -55,6 +57,81 @@
 <span class="k">def</span><span class="w"> </span><span class="nf">_log</span><span class="p">(</span><span class="n">msg</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">_logger</span><span class="o">.</span><span class="n">handlers</span><span class="p">:</span>
         <span class="n">_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="resolve_host">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.rabbitmq_network.resolve_host">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">resolve_host</span><span class="p">(</span><span class="n">host</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Validate that *host* (or the hostname embedded in an AMQP URL) is DNS-resolvable.</span>
+
+<span class="sd">    Called synchronously before spinning up :class:`RabbitMQNetwork`&#39;s background</span>
+<span class="sd">    threads, which otherwise retry a bad hostname silently forever (their errors</span>
+<span class="sd">    only surface via ``_log``, which is invisible unless debug logging is on).</span>
+
+<span class="sd">    :param host: RabbitMQ broker hostname, IP, or full AMQP/AMQPS URL.</span>
+<span class="sd">    :returns: *host*, unchanged, when resolution succeeds.</span>
+<span class="sd">    :raises ValueError: with a clear, user-facing message when the hostname</span>
+<span class="sd">        cannot be resolved.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">host</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;amqp://&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">host</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;amqps://&quot;</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">urlparse</span>
+        <span class="n">hostname</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">host</span><span class="p">)</span><span class="o">.</span><span class="n">hostname</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">hostname</span> <span class="o">=</span> <span class="n">host</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">hostname</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Could not determine a hostname from &#39;</span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">&#39;.&quot;</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">socket</span><span class="o">.</span><span class="n">getaddrinfo</span><span class="p">(</span><span class="n">hostname</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">socket</span><span class="o">.</span><span class="n">gaierror</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Could not resolve RabbitMQ host &#39;</span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2">&#39;: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">. &quot;</span>
+            <span class="s2">&quot;Check ORI_SESSION / ORI_RMQ_HOST for typos, or that the host is reachable.&quot;</span>
+        <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+    <span class="k">return</span> <span class="n">host</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_get_connection_params</span><span class="p">(</span><span class="n">host</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pika</span><span class="o">.</span><span class="n">ConnectionParameters</span> <span class="o">|</span> <span class="n">pika</span><span class="o">.</span><span class="n">URLParameters</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">host</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;amqp://&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">host</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;amqps://&quot;</span><span class="p">):</span>
+        <span class="n">url_str</span> <span class="o">=</span> <span class="n">host</span>
+        <span class="n">ignore_verify</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">cacertfile</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">certfile</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">keyfile</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">urlparse</span><span class="p">,</span> <span class="n">parse_qsl</span><span class="p">,</span> <span class="n">urlencode</span><span class="p">,</span> <span class="n">urlunparse</span>
+        <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url_str</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">query</span><span class="p">:</span>
+            <span class="n">qparams</span> <span class="o">=</span> <span class="n">parse_qsl</span><span class="p">(</span><span class="n">parsed</span><span class="o">.</span><span class="n">query</span><span class="p">)</span>
+            <span class="n">cleaned</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">qparams</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;verify&quot;</span><span class="p">,</span> <span class="s2">&quot;ssl_verify&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">v</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;ignore&quot;</span><span class="p">,</span> <span class="s2">&quot;false&quot;</span><span class="p">):</span>
+                    <span class="n">ignore_verify</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="k">elif</span> <span class="n">k</span> <span class="o">==</span> <span class="s2">&quot;cacertfile&quot;</span><span class="p">:</span>
+                    <span class="n">cacertfile</span> <span class="o">=</span> <span class="n">v</span>
+                <span class="k">elif</span> <span class="n">k</span> <span class="o">==</span> <span class="s2">&quot;certfile&quot;</span><span class="p">:</span>
+                    <span class="n">certfile</span> <span class="o">=</span> <span class="n">v</span>
+                <span class="k">elif</span> <span class="n">k</span> <span class="o">==</span> <span class="s2">&quot;keyfile&quot;</span><span class="p">:</span>
+                    <span class="n">keyfile</span> <span class="o">=</span> <span class="n">v</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">cleaned</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
+            <span class="n">url_str</span> <span class="o">=</span> <span class="n">urlunparse</span><span class="p">(</span><span class="n">parsed</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">query</span><span class="o">=</span><span class="n">urlencode</span><span class="p">(</span><span class="n">cleaned</span><span class="p">)))</span>
+
+        <span class="n">params</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">URLParameters</span><span class="p">(</span><span class="n">url_str</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">host</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;amqps://&quot;</span><span class="p">):</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
+            <span class="n">context</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">ignore_verify</span> <span class="ow">or</span> <span class="s2">&quot;localhost&quot;</span> <span class="ow">in</span> <span class="n">url_str</span> <span class="ow">or</span> <span class="s2">&quot;127.0.0.1&quot;</span> <span class="ow">in</span> <span class="n">url_str</span><span class="p">:</span>
+                <span class="n">context</span><span class="o">.</span><span class="n">check_hostname</span> <span class="o">=</span> <span class="kc">False</span>
+                <span class="n">context</span><span class="o">.</span><span class="n">verify_mode</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span>
+            <span class="k">if</span> <span class="n">cacertfile</span><span class="p">:</span>
+                <span class="n">context</span><span class="o">.</span><span class="n">load_verify_locations</span><span class="p">(</span><span class="n">cafile</span><span class="o">=</span><span class="n">cacertfile</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">certfile</span><span class="p">:</span>
+                <span class="n">context</span><span class="o">.</span><span class="n">load_cert_chain</span><span class="p">(</span><span class="n">certfile</span><span class="o">=</span><span class="n">certfile</span><span class="p">,</span> <span class="n">keyfile</span><span class="o">=</span><span class="n">keyfile</span><span class="p">)</span>
+            <span class="n">params</span><span class="o">.</span><span class="n">ssl_options</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">SSLOptions</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">params</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">pika</span><span class="o">.</span><span class="n">ConnectionParameters</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="n">port</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="RabbitMQNetwork">
@@ -83,8 +160,8 @@
 <span class="sd">    ``source_guid`` matches *self_guid* is silently discarded before being</span>
 <span class="sd">    enqueued.</span>
 
-<span class="sd">    :param host: RabbitMQ broker hostname or IP.</span>
-<span class="sd">    :param port: RabbitMQ broker AMQP port.</span>
+<span class="sd">    :param host: RabbitMQ broker hostname, IP, or full AMQP/AMQPS URL.</span>
+<span class="sd">    :param port: RabbitMQ broker AMQP port (ignored if host is a URL).</span>
 <span class="sd">    :param session_id: Logical session name; used to derive the exchange name.</span>
 <span class="sd">    :param self_guid: GUID of the local peer used to filter own messages.</span>
 <span class="sd">        Auto-generated if not provided.</span>
@@ -129,9 +206,8 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_event</span><span class="o">.</span><span class="n">is_set</span><span class="p">():</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">connection</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">BlockingConnection</span><span class="p">(</span>
-                    <span class="n">pika</span><span class="o">.</span><span class="n">ConnectionParameters</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="p">)</span>
-                <span class="p">)</span>
+                <span class="n">params</span> <span class="o">=</span> <span class="n">_get_connection_params</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="p">)</span>
+                <span class="n">connection</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">BlockingConnection</span><span class="p">(</span><span class="n">params</span><span class="p">)</span>
                 <span class="n">channel</span> <span class="o">=</span> <span class="n">connection</span><span class="o">.</span><span class="n">channel</span><span class="p">()</span>
                 <span class="n">channel</span><span class="o">.</span><span class="n">exchange_declare</span><span class="p">(</span>
                     <span class="n">exchange</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">exchange_name</span><span class="p">,</span> <span class="n">exchange_type</span><span class="o">=</span><span class="s1">&#39;fanout&#39;</span>
@@ -190,9 +266,8 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_event</span><span class="o">.</span><span class="n">is_set</span><span class="p">():</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">connection</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">BlockingConnection</span><span class="p">(</span>
-                    <span class="n">pika</span><span class="o">.</span><span class="n">ConnectionParameters</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="p">)</span>
-                <span class="p">)</span>
+                <span class="n">params</span> <span class="o">=</span> <span class="n">_get_connection_params</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="p">)</span>
+                <span class="n">connection</span> <span class="o">=</span> <span class="n">pika</span><span class="o">.</span><span class="n">BlockingConnection</span><span class="p">(</span><span class="n">params</span><span class="p">)</span>
                 <span class="n">channel</span> <span class="o">=</span> <span class="n">connection</span><span class="o">.</span><span class="n">channel</span><span class="p">()</span>
                 <span class="n">channel</span><span class="o">.</span><span class="n">exchange_declare</span><span class="p">(</span>
                     <span class="n">exchange</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">exchange_name</span><span class="p">,</span> <span class="n">exchange_type</span><span class="o">=</span><span class="s1">&#39;fanout&#39;</span>
@@ -270,11 +345,32 @@
 
 <div class="viewcode-block" id="RabbitMQNetwork.stop">
 <a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.rabbitmq_network.RabbitMQNetwork.stop">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">flush_timeout</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.5</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Signal background threads to exit and wait for them to finish.</span>
 
-<span class="sd">        Blocks for up to 2 seconds per thread.</span>
+<span class="sd">        Blocks for up to 2 seconds per thread, plus *flush_timeout* while the</span>
+<span class="sd">        publisher drains anything still queued.</span>
+
+<span class="sd">        The drain exists so a message enqueued immediately before shutdown — a</span>
+<span class="sd">        departure notice, most obviously — has a chance to reach the broker.</span>
+<span class="sd">        The publisher loop exits as soon as the stop event is set, so without</span>
+<span class="sd">        it that last message is simply discarded.</span>
+
+<span class="sd">        It is deliberately **bounded and best-effort**: callers include host</span>
+<span class="sd">        application disconnect paths that run on a UI thread, so this must not</span>
+<span class="sd">        become an unbounded wait for broker acknowledgement. Anything still</span>
+<span class="sd">        queued when the budget expires is dropped, exactly as before.</span>
+
+<span class="sd">        :param flush_timeout: Seconds to allow for draining queued messages.</span>
+<span class="sd">            Pass ``0`` to stop immediately without draining.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">+</span> <span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">flush_timeout</span><span class="p">)</span>
+        <span class="k">while</span> <span class="p">(</span>
+            <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_send_queue</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publisher_thread</span><span class="o">.</span><span class="n">is_alive</span><span class="p">()</span>
+            <span class="ow">and</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">&lt;</span> <span class="n">deadline</span>
+        <span class="p">):</span>
+            <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.01</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stop_event</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_consumer_thread</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_consumer_thread</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>

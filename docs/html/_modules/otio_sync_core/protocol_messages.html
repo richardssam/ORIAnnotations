@@ -308,6 +308,140 @@
 
 
 
+<div class="viewcode-block" id="PeerAnnounce">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerAnnounce">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PeerAnnounce</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Peer identity broadcast: who I am and what I can be authoritative for.</span>
+
+<span class="sd">    Feeds the peer table that host election reads.  Election is a pure function</span>
+<span class="sd">    of that table, so every peer must learn of every other peer — not just of</span>
+<span class="sd">    the master.</span>
+
+<span class="sd">    Sent on joining and **periodically thereafter**.  The periodic send is what</span>
+<span class="sd">    makes silence meaningful: a peer may legitimately go quiet for a whole</span>
+<span class="sd">    session, so only the absence of announcements distinguishes one that is idle</span>
+<span class="sd">    from one that has died.  Peers age out anyone they have not heard from</span>
+<span class="sd">    within the liveness timeout.</span>
+
+<span class="sd">    Nobody answers an announcement.  Answering used to be how a joiner</span>
+<span class="sd">    discovered peers that had long since gone quiet; a joiner now learns them</span>
+<span class="sd">    from the roster in :class:`StateSnapshot`, and any it misses from their next</span>
+<span class="sd">    periodic announcement.  Dropping the answer removes the only step in this</span>
+<span class="sd">    protocol whose message count grew with the size of the session.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;PEER_ANNOUNCE&quot;</span>
+
+    <span class="n">peer_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the announcing peer.&quot;</span><span class="p">)</span>
+    <span class="n">app</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Application name, e.g. &quot;xstudio&quot; or &quot;openrv&quot;. Ranks the peer for &#39;</span>
+            <span class="s2">&quot;host election; an unranked name is still eligible.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">capabilities</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Roles this peer can hold, e.g. [&quot;visibility&quot;].&#39;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">role</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Session role of the announcing peer: `driver`, `reviewer`, or &quot;</span>
+            <span class="s2">&quot;`viewer` — what this participant is permitted to emit at all, &quot;</span>
+            <span class="s2">&quot;which is a different question from who holds the canonical state &quot;</span>
+            <span class="s2">&quot;(master), who chooses what the session looks at (host), or who is &quot;</span>
+            <span class="s2">&quot;broadcasting a category right now (the write leases). Omitted when &quot;</span>
+            <span class="s2">&quot;the peer declares none, and an absent role means **the session&#39;s &quot;</span>
+            <span class="s2">&quot;default role**, not the most restrictive one: a peer running code &quot;</span>
+            <span class="s2">&quot;that predates roles must not read as ineligible, or one old peer &quot;</span>
+            <span class="s2">&quot;would make a session with drivers in it look driverless. &quot;</span>
+            <span class="s2">&quot;Self-declared on the same terms as `app`, and enforced by the &quot;</span>
+            <span class="s2">&quot;*sender*: a receiving peer applies a message without checking the &quot;</span>
+            <span class="s2">&quot;sender&#39;s role.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">identity</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Who is on the other end: {user, first_name, last_name, host, &quot;</span>
+            <span class="s2">&quot;source}. Every field is optional and the whole section is omitted &quot;</span>
+            <span class="s2">&quot;when the peer has no identity — a peer without one is a full &quot;</span>
+            <span class="s2">&quot;participant, labelled by app and GUID. Self-declared and &quot;</span>
+            <span class="s2">&quot;**unverified**, on the same terms as `app`: it identifies &quot;</span>
+            <span class="s2">&quot;cooperating participants, it does not authenticate them. &quot;</span>
+            <span class="s2">&quot;`source` records where it came from (`local`, `override`, or a &quot;</span>
+            <span class="s2">&quot;future authenticated provider). The displayed name is derived &quot;</span>
+            <span class="s2">&quot;from these fields by the receiver and is not transmitted.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="PeerAnnounce.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerAnnounce.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="n">payload</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;peer_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">peer_guid</span><span class="p">,</span>
+            <span class="s2">&quot;app&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">app</span><span class="p">,</span>
+            <span class="s2">&quot;capabilities&quot;</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">capabilities</span><span class="p">),</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">role</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;role&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">role</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">identity</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;identity&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">identity</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">payload</span></div>
+
+
+<div class="viewcode-block" id="PeerAnnounce.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerAnnounce.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;PeerAnnounce&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">peer_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;peer_guid&quot;</span><span class="p">),</span>
+            <span class="n">app</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;app&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+            <span class="n">capabilities</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;capabilities&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[]),</span>
+            <span class="n">role</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;role&quot;</span><span class="p">),</span>
+            <span class="n">identity</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;identity&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="PeerDepart">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerDepart">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PeerDepart</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Peer&#39;s notice that it is leaving the session.</span>
+
+<span class="sd">    Removes the sender from every other peer&#39;s peer table, so a role elected</span>
+<span class="sd">    from that table — host, in particular — moves off a peer that has gone.</span>
+<span class="sd">    Without it the table is append-only and a departed host keeps visibility</span>
+<span class="sd">    authority, freezing the session&#39;s view with no peer permitted to change it.</span>
+
+<span class="sd">    **Best-effort.**  It is sent once, on a path with no delivery guarantee, and</span>
+<span class="sd">    a peer that crashes never sends it at all.  Correctness therefore does not</span>
+<span class="sd">    rest on it: peers also age out anyone they have not heard announce within</span>
+<span class="sd">    the liveness timeout, and this message only makes the common case prompt.</span>
+<span class="sd">    Do not add a consumer that assumes arrival.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;LiveSession.1&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;PEER_DEPART&quot;</span>
+
+    <span class="n">peer_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the departing peer.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PeerDepart.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerDepart.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;peer_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">peer_guid</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="PeerDepart.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.PeerDepart.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;PeerDepart&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">peer_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;peer_guid&quot;</span><span class="p">))</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="StateRequest">
 <a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateRequest">[docs]</a>
 <span class="nd">@register</span>
@@ -366,6 +500,52 @@
     <span class="n">display_state</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Optional current display state to seed the joiner.&quot;</span>
     <span class="p">)</span>
+    <span class="n">host_guid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the session host (visibility authority) at snapshot time, &quot;</span>
+            <span class="s2">&quot;so a joiner does not assume it is host and fight the real one.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">peers</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Peers present at snapshot time, as {guid: {app, capabilities, role, identity}}, so &quot;</span>
+            <span class="s2">&quot;a joiner learns the peer set without every peer answering its &quot;</span>
+            <span class="s2">&quot;announcement. Not the only discovery path: a joiner that receives &quot;</span>
+            <span class="s2">&quot;no snapshot learns peers from their periodic announcements. &quot;</span>
+            <span class="s2">&quot;Carries no liveness stamp — that is the receiver&#39;s own clock. &quot;</span>
+            <span class="s2">&quot;`identity` is the same optional section PEER_ANNOUNCE carries, on &quot;</span>
+            <span class="s2">&quot;the same terms — self-declared and **unverified** — and is present &quot;</span>
+            <span class="s2">&quot;here so a peer that has gone quiet can still be named by a joiner &quot;</span>
+            <span class="s2">&quot;that has never heard it announce. `role` is carried for the same &quot;</span>
+            <span class="s2">&quot;reason and on the same terms as it is on PEER_ANNOUNCE — host &quot;</span>
+            <span class="s2">&quot;eligibility is evaluated against this table, and a peer that has &quot;</span>
+            <span class="s2">&quot;gone quiet is known to a joiner only through this roster, so a &quot;</span>
+            <span class="s2">&quot;role omitted here would make that peer look role-less until its &quot;</span>
+            <span class="s2">&quot;next heartbeat. An absent role means the session&#39;s default role.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">session_roles</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Session role policy at snapshot time, as {</span><span class="se">\&quot;</span><span class="s2">default_role</span><span class="se">\&quot;</span><span class="s2">: str, &quot;</span>
+            <span class="s1">&#39;&quot;peer_roles&quot;: {user: role}}. `default_role` is what a participant &#39;</span>
+            <span class="s2">&quot;the session does not recognise is given; `peer_roles` is the &quot;</span>
+            <span class="s2">&quot;session&#39;s memory of who has held a role, keyed on the identity&#39;s &quot;</span>
+            <span class="s2">&quot;`user` rather than on peer GUID — a driver who drops and rejoins &quot;</span>
+            <span class="s2">&quot;has a new GUID, which is the only case that memory exists for. &quot;</span>
+            <span class="s2">&quot;**Omitted when the session declares no policy**, exactly as a &quot;</span>
+            <span class="s2">&quot;free channel is omitted from `broadcast_ownership` and an unset &quot;</span>
+            <span class="s2">&quot;host is omitted from `host_guid`: an absent section means </span><span class="se">\&quot;</span><span class="s2">no &quot;</span>
+            <span class="s2">&quot;declared policy</span><span class="se">\&quot;</span><span class="s2">, not an empty one, so a peer predating this &quot;</span>
+            <span class="s2">&quot;field cannot clear a session&#39;s policy by relaying state. Policy &quot;</span>
+            <span class="s2">&quot;lives for the session only and is not persisted anywhere.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">broadcast_ownership</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Per-channel write-lease state at snapshot time, as &quot;</span>
+            <span class="s1">&#39;{&quot;position&quot;|&quot;display&quot;|&quot;structure&quot;: {&quot;owner_guid&quot;: str, &#39;</span>
+            <span class="s1">&#39;&quot;remaining_ms&quot;: float}}. A channel with no live owner is omitted, &#39;</span>
+            <span class="s2">&quot;not sent with a null owner, so a peer predating this field — or a &quot;</span>
+            <span class="s2">&quot;snapshot taken while every channel happened to be free — cannot &quot;</span>
+            <span class="s2">&quot;be read as clearing a lease another peer already holds.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
 
 <div class="viewcode-block" id="StateSnapshot.to_payload">
 <a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.StateSnapshot.to_payload">[docs]</a>
@@ -380,6 +560,16 @@
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;playback_state&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">playback_state</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">display_state</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;display_state&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">display_state</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_guid</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;host_guid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_guid</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">peers</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;peers&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">g</span><span class="p">:</span> <span class="nb">dict</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">g</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">peers</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">session_roles</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;session_roles&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">session_roles</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">broadcast_ownership</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;broadcast_ownership&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="n">ch</span><span class="p">:</span> <span class="nb">dict</span><span class="p">(</span><span class="n">info</span><span class="p">)</span> <span class="k">for</span> <span class="n">ch</span><span class="p">,</span> <span class="n">info</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">broadcast_ownership</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="p">}</span>
         <span class="k">return</span> <span class="n">payload</span></div>
 
 
@@ -394,6 +584,10 @@
             <span class="n">snapshot_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;snapshot_timestamp&quot;</span><span class="p">),</span>
             <span class="n">playback_state</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;playback_state&quot;</span><span class="p">),</span>
             <span class="n">display_state</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;display_state&quot;</span><span class="p">),</span>
+            <span class="n">host_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;host_guid&quot;</span><span class="p">),</span>
+            <span class="n">peers</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;peers&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}),</span>
+            <span class="n">session_roles</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;session_roles&quot;</span><span class="p">),</span>
+            <span class="n">broadcast_ownership</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;broadcast_ownership&quot;</span><span class="p">),</span>
         <span class="p">)</span></div>
 
 
@@ -513,6 +707,47 @@
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Timeline origin</span>
+<span class="c1">#</span>
+<span class="c1"># A timeline&#39;s sync model is selected by its origin, carried inside the</span>
+<span class="c1"># timeline&#39;s own ``metadata.sync.origin`` (so it travels for free inside any</span>
+<span class="c1"># serialized timeline — StateSnapshot, AddTimeline, ReplaceTimeline).  Peers</span>
+<span class="c1"># read it to route: OTIO-imported timelines use whole-OTIO snapshot pushes for</span>
+<span class="c1"># topology changes; native timelines use per-child patches.  A timeline lacking</span>
+<span class="c1"># the marker is treated as native for backward-compatibility with older peers.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="c1">#: Origin marker value for timelines expanded from an imported ``.otio`` file.</span>
+<span class="n">ORIGIN_OTIO_IMPORT</span> <span class="o">=</span> <span class="s2">&quot;otio_import&quot;</span>
+<span class="c1">#: Origin marker value (and default) for ad-hoc / native clip-list timelines.</span>
+<span class="n">ORIGIN_NATIVE</span> <span class="o">=</span> <span class="s2">&quot;native&quot;</span>
+
+
+<div class="viewcode-block" id="timeline_origin">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.timeline_origin">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">timeline_origin</span><span class="p">(</span><span class="n">timeline</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return a timeline&#39;s ``metadata.sync.origin``, defaulting to native.</span>
+
+<span class="sd">    Accepts either an OTIO ``Timeline`` object or its wire-form dict, so the</span>
+<span class="sd">    rule lives in exactly one place for both send and receive sides.  Any</span>
+<span class="sd">    timeline without the marker (older peers, native timelines) reads as</span>
+<span class="sd">    :data:`ORIGIN_NATIVE`.</span>
+
+<span class="sd">    :param timeline: An OTIO ``Timeline`` (has ``.metadata``) or a wire dict.</span>
+<span class="sd">    :returns: The origin marker string.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">metadata</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">timeline</span><span class="p">,</span> <span class="s2">&quot;metadata&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">metadata</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">timeline</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="n">metadata</span> <span class="o">=</span> <span class="n">timeline</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;metadata&quot;</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">origin</span> <span class="o">=</span> <span class="n">metadata</span><span class="p">[</span><span class="s2">&quot;sync&quot;</span><span class="p">][</span><span class="s2">&quot;origin&quot;</span><span class="p">]</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">KeyError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">ORIGIN_NATIVE</span>
+    <span class="k">return</span> <span class="n">origin</span> <span class="ow">or</span> <span class="n">ORIGIN_NATIVE</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
 <span class="c1"># Timeline family — TIMELINE_1.0</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 
@@ -604,6 +839,107 @@
 
 
 
+<div class="viewcode-block" id="RemoveTimeline">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveTimeline">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RemoveTimeline</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Removes an existing timeline from all peers.</span>
+
+<span class="sd">    Carries only the GUID — peers already hold the timeline, so no OTIO payload</span>
+<span class="sd">    is needed.  Receivers that do not hold the GUID treat it as a no-op.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;TIMELINE_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;REMOVE_TIMELINE&quot;</span>
+
+    <span class="n">timeline_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline to remove.&quot;</span><span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="RemoveTimeline.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveTimeline.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;timeline_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span><span class="p">,</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="RemoveTimeline.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.RemoveTimeline.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;RemoveTimeline&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ReplaceTimeline">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceTimeline">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReplaceTimeline</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wholesale replacement of a timeline&#39;s structure (&quot;brute-force push&quot;).</span>
+
+<span class="sd">    Carries a complete OTIO timeline and replaces the target&#39;s structure on each</span>
+<span class="sd">    peer in one shot, rather than as incremental child mutations.  Used for</span>
+<span class="sd">    topology changes (clip insert/remove, large re-edit) on OTIO-origin</span>
+<span class="sd">    timelines, where reconstructing the structure via RV&#39;s native OTIO reader is</span>
+<span class="sd">    cheaper and higher-fidelity than a stream of per-child patches.</span>
+
+<span class="sd">    Distinct from :class:`AddTimeline` (which models a *new* timeline and is a</span>
+<span class="sd">    no-op when the GUID already exists): ``REPLACE_TIMELINE`` deliberately</span>
+<span class="sd">    overwrites an existing timeline.  Each object&#39;s ``metadata.sync.guid`` in the</span>
+<span class="sd">    pushed timeline is preserved so attribute patches and annotations stay</span>
+<span class="sd">    resolvable across the replace.  Applying to an unknown GUID creates it.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;TIMELINE_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;REPLACE_TIMELINE&quot;</span>
+
+    <span class="n">timeline_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline to replace (or create).&quot;</span><span class="p">)</span>
+    <span class="n">timeline</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Full OTIO timeline (object on send, wire dict on receive).&quot;</span>
+    <span class="p">)</span>
+    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="ReplaceTimeline.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceTimeline.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;timeline_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span><span class="p">,</span>
+            <span class="s2">&quot;timeline&quot;</span><span class="p">:</span> <span class="n">_to_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timeline</span><span class="p">),</span>
+            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="ReplaceTimeline.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceTimeline.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;ReplaceTimeline&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">timeline</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline&quot;</span><span class="p">),</span>
+            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ReplaceTimeline.as_otio">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReplaceTimeline.as_otio">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the OTIO timeline, deserializing if still in wire form.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">_from_wire</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timeline</span><span class="p">)</span></div>
+</div>
+
+
+
 <span class="c1"># ---------------------------------------------------------------------------</span>
 <span class="c1"># Settings family — declare known fields, tolerate extras (hot paths)</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -628,9 +964,23 @@
     <span class="n">current_time</span><span class="p">:</span> <span class="s2">&quot;dict | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Current position as a serialized RationalTime.&quot;</span>
     <span class="p">)</span>
-    <span class="n">looping</span><span class="p">:</span> <span class="s2">&quot;bool | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Whether playback loops.&quot;</span><span class="p">)</span>
+    <span class="n">playback_mode</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Playback mode: &quot;play-once&quot;, &quot;loop&quot;, or &quot;ping-pong&quot;.&#39;</span><span class="p">,</span>
+    <span class="p">)</span>
     <span class="n">timeline_guid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline being played.&quot;</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the timeline being viewed/played.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">view_mode</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;View mode: &quot;sequence&quot; (position authoritative, clip derived from &#39;</span>
+            <span class="s1">&#39;the frame) or &quot;source&quot; (clip_guid authoritative, current_time is the &#39;</span>
+            <span class="s1">&#39;in-clip offset).&#39;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">clip_guid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Active clip sync GUID. Authoritative in source mode; confirmation/&quot;</span>
+            <span class="s2">&quot;highlight only in sequence mode (never seeked to).&quot;</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
@@ -641,8 +991,10 @@
     <span class="n">_KNOWN</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(</span>
         <span class="s2">&quot;playing&quot;</span><span class="p">,</span>
         <span class="s2">&quot;current_time&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;looping&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;playback_mode&quot;</span><span class="p">,</span>
         <span class="s2">&quot;timeline_guid&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;view_mode&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;clip_guid&quot;</span><span class="p">,</span>
         <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -654,10 +1006,14 @@
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;playing&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">playing</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;current_time&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_time</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">looping</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;looping&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">looping</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">playback_mode</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;playback_mode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">playback_mode</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">timeline_guid</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">view_mode</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;view_mode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">view_mode</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">clip_guid</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;clip_guid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">clip_guid</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">payload</span><span class="p">[</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span>
         <span class="n">payload</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">extras</span><span class="p">)</span>
@@ -672,8 +1028,10 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
             <span class="n">playing</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;playing&quot;</span><span class="p">),</span>
             <span class="n">current_time</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;current_time&quot;</span><span class="p">),</span>
-            <span class="n">looping</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;looping&quot;</span><span class="p">),</span>
+            <span class="n">playback_mode</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;playback_mode&quot;</span><span class="p">),</span>
             <span class="n">timeline_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;timeline_guid&quot;</span><span class="p">),</span>
+            <span class="n">view_mode</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;view_mode&quot;</span><span class="p">),</span>
+            <span class="n">clip_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;clip_guid&quot;</span><span class="p">),</span>
             <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
             <span class="n">extras</span><span class="o">=</span><span class="n">extras</span><span class="p">,</span>
         <span class="p">)</span></div>
@@ -752,47 +1110,13 @@
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
-<span class="c1"># Selection family — SELECTION_1.0</span>
+<span class="c1"># Selection family — RETIRED</span>
+<span class="c1">#</span>
+<span class="c1"># SELECTION_1.0 / SelectionSet was removed in the unify-view-state-sync change.</span>
+<span class="c1"># Selection state (active clip + sequence/source view mode) is now carried by the</span>
+<span class="c1"># view-state fields ``view_mode`` and ``clip_guid`` on PLAYBACK_SETTINGS_1.0, so</span>
+<span class="c1"># there is a single authoritative view-state message instead of two channels.</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
-
-
-<div class="viewcode-block" id="SelectionSet">
-<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet">[docs]</a>
-<span class="nd">@register</span>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">SelectionSet</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Broadcasts the clip the master has selected and the active view mode.&quot;&quot;&quot;</span>
-
-    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;SELECTION_1.0&quot;</span>
-    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;SET&quot;</span>
-
-    <span class="n">clip_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Sync GUID of the selected clip (&#39;&#39; to clear).&quot;</span><span class="p">)</span>
-    <span class="n">view_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;source&quot;</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;View mode: &quot;source&quot; or &quot;sequence&quot;.&#39;</span><span class="p">)</span>
-    <span class="n">sync_timestamp</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Epoch seconds when the message was sent.&quot;</span>
-    <span class="p">)</span>
-
-<div class="viewcode-block" id="SelectionSet.to_payload">
-<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet.to_payload">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="p">{</span>
-            <span class="s2">&quot;clip_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">clip_guid</span><span class="p">,</span>
-            <span class="s2">&quot;view_mode&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">view_mode</span><span class="p">,</span>
-            <span class="s2">&quot;sync_timestamp&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">sync_timestamp</span><span class="p">,</span>
-        <span class="p">}</span></div>
-
-
-<div class="viewcode-block" id="SelectionSet.from_payload">
-<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.SelectionSet.from_payload">[docs]</a>
-    <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;SelectionSet&quot;</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
-            <span class="n">clip_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;clip_guid&quot;</span><span class="p">),</span>
-            <span class="n">view_mode</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;view_mode&quot;</span><span class="p">,</span> <span class="s2">&quot;source&quot;</span><span class="p">),</span>
-            <span class="n">sync_timestamp</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sync_timestamp&quot;</span><span class="p">),</span>
-        <span class="p">)</span></div>
-</div>
-
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -807,8 +1131,11 @@
 <span class="k">class</span><span class="w"> </span><span class="nc">PartialAnnotation</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Mid-stroke partial annotation (visual preview, not persisted).</span>
 
-<span class="sd">    Hot path: fires repeatedly while a stroke is being drawn.  No validation or</span>
-<span class="sd">    reflective serialization is performed.</span>
+<span class="sd">    Hot path: fires repeatedly while a stroke is being drawn (before pen-up).</span>
+<span class="sd">    Peers render the transient stroke visually, but do not write it to the local</span>
+<span class="sd">    OTIO timeline. On pen-up/completion, a full stroke is committed via</span>
+<span class="sd">    :class:`InsertChild` instead. No validation or reflective serialization is</span>
+<span class="sd">    performed.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;Annotation.1&quot;</span>
@@ -1036,7 +1363,12 @@
 <span class="nd">@register</span>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">ReplaceAnnotationCommands</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Replaces the full annotation-command list on an annotation clip.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Replaces the full annotation-command list on an annotation clip.</span>
+
+<span class="sd">    Used when modifying/updating existing committed annotations in-place</span>
+<span class="sd">    (e.g., editing text/captions or dragging/moving them), rather than</span>
+<span class="sd">    appending a delta or committing a new stroke.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;OTIO_SESSION_1.0&quot;</span>
     <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;REPLACE_ANNOTATION_COMMANDS&quot;</span>
@@ -1076,6 +1408,99 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">as_otio</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the OTIO SyncEvent list, deserializing any wire-form entries.&quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="p">[</span><span class="n">_from_wire</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">commands</span><span class="p">]</span></div>
+</div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Broadcast ownership family — BROADCAST_OWNERSHIP_1.0</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="ClaimOwnership">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ClaimOwnership">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClaimOwnership</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A peer&#39;s claim to the write lease for one broadcast-ownership channel.</span>
+
+<span class="sd">    Sent both when a peer claims a free channel and when it re-claims a</span>
+<span class="sd">    channel it already holds (refreshing the lease). ``claim_ts`` is a wall</span>
+<span class="sd">    clock reading, not a local monotonic one — it is compared against another</span>
+<span class="sd">    peer&#39;s ``claim_ts`` for the deterministic tiebreak (earlier wins, lower</span>
+<span class="sd">    ``peer_guid`` breaks an exact tie), which only works if every peer</span>
+<span class="sd">    evaluates the same two values (design.md D2). Every peer, including the</span>
+<span class="sd">    claimant itself, resolves this message through the same rule.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;BROADCAST_OWNERSHIP_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;CLAIM_OWNERSHIP&quot;</span>
+
+    <span class="n">category</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Lease channel being claimed: &quot;position&quot;, &quot;display&quot;, or &quot;structure&quot;.&#39;</span>
+    <span class="p">)</span>
+    <span class="n">peer_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the claiming peer.&quot;</span><span class="p">)</span>
+    <span class="n">claim_ts</span><span class="p">:</span> <span class="s2">&quot;float | None&quot;</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s2">&quot;Wall-clock epoch seconds when the claim was made; drives the &quot;</span>
+            <span class="s2">&quot;deterministic tiebreak between simultaneous claims.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="ClaimOwnership.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ClaimOwnership.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;category&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">category</span><span class="p">,</span>
+            <span class="s2">&quot;peer_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">peer_guid</span><span class="p">,</span>
+            <span class="s2">&quot;claim_ts&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">claim_ts</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="ClaimOwnership.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ClaimOwnership.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;ClaimOwnership&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">category</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;category&quot;</span><span class="p">),</span>
+            <span class="n">peer_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;peer_guid&quot;</span><span class="p">),</span>
+            <span class="n">claim_ts</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;claim_ts&quot;</span><span class="p">),</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ReleaseOwnership">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReleaseOwnership">[docs]</a>
+<span class="nd">@register</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReleaseOwnership</span><span class="p">(</span><span class="n">ProtocolMessage</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A peer&#39;s explicit release of a broadcast-ownership channel it holds.</span>
+
+<span class="sd">    Frees the channel (or promotes a pending claimant) immediately rather than</span>
+<span class="sd">    waiting for the lease to expire. Best-effort: a peer that disconnects</span>
+<span class="sd">    without sending this is still handled — the lease simply expires through</span>
+<span class="sd">    the ordinary silence-based path.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">SCHEMA</span> <span class="o">=</span> <span class="s2">&quot;BROADCAST_OWNERSHIP_1.0&quot;</span>
+    <span class="n">EVENT</span> <span class="o">=</span> <span class="s2">&quot;RELEASE_OWNERSHIP&quot;</span>
+
+    <span class="n">category</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span>
+        <span class="n">doc</span><span class="o">=</span><span class="s1">&#39;Lease channel being released: &quot;position&quot;, &quot;display&quot;, or &quot;structure&quot;.&#39;</span>
+    <span class="p">)</span>
+    <span class="n">peer_guid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">doc_field</span><span class="p">(</span><span class="n">doc</span><span class="o">=</span><span class="s2">&quot;GUID of the releasing peer.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ReleaseOwnership.to_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReleaseOwnership.to_payload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_payload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;category&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">category</span><span class="p">,</span> <span class="s2">&quot;peer_guid&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">peer_guid</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="ReleaseOwnership.from_payload">
+<a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.protocol_messages.ReleaseOwnership.from_payload">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_payload</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;ReleaseOwnership&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">category</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;category&quot;</span><span class="p">),</span> <span class="n">peer_guid</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;peer_guid&quot;</span><span class="p">))</span></div>
 </div>
 
 </pre></div>

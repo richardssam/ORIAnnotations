@@ -82,11 +82,44 @@
 <span class="sd">    property changes or hierarchy insertions/moves/removals) to the local graph.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
+    <span class="c1">#: Most recent unresolved patches retained for reporting. Bounded: this is a</span>
+    <span class="c1">#: diagnostic record, not a replay queue (see below).</span>
+    <span class="n">_UNRESOLVED_HISTORY</span> <span class="o">=</span> <span class="mi">10</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">otio</span><span class="o">.</span><span class="n">core</span><span class="o">.</span><span class="n">SerializableObject</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_is_syncing</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_property_callbacks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_hierarchy_callbacks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1">#: Descriptions of patches that could not be applied, most recent last.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unresolved_patches</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1">#: Total unresolved patches seen, which the bounded list above loses.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unresolved_patch_count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_record_unresolved</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">target_uuid</span><span class="p">:</span> <span class="s2">&quot;str | None&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Record a patch that could not be applied because its target is unknown.</span>
+
+<span class="sd">        These used to be dropped in silence, and that is what let a peer receive</span>
+<span class="sd">        eight consecutive structural messages, apply none of them, and go on</span>
+<span class="sd">        reporting itself synced while its node graph stayed empty. A patch that</span>
+<span class="sd">        cannot be applied is a fact the session needs to surface.</span>
+
+<span class="sd">        Recorded, deliberately not queued for replay. The condition it signals —</span>
+<span class="sd">        a peer broadcasting a patch against an object its peers were never given</span>
+<span class="sd">        — is a bug at the sender, and a queue that silently succeeded later would</span>
+<span class="sd">        be the same &quot;looks fine, is not&quot; behaviour this record exists to remove.</span>
+
+<span class="sd">        :param kind: Message kind, e.g. ``&quot;INSERT_CHILD&quot;``.</span>
+<span class="sd">        :param target_uuid: GUID that could not be resolved.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unresolved_patch_count</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="n">detail</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">kind</span><span class="si">}</span><span class="s2">: target </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">target_uuid</span><span class="p">)[:</span><span class="mi">8</span><span class="p">]</span><span class="si">}</span><span class="s2"> not in object_map &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="p">)</span><span class="si">}</span><span class="s2"> objects held)&quot;</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unresolved_patches</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span>
+        <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">unresolved_patches</span><span class="p">[:</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">_UNRESOLVED_HISTORY</span><span class="p">]</span>
+        <span class="n">_log</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;UNRESOLVED PATCH </span><span class="si">{</span><span class="n">detail</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="OTIOPatcher.on_property_changed">
 <a class="viewcode-back" href="../../otio_sync_core.html#otio_sync_core.patcher.OTIOPatcher.on_property_changed">[docs]</a>
@@ -432,6 +465,10 @@
                 <span class="n">to_index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">to_index</span>
                 <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">parent_uuid</span><span class="p">)</span>
                 <span class="n">child</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">child_uuid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">child</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_unresolved</span><span class="p">(</span>
+                        <span class="s2">&quot;MOVE_CHILD&quot;</span><span class="p">,</span> <span class="n">parent_uuid</span> <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">child_uuid</span>
+                    <span class="p">)</span>
                 <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">child</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">current_index</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span>
                         <span class="p">(</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">item</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
@@ -448,6 +485,8 @@
                 <span class="n">parent_uuid</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">parent_uuid</span>
                 <span class="n">child_uuid</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">child_uuid</span>
                 <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">parent_uuid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_unresolved</span><span class="p">(</span><span class="s2">&quot;REMOVE_CHILD&quot;</span><span class="p">,</span> <span class="n">parent_uuid</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">current_index</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span>
                         <span class="p">(</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">item</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
@@ -471,6 +510,8 @@
 
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="n">InsertChild</span><span class="p">):</span>
                 <span class="n">parent_uuid</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">parent_uuid</span>
+                <span class="k">if</span> <span class="n">parent_uuid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_unresolved</span><span class="p">(</span><span class="s2">&quot;INSERT_CHILD&quot;</span><span class="p">,</span> <span class="n">parent_uuid</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">parent_uuid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="p">:</span>
                     <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">object_map</span><span class="p">[</span><span class="n">parent_uuid</span><span class="p">]</span>
                     <span class="n">index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">index</span>
