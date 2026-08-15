@@ -38,6 +38,43 @@ never read — and was deleted directly; no design work needed there. This
 change is the deferred "dedicated future pass" `broadcast-ownership`'s
 Group 3 called for, to actually retire what remains.
 
+### Inherited 2026-08-15 from `lease-visibility-authority` (its task 9.14)
+
+That change found the same defect **four times** in live two-peer testing (its
+tasks 9.7-9.10), and named the shared root cause: **a wall-clock window
+standing in for "who is driving"** — a question the lease now answers
+directly. The `_playback_apply_suppress_until` readers described above are the
+last place that pattern lives, which makes deciding their fate part of this
+change rather than a separate exercise.
+
+It also established the distinction to apply, which is sharper than "replace
+the window with the lease":
+
+- Where a guard's real question is **authority** — *may I broadcast?* — ask the
+  lease.
+- Where it is **what the user just did** — an isolation vs. a scrub, a local
+  write vs. an applied one — the lease cannot answer it, and a window is not
+  made correct by the lease existing alongside it.
+
+The worked precedent is `_view_assertion_is_echo` in
+`xstudio_plugin/ori_sync/playback_sync.py`. Its predecessor treated *any*
+remote message as making the next 5 s non-local, which silenced a peer's own
+view changes for up to five seconds after any peer spoke. Tuning was not
+available: the false positives sat at 1.76 s and the true echoes at 1.52-1.90 s.
+The fix was to stop asking *when* and start asking *what* — a peer's message
+cannot make this peer switch to a clip that message never named. Expect the
+position guards to need the same treatment rather than a lease lookup, and
+expect a window that cannot be tuned to be the signal that it does.
+
+Two further inputs this change now has that `broadcast-ownership` did not:
+`docs/visibility_authority_guards.md` carries a 2026-08-15 section stating the
+distinction above, and `sync_test` gained the machinery for contended
+scenarios — `repeat` blocks, `settle` on `concurrent_commands`, per-peer
+naming, and `expect_ownership_contested`, which fails a scenario that
+converges without ever having contended. The "extend the contended test
+coverage" item below should build on those rather than start from
+`contended_position_scrub`.
+
 ## What Changes
 
 - **Split, don't delete, the mixed-purpose guards.** `_loop_mode_apply_suppress_until`

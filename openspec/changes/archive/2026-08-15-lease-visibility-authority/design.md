@@ -356,6 +356,17 @@ other three channels to unconditional, as it does today);
 
 ## Open Questions
 
-- Whether 3.0 s / 1.5 s survive a two-driver soak, or want to be 2.0 s / 1.0 s.
-  Deferrable: the values are two constants in `authority.py` and no spec,
-  interface, or task depends on which one is right.
+- ~~Whether 3.0 s / 1.5 s survive a two-driver soak, or want to be 2.0 s / 1.0 s.~~
+  **Resolved 2026-08-15: keep 3.0 / 1.5.** Answered by
+  `contended_visibility_selection_rv` — sixteen rounds of two OpenRV peers
+  asserting different clips at a ~1.15 s cadence. The hold-off fired 14 times,
+  and ownership changed hands **once**, early, rather than alternating per
+  claim. Every round moved the view exactly once, with no oscillation and no
+  round where it crossed back. Since thrash is the only thing these values
+  trade against, and none appeared, there is no observed problem for 2.0 / 1.0
+  to solve.
+
+  Two OpenRV peers rather than the mixed pair, deliberately: OpenRV's
+  view-change events are synchronous while xStudio's selection poll coalesces,
+  so a mixed session claims 15-to-2 and never gets two claims inside one
+  hold-off window. The mechanism was never the limit — the instrument was.
