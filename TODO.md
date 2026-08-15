@@ -322,7 +322,6 @@ ORI_SESSION="amqps://aswf:29a5953658144449ac73385b9e3144eedb76@146.235.219.100:5
 
 # Openspec changes
 
-* fix-visibility-authority-bypass - Fixing some issues where a client is still affecting the host, and/or ignoring the host.
 
 Later:
 
