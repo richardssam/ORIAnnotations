@@ -893,6 +893,8 @@ class ORISyncPlugin(PluginBase):
         try:
             if cmd == "load_timelines":
                 self.builder.do_load_timelines()
+            elif cmd == "reload_existing_timelines":
+                self.structure.reload_existing_timelines()
             elif cmd == "apply_join_playback":
                 self.playback.apply_join_playback_state(
                     payload.get("attempt", 0), payload.get("generation")
@@ -1159,6 +1161,15 @@ class ORISyncPlugin(PluginBase):
         if not self.manager.is_master:
             # We joined an existing session — create one playlist per received timeline.
             self._cmd_queue.put(("load_timelines", {}))
+            # Recovery re-enters this exact path (structure-divergence-recovery,
+            # design D2) — but do_load_timelines() skips any guid this peer
+            # already has a playlist for, which is exactly the timeline a
+            # diverged peer needs reconciled (it already held that playlist,
+            # that is how it made the disallowed local edit). A fresh join
+            # never has anything in _sync_playlists yet, so this is a no-op
+            # there and only does work on a genuine recovery (design D2a).
+            if self.manager.state_request_reason == "recovery":
+                self._cmd_queue.put(("reload_existing_timelines", {}))
             if self.manager.display_state:
                 self.display.apply_display_state(self.manager.display_state)
 

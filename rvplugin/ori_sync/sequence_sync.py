@@ -1781,7 +1781,23 @@ class SequenceSyncController:
 
         # Pass 3: create one RVSequenceGroup per OTIO timeline when there are
         # multiple, so the client mirrors the host's sequence structure.
+        #
+        # A recovery rebuild (structure-divergence-recovery) runs on a session
+        # this peer has already been using, not an empty one — timelines this
+        # peer already mirrors (built earlier by the ordinary ADD_TIMELINE
+        # receive path) are still live in _rv_node_to_timeline_guid. Creating
+        # unconditionally here duplicated every one of them: two
+        # RVSequenceGroups sharing a name, only one tracked going forward,
+        # and view-follow logic that resolves "the" sequence for a guid no
+        # longer finding the one actually on screen. Reuse the existing node
+        # when one is already known and still present in the graph, exactly
+        # as the single-timeline branch below already does.
         if len(timelines) > 1:
+            live_seq_groups = set()
+            try:
+                live_seq_groups = set(rv.commands.nodesOfType("RVSequenceGroup"))
+            except Exception:
+                pass
             for timeline in timelines:
                 timeline_sgs = []
                 for item in timeline.tracks:
@@ -1795,21 +1811,37 @@ class SequenceSyncController:
                             sg = path_to_sg.get(_media_path(ref.target_url))
                             if sg:
                                 timeline_sgs.append(sg)
-                if timeline_sgs:
+                if not timeline_sgs:
+                    continue
+                tl_guid = timeline.metadata.get("sync", {}).get("guid")
+                existing_node = None
+                if tl_guid:
+                    for node, mapped_guid in self._rv_node_to_timeline_guid.items():
+                        if mapped_guid == tl_guid and node in live_seq_groups:
+                            existing_node = node
+                            break
+                if existing_node:
                     try:
-                        seq_node = rv.commands.newNode("RVSequenceGroup", timeline.name)
-                        # See _create_rv_sequence_for_timeline: set ui.name to the
-                        # full timeline name so the rename poller does not echo a
-                        # spurious RENAME from newNode's space-truncated node name.
-                        self._set_sequence_ui_name(seq_node, timeline.name)
-                        rv.commands.setNodeInputs(seq_node, list(timeline_sgs))
-                        tl_guid = timeline.metadata.get("sync", {}).get("guid")
-                        if tl_guid:
-                            self._rv_node_to_timeline_guid[seq_node] = tl_guid
-                        self._sequence_input_order[seq_node] = list(timeline_sgs)
-                        _log(f"Created sequence '{timeline.name}' with {len(timeline_sgs)} sources")
+                        rv.commands.setNodeInputs(existing_node, list(timeline_sgs))
+                        self._set_sequence_ui_name(existing_node, timeline.name)
+                        self._sequence_input_order[existing_node] = list(timeline_sgs)
+                        _log(f"Reused sequence '{timeline.name}' ({existing_node}) with {len(timeline_sgs)} sources")
                     except Exception as e:
-                        _log(f"Could not create sequence '{timeline.name}': {e}")
+                        _log(f"Could not reuse sequence '{timeline.name}': {e}")
+                    continue
+                try:
+                    seq_node = rv.commands.newNode("RVSequenceGroup", timeline.name)
+                    # See _create_rv_sequence_for_timeline: set ui.name to the
+                    # full timeline name so the rename poller does not echo a
+                    # spurious RENAME from newNode's space-truncated node name.
+                    self._set_sequence_ui_name(seq_node, timeline.name)
+                    rv.commands.setNodeInputs(seq_node, list(timeline_sgs))
+                    if tl_guid:
+                        self._rv_node_to_timeline_guid[seq_node] = tl_guid
+                    self._sequence_input_order[seq_node] = list(timeline_sgs)
+                    _log(f"Created sequence '{timeline.name}' with {len(timeline_sgs)} sources")
+                except Exception as e:
+                    _log(f"Could not create sequence '{timeline.name}': {e}")
         elif len(timelines) == 1:
             timeline = timelines[0]
             tl_guid = timeline.metadata.get("sync", {}).get("guid")

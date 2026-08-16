@@ -129,6 +129,19 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
             }
         )
 
+    # Structure divergence recovery (structure-divergence-recovery, design D7):
+    # one derived condition rather than two raw booleans, so both panels
+    # switch on the same value and cannot render it differently. ``getattr``
+    # defaults match the pattern above for test doubles that predate this
+    # attribute.
+    structure_diverged = getattr(manager, "structure_diverged", False)
+    if not structure_diverged:
+        structure_divergence = None
+    elif getattr(manager, "_recovery_unreachable", False):
+        structure_divergence = "unrecoverable"
+    else:
+        structure_divergence = "recovering"
+
     return {
         "status": manager.status,
         "self_guid": self_guid,
@@ -158,4 +171,7 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
         # session — distinct from a recorded outcome, so a panel can tell "not
         # checked yet" apart from any of the three checked outcomes.
         "join_confirmation": getattr(manager, "join_confirmation", None),
+        # None | "recovering" | "unrecoverable" (structure-divergence-recovery,
+        # design D7). None for a synchronised peer that has never diverged.
+        "structure_divergence": structure_divergence,
     }

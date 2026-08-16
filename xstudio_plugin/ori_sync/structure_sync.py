@@ -2390,6 +2390,120 @@ class StructureSyncController:
             self.plugin.annotation.clear_reload_state()
             _log_exc(f"sequence insert: failed to reload timeline {tl_guid[:8]}")
 
+    # ── structure divergence recovery ────────────────────────────────────
+
+    def reload_existing_timelines(self) -> None:
+        """Reconcile every playlist this peer already has to the recovered structure.
+
+        Recovery-only counterpart to ``TimelineBuildController.do_load_timelines``,
+        which skips any guid already in ``plugin._sync_playlists`` — exactly the
+        timelines a diverged peer needs reconciled, since it already held a
+        playlist for whichever one it diverged on (that is how it made the
+        disallowed local edit) (structure-divergence-recovery, design D2a).
+
+        Reuses the same per-branch mechanics the live delta-apply path already
+        proved rather than a new bulk algorithm: a sequence timeline is
+        reloaded via ``load_otio(clear=True)`` under the same annotation
+        reload scope :meth:`apply_remote_remove_child` uses; a flat playlist's
+        membership and order go through the existing single-clip appliers
+        (:meth:`apply_remote_clip_insert`, :meth:`apply_remote_remove_child`,
+        :meth:`apply_flat_playlist_move`), so recovery gets their suppress-window
+        and annotation-scope handling for free instead of a second copy of it.
+
+        Called only when the synced firing that triggered this is a recovery
+        (``manager.state_request_reason == "recovery"``) — never from the
+        general ``add_timeline`` remote-apply path, which must keep calling
+        only ``do_load_timelines()`` so an ordinary new-timeline broadcast does
+        not wipe every peer's already-open playlists.
+        """
+        plugin = self.plugin
+        if not plugin.manager:
+            return
+        for tl_guid, otio_tl in list(plugin.manager.timelines.items()):
+            if tl_guid not in plugin._sync_playlists:
+                continue  # not yet known locally — do_load_timelines() covers it
+            if otio_tl.metadata.get("clip_timeline_for"):
+                continue  # dynamic single-clip timeline; never has its own container
+            xs_playlist, xs_timeline = plugin._sync_playlists[tl_guid]
+            if xs_timeline is None or otio_tl.metadata.get("xs_flat_playlist"):
+                self._reload_flat_playlist(tl_guid, otio_tl, xs_playlist)
+            else:
+                self._reload_sequence_timeline(tl_guid, otio_tl, xs_playlist, xs_timeline)
+
+    def _reload_sequence_timeline(self, tl_guid, otio_tl, xs_playlist, xs_timeline) -> None:
+        """Reload one sequence Timeline's xStudio content from the recovered OTIO.
+
+        Mirrors :meth:`apply_remote_remove_child`'s sequence branch call for
+        call — the same ``load_otio(clear=True)`` idiom, under the same
+        annotation reload scope, is correct here for the same reason: xStudio
+        has no incremental reconciliation API for a Timeline, only a
+        clear-and-reload one.
+        """
+        self._structural_mutation_suppress_until = time.monotonic() + 1.5
+        try:
+            prepared_otio = self.plugin.media.prepare_otio_for_load(otio_tl)
+            self.plugin.builder.fill_source_ranges(prepared_otio)
+            otio_str = otio.adapters.write_to_string(prepared_otio, "otio_json")
+            self._xs_sequence_track_names[tl_guid] = None
+            with self.plugin.annotation.remote_structural_apply_scope():
+                xs_timeline.load_otio(otio_str, clear=True)
+                self.plugin.media.bootstrap_mapping(xs_playlist, otio_tl, xs_timeline)
+                self.update_xs_media_order(tl_guid, otio_tl)
+                if tl_guid in self._xs_sequence_playlists:
+                    self._reset_sequence_broadcast_record(tl_guid, otio_tl)
+                _log(f"structure recovery: reloaded sequence timeline {tl_guid[:8]}")
+            self.plugin.annotation.arm_reload_residual()
+        except Exception:
+            self.plugin.annotation.clear_reload_state()
+            _log_exc(f"structure recovery: reload failed for sequence {tl_guid[:8]}")
+
+    def _reload_flat_playlist(self, tl_guid, otio_tl, xs_playlist) -> None:
+        """Reconcile one flat playlist's bin membership and order to the recovered OTIO.
+
+        Computes the membership diff directly (xStudio has no bulk load for a
+        media bin), then drives it through the same single-item appliers a
+        live INSERT_CHILD/REMOVE_CHILD delta would run, so each already
+        carries its own suppress-window handling.
+        """
+        video_track = next(
+            (t for t in otio_tl.tracks if t.kind == otio.schema.TrackKind.Video), None
+        )
+        if video_track is None:
+            return
+        track_guid = video_track.metadata.get("sync", {}).get("guid")
+        if not track_guid:
+            return
+
+        plugin = self.plugin
+        target_clips = [c for c in video_track if isinstance(c, otio.schema.Clip)]
+        target_guids = {c.metadata.get("sync", {}).get("guid") for c in target_clips}
+        try:
+            current_guids = {
+                plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid)
+                for m in xs_playlist.media
+            }
+        except Exception:
+            _log_exc(
+                f"structure recovery: could not read flat playlist media for {tl_guid[:8]}"
+            )
+            return
+
+        for cg in current_guids - target_guids:
+            if cg:
+                self.apply_remote_remove_child({"parent_uuid": track_guid, "child_uuid": cg})
+        for clip in target_clips:
+            cg = clip.metadata.get("sync", {}).get("guid")
+            if cg and cg not in current_guids:
+                self.apply_remote_clip_insert(clip)
+
+        # apply_remote_clip_insert already reconciles order after each insert,
+        # but a pure reorder with no membership change needs its own pass.
+        try:
+            self.apply_flat_playlist_move(tl_guid, xs_playlist, otio_tl, 0)
+        except Exception:
+            _log_exc(f"structure recovery: order reconcile failed for {tl_guid[:8]}")
+        _log(f"structure recovery: reconciled flat playlist {tl_guid[:8]}")
+
     # ── remote remove/move child ───────────────────────────────────────
 
     def apply_remote_remove_child(self, data: dict) -> None:

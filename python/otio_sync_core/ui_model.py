@@ -44,6 +44,7 @@ class SessionStateModel(QObject):
     selfHoldsVisibilityChanged = Signal()
     mayHoldVisibilityChanged = Signal()
     joinConfirmationChanged = Signal()
+    structureDivergenceChanged = Signal()
 
     def __init__(self, manager, local_view_provider=None, parent=None):
         super().__init__(parent)
@@ -81,6 +82,8 @@ class SessionStateModel(QObject):
             self.mayHoldVisibilityChanged.emit()
         if self._snapshot["join_confirmation"] != previous["join_confirmation"]:
             self.joinConfirmationChanged.emit()
+        if self._snapshot["structure_divergence"] != previous["structure_divergence"]:
+            self.structureDivergenceChanged.emit()
 
         is_split = self._compute_split_view()
         if is_split != self._is_split:
@@ -175,6 +178,16 @@ class SessionStateModel(QObject):
         """Itemised differences for a mismatch; empty for any other outcome."""
         jc = self._snapshot["join_confirmation"]
         return jc["differences"] if jc else []
+
+    @Property(str, notify=structureDivergenceChanged)
+    def structureDivergence(self):
+        """``"recovering"`` / ``"unrecoverable"``, or ``""`` when synchronised.
+
+        Empty string for a peer that has never diverged, distinguishable from
+        both conditions the same way ``joinConfirmationOutcome`` uses an empty
+        string for "never joined" (structure-divergence-recovery, design D7).
+        """
+        return self._snapshot["structure_divergence"] or ""
 
     @Property(bool, notify=isDebugChanged)
     def isDebug(self):

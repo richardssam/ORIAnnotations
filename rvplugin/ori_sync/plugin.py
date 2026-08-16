@@ -345,12 +345,46 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 # call actually runs, the check notices and abandons rather
                 # than silently confirming against the wrong join.
                 _join_generation = self.sync_manager.join_generation
+                # A recovery rebuild (structure-divergence-recovery) can
+                # re-input an RVSequenceGroup that was already on screen —
+                # restoring or reordering the diverged sequence's own node,
+                # rather than building a fresh one the way a join does — and
+                # that reset RV's own frame asynchronously, landing after the
+                # synchronous _apply_playback above but before even the single
+                # deferred tick below (observed live 2026-08-16: a settled
+                # frame that did not match what was just sent, a different
+                # wrong value each time, consistent with a reset racing the
+                # apply rather than a fixed arithmetic bug). Re-applying once
+                # more, one tick later, wins that race — re-applying an
+                # already-correct frame is a no-op. Confined to recovery: the
+                # plain join path has no such evidence and is left exactly as
+                # verified in post-join-state-confirmation.
+                _is_recovery = self.sync_manager.state_request_reason == "recovery"
+
+                def _confirm_after_settling():
+                    if (_is_recovery
+                            and self.sync_manager.join_generation == _join_generation
+                            and self.sync_manager.playback_state):
+                        self._rv_updating = True
+                        try:
+                            self.playback._apply_playback(self.sync_manager.playback_state)
+                        finally:
+                            self._rv_updating = False
+                        # One further tick for this reapply itself to settle
+                        # before the confirmation reads it.
+                        if QtCore:
+                            QtCore.QTimer.singleShot(
+                                0, lambda: self.playback.confirm_join_state(_join_generation)
+                            )
+                        else:
+                            self.playback.confirm_join_state(_join_generation)
+                    else:
+                        self.playback.confirm_join_state(_join_generation)
+
                 if QtCore:
-                    QtCore.QTimer.singleShot(
-                        0, lambda: self.playback.confirm_join_state(_join_generation)
-                    )
+                    QtCore.QTimer.singleShot(0, _confirm_after_settling)
                 else:
-                    self.playback.confirm_join_state(_join_generation)
+                    _confirm_after_settling()
             if self._pending_create_check:
                 self._pending_create_check = False
                 if not self.sync_manager.is_master:

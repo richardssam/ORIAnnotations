@@ -238,6 +238,31 @@ def test_snapshot_reports_the_join_confirmation_outcome(outcome, differences):
     assert snap["join_confirmation"] == {"outcome": outcome, "differences": differences}
 
 
+def test_snapshot_reports_no_structure_divergence_when_synchronised():
+    snap = session_state_snapshot(_manager())
+    assert snap["structure_divergence"] is None
+
+
+def test_snapshot_reports_recovering():
+    mgr = _manager()
+    mgr.structure_diverged = True
+    mgr._recovery_unreachable = False
+
+    snap = session_state_snapshot(mgr)
+
+    assert snap["structure_divergence"] == "recovering"
+
+
+def test_snapshot_reports_unrecoverable():
+    mgr = _manager()
+    mgr.structure_diverged = True
+    mgr._recovery_unreachable = True
+
+    snap = session_state_snapshot(mgr)
+
+    assert snap["structure_divergence"] == "unrecoverable"
+
+
 def test_snapshot_carries_the_shared_view():
     mgr = _manager()
     mgr.active_timeline_guid = "tl-1"

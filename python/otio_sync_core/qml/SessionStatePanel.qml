@@ -129,6 +129,27 @@ Rectangle {
                 font.bold: true
             }
 
+            // Structure divergence recovery: distinct from the driverless
+            // banner above (that is about who may drive the view; this is
+            // about whether THIS peer's structure matches the session), and
+            // "being repaired" must read differently from "could not be
+            // repaired" — the user's options differ (session-state-ui).
+            Text {
+                visible: sessionState.structureDivergence === "recovering"
+                         || sessionState.structureDivergence === "unrecoverable"
+                text: {
+                    if (sessionState.structureDivergence === "recovering")
+                        return "Resynchronising — a local change could not be shared, rebuilding from the session."
+                    return "This peer's content may not match the session — no peer could be reached to resynchronise."
+                }
+                color: sessionState.structureDivergence === "unrecoverable" ? uiStyle.warningColor : uiStyle.joiningColor
+                wrapMode: Text.WordWrap
+                width: parent.width
+                font.family: uiStyle.fontFamily
+                font.pixelSize: uiStyle.fontSize - 2
+                font.bold: true
+            }
+
             // Post-join state confirmation: whether this peer's joined state
             // was confirmed against the snapshot it was sent.  Absent (empty
             // outcome string) before this peer has ever joined a session — a

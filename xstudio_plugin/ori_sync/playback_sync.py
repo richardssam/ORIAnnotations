@@ -900,6 +900,17 @@ class PlaybackSyncController:
     #: is included deliberately: a remote structural change is not a local view
     #: action either, and the tight window keeps that from over-reaching.
     #:
+    #: ``REMOVE_CHILD``/``MOVE_CHILD`` are ``INSERT_CHILD``'s missing structural
+    #: siblings — the same reasoning applies, and their sequence-branch appliers
+    #: (``apply_remote_remove_child``, ``apply_remote_move_child``,
+    #: ``reload_existing_timelines``) reload the timeline the identical way
+    #: (``load_otio(clear=True)``). Without them here, that reload's own
+    #: playhead settling fired a burst of genuine-looking show_atoms this peer
+    #: read as local view actions and rebroadcast — observed live 2026-08-16: a
+    #: single remote ``REMOVE_CHILD`` produced 19 spurious ``broadcast_view_state``
+    #: calls across 0.56 s, which is what a peer watching for "did the delete
+    #: actually land" read as the delete never having landed.
+    #:
     #: ``STATE_SNAPSHOT`` is here because joining a session is not a user
     #: action.  Without it, a peer joining a session whose host was mid-shot
     #: broadcast the *first* clip at frame 0 and dragged the host onto it
@@ -910,6 +921,8 @@ class PlaybackSyncController:
         ("Annotation.1", "PARTIAL"): _ANNOTATION_VIEW_ECHO_S,
         ("OTIO_SESSION_1.0", "REPLACE_ANNOTATION_COMMANDS"): _ANNOTATION_VIEW_ECHO_S,
         ("OTIO_SESSION_1.0", "INSERT_CHILD"): _ANNOTATION_VIEW_ECHO_S,
+        ("OTIO_SESSION_1.0", "REMOVE_CHILD"): _ANNOTATION_VIEW_ECHO_S,
+        ("OTIO_SESSION_1.0", "MOVE_CHILD"): _ANNOTATION_VIEW_ECHO_S,
         ("LiveSession.1", "STATE_SNAPSHOT"): _SNAPSHOT_VIEW_ECHO_S,
     }
 

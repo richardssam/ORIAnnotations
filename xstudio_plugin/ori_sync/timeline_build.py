@@ -277,6 +277,21 @@ class TimelineBuildController:
                         }))
                     plugin.structure._xs_sequence_track_names[guid] = None
                     plugin._sync_playlists[guid] = (playlist, xs_timeline)
+                    # Without this, local edits to this sequence (added by any
+                    # peer that loaded it from a snapshot — a join or a
+                    # structure-divergence-recovery reconciliation, neither of
+                    # which goes through the other creation path at
+                    # timeline_build.py:405 that already subscribes) are never
+                    # detected: no item_atom callback means poll_sequence_
+                    # track_deletions/_new_media/_reorders are never queued via
+                    # execute_sync_container, and there is no periodic backstop
+                    # for this specific subscription — join_known_playlist_
+                    # groups only re-attempts the playlist-level join, not this
+                    # per-timeline one (structure-divergence-recovery, found
+                    # live 2026-08-16: an xStudio client's own deletion from a
+                    # sequence loaded this way was never even noticed, let
+                    # alone refused-and-recovered).
+                    plugin.structure.subscribe_timeline_item_events(guid, xs_timeline)
                     plugin.media.bootstrap_mapping(playlist, otio_tl, xs_timeline)
                     _media_tr = next(
                         (t for t in otio_tl.tracks

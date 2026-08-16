@@ -90,6 +90,23 @@ XsWindow {
         return "#f59e0b"
     }
 
+    // Reported as a fact about THIS peer's own session, not a peer or session
+    // error (session-state-ui) — a repair needs no action from the user, but
+    // an unrecoverable divergence means this peer must not be trusted to
+    // review from, so the two must never look alike.
+    function structureDivergenceText() {
+        var d = panel.state.structure_divergence
+        if (d === "recovering") return "Resynchronising — a local change could not be shared, rebuilding from the session."
+        if (d === "unrecoverable") return "This peer's content may not match the session — no peer could be reached to resynchronise."
+        return ""
+    }
+
+    function structureDivergenceColour() {
+        var d = panel.state.structure_divergence
+        if (d === "unrecoverable") return "#ef4444"
+        return "#f59e0b"
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: XsStyleSheet.panelPadding * 2
@@ -182,6 +199,23 @@ XsWindow {
                     visible: panel.debugMode
                     text: "This peer: " + panel.shortGuid(panel.state.self_guid)
                           + (panel.state.is_host ? " — holds visibility authority" : "")
+                }
+
+                // Structure divergence recovery: shown distinctly from the
+                // driverless banner above (a different condition — this one
+                // is about whether *this peer's* structure matches the
+                // session, not who may drive it) and distinguishable between
+                // "being repaired" and "could not be repaired" by both text
+                // and colour.
+                XsText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignLeft
+                    font.bold: true
+                    visible: panel.state.structure_divergence === "recovering"
+                             || panel.state.structure_divergence === "unrecoverable"
+                    color: panel.structureDivergenceColour()
+                    text: panel.structureDivergenceText()
                 }
 
                 // Post-join state confirmation: whether this peer's joined

@@ -137,6 +137,24 @@ PEER_LIVENESS_TIMEOUT = 15.0
 #: rather than acted on silently.
 REMOTE_APPLY_SETTLE_SECONDS = 5.0
 
+#: Seconds a structural divergence must sit unrenewed before recovery starts
+#: (structure-divergence-recovery, design D4).
+#:
+#: Deleting a multi-clip selection refuses one structural broadcast per child,
+#: a few milliseconds apart; a person's *next* deliberate edit is an order of
+#: magnitude slower. Recovery is started from :meth:`SyncManager.tick`, never
+#: from the refusal itself, so a run of refusals inside this window collapses
+#: into the one rebuild it deserves rather than one request per child.
+DIVERGENCE_SETTLE = 0.5
+
+#: Minimum seconds between successive recovery attempts (design D5).
+#:
+#: A lease refusal is a legitimate, recurring race between two peers who may
+#: both write — unlike a role refusal, which is a stable property of the
+#: session — so under sustained contention this paces recovery to a slow
+#: periodic re-check instead of a rebuild loop.
+RECOVERY_COOLDOWN = 5.0
+
 #: ``(command_schema, event)`` pairs that open no provenance window, because
 #: they cannot change what any peer displays.
 #:
@@ -473,6 +491,42 @@ class SyncManager:
         #: its check is stale and skip it, rather than mis-attribute the
         #: outcome to the wrong join.
         self.join_generation: int = 0
+
+        #: Set when this peer makes a structural change it could not broadcast
+        #: (structure-divergence-recovery).  Cleared only by a recovery-driven
+        #: :meth:`apply_snapshot` completing successfully — never by the
+        #: request, and never by a failed or timed-out one.
+        self.structure_diverged: bool = False
+        #: Monotonic deadline at which a settled divergence becomes eligible to
+        #: trigger recovery (design D4).  ``None`` when nothing is pending.
+        self._divergence_settle_deadline: float | None = None
+        #: Why the most recent :meth:`request_state` was sent: ``"join"`` or
+        #: ``"recovery"`` (design D3).  Governs how :meth:`tick` handles that
+        #: request timing out, and — held through the ``on_synced`` firing
+        #: inside :meth:`apply_snapshot` — lets a host integration's synced
+        #: callback tell a recovery rebuild apart from a fresh join.  Public
+        #: (no leading underscore) because callbacks outside the manager are
+        #: meant to read it, the same way they read :attr:`structure_diverged`.
+        self.state_request_reason: str | None = None
+        #: Monotonic time recovery last completed (success or failure), so
+        #: :meth:`tick` can pace re-attempts by :data:`RECOVERY_COOLDOWN`
+        #: rather than retrying every tick under sustained contention.
+        self._last_recovery_attempt: float | None = None
+        #: Monotonic time the in-flight recovery request was sent, or ``None``.
+        #: :meth:`apply_snapshot` compares this against
+        #: :attr:`_last_diverge_mark_at` to tell whether this peer diverged
+        #: again after the request went out — if so the flag must survive the
+        #: rebuild rather than be cleared out from under a newer divergence.
+        self._recovery_request_sent_at: float | None = None
+        #: Monotonic time :meth:`_note_structure_diverged` most recently ran.
+        self._last_diverge_mark_at: float | None = None
+        #: Whether the most recent recovery attempt failed to reach a master
+        #: (no master known, or the request timed out).  Distinct from
+        #: :attr:`structure_diverged` alone, which does not say whether a
+        #: recovery is in flight or has already been tried and failed —
+        #: :meth:`otio_sync_core.session_state.session_state_snapshot` needs
+        #: both to tell "recovering" from "unrecoverable".
+        self._recovery_unreachable: bool = False
 
         #: Receive-side dispatch table: ``(command_schema, event)`` -> handler.
         #: Each handler takes ``(msg, data, source)`` and returns an
@@ -1187,10 +1241,15 @@ class SyncManager:
     def on_synced(
         self, callback: Callable[[], None]
     ) -> Callable[[], None]:
-        """Register a callback fired once when the session reaches ``STATE_SYNCED``.
+        """Register a callback fired when the session reaches ``STATE_SYNCED``.
 
-        Fires both when this peer self-elects as master and when it finishes
-        joining an existing master.  Also usable as a decorator.
+        Fires when this peer self-elects as master, when it finishes joining
+        an existing master, **and** when a diverged peer completes a
+        recovery rebuild mid-session (structure-divergence-recovery, design
+        D2) — "once" means once per join, not once per process lifetime, and
+        a recovery is a re-join in place. Both host plugins' handlers are
+        idempotent full rebuilds already, which is what makes this safe.
+        Also usable as a decorator.
 
         :param callback: Zero-argument callable.
         :returns: The *callback* unchanged (decorator-compatible).
@@ -1817,6 +1876,50 @@ class SyncManager:
         return True
 
     # ------------------------------------------------------------------
+    # Structure divergence recovery
+    # ------------------------------------------------------------------
+
+    def _structural_divergence_applies(self) -> bool:
+        """Return whether a structural refusal right now would be a divergence.
+
+        Excludes exactly the early returns that are not "this peer changed
+        structure the session was not told about" (structure-divergence-recovery,
+        design D1):
+
+        - ``_is_syncing`` — the change came *from* the session, not from this peer.
+        - No :attr:`network` — there is no session to diverge from.
+        - ``status != STATE_SYNCED`` — critically, this also excludes
+          ``STATE_JOINING``, which is the status while a recovery rebuild is in
+          progress. Without this a rebuild's own structural churn would mark a
+          fresh divergence and re-trigger itself.
+
+        :rtype: bool
+        """
+        return not self._is_syncing and bool(self.network) and self.status == STATE_SYNCED
+
+    def _note_structure_diverged(self, site: str, reason: str) -> None:
+        """Record that this peer changed structure it could not broadcast.
+
+        Called from the role/lease refusal branches of the structural
+        broadcast sites once :meth:`_structural_divergence_applies` holds
+        (structure-divergence-recovery, design D1). Idempotent: repeated calls
+        while already diverged just push the settle deadline out, which is
+        what lets a burst of refusals from one user action coalesce into a
+        single recovery (design D4).
+
+        :param site: Name of the calling ``broadcast_*``/``insert_child`` method.
+        :param reason: Short cause, folded into the log line and the dedup key.
+        """
+        self.structure_diverged = True
+        self._divergence_settle_deadline = time.monotonic() + DIVERGENCE_SETTLE
+        self._last_diverge_mark_at = time.monotonic()
+        self._log_field_strip(
+            "structure-diverged",
+            (site, reason),
+            f"{site}: structure diverged — {reason}",
+        )
+
+    # ------------------------------------------------------------------
     # Broadcast Ownership (write leases: position, display, structure)
     # ------------------------------------------------------------------
 
@@ -2225,15 +2328,31 @@ class SyncManager:
             self._settle_lease_expiry(channel)
             _log(f"lease[{channel}]: released — holder {peer_guid[:8]} departed")
 
-    def request_state(self) -> None:
+    def request_state(self, reason: str = "join") -> None:
         """Send a ``STATE_REQUEST`` to the master and enter ``STATE_JOINING``.
 
         Non-session messages received while joining are buffered in
         ``_delta_buffer`` and replayed by :meth:`apply_snapshot`.
+
+        Reachable both while joining and from ``STATE_SYNCED``
+        (structure-divergence-recovery, design D2/D3): a synchronised peer
+        that diverged re-enters this exact path rather than a second one, so
+        it inherits delta buffering and replay for free. The master answers a
+        mid-session request identically to a joining one — ``_h_state_request``
+        does not inspect the requester's prior status.
+
+        :param reason: ``"join"`` (default) or ``"recovery"``. Read by
+            :meth:`tick` to decide what an unanswered request means: a join
+            that never found a master falls back to discovery, but a
+            recovery request must not — this peer is already a member of the
+            session it is repairing and must not eject itself from it.
         """
         if self.master_guid:
             self._set_status(STATE_JOINING)
             self._state_request_time = time.time()
+            self.state_request_reason = reason
+            if reason == "recovery":
+                self._recovery_request_sent_at = time.monotonic()
             self._send_message(StateRequest(
                 target_guid=self.master_guid,
                 requester_guid=self.self_guid,
@@ -2448,7 +2567,7 @@ class SyncManager:
         index: int = -1,
         *,
         group: str = authority.STRUCTURE,
-    ) -> None:
+    ) -> str:
         """Insert *child_obj* into the parent container and broadcast the change.
 
         A GUID is assigned to *child_obj* if it does not already have one.
@@ -2468,6 +2587,10 @@ class SyncManager:
             annotation clip inserted into an Annotations track is an annotation
             by every measure except the message that carries it — and a reviewer
             may emit one while it may not reshape the timeline.
+        :returns: :data:`~otio_sync_core.authority.SENT` when the insert was
+            broadcast, :data:`~otio_sync_core.authority.SUPPRESSED` otherwise
+            (nothing to send, no network, or the role forbids *group*).
+        :rtype: str
         """
         msg = self.patcher.insert_child(parent_uuid, child_obj, index)
 
@@ -2477,7 +2600,9 @@ class SyncManager:
                 (self._self_role, "insert_child", group),
                 f"insert_child: suppressed — role {self._self_role!r} may not emit {group}",
             )
-            return
+            if group == authority.STRUCTURE and self._structural_divergence_applies():
+                self._note_structure_diverged("insert_child", f"role:{self._self_role}")
+            return authority.SUPPRESSED
 
         if not self._is_syncing and self.network and msg:
             _log(
@@ -2487,6 +2612,8 @@ class SyncManager:
             self._check_parent_published(InsertChild.EVENT, parent_uuid)
             self._send_message(msg)
             self._note_session_guids(child_obj)
+            return authority.SENT
+        return authority.SUPPRESSED
 
     #: Emit a field-strip line every this many identical repeats, so a long
     #: unchanging run still shows its scale without waiting for it to end.
@@ -3239,10 +3366,17 @@ class SyncManager:
         if self.status != STATE_SYNCED:
             _log(f"broadcast_move_child: skipped (status={self.status})")
             return authority.SUPPRESSED
+        # Both refusal branches below are reached only past the _is_syncing /
+        # network / STATE_SYNCED checks above, so _structural_divergence_applies()
+        # is already known true (design D1) — no need to re-test it.
         if self._role_blocks("broadcast_move_child"):
+            self._note_structure_diverged(
+                "broadcast_move_child", f"role:{self._self_role}"
+            )
             return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
             _log("broadcast_move_child: skipped (structure lease not held)")
+            self._note_structure_diverged("broadcast_move_child", "lease")
             return authority.SUPPRESSED
 
         msg = self.patcher.move_child(parent_uuid, child_uuid, to_index)
@@ -3264,9 +3398,15 @@ class SyncManager:
         """
         if self._is_syncing or not self.network or self.status != STATE_SYNCED:
             return authority.SUPPRESSED
+        # Past the guard above, _structural_divergence_applies() is already
+        # known true (design D1) — no need to re-test it.
         if self._role_blocks("broadcast_remove_child"):
+            self._note_structure_diverged(
+                "broadcast_remove_child", f"role:{self._self_role}"
+            )
             return authority.SUPPRESSED
         if not self._owns_channel(authority.CHANNEL_STRUCTURE):
+            self._note_structure_diverged("broadcast_remove_child", "lease")
             return authority.SUPPRESSED
 
         msg = self.patcher.remove_child(parent_uuid, child_uuid)
@@ -3721,11 +3861,56 @@ class SyncManager:
         if (self.status == STATE_JOINING
                 and getattr(self, "_state_request_time", None) is not None):
             if time.time() - self._state_request_time > 5.0:
-                _log("STATE_REQUEST timed out. Reverting to DISCOVERING.")
-                self.master_guid = None
-                self._state_request_time = None
-                self._set_status(STATE_DISCOVERING)
-                app_events.append(("state_request_timeout", None))
+                if self.state_request_reason == "recovery":
+                    # A recovery request answers no differently than a join's
+                    # would — the master doesn't know the difference — so an
+                    # unanswered one means no peer can currently serve state,
+                    # not that discovery failed. Ejecting this peer to
+                    # STATE_DISCOVERING would drop its host-election standing
+                    # and every lease it holds, and announce a departure and
+                    # rejoin to everyone else, over a peer that never left
+                    # (design D3; spec: "SHALL remain in the session").
+                    _log("Recovery STATE_REQUEST timed out. Staying diverged, in session.")
+                    self._state_request_time = None
+                    self.state_request_reason = None
+                    self._recovery_request_sent_at = None
+                    self._recovery_unreachable = True
+                    self._set_status(STATE_SYNCED)
+                    app_events.append(("structure_recovery_failed", None))
+                else:
+                    _log("STATE_REQUEST timed out. Reverting to DISCOVERING.")
+                    self.master_guid = None
+                    self._state_request_time = None
+                    self.state_request_reason = None
+                    self._set_status(STATE_DISCOVERING)
+                    app_events.append(("state_request_timeout", None))
+
+        # Structure divergence recovery (structure-divergence-recovery, design
+        # D4/D5). Started here, never from the refusal itself: the refusal
+        # arrives inside the host application's own callback, and re-entering
+        # a full snapshot apply from inside one is exactly the reentrancy both
+        # plugins guard against elsewhere.
+        if (self.structure_diverged
+                and self.status == STATE_SYNCED
+                and self._divergence_settle_deadline is not None
+                and time.monotonic() >= self._divergence_settle_deadline
+                and (self._last_recovery_attempt is None
+                     or time.monotonic() - self._last_recovery_attempt >= RECOVERY_COOLDOWN)):
+            self._last_recovery_attempt = time.monotonic()
+            if self.is_master or not self.master_guid:
+                # A diverged master has no authority to ask but itself, and a
+                # peer with no known master has nowhere to send the request
+                # (design D8). Neither sends anything.
+                self._recovery_unreachable = True
+                _log("structure recovery: no master to ask — staying diverged")
+                app_events.append(("structure_recovery_failed", None))
+            else:
+                self._recovery_unreachable = False
+                _log(
+                    f"structure recovery: requesting state from master "
+                    f"{self.master_guid[:8]}"
+                )
+                self.request_state(reason="recovery")
 
         return app_events
 
@@ -3981,7 +4166,30 @@ class SyncManager:
 
             self._delta_buffer = []
             self._state_request_time = None
+
+            # Structure divergence recovery (design D3, spec: "Recovery clears
+            # the divergence only on success"). Only a recovery-driven
+            # snapshot may clear structure_diverged, and only if nothing
+            # marked a fresh divergence after this request was sent — if it
+            # did, this peer diverged again while the rebuild was in flight
+            # and must stay marked so tick() starts another recovery (spec:
+            # "Divergence during a rebuild is not lost").
+            if self.state_request_reason == "recovery":
+                if (self._recovery_request_sent_at is not None
+                        and (self._last_diverge_mark_at is None
+                             or self._last_diverge_mark_at <= self._recovery_request_sent_at)):
+                    self.structure_diverged = False
+                    self._divergence_settle_deadline = None
+                self._recovery_unreachable = False
+                self._recovery_request_sent_at = None
+
+            # state_request_reason stays set through this call so the
+            # on_synced callbacks it fires (below) can tell a recovery rebuild
+            # apart from a fresh join — xStudio's needs to: an existing local
+            # playlist must be reconciled to the adopted structure, which a
+            # fresh join's create-only build never touches. Cleared after.
             self._set_status(STATE_SYNCED)
+            self.state_request_reason = None
             return replay_results
         finally:
             self._is_syncing = False
