@@ -384,3 +384,66 @@ that never settles.
 
 Report-only: no state request, no broadcast, no local change. A wrong report
 costs a wrong indicator in the Session State panel, never a wrong session.
+
+## Structural events: two-level subscription, never leave, event handlers never publish
+
+`StructureSyncController` discovers local structural changes (new playlist,
+new sequence, rename, removal) from xStudio's own events rather than only
+polling for them — see `openspec/changes/structure-events/`. Three
+non-obvious constraints, all confirmed empirically against build `e106f0f9`
+(`openspec/changes/structure-events/investigation/findings.md`):
+
+**A session-level subscription alone cannot see a sequence created inside an
+existing playlist.** `add_playlist_atom`/`rename_container_atom`/
+`remove_container_atom` fire on the **session**'s event group;
+`create_timeline_atom` fires only on the **playlist**'s own event group — the
+session actor has no handler for it and does not relay it. The plugin
+therefore joins the session's group once at connect (`ori_sync_plugin.py`,
+beside the bookmarks subscription) and every known playlist's group
+(`StructureSyncController.join_known_playlist_groups`), re-attempting every
+playlist's join on every structural poll pass so a missed or failed join
+self-heals within one cycle.
+
+**Every join is permanent — never call `unsubscribe_from_event_group` on
+these groups.** This build (`e106f0f9`) has the Python event-group routing
+fix (`70aaaa3f`) but not per-subscription listeners (`3b0a0e72`, unmerged): a
+connection shares one listener actor, and messages are dispatched by matching
+`current_sender()`. A `BroadcastActor` relays with
+`send_as(current_sender(), ...)`, so events from a group's owner all key on
+the *same* sender — a playlist's own group and its two sibling groups
+collapse onto the one entry the plugin actually joined, meaning a playlist
+subscription also delivers negligible `last_changed_atom`/`name_atom`
+crosstalk from those siblings (handlers must ignore unrecognised types
+cheaply, never by reading xStudio state to tell them apart). Worse: leaving
+one callback's membership revokes the *shared* entry for every other callback
+relying on it — this is what previously read as "per-playlist subscription
+causes SIGSEGV on teardown". The fix is the pattern already used for
+playheads/timeline items/viewed containers: `join_event_group` joins a group
+at most once and never leaves it; `detach_event_group_handler` removes a
+callback from the fan-out while the join itself stays. A stale join after a
+playlist is deleted costs one no-op dispatch — logged (join count) so an
+unbounded run is visible — not a re-subscription.
+
+**A structural event handler must not touch the `SyncManager`, read container
+content, or publish, on the thread it arrives on.** These events fire on an
+xStudio actor's own callback thread, not the plugin's poll thread — inline
+work there blocks xStudio itself, not just this plugin. Every handler
+(`StructureSyncController.on_structure_event`) does at most a set insert
+(`mark_container_dirty`) and a queue put (`plugin._cmd_queue`), then returns;
+every content read and every broadcast happens later on the poll thread,
+inside `_execute_command`'s `structure_dirty`/`structure_removed`/
+`structure_renamed` branches or the ordinary interval poll. The structural
+poll itself is unmodified and remains the backstop — an event only makes
+discovery not wait out the poll interval, it does not replace what the poll
+still independently verifies.
+
+One more non-obvious identity gotcha specific to renames/removals:
+`rename_container_atom`/`remove_container_atom` carry the **container
+uuid** — `create_playlist`'s/`create_timeline`'s first return value, resolved
+from a parent's `playlist_tree` — not the Playlist/Timeline actor's own
+`.uuid` that `_sync_playlists` otherwise keys sequences by (see
+`xstudio_container_uuid` in project memory for the session-level case this
+generalises). `StructureSyncController` keeps a
+`_container_uuid_to_tl_guid` reverse index, populated once while a container
+is known to be alive, so an event-driven removal/rename can resolve directly
+without reading the (possibly just-removed) actor's identity.

@@ -175,6 +175,31 @@ def bounded_timeout(connection, timeout_ms: int):
             connection.default_timeout_ms = prev
 
 
+# ── environment switches ──────────────────────────────────────────────────────
+
+#: Environment variable that disables event-driven structure discovery.
+STRUCTURE_EVENTS_ENV = "ORI_STRUCTURE_EVENTS"
+
+_FALSEY = {"0", "false", "no", "off"}
+
+
+def structure_events_enabled() -> bool:
+    """Whether event-driven structure discovery (session/playlist event-group
+    subscriptions and dirty-marking) is active.
+
+    Enabled by default. Setting ``ORI_STRUCTURE_EVENTS=0`` disables all
+    subscription and marking — the structural poll alone then detects
+    structure, exactly as it did before this capability existed, so the whole
+    mechanism can be backed out of a live session without a rebuild (mirrors
+    ``otio_sync_core.authority.enforcement_enabled`` /
+    ``ownership_enforcement_enabled``). Read per call rather than cached at
+    import, so the switch can be flipped in a running interpreter.
+
+    :rtype: bool
+    """
+    return os.environ.get(STRUCTURE_EVENTS_ENV, "1").strip().lower() not in _FALSEY
+
+
 # ── QML constants ──────────────────────────────────────────────────────────────
 
 QML_FOLDER = "qml/ORISyncPlugin.1"

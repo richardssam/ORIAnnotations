@@ -10,9 +10,12 @@ import threading
 import time
 from collections import Counter
 import opentimelineio as otio
+from xstudio.api.session.playlist import Playlist
 from xstudio.api.session.playlist.timeline import Timeline
 from xstudio.core import (
     event_atom, item_atom, media_content_changed_atom,
+    add_playlist_atom, create_timeline_atom, rename_container_atom,
+    remove_container_atom,
 )
 try:
     from xstudio.core import add_media_atom as _add_media_atom
@@ -20,7 +23,7 @@ except ImportError:
     _add_media_atom = None
 from otio_sync_core.manager import STATE_SYNCED
 from otio_sync_core.authority import CHANNEL_STRUCTURE
-from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
+from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout, structure_events_enabled
 
 _MEDIA_NAME_TIMEOUT_MS = 2000
 
@@ -118,6 +121,27 @@ class StructureSyncController:
         # self.plugin.structure._structural_mutation_suppress_until.
         self._structural_mutation_suppress_until: float = 0.0
 
+        # ── [3E] event-driven structure discovery (structure-events) ──────
+        # Native container uuids marked dirty by add_playlist_atom /
+        # create_timeline_atom handlers.  Consumed by consume_dirty_marks(),
+        # which runs the SAME publish passes the interval poll already runs
+        # (design D1) — an event's only effect is to run that pass now
+        # instead of waiting out the poll interval.  A set, not a queue, so N
+        # marks for one container cost one pass (task 2.3).
+        self._dirty_containers: set[str] = set()
+        self._dirty_lock = threading.Lock()
+        # Container uuid (create_playlist's/create_timeline's first return
+        # value — confirmed empirically to be what rename_container_atom and
+        # remove_container_atom carry, NOT the Playlist/Timeline actor's own
+        # .uuid) -> tl_guid.  Populated once, while a container is known to
+        # be alive, wherever poll_new_playlists first tracks it, so an
+        # event-driven rename/removal can resolve tl_guid directly from the
+        # uuid the event carries — no read of the (possibly just-removed)
+        # actor needed (task 6.1).  Entries for containers purged via the
+        # poll backstop rather than the direct path go stale; harmless,
+        # session-scoped, same trade already accepted for event-group joins.
+        self._container_uuid_to_tl_guid: dict[str, str] = {}
+
     def reset(self) -> None:
         """Clear all owned state (called from plugin disconnect)."""
         self._xs_flat_playlists.clear()
@@ -139,6 +163,9 @@ class StructureSyncController:
         self._last_structure_scan = 0.0
         self._last_scan_census = ""
         self._structural_mutation_suppress_until = 0.0
+        with self._dirty_lock:
+            self._dirty_containers.clear()
+        self._container_uuid_to_tl_guid.clear()
 
     # ── timeline item event subscription ──────────────────────────────
 
@@ -176,6 +203,299 @@ class StructureSyncController:
         self._timeline_item_sub_ids.pop(tl_guid, None)
         key = self._timeline_item_group_keys.pop(tl_guid, None)
         self.plugin.detach_event_group_handler(key, f"item:{tl_guid[:8]}")
+
+    # ── [3E] event-driven structure discovery ──────────────────────────
+    # Handlers for the session's and each playlist's event group (design D3):
+    # record identity, mark dirty or enqueue a targeted command, and return.
+    # No manager access, no content read, no publish here — every content
+    # read and every broadcast happens on the poll thread, in
+    # consume_dirty_marks / _apply_removal_by_container_uuid /
+    # _apply_rename_by_container_uuid or the ordinary interval poll passes.
+
+    def mark_container_dirty(self, native_uuid: "str | None") -> None:
+        """Record that *native_uuid* may need a publish pass.
+
+        Called only from xStudio event-handler callbacks — a set insert and
+        nothing else, so it is safe on an xStudio actor's callback thread
+        (design D3).  Idempotent: marking the same uuid any number of times
+        before it is consumed still costs exactly one pass (task 2.3).
+        """
+        if not native_uuid:
+            return
+        with self._dirty_lock:
+            self._dirty_containers.add(str(native_uuid))
+
+    def consume_dirty_marks(self) -> None:
+        """Poll-thread entry point: run the existing publish passes for dirty marks.
+
+        No new publishing logic (design D1) — this calls exactly the passes
+        the interval poll already runs, just now instead of waiting out the
+        poll interval.  Resolution is then re-checked per mark
+        (:meth:`_reconcile_dirty_marks`); a container the passes still cannot
+        describe (design D4) stays marked and is retried on the very next
+        pass — this call, a later one, or the ordinary 1 Hz backstop tick —
+        without blocking marks that resolved this time (task 2.5).
+        """
+        with self._dirty_lock:
+            if not self._dirty_containers:
+                return
+        self.poll_new_playlists()
+        self.poll_playlist_renames()
+        self.poll_deleted_playlists()
+        self._reconcile_dirty_marks()
+
+    def _reconcile_dirty_marks(self) -> None:
+        """Drop dirty marks the publish passes have since resolved.
+
+        Called after any run of the three passes above — whether triggered by
+        an event (:meth:`consume_dirty_marks`) or by the ordinary 1 Hz
+        backstop tick — so an event-marked container that was not yet
+        readable (design D4) is re-evaluated on every subsequent pass, event
+        or poll, without a second implementation of "is this done yet".
+        """
+        with self._dirty_lock:
+            if not self._dirty_containers:
+                return
+            pending = set(self._dirty_containers)
+        for native_uuid in pending:
+            if self._dirty_mark_resolved(native_uuid):
+                with self._dirty_lock:
+                    self._dirty_containers.discard(native_uuid)
+
+    def _dirty_mark_resolved(self, native_uuid: str) -> bool:
+        """Whether *native_uuid* no longer needs another consume pass.
+
+        Only a container xStudio still reports but the manager has not yet
+        been able to publish stays dirty (design D4 — an event announces
+        existence, not readiness).  Everything else — a container now
+        tracked, or one that no longer exists in xStudio at all (removed, or
+        never existed) — is resolved: asking again would learn nothing new.
+        """
+        tracked_native: set[str] = set()
+        for pl, xs_tl in self.plugin._sync_playlists.values():
+            try:
+                tracked_native.add(str(xs_tl.uuid if xs_tl is not None else pl.uuid))
+            except Exception:
+                continue
+        if native_uuid in tracked_native:
+            return True
+        try:
+            playlists = self.plugin.connection.api.session.playlists
+        except Exception:
+            return True  # can't check — don't spin forever on a read failure
+        try:
+            for playlist in playlists:
+                if str(playlist.uuid) == native_uuid:
+                    return False  # still exists, not yet published — keep retrying
+                for c in playlist.containers:
+                    if isinstance(c, Timeline) and str(c.uuid) == native_uuid:
+                        return False
+        except Exception:
+            return True
+        return True  # xStudio no longer reports it — nothing left to do
+
+    def _join_playlist_group(self, playlist) -> None:
+        """Join *playlist*'s event group for structural events, once.
+
+        Goes through the plugin's ``join_event_group`` (join-once,
+        never-leave — design D5), so calling this for an already-joined
+        playlist is a safe no-op (task 3.7), and it is safe to call from the
+        structural poll on every pass to self-heal a missed or failed join
+        (task 3.5).
+        """
+        if not structure_events_enabled():
+            return
+        if self.plugin.join_event_group(
+            playlist, "playlist-structure", self.plugin._on_structure_event
+        ) is None:
+            try:
+                name = playlist.name
+            except Exception:
+                name = "?"
+            _log(f"[3E] join_event_group failed for playlist {name!r} — will retry on next poll")
+
+    def _join_playlist_group_from_actor(self, actor, uuid=None) -> None:
+        """Join a playlist's event group given only its raw actor + uuid.
+
+        Used when a new playlist is announced by ``add_playlist_atom``: the
+        event carries a ``UuidActor``, not a wrapped ``Playlist``.  Wrapping
+        it costs no round trip — ``ActorConnection.__init__`` just assigns
+        ``.remote``, and the uuid, if given, is cached rather than re-fetched.
+        """
+        self._join_playlist_group(Playlist(self.plugin.connection, actor, uuid))
+
+    def join_known_playlist_groups(self, playlists=None) -> None:
+        """Join every currently-known playlist's event group.
+
+        Called once at sync start (beside the session-group join in
+        ``ori_sync_plugin.py``) and again on every structural poll pass
+        (:meth:`poll_new_playlists`), so a join missed or failed at start-up
+        self-heals within one cycle (task 3.5) without needing its own
+        retry/backoff logic — the requirement is "a failed subscription
+        self-heals", not "a failed subscription retries itself".
+
+        :param playlists: Pre-fetched ``session.playlists``, when the caller
+            already has it (avoids a second round trip). Fetched fresh when
+            omitted.
+        """
+        if not structure_events_enabled():
+            return
+        if playlists is None:
+            try:
+                playlists = self.plugin.connection.api.session.playlists
+            except Exception:
+                return
+        for playlist in playlists:
+            self._join_playlist_group(playlist)
+
+    def on_structure_event(self, event) -> None:
+        """Handle a structural event from either the session or a playlist group.
+
+        Both levels feed this one handler (design D3): the message types are
+        disjoint by level in practice — a session group never emits
+        ``create_timeline_atom``; a playlist group never emits
+        ``add_playlist_atom`` — so one dispatcher covers both without needing
+        to know which level an event arrived on.  Every recognised type does
+        one cheap thing and returns; the poll thread does everything else.
+        Unrecognised types (``last_changed_atom``, ``name_atom``, a sibling
+        group's crosstalk on this build — design D5/D6, task 1.7) are ignored
+        without reading xStudio state (task 4.5).
+        """
+        if not structure_events_enabled():
+            return
+        if not (len(event) > 1 and isinstance(event[0], event_atom)):
+            return
+        if time.monotonic() < self._structural_mutation_suppress_until:
+            # Design D7: applying a peer's structural change mutates local
+            # xStudio structure and fires these same events: drop them before
+            # they reach the dirty set / command queue at all.
+            return
+        payload = event[1]
+
+        # 4.1/4.2 — a new sequence or playlist exists.  No manager access, no
+        # content read: mark dirty and let the poll thread's existing
+        # discovery pass (poll_new_playlists) decide whether it is
+        # publishable yet (design D4).
+        if isinstance(payload, (add_playlist_atom, create_timeline_atom)) and len(event) > 2:
+            ua = event[2]
+            native_uuid = str(getattr(ua, "uuid", ua) or "")
+            actor = getattr(ua, "actor", None)
+            if isinstance(payload, add_playlist_atom) and actor is not None:
+                self._join_playlist_group_from_actor(actor, getattr(ua, "uuid", None))
+            self.mark_container_dirty(native_uuid)
+            _log(
+                f"[3E] {type(payload).__name__} uuid={native_uuid[:8] if native_uuid else '?'}"
+                " — marked dirty"
+            )
+            self.plugin._cmd_queue.put(("structure_dirty", {}))
+            return
+
+        # 4.3 — a container was renamed.  The event carries the new name
+        # directly, so the poll thread does not need to re-read it.
+        if isinstance(payload, rename_container_atom) and len(event) > 3:
+            container_uuid = str(event[2])
+            new_name = event[3]
+            self.plugin._cmd_queue.put((
+                "structure_renamed",
+                {"container_uuid": container_uuid, "new_name": new_name},
+            ))
+            return
+
+        # 4.4 — a container was removed.  Carries either a single Uuid or a
+        # VectorUuid (observed on a playlist's own removal, task 1.6 — the
+        # bulk report of its removed children); handle both.
+        if isinstance(payload, remove_container_atom) and len(event) > 2:
+            try:
+                items = list(event[2])
+            except TypeError:
+                items = [event[2]]
+            for item in items:
+                self.plugin._cmd_queue.put((
+                    "structure_removed", {"container_uuid": str(item)},
+                ))
+            return
+        # Anything else — last_changed_atom, name_atom, a sibling group's
+        # traffic — is ignored here without touching xStudio state (task 4.5).
+
+    def _container_uuid_for_timeline(self, playlist, xs_tl) -> "object | None":
+        """Resolve a Timeline's container-tree uuid from its parent playlist.
+
+        Mirrors :meth:`_container_uuid_for_playlist` one level down: a
+        sequence's node lives in the playlist's own ``playlist_tree``, keyed
+        the same way (``value_uuid`` = actor uuid, ``uuid`` = container
+        uuid).  Confirmed empirically (task 1/6 investigation) that
+        ``rename_container_atom``/``remove_container_atom`` carry this
+        container uuid, not the Timeline actor's own ``.uuid``.
+        """
+        try:
+            actor_uuid = str(xs_tl.uuid)
+        except Exception:
+            return None
+        try:
+            for node in playlist.playlist_tree.children:
+                try:
+                    if str(node.value_uuid) == actor_uuid:
+                        return node.uuid
+                except Exception:
+                    continue
+        except Exception:
+            _log_exc("_container_uuid_for_timeline: failed to walk playlist_tree")
+        return None
+
+    def _apply_removal_by_container_uuid(self, container_uuid: str) -> bool:
+        """Resolve and publish a removal directly from a removal event's uuid.
+
+        No read of the removed container's own (now possibly-dead) actor —
+        the tl_guid is resolved from :attr:`_container_uuid_to_tl_guid`,
+        populated while the container was still known to be alive (task 6.1).
+
+        :returns: True if a tracked container was resolved (and, if a
+            genuine local change, its removal published) — False if
+            *container_uuid* names nothing this peer has tracked, so the
+            caller should fall back to the poll backstop.
+        """
+        tl_guid = self._container_uuid_to_tl_guid.pop(str(container_uuid), None)
+        if tl_guid is None or tl_guid not in self.plugin._sync_playlists:
+            return False
+        self._purge_local_playlist_entry(tl_guid)
+        try:
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
+            self.plugin.manager.broadcast_remove_timeline(tl_guid)
+        except Exception:
+            _log_exc(f"_apply_removal_by_container_uuid: broadcast failed for {tl_guid[:8]}")
+            return True
+        _log(
+            f"[3E] Container {container_uuid[:8]} removed (event-driven) →"
+            f" removal broadcast for {tl_guid[:8]}"
+        )
+        return True
+
+    def _apply_rename_by_container_uuid(self, container_uuid: str, new_name: str) -> bool:
+        """Resolve and publish a rename directly from a rename event's uuid + name.
+
+        Reuses ``broadcast_timeline_rename`` — the same call
+        :meth:`poll_playlist_renames` makes — so this is the same publishing
+        logic reached by a second, more direct route (design D1), not a new
+        implementation of it.
+
+        :returns: True if a tracked container was resolved — False if
+            *container_uuid* names nothing this peer has tracked, so the
+            caller should fall back to the poll backstop.
+        """
+        tl_guid = self._container_uuid_to_tl_guid.get(str(container_uuid))
+        if tl_guid is None or tl_guid not in self.plugin._sync_playlists:
+            return False
+        otio_tl = self.plugin.manager.timelines.get(tl_guid) if self.plugin.manager else None
+        if otio_tl is None:
+            return False
+        if new_name and new_name != (otio_tl.name or ""):
+            _log(
+                f"[3E] Container {container_uuid[:8]} renamed (event-driven) →"
+                f" {new_name!r} ({tl_guid[:8]})"
+            )
+            self.plugin.claim_lease(CHANNEL_STRUCTURE)
+            self.plugin.manager.broadcast_timeline_rename(tl_guid, new_name)
+        return True
 
     def subscribe_sequence_playlist_events(self, tl_guid: str, xs_playlist) -> None:
         """No-op placeholder — see poll_sequence_new_media in the periodic poll.
@@ -883,6 +1203,15 @@ class StructureSyncController:
             self._log_scan_census(["session.playlists: UNREADABLE"])
             return
 
+        # [3E] Re-attempt every playlist's event-group join on every pass, so
+        # one missed or failed at start-up (or on add_playlist_atom) self-heals
+        # within one cycle (task 3.5) — join_event_group is a cheap no-op for
+        # an already-joined group, no round trip.
+        try:
+            self.join_known_playlist_groups(playlists)
+        except Exception:
+            _log_exc("poll_new_playlists: join_known_playlist_groups failed")
+
         # Per-pass census of what the scan can actually see and what it did with
         # it (see :meth:`_log_scan_census`).  Built unconditionally; logged only
         # when it changes, so a steady session costs one line.
@@ -1008,6 +1337,12 @@ class StructureSyncController:
                         pass
                     self._xs_sequence_playlists[tl_guid] = (playlist, xs_tl, _known_np)
                     self.plugin._sync_playlists[tl_guid] = (playlist, xs_tl)
+                    # [3E] Record the container-tree uuid (not xs_tl.uuid) so
+                    # a later rename_container_atom/remove_container_atom for
+                    # this sequence can resolve tl_guid directly (task 6.1).
+                    _container_uuid = self._container_uuid_for_timeline(playlist, xs_tl)
+                    if _container_uuid:
+                        self._container_uuid_to_tl_guid[str(_container_uuid)] = tl_guid
                     try:
                         self._xs_sequence_media_names[tl_guid] = {m.name for m in playlist.media}
                     except Exception:

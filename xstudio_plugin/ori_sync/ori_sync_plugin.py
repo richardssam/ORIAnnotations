@@ -44,6 +44,7 @@ timeout" for the full rule.
 from .utils import (  # noqa: E402
     _log, _log_exc, _parse_ori_session, _uri_to_posix_path,
     QML_FOLDER, SESSION_DIALOG_QML, SESSION_STATE_PANEL_QML,
+    structure_events_enabled,
 )
 from .media_map import MediaMapController  # noqa: E402
 from .timeline_build import TimelineBuildController  # noqa: E402
@@ -97,6 +98,15 @@ class ORISyncPlugin(PluginBase):
     #: Was 1.0 while those events were going to a group nothing broadcast on;
     #: they are confirmed live since fix-xs-annotation-draw-subscription.
     ANNOTATION_SCAN_INTERVAL = 30.0
+
+    #: Structural poll cadence (poll_new_playlists/poll_playlist_renames/
+    #: poll_deleted_playlists + dirty-mark reconciliation). Was 1.0 while the
+    #: poll was the discovery path and this interval was therefore also the
+    #: detection-latency floor; relaxed under structure-events now that
+    #: discovery is event-driven and this is only the backstop's recheck
+    #: cadence (design D2, migration step 5) — live-verified (task 8.7) that
+    #: event-driven discovery latency does not depend on this value.
+    STRUCTURE_POLL_INTERVAL = 5.0
 
     def __init__(self, connection):
         PluginBase.__init__(
@@ -476,6 +486,30 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc("Could not subscribe to bookmarks events")
 
+        # [3E] Structural events: playlists/timelines created, renamed,
+        # removed.  Joined at the session level here, and per-playlist in
+        # structure.join_known_playlist_groups() below — the session's group
+        # does not relay a sequence created inside an existing playlist
+        # (design D5/D6; see structure.on_structure_event for the dispatch
+        # shared by both levels).  ORI_STRUCTURE_EVENTS=0 disables both
+        # (design D8) — the structural poll alone then detects structure,
+        # exactly as before this capability existed.
+        if structure_events_enabled():
+            try:
+                self.join_event_group(
+                    self.connection.api.session,
+                    "session-structure",
+                    self._on_structure_event,
+                )
+                _log("[3E] Subscribed to session structural events")
+            except Exception:
+                _log_exc("[3E] Could not subscribe to session structural events")
+
+            try:
+                self.structure.join_known_playlist_groups()
+            except Exception:
+                _log_exc("[3E] Could not join known playlist groups")
+
         # Subscribe to the current viewed container's event group for add_media
         # detection.  If there's no container yet (peer joined an empty session),
         # on_global_playhead_event re-subscribes once one is viewed.
@@ -825,14 +859,20 @@ class ORISyncPlugin(PluginBase):
                         self._push_session_state()
                     self._last_session_state_push = now
 
-                # 6.5. Periodic structure scan (1.0s interval)
-                if now - self.structure._last_structure_scan >= 1.0:
+                # 6.5. Periodic structure scan (backstop cadence — see
+                # STRUCTURE_POLL_INTERVAL)
+                if now - self.structure._last_structure_scan >= self.STRUCTURE_POLL_INTERVAL:
                     with _timed("structure.poll_new_playlists"):
                         self.structure.poll_new_playlists()
                     with _timed("structure.poll_playlist_renames"):
                         self.structure.poll_playlist_renames()
                     with _timed("structure.poll_deleted_playlists"):
                         self.structure.poll_deleted_playlists()
+                    with _timed("structure.reconcile_dirty_marks"):
+                        # [3E] Retry any dirty mark the passes above still
+                        # cannot resolve (design D4) on every backstop tick,
+                        # not only when a fresh event arrives.
+                        self.structure._reconcile_dirty_marks()
                     self.structure._last_structure_scan = now
 
                 # 7. Deferred snapshot responses
@@ -927,6 +967,24 @@ class ORISyncPlugin(PluginBase):
                 self.structure.execute_sequence_rebuild(payload.get("tl_guid"))
             elif cmd == "remove_timeline":
                 self.structure.delete_local_container(payload.get("tl_guid"))
+            elif cmd == "structure_dirty":
+                # [3E] Event-driven creation (add_playlist_atom /
+                # create_timeline_atom): run the existing discovery pass now
+                # instead of waiting out the poll interval (design D1).
+                self.structure.consume_dirty_marks()
+            elif cmd == "structure_removed":
+                # [3E] Resolve directly from the event's uuid (task 6.1); if
+                # this peer never tracked that container, mark dirty so the
+                # ordinary passes reconcile it if they should.
+                container_uuid = payload.get("container_uuid")
+                if not self.structure._apply_removal_by_container_uuid(container_uuid):
+                    self.structure.mark_container_dirty(container_uuid)
+            elif cmd == "structure_renamed":
+                # [3E] Same direct-resolution-with-fallback shape as removal.
+                container_uuid = payload.get("container_uuid")
+                new_name = payload.get("new_name")
+                if not self.structure._apply_rename_by_container_uuid(container_uuid, new_name):
+                    self.structure.mark_container_dirty(container_uuid)
             elif cmd == "load_bin_media":
                 playlist = payload.get("playlist")
                 uris = payload.get("uris", [])
@@ -1215,6 +1273,9 @@ class ORISyncPlugin(PluginBase):
 
     def _on_test_container_event(self, event) -> None:
         self.structure.on_test_container_event(event)
+
+    def _on_structure_event(self, event) -> None:
+        self.structure.on_structure_event(event)
 
     def _on_annotation_draw_event(self, event_data, user_id, stroke_completed) -> None:
         self.annotation.on_draw_event(event_data, user_id, stroke_completed)
