@@ -10,14 +10,21 @@ XsWindow {
     id: dialog
     title: "Connect to Session"
     width: 400
+    height: 300
     minimumWidth: 360
-    minimumHeight: 160
+    minimumHeight: 280
 
     modality: Qt.WindowModal
     flags: Qt.Dialog | Qt.WindowStaysOnTopHint
 
     property string mode: "join"
     property var rowHeight: 24
+
+    // Enter/Return submits the form: each text field's onAccepted below
+    // calls this when it has focus.
+    function tryConnect() {
+        if (nameField.text.trim() !== "") connectButton.clicked()
+    }
 
     GridLayout {
 
@@ -43,7 +50,7 @@ XsWindow {
                 var env = Qt.environment ? Qt.environment["ORI_RMQ_HOST"] : ""
                 text = env || "localhost"
             }
-            onAccepted: nameField.forceActiveFocus()
+            onAccepted: dialog.tryConnect()
         }
 
         // ── Session Name ───────────────────────────────────────────────
@@ -58,9 +65,7 @@ XsWindow {
             Layout.preferredHeight: rowHeight
             placeholderText: "e.g. daily-review"
             text: ""
-            onAccepted: {
-                if (text.trim() !== "") connectButton.clicked()
-            }
+            onAccepted: dialog.tryConnect()
         }
 
         // ── You (Identity) ─────────────────────────────────────────────
@@ -80,9 +85,28 @@ XsWindow {
                 text = def
                 defaultYou = def
             }
-            onAccepted: {
-                if (nameField.text.trim() !== "") connectButton.clicked()
-            }
+            onAccepted: dialog.tryConnect()
+        }
+
+        // ── Default Role (create path only) ──────────────────────────────
+        // session-role-config: the session's default role is declared once,
+        // at creation, through the host application — never through the
+        // join path, where the session already has a policy and sends it in
+        // STATE_SNAPSHOT.
+        XsText {
+            visible: dialog.mode === "create"
+            text: "Default Role"
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+        }
+
+        XsComboBox {
+            id: defaultRoleCombo
+            visible: dialog.mode === "create"
+            Layout.fillWidth: true
+            Layout.preferredHeight: rowHeight
+            model: ["Driver (unrestricted)", "Reviewer", "Viewer"]
+            property var wireValues: ["driver", "reviewer", "viewer"]
+            currentIndex: 0
         }
 
         // ── Spacer ─────────────────────────────────────────────────────
@@ -111,15 +135,22 @@ XsWindow {
                 width: XsStyleSheet.primaryButtonStdWidth * 2
                 enabled: nameField.text.trim() !== ""
                 onClicked: {
-                    var result = python_callback(
-                        "do_session_connect",
-                        {
-                            "host": hostField.text.trim() || "localhost",
-                            "name": nameField.text.trim(),
-                            "you": youField.text.trim() !== youField.defaultYou ? youField.text.trim() : null,
-                            "mode": dialog.mode
-                        }
-                    )
+                    var payload = {
+                        "host": hostField.text.trim() || "localhost",
+                        "name": nameField.text.trim(),
+                        // "" rather than null: do_session_connect() already
+                        // treats an absent/empty "you" identically
+                        // (`(data.get("you") or "").strip()`), and a null
+                        // value in the payload dict is a plausible cause of a
+                        // silent failure in the QML->Python argument
+                        // marshalling — a null costs nothing to avoid here.
+                        "you": youField.text.trim() !== youField.defaultYou ? youField.text.trim() : "",
+                        "mode": dialog.mode
+                    }
+                    if (dialog.mode === "create") {
+                        payload["default_role"] = defaultRoleCombo.wireValues[defaultRoleCombo.currentIndex]
+                    }
+                    var result = python_callback("do_session_connect", payload)
                     dialog.hide()
                 }
             }

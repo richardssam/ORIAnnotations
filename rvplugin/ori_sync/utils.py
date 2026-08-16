@@ -116,7 +116,16 @@ def _parse_ori_session(env_val):
     return (default_host, env_val)
 
 
-def session_dialog(title):
+#: Default-role choices offered on the create path, label -> wire value.
+#: Plain strings rather than an ``authority`` import: this module stays
+#: importable in headless contexts that never touch the sync core (see the
+#: docstring below), and these three values are the whole of ``authority.ROLES``.
+_DEFAULT_ROLE_CHOICES = [("Driver (unrestricted)", "driver"),
+                          ("Reviewer", "reviewer"),
+                          ("Viewer", "viewer")]
+
+
+def session_dialog(title, show_default_role=False):
     """Show a two-field dialog for MQ Host and Session Name.
 
     The Qt widget imports are function-local on purpose: ``QtWidgets`` is only
@@ -125,20 +134,26 @@ def session_dialog(title):
     :func:`_media_path` and :func:`_clip_effective_range`.
 
     :param title: Dialog window title (e.g. "Create Session").
-    :returns: ``(host, name, identity_override)`` or ``(None, None, None)`` on cancel.
+    :param show_default_role: Show the session default-role combo
+        (``session-role-config``). Pass ``True`` only from the create path —
+        the value has no meaning on join, where the session already has a
+        policy and sends it in ``STATE_SNAPSHOT``.
+    :returns: ``(host, name, identity_override, default_role)``, or
+        ``(None, None, None, None)`` on cancel. ``default_role`` is ``None``
+        unless *show_default_role* was passed.
     :rtype: tuple
     """
     try:
-        from PySide2.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+        from PySide2.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel, QComboBox
     except ImportError:
         try:
-            from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel
+            from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QLabel, QComboBox
         except ImportError:
             _log("PySide not available — cannot show session dialog")
-            return None, None, None
+            return None, None, None, None
 
     default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
-    
+
     try:
         from otio_sync_core.identity import resolve_identity
         from otio_sync_core.session_state import display_name
@@ -146,7 +161,7 @@ def session_dialog(title):
         default_you = display_name({"identity": resolve_identity()})
     except Exception:
         default_you = ""
-        
+
     dlg = QDialog()
     dlg.setWindowTitle(title)
     dlg.setMinimumWidth(360)
@@ -157,6 +172,12 @@ def session_dialog(title):
     layout.addRow(QLabel("MQ Host:"), host_edit)
     layout.addRow(QLabel("Session Name:"), name_edit)
     layout.addRow(QLabel("You:"), you_edit)
+    role_combo = None
+    if show_default_role:
+        role_combo = QComboBox()
+        for label, _value in _DEFAULT_ROLE_CHOICES:
+            role_combo.addItem(label)
+        layout.addRow(QLabel("Default Role:"), role_combo)
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     buttons.accepted.connect(dlg.accept)
     buttons.rejected.connect(dlg.reject)
@@ -164,15 +185,16 @@ def session_dialog(title):
     name_edit.returnPressed.connect(dlg.accept)
     layout.addRow(buttons)
     if dlg.exec_() != QDialog.Accepted:
-        return None, None, None
+        return None, None, None, None
     host = host_edit.text().strip() or default_host
     name = name_edit.text().strip()
     you = you_edit.text().strip()
     if not name:
-        return None, None, None
-    
+        return None, None, None, None
+
     override = you if you != default_you else None
-    return host, name, override
+    default_role = _DEFAULT_ROLE_CHOICES[role_combo.currentIndex()][1] if role_combo is not None else None
+    return host, name, override, default_role
 
 
 def _media_path(url: str) -> str:

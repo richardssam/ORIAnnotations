@@ -156,6 +156,13 @@ def session_state_snapshot(manager) -> "dict[str, Any]":
             getattr(manager, "self_role", authority.DEFAULT_ROLE),
             authority.VISIBILITY,
         ),
+        # session-role-administration: whether this peer may grant another
+        # participant a role, so a panel can decide whether to *offer* the
+        # per-row role control.  No per-peer field is needed for this — rows
+        # already carry `user`, which is what a grant is addressed to.
+        "may_administer_roles": authority.role_may_administer(
+            getattr(manager, "self_role", authority.DEFAULT_ROLE),
+        ),
         "default_role": default_role or authority.DEFAULT_ROLE,
         # Reported, not merely inferable from a menu item being disabled: a
         # session whose view nobody may change has to say so, and the panel is

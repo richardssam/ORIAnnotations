@@ -31,6 +31,13 @@ protocol_messages:
       target_guid: "peer-master-001"
       requester_guid: "peer-abc123"
 
+  SetPeerRole:
+    _category: Session
+    default:
+      user: "alice"
+      role: "reviewer"
+      issuer_guid: "peer-abc123"
+
   NewPresenter:
     _category: Session
     default:

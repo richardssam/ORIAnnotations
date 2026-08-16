@@ -140,6 +140,59 @@ def test_an_explicit_argument_wins_over_the_environment(monkeypatch):
     assert mgr.default_role == authority.DRIVER
 
 
+# ---------------------------------------------------------------------------
+# Create-time creator seeding (session-role-config "The create-time trap")
+# ---------------------------------------------------------------------------
+
+
+def test_declaring_a_restrictive_default_with_seed_creator_seeds_the_creator():
+    mgr = _manager(user="organiser", default_role=authority.VIEWER, seed_creator=True)
+
+    assert mgr.default_role == authority.VIEWER
+    assert mgr.self_role == authority.DRIVER
+    assert mgr.has_eligible_driver() is True
+
+
+def test_a_restrictive_default_without_seed_creator_does_not_seed():
+    """default_role= alone (no seed_creator) is also the established way to
+    pin a constructed peer's own role for reasons other than starting a
+    session — e.g. simulating a joiner, or a test fixture. It must not be
+    silently treated as session creation."""
+    mgr = _manager(user="participant", default_role=authority.VIEWER)
+
+    assert mgr.default_role == authority.VIEWER
+    assert mgr.self_role == authority.VIEWER
+
+
+def test_the_same_restrictive_default_via_the_environment_does_not_seed(monkeypatch):
+    """The env var is read by every peer that has it set, joiners included —
+    seeding on it would make every env-configured peer a driver even with
+    seed_creator=True."""
+    monkeypatch.setenv(authority.ROLE_DEFAULT_ENV, "viewer")
+
+    mgr = _manager(user="joiner", seed_creator=True)
+
+    assert mgr.default_role == authority.VIEWER
+    assert mgr.self_role == authority.VIEWER
+
+
+def test_the_argument_wins_the_seeding_decision_over_the_environment(monkeypatch):
+    """Both declare a restrictive default; only the constructor argument (the
+    create path, with seed_creator=True) seeds the creator as driver."""
+    monkeypatch.setenv(authority.ROLE_DEFAULT_ENV, "viewer")
+
+    mgr = _manager(user="organiser", default_role=authority.REVIEWER, seed_creator=True)
+
+    assert mgr.default_role == authority.REVIEWER
+    assert mgr.self_role == authority.DRIVER
+
+
+def test_declaring_the_permissive_default_seeds_nobody():
+    mgr = _manager(user="organiser", default_role=authority.DRIVER, seed_creator=True)
+
+    assert mgr.role_policy() is None
+
+
 def test_a_malformed_environment_policy_does_not_stop_a_session(monkeypatch):
     monkeypatch.setenv(authority.ROLE_MEMORY_ENV, "garbage,,=,alice=driver")
 

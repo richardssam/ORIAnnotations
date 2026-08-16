@@ -234,7 +234,69 @@ Rectangle {
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }
-                
+
+                // Role administration (session-role-administration): offered
+                // only while this peer may administer, and only for a peer
+                // that carries an identity — a grant is addressed by
+                // identity, so there is nothing to grant a peer with none.
+                Row {
+                    id: roleControl
+                    visible: sessionState.mayAdministerRoles && user !== ""
+                    spacing: 6
+                    // Which role is awaiting a second click to confirm; ""
+                    // when nothing is pending.
+                    property string confirmingRole: ""
+
+                    Repeater {
+                        model: ["driver", "reviewer", "viewer"]
+                        delegate: Rectangle {
+                            property string roleValue: modelData
+                            property bool isCurrent: role === roleValue
+                            property bool isConfirming: roleControl.confirmingRole === roleValue
+                            width: roleLabel.implicitWidth + 10
+                            height: roleLabel.implicitHeight + 4
+                            radius: 3
+                            color: isCurrent ? uiStyle.syncedColor
+                                   : (isConfirming ? uiStyle.warningColor : "transparent")
+                            border.color: uiStyle.secondaryTextColor
+                            border.width: 1
+
+                            Text {
+                                id: roleLabel
+                                anchors.centerIn: parent
+                                text: isConfirming ? "confirm?" : roleValue
+                                color: isCurrent ? uiStyle.panelBgColor : uiStyle.textColor
+                                font.family: uiStyle.fontFamily
+                                font.pixelSize: uiStyle.fontSize - 4
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                enabled: !isCurrent
+                                onClicked: {
+                                    // A courtesy confirmation in this view
+                                    // only, before demoting a peer away from
+                                    // "driver" — the core applies or refuses
+                                    // the grant on its own evaluation either
+                                    // way (session-state-ui: the panel does
+                                    // not decide whether an action is
+                                    // permitted).  The panel has no cheap way
+                                    // to know whether this is the *last*
+                                    // driver, so it asks on every such
+                                    // demotion rather than only that one.
+                                    if (role === "driver" && roleValue !== "driver" && !isConfirming) {
+                                        roleControl.confirmingRole = roleValue
+                                    } else {
+                                        roleControl.confirmingRole = ""
+                                        sessionState.setPeerRole(user, roleValue)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Debug Information
                 Column {
                     visible: isDebug

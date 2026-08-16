@@ -229,7 +229,7 @@
 </head>
 <body>
     <div class="container">
-        <nav class="sidebar"><div class="back-link" style="margin-bottom: 15px;"><a href="../" style="color: #3498db; text-decoration: none; font-size: 0.95em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">← Back to Main Docs</a></div><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li><li><a href="#ellipse-annotation">EllipseAnnotation</a></li><li><a href="#rectangle-annotation">RectangleAnnotation</a></li><li><a href="#arrow-annotation">ArrowAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Ownership</h2><ul><li><a href="#claim-ownership">ClaimOwnership</a></li><li><a href="#release-ownership">ReleaseOwnership</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#remove-timeline">RemoveTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul><h2>Uncategorized</h2><ul><li><a href="#peer-announce">PeerAnnounce</a></li><li><a href="#peer-depart">PeerDepart</a></li><li><a href="#replace-timeline">ReplaceTimeline</a></li></ul></nav>
+        <nav class="sidebar"><div class="back-link" style="margin-bottom: 15px;"><a href="../" style="color: #3498db; text-decoration: none; font-size: 0.95em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">← Back to Main Docs</a></div><h1>OTIO Sync Protocol</h1><div class="sidebar-section">OTIO SyncEvents</div><h2>Annotation Events</h2><ul><li><a href="#annotation-effect">AnnotationEffect</a></li><li><a href="#paint-start">PaintStart</a></li><li><a href="#paint-vertices">PaintVertices</a></li><li><a href="#paint-vertex">PaintVertex</a></li><li><a href="#paint-points">PaintPoints</a></li><li><a href="#paint-end">PaintEnd</a></li><li><a href="#text-annotation">TextAnnotation</a></li><li><a href="#ellipse-annotation">EllipseAnnotation</a></li><li><a href="#rectangle-annotation">RectangleAnnotation</a></li><li><a href="#arrow-annotation">ArrowAnnotation</a></li></ul><div class="sidebar-section">Protocol Messages</div><h2>Annotation</h2><ul><li><a href="#partial-annotation">PartialAnnotation</a></li></ul><h2>OTIO Session</h2><ul><li><a href="#insert-child">InsertChild</a></li><li><a href="#move-child">MoveChild</a></li><li><a href="#remove-child">RemoveChild</a></li><li><a href="#replace-annotation-commands">ReplaceAnnotationCommands</a></li><li><a href="#set-property">SetProperty</a></li></ul><h2>Ownership</h2><ul><li><a href="#claim-ownership">ClaimOwnership</a></li><li><a href="#release-ownership">ReleaseOwnership</a></li></ul><h2>Session</h2><ul><li><a href="#i-am-master">IAmMaster</a></li><li><a href="#new-participant">NewParticipant</a></li><li><a href="#new-presenter">NewPresenter</a></li><li><a href="#set-peer-role">SetPeerRole</a></li><li><a href="#shared-key-request">SharedKeyRequest</a></li><li><a href="#shared-key-response">SharedKeyResponse</a></li><li><a href="#state-request">StateRequest</a></li><li><a href="#state-snapshot">StateSnapshot</a></li><li><a href="#who-is-master">WhoIsMaster</a></li></ul><h2>Settings</h2><ul><li><a href="#display-settings-set">DisplaySettingsSet</a></li><li><a href="#playback-settings-set">PlaybackSettingsSet</a></li></ul><h2>Timeline</h2><ul><li><a href="#add-timeline">AddTimeline</a></li><li><a href="#remove-timeline">RemoveTimeline</a></li><li><a href="#rename-timeline">RenameTimeline</a></li></ul><h2>Uncategorized</h2><ul><li><a href="#peer-announce">PeerAnnounce</a></li><li><a href="#peer-depart">PeerDepart</a></li><li><a href="#replace-timeline">ReplaceTimeline</a></li></ul></nav>
         <main class="content"><div class="section"><div class="intro-content"><h1>OTIO Sync Protocol</h1>
 <p>This project synchronises live review sessions (playback, selection, and
 annotations) between hosts such as OpenRV and xStudio. It is built on two
@@ -298,15 +298,14 @@ definitions.</p>
 implementing against this protocol — none of them are visible in a message's
 shape.</p>
 <p>Two of them are properties of the <em>session</em>, carried on <code>STATE_SNAPSHOT</code>: the
-elected <strong>host</strong> is the only peer whose playback message may carry the
-<code>view_mode</code>/<code>clip_guid</code> field group (what everyone is looking at), and the
 per-category <strong>write leases</strong> in <code>broadcast_ownership</code> decide which peer is
-currently driving position, display, or structure.</p>
+currently driving visibility, position, display, or structure. If no peer holds
+the visibility lease, it falls back to the elected <strong>host</strong>.</p>
 <p>The third is a property of the <em>participant</em>: a peer's <strong>session role</strong> —
 <code>driver</code>, <code>reviewer</code>, or <code>viewer</code> — carried as a field on <code>PEER_ANNOUNCE</code> and on
 each entry of the <code>STATE_SNAPSHOT</code> peer roster, with the session's policy in that
 message's <code>session_roles</code> section. Role is a ceiling; the other two are gates. A
-driver has permission to emit visibility; only the host actually does.</p>
+driver has permission to emit visibility; the peer holding the visibility lease (or the elected host if the lease is unclaimed) is the one permitted to broadcast it.</p>
 <p><strong>Role is enforced by the sender, and is not validated on receipt.</strong> A receiving
 peer applies a message without checking what role its sender declared, and no
 broker-side filtering is involved. An implementer should not assume messages
@@ -317,6 +316,12 @@ means the session's <strong>default role</strong>, never the most restrictive on
 absent <code>session_roles</code> section means &quot;no policy declared&quot; rather than an empty
 policy. A session that declares nothing behaves exactly as one predating roles:
 every peer may emit everything.</p>
+<p>A role may also change mid-session: a peer already holding <code>driver</code> may grant
+another participant a role via <code>SET_PEER_ROLE</code>. The message is <strong>broadcast</strong>
+— every peer merges it into its own copy of the session's role memory — and
+is <strong>applied by its target</strong>, which then re-announces; <code>PEER_ANNOUNCE</code> stays
+the only path that writes a role into the peer table. An implementer should
+not write a grant's role into the peer table directly on receipt.</p>
 <hr />
 <h2>How a message is wrapped and sent</h2>
 <p>When the manager broadcasts a message it calls <code>_send_message()</code>
@@ -2259,6 +2264,76 @@ msg = NewParticipant(timestamp=<span class="py-string">'2025-01-31T16:14:05Z'</s
 <span class="py-keyword">from</span> otio_sync_core.protocol_messages <span class="py-keyword">import</span> NewPresenter
 
 msg = NewPresenter(presenter_hash=<span class="py-string">'d3447b5cb61b41de73a2de39c4f06ab790e66e4cad81f7d449c0147a546244b5'</span>, timestamp=<span class="py-string">'2025-01-31T16:14:00Z'</span>)</pre>
+                    </div>
+                </div></div>
+        <div id="set-peer-role" class="section">
+            <h2>SetPeerRole</h2>
+            <span class="schema-label">LiveSession.1</span><span class="event-label">event: SET_PEER_ROLE</span>
+            <div class="description">A driver's grant of a session role to a named participant (``session-role-administration``).
+
+Two properties are not inferable from the field list alone:
+
+**Broadcast, not addressed to its target alone.**  Every peer — issuer,
+target, and everyone else — merges ``{user: role}`` into its own copy of
+the session's identity-keyed role memory.  This is what makes the grant
+reach the master's memory (and so every later joiner's :class:`StateSnapshot`)
+without a routing hop, and what makes it survive the target's reconnection:
+a unicast to the target alone would leave the master's memory unaware the
+grant ever happened.
+
+**Applied by its target, which then re-announces.**  A receiving peer does
+**not** write ``role`` into its peer-table entry for ``user`` on receipt of
+this message.  Only the peer whose own identity matches ``user`` adopts the
+role, for itself, and re-announces it — :class:`PeerAnnounce` remains the
+single write path into every peer's table.  Every other peer learns the new
+role from that subsequent announcement, the same way it learns a role on
+joining.</div>
+            <h3>Parameters</h3>
+            <table class="params-table">
+                <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td><code>user</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>Identity key of the participant being granted a role — the same `identity["user"]` value the session's role memory is keyed on, never a peer GUID.</td>
+                    </tr>
+                    <tr>
+                        <td><code>role</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">str</span></td>
+                        <td>The role being granted: `driver`, `reviewer`, or `viewer`.</td>
+                    </tr>
+                    <tr>
+                        <td><code>issuer_guid</code><span class="required-badge">Optional</span></td>
+                        <td><span class="type-badge">'str | None'</span></td>
+                        <td>GUID of the peer that issued the grant, carried for logging and provenance only. Not consulted by any receiving peer: who may issue a grant is checked by the issuer, before sending, against the same role table the broadcast guard uses.</td>
+                    </tr></tbody></table><h3>Example</h3><div class="example-tabs" id="tabs-set-peer-role"><button class="example-tab active" onclick="switchExampleTab(event, 'set-peer-role', 'default')">Default</button><button class="example-tab active" onclick="switchExampleTab(event, 'set-peer-role', 'default_python')">Default (Python)</button></div>
+                <div id="set-peer-role-default" class="example-content active">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre>{
+  <span class="json-key">"session"</span>: <span class="json-string">"default_session"</span>,
+  <span class="json-key">"source_guid"</span>: <span class="json-string">"9bf2-4cd6-...-786d"</span>,
+  <span class="json-key">"payload"</span>: {
+    <span class="json-key">"command_schema"</span>: <span class="json-string">"LiveSession.1"</span>,
+    <span class="json-key">"command"</span>: {
+      <span class="json-key">"event"</span>: <span class="json-string">"SET_PEER_ROLE"</span>,
+      <span class="json-key">"payload"</span>: {
+        <span class="json-key">"user"</span>: <span class="json-string">"alice"</span>,
+        <span class="json-key">"role"</span>: <span class="json-string">"reviewer"</span>,
+        <span class="json-key">"issuer_guid"</span>: <span class="json-string">"peer-abc123"</span>
+      }
+    }
+  }
+}</pre>
+                    </div>
+                </div>
+                <div id="set-peer-role-default_python" class="example-content">
+                    <div class="code-block">
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        <pre><span class="py-comment"># Protocol Message (transport layer)</span>
+<span class="py-keyword">from</span> otio_sync_core.protocol_messages <span class="py-keyword">import</span> SetPeerRole
+
+msg = SetPeerRole(user=<span class="py-string">'alice'</span>, role=<span class="py-string">'reviewer'</span>, issuer_guid=<span class="py-string">'peer-abc123'</span>)</pre>
                     </div>
                 </div></div>
         <div id="shared-key-request" class="section">

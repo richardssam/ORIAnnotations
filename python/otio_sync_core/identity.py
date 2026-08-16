@@ -84,8 +84,10 @@ def local_identity() -> dict:
 
 def identity_from_override(text: str) -> dict:
     """
-    Create an identity from a user-supplied override string, maintaining the local
-    user and host.
+    Create an identity from a user-supplied override string, keeping the
+    user and host resolved for this process — including any
+    ``ORI_SYNC_USER``/``ORI_SYNC_NAME`` environment override already in
+    effect — and replacing only the display name.
 
     :param text: The user-supplied identity string.
     :returns: A dictionary with the parsed identity, or an empty dict if text is blank.
@@ -104,8 +106,14 @@ def identity_from_override(text: str) -> dict:
         first_name = ""
         last_name = ""
 
-    # Get local identity just for user and host
-    local = local_identity()
+    # resolve_identity(), not local_identity(): the two override mechanisms
+    # must compose rather than one silently discarding the other. A typed
+    # dialog field is a display-name override; ORI_SYNC_USER is an account
+    # override. Basing this on local_identity() would make the account
+    # override vanish the moment anything was typed into the dialog field —
+    # a confusing, order-dependent interaction with no indication it had
+    # happened.
+    local = resolve_identity()
 
     return {
         "user": local.get("user", ""),

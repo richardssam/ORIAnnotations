@@ -203,5 +203,14 @@ def structure_events_enabled() -> bool:
 # ── QML constants ──────────────────────────────────────────────────────────────
 
 QML_FOLDER = "qml/ORISyncPlugin.1"
-SESSION_DIALOG_QML = "SessionDialog {}"
+# Two distinct snippets, not one reused with a property set afterwards:
+# create_qml_item keys its singleton attribute on hash(qml_item), so distinct
+# snippet text is what gives Create and Join their own persistent dialog
+# instance, each permanently in the right mode. A single "SessionDialog {}"
+# snippet — the previous form — has no way to communicate mode at all: nothing
+# outside the QML ever sets dialog.mode, so it silently stayed at its "join"
+# default for both menu items, and any QML gated on mode === "create" (the
+# session-role-config default-role picker) never appeared.
+SESSION_CREATE_DIALOG_QML = 'SessionDialog { mode: "create" }'
+SESSION_JOIN_DIALOG_QML = 'SessionDialog { mode: "join" }'
 SESSION_STATE_PANEL_QML = "SessionStatePanel {}"

@@ -346,6 +346,60 @@ class PeerDepart(ProtocolMessage):
 
 @register
 @dataclass
+class SetPeerRole(ProtocolMessage):
+    """A driver's grant of a session role to a named participant (``session-role-administration``).
+
+    Two properties are not inferable from the field list alone:
+
+    **Broadcast, not addressed to its target alone.**  Every peer — issuer,
+    target, and everyone else — merges ``{user: role}`` into its own copy of
+    the session's identity-keyed role memory.  This is what makes the grant
+    reach the master's memory (and so every later joiner's :class:`StateSnapshot`)
+    without a routing hop, and what makes it survive the target's reconnection:
+    a unicast to the target alone would leave the master's memory unaware the
+    grant ever happened.
+
+    **Applied by its target, which then re-announces.**  A receiving peer does
+    **not** write ``role`` into its peer-table entry for ``user`` on receipt of
+    this message.  Only the peer whose own identity matches ``user`` adopts the
+    role, for itself, and re-announces it — :class:`PeerAnnounce` remains the
+    single write path into every peer's table.  Every other peer learns the new
+    role from that subsequent announcement, the same way it learns a role on
+    joining.
+    """
+
+    SCHEMA = "LiveSession.1"
+    EVENT = "SET_PEER_ROLE"
+
+    user: str = doc_field(doc="Identity key of the participant being granted a role — the "
+                               "same `identity[\"user\"]` value the session's role memory is "
+                               "keyed on, never a peer GUID.")
+    role: str = doc_field(doc="The role being granted: `driver`, `reviewer`, or `viewer`.")
+    issuer_guid: "str | None" = doc_field(
+        default=None,
+        doc="GUID of the peer that issued the grant, carried for logging and "
+            "provenance only. Not consulted by any receiving peer: who may "
+            "issue a grant is checked by the issuer, before sending, against "
+            "the same role table the broadcast guard uses.",
+    )
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {"user": self.user, "role": self.role}
+        if self.issuer_guid:
+            payload["issuer_guid"] = self.issuer_guid
+        return payload
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> "SetPeerRole":
+        return cls(
+            user=data.get("user"),
+            role=data.get("role"),
+            issuer_guid=data.get("issuer_guid"),
+        )
+
+
+@register
+@dataclass
 class StateRequest(ProtocolMessage):
     """Joiner's request to the master for a full state snapshot."""
 

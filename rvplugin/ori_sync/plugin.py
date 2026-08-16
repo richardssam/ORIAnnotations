@@ -230,8 +230,16 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         except Exception as e:
             _log(f"_rebuild_menu failed: {e}")
 
-    def connect_to_session(self, host, session_name, identity_override=None):
-        """Create a SyncManager and join the named session."""
+    def connect_to_session(self, host, session_name, identity_override=None, default_role=None):
+        """Create a SyncManager and join the named session.
+
+        :param default_role: Session default role, declared only on the
+            **create** path (``session-role-config``). ``None`` on join —
+            the session already has a policy and sends it in
+            ``STATE_SNAPSHOT``. When given, also seeds this peer (the
+            creator) as ``driver`` so a restrictive default cannot lock out
+            the person who just declared it (``seed_creator``).
+        """
         if not SyncManager or not RabbitMQNetwork:
             _log("SyncManager/RabbitMQNetwork not available — cannot connect")
             return
@@ -249,7 +257,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
 
         # app_name ranks this peer for host election: xStudio is the preferred
         # visibility authority, so RV hosts only an RV-only session.
-        
+
         identity_arg = None
         if identity_override:
             try:
@@ -257,11 +265,17 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                 identity_arg = identity_from_override(identity_override)
             except Exception as e:
                 _log(f"Failed to process identity override: {e}")
-                
+
+        manager_kwargs = {}
+        if default_role is not None:
+            manager_kwargs["default_role"] = default_role
+            manager_kwargs["seed_creator"] = True
+
         self.sync_manager = SyncManager(
             session_id=session_name,
             app_name="openrv",
-            identity_override=identity_arg
+            identity_override=identity_arg,
+            **manager_kwargs
         )
         # Expose the manager to the in-process sync_test inspector (it reads
         # manager.export_state() for /full_state and the active timeline name).
@@ -687,10 +701,10 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name, identity = session_dialog("Create Session")
+        host, name, identity, default_role = session_dialog("Create Session", show_default_role=True)
         if name:
             self._pending_create_check = True
-            self.connect_to_session(host, name, identity)
+            self.connect_to_session(host, name, identity, default_role)
         if event: event.reject()
 
     def do_join_session(self, event=None):
@@ -702,7 +716,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             )
             if event: event.reject()
             return
-        host, name, identity = session_dialog("Join Session")
+        host, name, identity, _default_role = session_dialog("Join Session")
         if name:
             self.connect_to_session(host, name, identity)
         if event: event.reject()

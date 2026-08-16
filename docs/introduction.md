@@ -71,6 +71,13 @@ absent `session_roles` section means "no policy declared" rather than an empty
 policy. A session that declares nothing behaves exactly as one predating roles:
 every peer may emit everything.
 
+A role may also change mid-session: a peer already holding `driver` may grant
+another participant a role via `SET_PEER_ROLE`. The message is **broadcast**
+— every peer merges it into its own copy of the session's role memory — and
+is **applied by its target**, which then re-announces; `PEER_ANNOUNCE` stays
+the only path that writes a role into the peer table. An implementer should
+not write a grant's role into the peer table directly on receipt.
+
 ---
 
 ## How a message is wrapped and sent

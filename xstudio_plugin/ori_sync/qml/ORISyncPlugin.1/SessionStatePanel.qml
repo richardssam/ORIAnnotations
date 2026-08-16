@@ -303,6 +303,81 @@ XsWindow {
                             Item { Layout.fillWidth: true }
                         }
 
+                        // Role administration (session-role-administration):
+                        // offered only while this peer may administer, and
+                        // only for a peer that carries an identity — a grant
+                        // is addressed by identity, so there is nothing to
+                        // grant a peer with none. Dispatches via
+                        // python_callback on click only, never from the
+                        // polling path (see the header comment on why).
+                        RowLayout {
+                            id: roleControl
+                            spacing: 6
+                            visible: panel.state.may_administer_roles === true
+                                     && modelData.user !== ""
+                            // Captured here, in the outer delegate's own
+                            // scope, rather than read from inside the nested
+                            // Repeater below — where `modelData` would
+                            // instead resolve to that Repeater's own string
+                            // model item.
+                            property string peerRole: modelData.role
+                            property string peerUser: modelData.user
+                            // Which role is awaiting a second click to
+                            // confirm; "" when nothing is pending.
+                            property string confirmingRole: ""
+
+                            Repeater {
+                                model: ["driver", "reviewer", "viewer"]
+                                delegate: Rectangle {
+                                    property string roleValue: modelData
+                                    property bool isCurrent: roleControl.peerRole === roleValue
+                                    property bool isConfirming: roleControl.confirmingRole === roleValue
+                                    implicitWidth: roleLabel.implicitWidth + 10
+                                    implicitHeight: roleLabel.implicitHeight + 4
+                                    radius: 3
+                                    color: isCurrent ? XsStyleSheet.accentColor
+                                           : (isConfirming ? "#f59e0b" : "transparent")
+                                    border.width: 1
+                                    border.color: XsStyleSheet.hintColor
+
+                                    XsText {
+                                        id: roleLabel
+                                        anchors.centerIn: parent
+                                        text: isConfirming ? "confirm?" : roleValue
+                                        color: isCurrent ? XsStyleSheet.panelBgColor : XsStyleSheet.secondaryTextColor
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        enabled: !isCurrent
+                                        onClicked: {
+                                            // A courtesy confirmation in this
+                                            // view only, before demoting a
+                                            // peer away from "driver" — the
+                                            // core applies or refuses the
+                                            // grant on its own evaluation
+                                            // either way (session-state-ui).
+                                            // The panel has no cheap way to
+                                            // know whether this is the *last*
+                                            // driver, so it asks on every
+                                            // such demotion rather than only
+                                            // that one.
+                                            if (roleControl.peerRole === "driver" && roleValue !== "driver" && !isConfirming) {
+                                                roleControl.confirmingRole = roleValue
+                                            } else {
+                                                roleControl.confirmingRole = ""
+                                                python_callback("set_peer_role", {
+                                                    "user": roleControl.peerUser,
+                                                    "role": roleValue
+                                                })
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         XsText {
                             Layout.fillWidth: true
                             elide: Text.ElideRight

@@ -651,3 +651,14 @@ def test_two_peer_replace_topology_end_to_end():
 
     assert [c.name for c in peer._timelines["tl-1"].tracks[0]] == ["a.mov", "b.mov"]
     assert {"clip-a", "clip-b"} <= set(peer._object_map)
+
+
+def test_set_peer_role_roundtrip_and_registry():
+    assert pm.message_for("LiveSession.1", "SET_PEER_ROLE") is pm.SetPeerRole
+
+    payload = {"user": "alice", "role": authority.DRIVER, "issuer_guid": "g1"}
+    assert pm.SetPeerRole.from_payload(payload).to_payload() == payload
+
+    # issuer_guid is optional and omitted from the wire form when unset.
+    msg = pm.SetPeerRole(user="bob", role=authority.VIEWER)
+    assert msg.to_payload() == {"user": "bob", "role": authority.VIEWER}

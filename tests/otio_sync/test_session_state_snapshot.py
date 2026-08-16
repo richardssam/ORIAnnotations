@@ -157,6 +157,27 @@ def test_snapshot_reports_role_and_driverless_state():
     assert snap["peers"][0]["is_host"] is False
 
 
+def test_snapshot_reports_may_administer_roles_for_a_driver():
+    mgr = _manager()
+
+    assert session_state_snapshot(mgr)["may_administer_roles"] is True
+
+
+def test_snapshot_reports_may_administer_roles_false_for_a_reviewer():
+    mgr = _manager()
+    mgr._self_role = authority.REVIEWER
+
+    assert session_state_snapshot(mgr)["may_administer_roles"] is False
+
+
+def test_snapshot_reports_may_administer_roles_false_for_a_viewer():
+    mgr = _manager()
+    mgr._default_role = authority.VIEWER
+    mgr.resolve_own_role()
+
+    assert session_state_snapshot(mgr)["may_administer_roles"] is False
+
+
 def test_snapshot_reports_a_driverless_session():
     """The condition is reported, not merely inferable from a disabled menu."""
     mgr = _manager()

@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     Qt,
     Property,
     Signal,
+    Slot,
 )
 
 from .session_state import session_state_snapshot
@@ -40,6 +41,7 @@ class SessionStateModel(QObject):
     isDebugChanged = Signal()
     splitViewChanged = Signal()
     roleChanged = Signal()
+    mayAdministerRolesChanged = Signal()
     driverlessChanged = Signal()
     selfHoldsVisibilityChanged = Signal()
     mayHoldVisibilityChanged = Signal()
@@ -74,6 +76,8 @@ class SessionStateModel(QObject):
             self.isHostChanged.emit()
         if self._snapshot["self_role"] != previous["self_role"]:
             self.roleChanged.emit()
+        if self._snapshot["may_administer_roles"] != previous["may_administer_roles"]:
+            self.mayAdministerRolesChanged.emit()
         if self._snapshot["driverless"] != previous["driverless"]:
             self.driverlessChanged.emit()
         if self._snapshot["self_holds_visibility"] != previous["self_holds_visibility"]:
@@ -142,6 +146,32 @@ class SessionStateModel(QObject):
     def defaultRole(self):
         """The role this session gives a participant it does not recognise."""
         return self._snapshot["default_role"]
+
+    @Property(bool, notify=mayAdministerRolesChanged)
+    def mayAdministerRoles(self):
+        """Whether this peer may grant another participant a role.
+
+        Read by the panel to decide whether to *offer* the per-row role
+        control; the core makes the actual decision independently when
+        :meth:`setPeerRole` is invoked (session-role-administration).
+        """
+        return self._snapshot["may_administer_roles"]
+
+    @Slot(str, str)
+    def setPeerRole(self, user, role):
+        """Grant *user* *role* (session-role-administration).
+
+        A thin dispatch to :meth:`SyncManager.set_peer_role`; the permission
+        check, the local application, and the broadcast all happen there —
+        this model does not decide whether the grant is permitted, only
+        whether to offer the control (see :attr:`mayAdministerRoles`).
+        """
+        if self._manager is None:
+            return
+        try:
+            self._manager.set_peer_role(user, role)
+        except Exception as exc:
+            _logger.debug("setPeerRole(%r, %r) failed: %s", user, role, exc)
 
     @Property(bool, notify=driverlessChanged)
     def isDriverless(self):

@@ -43,7 +43,7 @@ timeout" for the full rule.
 # utils performs the sys.path / OTIO_PLUGIN_MANIFEST_PATH setup as a side-effect.
 from .utils import (  # noqa: E402
     _log, _log_exc, _parse_ori_session, _uri_to_posix_path,
-    QML_FOLDER, SESSION_DIALOG_QML, SESSION_STATE_PANEL_QML,
+    QML_FOLDER, SESSION_CREATE_DIALOG_QML, SESSION_JOIN_DIALOG_QML, SESSION_STATE_PANEL_QML,
     structure_events_enabled,
 )
 from .media_map import MediaMapController  # noqa: E402
@@ -300,14 +300,27 @@ class ORISyncPlugin(PluginBase):
 
     # ── connection lifecycle ───────────────────────────────────────────────────
 
-    def connect_to_session(self, host: str | None = None, session_name: str | None = None, identity_override: str | None = None) -> None:
+    def connect_to_session(
+        self,
+        host: str | None = None,
+        session_name: str | None = None,
+        identity_override: str | None = None,
+        default_role: str | None = None,
+    ) -> None:
         """Connect to RabbitMQ and join the sync session.
 
         :param host: RabbitMQ hostname; falls back to ``mq_host_attr`` if ``None``.
         :param session_name: Session / exchange name; falls back to ``session_id_attr``
             if ``None``.
         :param identity_override: Optional user-supplied identity string.
+        :param default_role: Session default role, declared only on the
+            **create** path (``session-role-config``). ``None`` on join — the
+            session already has a policy and sends it in ``STATE_SNAPSHOT``.
+            When given, also seeds this peer (the creator) as ``driver`` so a
+            restrictive default cannot lock out the person who just declared
+            it (``seed_creator``).
         """
+        _log(f"connect_to_session: entered (host={host!r}, session_name={session_name!r}, default_role={default_role!r})")
         if host is None:
             host = self.mq_host_attr.value()
         if session_name is None:
@@ -344,6 +357,11 @@ class ORISyncPlugin(PluginBase):
             except Exception as e:
                 _log(f"Failed to process identity override: {e}")
                 
+        manager_kwargs = {}
+        if default_role is not None:
+            manager_kwargs["default_role"] = default_role
+            manager_kwargs["seed_creator"] = True
+
         self.manager = SyncManager(
             session_id=session_name,
             self_guid=str(self.uuid),
@@ -352,6 +370,7 @@ class ORISyncPlugin(PluginBase):
             # authority whenever it is in the session.
             app_name="xstudio",
             identity_override=identity_arg,
+            **manager_kwargs,
         )
         self.manager.on_playback_changed(self.playback.apply_playback_state)
         self.manager.on_status_changed(
@@ -579,7 +598,7 @@ class ORISyncPlugin(PluginBase):
             )
             return
         self._pending_create_check = True
-        self.create_qml_item(SESSION_DIALOG_QML)
+        self.create_qml_item(SESSION_CREATE_DIALOG_QML)
 
     def _menu_join_session(self) -> None:
         """Open SessionDialog in 'join' mode."""
@@ -591,7 +610,7 @@ class ORISyncPlugin(PluginBase):
             )
             return
         self._pending_create_check = False
-        self.create_qml_item(SESSION_DIALOG_QML)
+        self.create_qml_item(SESSION_JOIN_DIALOG_QML)
 
     def _menu_leave_session(self) -> None:
         """Disconnect from the active session."""
@@ -623,6 +642,39 @@ class ORISyncPlugin(PluginBase):
                 _log("Become Controller: refused — session already has a driver")
         except Exception:
             _log_exc("Become Controller failed")
+
+    def set_peer_role(self, data) -> list:
+        """Grant a participant a role (session-role-administration).
+
+        Called from QML ``SessionStatePanel`` via ``python_callback`` on
+        click only — never from the polling path, which stays attribute-bound
+        (see the panel's own comment on why: ``python_callback`` blocks
+        xStudio's Qt main thread).  Calls the manager directly rather than
+        going through ``_cmd_queue``, the same threading convention
+        :meth:`_menu_become_controller` already uses for the other role
+        action reachable from this thread.
+
+        The permission check, the local application, and the broadcast all
+        happen in :meth:`SyncManager.set_peer_role`; this method does not
+        decide whether the grant is permitted, only whether to call it.
+
+        :param data: Dict with ``user`` and ``role`` keys.
+        :returns: ``[True, ""]`` on success, ``[False, reason]`` otherwise.
+        :rtype: list
+        """
+        if self.manager is None:
+            return [False, "Not connected to a session."]
+        user = (data.get("user") or "").strip()
+        role = (data.get("role") or "").strip()
+        if not user or not role:
+            return [False, "Missing target participant or role."]
+        try:
+            if self.manager.set_peer_role(user, role):
+                return [True, ""]
+            return [False, "Grant refused — this peer may not administer roles."]
+        except Exception:
+            _log_exc("set_peer_role failed")
+            return [False, "Grant failed."]
 
     def _menu_show_session_state(self, *args, **kwargs) -> None:
         """Open the Session State panel.
@@ -694,26 +746,39 @@ class ORISyncPlugin(PluginBase):
         calls disconnect() internally, which joins the poll thread — that join
         must not happen on the poll thread itself.
 
-        :param data: Dict with ``host`` and ``name`` keys.
+        :param data: Dict with ``host`` and ``name`` keys, and ``default_role``
+            on the create path (``session-role-config``; ``None``/absent on
+            join).
         :returns: ``[True, "Connecting…"]`` immediately.
         :rtype: list
         """
+        # Printed unconditionally, not just via _log(), because _log() is a
+        # no-op unless ORI_SYNC_LOG_FILE was exported *before* xStudio
+        # launched — a silent log file does not mean this was never reached.
+        print(f"[OTIOSync] do_session_connect: called with data={data!r}", file=sys.stderr)
+        _log(f"do_session_connect: called with data={data!r}")
         host = (data.get("host") or "").strip() or os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
         name = (data.get("name") or "").strip()
         you = (data.get("you") or "").strip()
+        default_role = (data.get("default_role") or "").strip() or None
         if not name:
+            print("[OTIOSync] do_session_connect: refused — empty session name", file=sys.stderr)
+            _log("do_session_connect: refused — empty session name")
             return [False, "Session name cannot be empty."]
         threading.Thread(
             target=self._session_connect_worker,
-            args=(host, name, you),
+            args=(host, name, you, default_role),
             daemon=True,
         ).start()
         return [True, "Connecting…"]
 
-    def _session_connect_worker(self, host: str, name: str, identity_override: str) -> None:
+    def _session_connect_worker(
+        self, host: str, name: str, identity_override: str, default_role: str | None = None
+    ) -> None:
         """Background thread that calls connect_to_session safely off the poll thread."""
+        _log(f"_session_connect_worker: starting connect_to_session(host={host!r}, name={name!r}, default_role={default_role!r})")
         try:
-            self.connect_to_session(host, name, identity_override or None)
+            self.connect_to_session(host, name, identity_override or None, default_role)
         except Exception:
             _log_exc("session connect worker failed")
 

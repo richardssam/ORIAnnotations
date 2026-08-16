@@ -41,6 +41,7 @@ from .protocol_messages import (
     PeerAnnounce,
     PeerDepart,
     ReplaceTimeline,
+    SetPeerRole,
     SetProperty,
     StateRequest,
     StateSnapshot,
@@ -177,6 +178,7 @@ NON_DISPLAY_EVENTS = frozenset({
     ("LiveSession.1", "I_AM_MASTER"),
     ("LiveSession.1", "PEER_ANNOUNCE"),
     ("LiveSession.1", "PEER_DEPART"),
+    ("LiveSession.1", "SET_PEER_ROLE"),
     ("LiveSession.1", "STATE_REQUEST"),
     ("BROADCAST_OWNERSHIP_1.0", "CLAIM_OWNERSHIP"),
     ("BROADCAST_OWNERSHIP_1.0", "RELEASE_OWNERSHIP"),
@@ -272,6 +274,15 @@ class SyncManager:
         ``{user: role}``, keyed on the identity's ``user`` so a reconnecting
         driver is recognised as the same person under a new GUID.  Merged over
         anything ``ORI_SESSION_PEER_ROLES`` declares.
+    :param seed_creator: Pass ``True`` only from a host's *create-session*
+        path, alongside a *default_role* other than ``driver``, to seed this
+        peer's own identity into *peer_roles* as ``driver``
+        (``session-role-config`` "The create-time trap"). Without it, an
+        organiser who declares a restrictive default resolves against it
+        themselves and locks themselves out of the session they just started.
+        ``False`` on join, and ``False`` for any construction that uses
+        *default_role* to pin a peer's own role for reasons other than
+        starting a session (tests, the sync viewer's passive peer).
     """
 
     def __init__(
@@ -284,6 +295,7 @@ class SyncManager:
         identity_override: "dict[str, str] | None" = None,
         default_role: "str | None" = None,
         peer_roles: "dict[str, str] | None" = None,
+        seed_creator: bool = False,
     ) -> None:
         self.session_id = session_id
         self.self_guid: str = self_guid or str(uuid.uuid4())
@@ -378,6 +390,29 @@ class SyncManager:
             for user, role in (peer_roles or {}).items()
             if user
         })
+        # Creator seeding (session-role-config "The create-time trap", design
+        # D5): a session created with a restrictive default must not lock its
+        # own creator out of it.  resolve_own_role() below applies memory
+        # first, default second — so without this, declaring
+        # default_role="viewer" would resolve the creator to viewer in the
+        # session they just started, reporting itself driverless immediately.
+        #
+        # Gated on the explicit *seed_creator* flag, never inferred from
+        # ``default_role`` merely being non-``None``: that parameter is also
+        # the established way to pin a constructed peer's own effective role
+        # (see e.g. ``test_role_enforcement.py``), a use with no creation
+        # semantics at all, and inferring from its presence silently seeded
+        # every such peer as a driver regardless of intent. It is likewise
+        # never inferred from ``ORI_SESSION_DEFAULT_ROLE``: that environment
+        # variable is read by every peer that has it set, joiners included,
+        # and seeding on it would make every env-configured peer a driver.
+        # Both host applications pass ``seed_creator=True`` together with
+        # ``default_role=`` on their create path only, and pass neither on
+        # join.
+        if seed_creator and authority.normalise_role(default_role) != authority.DRIVER:
+            creator = (self.identity or {}).get("user") or ""
+            if creator:
+                self._peer_roles[creator] = authority.DRIVER
         #: This peer's own role.  Written only by :meth:`resolve_own_role`.
         self._self_role: str = authority.DEFAULT_ROLE
 
@@ -540,6 +575,7 @@ class SyncManager:
             ("LiveSession.1", "I_AM_MASTER"): self._h_i_am_master,
             ("LiveSession.1", "PEER_ANNOUNCE"): self._h_peer_announce,
             ("LiveSession.1", "PEER_DEPART"): self._h_peer_depart,
+            ("LiveSession.1", "SET_PEER_ROLE"): self._h_set_peer_role,
             ("LiveSession.1", "STATE_REQUEST"): self._h_state_request,
             ("LiveSession.1", "STATE_SNAPSHOT"): self._h_state_snapshot,
             ("BROADCAST_OWNERSHIP_1.0", "CLAIM_OWNERSHIP"): self._h_claim_ownership,
@@ -1831,6 +1867,54 @@ class SyncManager:
         _log("elect_role_to_driver: self-elevated to driver (driverless session)")
         self.announce_peer()
         self.request_host_election("role-self-elevation")
+        return True
+
+    def set_peer_role(self, user: str, role: str) -> bool:
+        """Grant *user* *role*, on behalf of this peer (``session-role-administration``).
+
+        Refused unless this peer's own role permits administration — the same
+        role table the broadcast guard and the lease claim gate consult, via
+        :func:`~otio_sync_core.authority.role_may_administer`.  Deliberately
+        **not** restricted to the host: host is an election outcome nobody
+        chooses, and any driver may administer (see the change proposal,
+        "Any driver may issue a grant").
+
+        Applies the grant to this peer's own state (via
+        :meth:`adopt_role_policy`) **before** sending it. The network layer
+        discards a peer's own broadcasts (``rabbitmq_network.py``), so an
+        issuer that only sent would never see its own grant applied locally —
+        wrong in general, and fatal when the issuer is also the master, whose
+        copy of ``_peer_roles`` is what :meth:`role_policy` ships to every
+        later joiner.
+
+        Does **not** change :attr:`default_role`. One participant being
+        promoted or demoted is not a decision about every future joiner, and
+        is not a substitute for :meth:`elect_role_to_driver`, whose gate stays
+        untouched: this method does not check whether the session is
+        driverless, and does not relax that gate in either direction.
+
+        No guard refuses a grant that would leave the session with no
+        eligible driver (see ``session-role-administration`` spec, "The last
+        driver may be demoted"): the peer table this would have to check can
+        be stale, and the already-shipped driverless report plus
+        self-elevation is the recovery.
+
+        :param user: Target participant identity — an ``identity["user"]``
+            value, never a peer GUID.
+        :param role: The role to grant.
+        :returns: ``True`` when the grant was issued, ``False`` when refused.
+        :rtype: bool
+        """
+        if not self._role_permits(authority.ADMINISTRATION):
+            _log(f"set_peer_role: refused — this peer's role ({self._self_role}) may not administer")
+            return False
+        if not user:
+            _log("set_peer_role: refused — no target participant identity")
+            return False
+        norm_role = authority.normalise_role(role)
+        _log(f"set_peer_role: granting user={user} role={norm_role}")
+        self.adopt_role_policy({"peer_roles": {user: norm_role}})
+        self._send_message(SetPeerRole(user=user, role=norm_role, issuer_guid=self.self_guid))
         return True
 
     def _role_permits(self, group: "str | None", *, destructive: bool = False) -> bool:
@@ -3644,6 +3728,23 @@ class SyncManager:
         # was written to prevent.  Same poll-thread position as
         # _h_peer_announce, so the direct call is right.
         self.drop_peer(msg.peer_guid or source)
+        return None
+
+    def _h_set_peer_role(
+        self, msg: SetPeerRole, data: dict[str, Any], source: str
+    ) -> "tuple[str, Any] | None":
+        # Reuses adopt_role_policy wholesale rather than a parallel merge: it
+        # already provides everything a grant needs — additive merge into
+        # _peer_roles, re-resolution of this peer's own role, a re-announce
+        # only when this peer's own role actually moved (so a grant about
+        # someone else never announces here), and a host-election request
+        # (design.md D2).  Whether the *target* applies the grant or another
+        # peer merely records it is exactly what resolve_own_role, called
+        # inside adopt_role_policy, already decides by identity.
+        if not msg.user or not msg.role:
+            return None
+        _log(f"SET_PEER_ROLE received: user={msg.user} role={msg.role} issuer={msg.issuer_guid}")
+        self.adopt_role_policy({"peer_roles": {msg.user: msg.role}})
         return None
 
     def _h_state_request(

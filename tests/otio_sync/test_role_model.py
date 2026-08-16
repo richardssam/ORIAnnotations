@@ -110,6 +110,34 @@ def test_every_gated_broadcast_method_has_a_role_group():
             assert group == category
 
 
+def test_only_driver_may_administer():
+    assert authority.role_may_administer(authority.DRIVER) is True
+    assert authority.role_may_administer(authority.REVIEWER) is False
+    assert authority.role_may_administer(authority.VIEWER) is False
+
+
+def test_unknown_role_administers_permissively():
+    # Absent/unknown resolves via normalise_role() to DEFAULT_ROLE (driver),
+    # never to the most restrictive outcome.
+    assert authority.DEFAULT_ROLE == authority.DRIVER
+    assert authority.role_may_administer(None) is True
+    assert authority.role_may_administer("nonsense") is True
+
+
+def test_administration_is_inert_on_the_broadcast_path():
+    """ADMINISTRATION gates set_peer_role itself, not a stripped field group —
+    it must never surface through role_group_for or strip_role_fields."""
+    for method in authority.ROLE_GROUPS:
+        assert authority.role_group_for(method) != authority.ADMINISTRATION
+
+    before = _state()
+    for role in authority.ROLES:
+        out = authority.strip_role_fields(_state(), role)
+        # Only VISIBILITY/POSITION fields are ever candidates for stripping;
+        # administration permission does not change this output.
+        assert out == authority.strip_role_fields(before, role)
+
+
 def _state():
     return {
         "view_mode": "sequence",

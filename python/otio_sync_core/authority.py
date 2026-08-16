@@ -613,15 +613,22 @@ DEFAULT_ROLE = DRIVER
 #: because the two tables answer different questions.
 DISPLAY = CHANNEL_DISPLAY
 
+#: Granting another participant a role (``session-role-administration``).
+#: Deliberately **not** wired into :data:`ROLE_GROUPS` or
+#: :func:`role_group_for`: it gates a whole message — whether ``set_peer_role``
+#: may be issued at all — never a field group stripped from an outgoing
+#: playback message, so it must stay invisible to :func:`strip_role_fields`.
+ADMINISTRATION = "administration"
+
 #: Role → the field groups that role may emit.
 #:
-#: Keyed on the :data:`BROADCAST_CATEGORIES` vocabulary plus :data:`DISPLAY`.
-#: The rows are field *groups*, not message types: the visibility boundary runs
-#: inside ``PLAYBACK_SETTINGS_1.0``, so a table keyed on message type could not
-#: express "a reviewer may scrub but not change the shot" — which is the whole
-#: of the reviewer tier.
+#: Keyed on the :data:`BROADCAST_CATEGORIES` vocabulary plus :data:`DISPLAY`
+#: and :data:`ADMINISTRATION`.  The rows are field *groups*, not message
+#: types: the visibility boundary runs inside ``PLAYBACK_SETTINGS_1.0``, so a
+#: table keyed on message type could not express "a reviewer may scrub but not
+#: change the shot" — which is the whole of the reviewer tier.
 ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
-    DRIVER: frozenset({VISIBILITY, POSITION, DISPLAY, ANNOTATION, STRUCTURE}),
+    DRIVER: frozenset({VISIBILITY, POSITION, DISPLAY, ANNOTATION, STRUCTURE, ADMINISTRATION}),
     REVIEWER: frozenset({POSITION, DISPLAY, ANNOTATION}),
     VIEWER: frozenset({DISPLAY}),
 }
@@ -695,6 +702,21 @@ def role_permits(role: "str | None", group: "str | None", *, destructive: bool =
     if destructive and group == ANNOTATION:
         return resolved == DRIVER
     return group in ROLE_PERMISSIONS[resolved]
+
+
+def role_may_administer(role: "str | None") -> bool:
+    """Return whether *role* may grant a session role to a participant.
+
+    A thin, named wrapper over ``role_permits(role, ADMINISTRATION)`` so call
+    sites in :mod:`~otio_sync_core.manager` and the session-state projection
+    read as intent ("may this peer administer roles?") rather than as a bare
+    permission-table lookup (``session-role-administration``).
+
+    :param role: The peer's session role; unknown resolves permissively via
+        :func:`normalise_role`, i.e. to :data:`DEFAULT_ROLE`.
+    :rtype: bool
+    """
+    return role_permits(role, ADMINISTRATION)
 
 
 def strip_role_fields(state: Mapping[str, Any], role: "str | None") -> dict[str, Any]:
