@@ -20,6 +20,15 @@ The module set SHALL be:
 | `annotation_sync.py` | `AnnotationSyncController` — annotation broadcast and apply |
 | `media_map.py` | `MediaMapController` — sync-GUID ↔ xStudio-media mapping |
 
+Payload location SHALL NOT be a responsibility of any of these modules. A single shared
+resolver, living outside both plugin packages at the top level of the search folder, SHALL
+own it. `utils.py` SHALL invoke that resolver rather than performing its own `sys.path`
+and `OTIO_PLUGIN_MANIFEST_PATH` manipulation, and SHALL no longer assume the plugin sits
+at a fixed depth below a repository checkout.
+
+The resolver SHALL be a file, not a directory, so that xStudio's plugin scan does not
+attempt to load it as a plugin.
+
 #### Scenario: Plugin loads successfully with split modules
 
 - **WHEN** xStudio loads the `ORI Sync Review` plugin package
@@ -31,6 +40,13 @@ The module set SHALL be:
 - **WHEN** the `ori_sync` package is imported
 - **THEN** `create_plugin_instance` and `ORISyncPlugin` SHALL be importable from the package as before
 - **AND** `create_plugin_instance(connection)` SHALL return an `ORISyncPlugin` instance
+
+#### Scenario: Payload location is not derived from the module's own depth
+
+- **WHEN** the plugin package is placed at a location that is not two levels below a
+  repository checkout
+- **THEN** the plugin SHALL still resolve `otio_sync_core`, `ORIAnnotations`, and the
+  `SyncEvent` schemadef
 
 ### Requirement: Delegated controller pattern
 
