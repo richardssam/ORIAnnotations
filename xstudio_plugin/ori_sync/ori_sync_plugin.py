@@ -40,7 +40,7 @@ deliberately left unbounded — they can be legitimately slow.  See
 timeout" for the full rule.
 """
 
-# utils performs the sys.path / OTIO_PLUGIN_MANIFEST_PATH setup as a side-effect.
+# utils resolves the shared payload (sys.path, SyncEvent schemadef) as a side-effect.
 from .utils import (  # noqa: E402
     _log, _log_exc, _parse_ori_session, _uri_to_posix_path,
     QML_FOLDER, SESSION_CREATE_DIALOG_QML, SESSION_JOIN_DIALOG_QML, SESSION_STATE_PANEL_QML,

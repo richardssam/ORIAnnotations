@@ -6,26 +6,43 @@ import contextlib
 import logging
 import os
 import sys
+import types
 
-# ── path setup ─────────────────────────────────────────────────────────────────
-# Performed here so any module that imports utils gets the sys.path side-effects.
+# ── payload resolution ────────────────────────────────────────────────────────
+# Performed here so any module that imports utils gets the payload side-effects
+# (otio_sync_core, ORIAnnotations, and the SyncEvent schemadef become
+# importable/registered). Loaded by filesystem path, not `import`, so it works
+# whether xStudio put the search folder on sys.path (production) or a test
+# harness put this plugin's own directory there instead — see
+# _ori_bootstrap.py for the full rationale.
 
 _here = os.path.dirname(os.path.realpath(__file__))
-_repo_root = os.path.dirname(os.path.dirname(_here))
-_python_dir = os.path.join(_repo_root, "python")
-_manifest_dir = os.path.join(_repo_root, "otio_event_plugin")
-_manifest_file = os.path.join(_manifest_dir, "plugin_manifest.json")
 
-for _p in (_python_dir, _manifest_dir):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-if os.path.exists(_manifest_file):
-    _existing = os.environ.get("OTIO_PLUGIN_MANIFEST_PATH", "")
-    if _manifest_file not in _existing:
-        os.environ["OTIO_PLUGIN_MANIFEST_PATH"] = (
-            _existing + os.pathsep + _manifest_file if _existing else _manifest_file
-        )
+def _load_bootstrap():
+    _bootstrap_path = os.path.join(os.path.dirname(_here), "_ori_bootstrap.py")
+    _module = sys.modules.get("_ori_bootstrap")
+    if _module is None or getattr(_module, "__file__", None) != _bootstrap_path:
+        # exec() the source directly rather than going through importlib's
+        # SourceFileLoader. That loader writes a bytecode cache next to the
+        # source file on first load — and _ori_bootstrap.py deliberately
+        # lives as a bare file at the top of the search folder specifically
+        # so xStudio's plugin scan skips it. A __pycache__/ appearing there
+        # as a side effect of loading it is exactly the stray top-level
+        # directory the layout exists to avoid, and xStudio's scan has no
+        # quiet failure path for one (confirmed live: "Failed to load plugin
+        # __pycache__ ... AttributeError: module '__pycache__' has no
+        # attribute 'create_plugin_instance'").
+        with open(_bootstrap_path, "r", encoding="utf-8") as _f:
+            _source = _f.read()
+        _module = types.ModuleType("_ori_bootstrap")
+        _module.__file__ = _bootstrap_path
+        sys.modules["_ori_bootstrap"] = _module
+        exec(compile(_source, _bootstrap_path, "exec"), _module.__dict__)
+    return _module
+
+
+_load_bootstrap().ensure_payload(_here)
 
 # ── logging ────────────────────────────────────────────────────────────────────
 

@@ -10,26 +10,25 @@ Exports annotations (bookmarks) from xSTUDIO as an ORIAnnotations-compatible OTI
 
 ## Installation
 
-No build step required. Point xSTUDIO at this directory via environment variables.
+No build step, no environment variables required, no packages to install into xStudio's interpreter. Point xStudio at the plugin folder.
 
-### Required environment variables
+The packaging script at the repo root (`./make_xstudio_package.sh --help` for the full list of modes) produces a self-contained tree containing this plugin, its sibling `ori_sync/`, and their supporting payload. Pick whichever install mode suits your site:
+
+- **Suggested default** — install into the app bundle, which xStudio scans unconditionally: `./make_xstudio_package.sh --install-app /path/to/xSTUDIO.app` (re-run after rebuilding xStudio)
+- **A persistent folder, independent of any one app bundle** — for a plugin location shared across multiple xStudio builds/versions: `./make_xstudio_package.sh --install-dir /path/to/a/persistent/folder`, then either `export XSTUDIO_PYTHON_PLUGIN_PATH=/path/to/that/folder` or add the path via Preferences → Python → "Python Plugins Search Paths"
+- **A versioned artifact to hand someone** — `./make_xstudio_package.sh --package` stages and zips into `dist/`
+
+A repository checkout's `xstudio_plugin/` directory also works directly as a search folder while developing, with no packaging step:
 
 ```bash
-# Tell xSTUDIO where to find the plugin
 export XSTUDIO_PYTHON_PLUGIN_PATH=/path/to/ORIAnnotations/xstudio_plugin
-
-# Make the ORIAnnotations Python module importable
-export PYTHONPATH=/path/to/ORIAnnotations/python:$PYTHONPATH
-
-# Register the SyncEvent OTIO schemadef
-export OTIO_PLUGIN_MANIFEST_PATH=/path/to/ORIAnnotations/otio_event_plugin/plugin_manifest.json
 ```
 
-> **Note:** The plugin automatically extends `OTIO_PLUGIN_MANIFEST_PATH` and `sys.path` at load time, so only `XSTUDIO_PYTHON_PLUGIN_PATH` is strictly required if the ORIAnnotations repo is on `PYTHONPATH`. Setting all three explicitly avoids any ordering issues.
+See [`../ori_sync/README.md`](../ori_sync/README.md) for the full installation rationale — both plugins share the same folder and the same install routes.
 
 ### Debug logging environment variables (Optional)
 
-To write detailed execution and debug logs to a file, set the following environment variables before launching xSTUDIO:
+Nothing is required for the plugin to function. To write detailed execution and debug logs to a file, set the following environment variables before launching xSTUDIO:
 
 ```bash
 # Enable file logging for the Live Sync plugin
@@ -37,15 +36,6 @@ export ORI_SYNC_LOG_FILE=/path/to/sync_plugin.log
 
 # Enable file logging for the manual Annotations Export plugin
 export ORI_ANNOTATIONS_LOG_FILE=/path/to/annotations_plugin.log
-```
-
-### Example (bash, absolute paths)
-
-```bash
-export REPO=/Users/sam/git/ORIAnnotations
-export XSTUDIO_PYTHON_PLUGIN_PATH=$REPO/xstudio_plugin
-export PYTHONPATH=$REPO/python:$PYTHONPATH
-export OTIO_PLUGIN_MANIFEST_PATH=$REPO/otio_event_plugin/plugin_manifest.json
 ```
 
 ## Usage

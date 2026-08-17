@@ -58,6 +58,58 @@ playhead active.  The user scrubs on the first timeline → no events arrive.
 Use poll-based position reading from the poll thread instead (see
 `_poll_and_broadcast_frame`).
 
+## Never call `subscribe_to_playhead_events()` — and acquire the playhead from the viewport, not `current_playhead()`
+
+xStudio's own maintainer-recommended `subscribe_to_playhead_events()` +
+`playhead_attribute_changed` path silently kills the very subscription it sets
+up, taking all position/playback sync with it. Two compounding causes,
+documented in `xstudio/scratch/python-event-routing-notes.md`:
+
+- it calls `subscribe_to_global_playhead_events()` a second time on top of the
+  plugin's own call, and `PlayheadGlobalEventsActor` delegates **both** join and
+  leave to its single `event_group_` (`playhead_global_events_actor.cpp:101-105`),
+  collapsing both routes onto one `BroadcastActor::subscribers_` entry; and
+- its `__connect_to_playhead` calls `cleanup_message_handler()` on the previous
+  playhead at every `viewport_playhead_atom` event, and with one shared
+  listener per connection that leave revokes the membership the plugin's own
+  `Playhead` objects depend on.
+
+`PlaybackSyncController._adopt_playhead` does the one thing the base call was
+wanted for — assigning `attribute_changed` — at every site that acquires a
+playhead, without issuing the fatal leave.
+
+A related trap sits one level up: `PluginBase.current_playhead()` sends a bare
+`viewport_playhead_atom` to `PlayheadGlobalEventsActor`, which answers with
+`global_active_playhead_`. **That is not the viewport's playhead.** It starts
+life as a spawned `"DummyPlayhead"` (`playhead_global_events_actor.cpp:31-33`)
+that emits no position events, and it is only reassigned by the explicit "set
+the global playhead" handler (`:182`) — the handler that runs when a
+*viewport* connects to a playhead (`:189-243`) updates
+`viewports_[name].playhead` and leaves `global_active_playhead_` alone.
+
+Symptom when this bites: build a sequence out of a bin and the plugin keeps
+the pre-sequence playhead for the rest of the session.
+`on_playhead_attribute_changed` never fires, so scrubbing and play/stop are
+silently never broadcast, while selection sync keeps working and masks it.
+The peer log shows the *same* playhead address before the sequence existed
+and after it is on screen, and zero `queuing playback state broadcast` lines.
+
+Use `PlaybackSyncController._viewport_playhead()` instead — it asks the
+viewport actor directly. Don't build a `Viewport` wrapper for this either: it
+is a `ModuleBase` (constructing one subscribes it to the viewport's attribute
+events) and it memoises `self.__playhead`, so it returns a stale playhead
+after the first call.
+
+Because not every playhead change is announced — creating a sequence fires no
+`viewport_playhead_atom` at all, since the C++ handler early-returns when the
+viewport's playhead is unchanged — `_poll_loop` also re-checks once a second.
+`_adopt_playhead` no-ops on an unchanged remote key, so that costs one bounded
+read per second and no re-subscription.
+
+**If `pr/python-per-subscription-listeners` lands, redo this rather than
+assuming it still holds** — see the per-subscription-listeners note under
+"Structural events" below for what that branch changes and why.
+
 ## `request_receive` has a 100-second default timeout — bound poll-thread reads
 
 **This is the single most important gotcha for the sync poll thread.**
@@ -423,6 +475,20 @@ at most once and never leaves it; `detach_event_group_handler` removes a
 callback from the fan-out while the join itself stays. A stale join after a
 playlist is deleted costs one no-op dispatch — logged (join count) so an
 unbounded run is visible — not a re-subscription.
+
+**If `pr/python-per-subscription-listeners` (`3b0a0e72`) lands, redo the
+playhead-acquisition workaround too, not just this structural pattern** — it
+changes the ground under both. Each subscription gets its own listener actor,
+so: both reasons for avoiding `subscribe_to_playhead_events()` dissolve (a
+leave can only revoke its own membership), meaning the hand-rolled
+`_adopt_playhead`/`_viewport_playhead` ownership may become unnecessary;
+`Playhead` construction stops being free, which makes the remote-key guards
+and the 1 Hz re-check in `_poll_loop` load-bearing for resource use rather
+than just for reducing churn; and the fix *removes* events that callbacks
+currently receive via crosstalk between a `PlayheadActor`'s groups — the same
+kind of crosstalk described above for playlist siblings, but here a
+silent-omission change rather than harmless noise. Diff an event trace, don't
+eyeball behaviour.
 
 **A structural event handler must not touch the `SyncManager`, read container
 content, or publish, on the thread it arrives on.** These events fire on an

@@ -27,6 +27,8 @@ testoutput/
 test_integration_output/
 xstudio_output/
 batch_output/
+dist/
+xstudio_plugin/ori_sync/_vendor/
 
 # Build outputs
 #docs/html/
