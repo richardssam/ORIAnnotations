@@ -10,9 +10,9 @@ XsWindow {
     id: dialog
     title: "Connect to Session"
     width: 400
-    height: 300
+    height: 336
     minimumWidth: 360
-    minimumHeight: 280
+    minimumHeight: 316
 
     modality: Qt.WindowModal
     flags: Qt.Dialog | Qt.WindowStaysOnTopHint
@@ -48,7 +48,11 @@ XsWindow {
             text: ""
             Component.onCompleted: {
                 var env = Qt.environment ? Qt.environment["ORI_RMQ_HOST"] : ""
-                text = env || "localhost"
+                // site-config-file: a config file dropped into this plugin's
+                // folder pre-defines the host beneath the env var and above
+                // the hardcoded fallback.
+                var site = env ? "" : (python_callback("get_site_default_host", {}) || "")
+                text = env || site || "localhost"
             }
             onAccepted: dialog.tryConnect()
         }
@@ -66,6 +70,28 @@ XsWindow {
             placeholderText: "e.g. daily-review"
             text: ""
             onAccepted: dialog.tryConnect()
+        }
+
+        // ── Account (read-only) ──────────────────────────────────────────
+        // session-connection-ux: the resolved account identity, distinct
+        // from the editable display-name override below. Read-only — an
+        // account-level override, where one exists, is set the way it is
+        // today (ORI_SYNC_USER), not through this dialog.
+        XsText {
+            text: "Account:"
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+        }
+
+        XsTextField {
+            id: accountField
+            Layout.fillWidth: true
+            Layout.preferredHeight: rowHeight
+            text: ""
+            readOnly: true
+            enabled: false
+            Component.onCompleted: {
+                text = python_callback("get_account_identity", {}) || ""
+            }
         }
 
         // ── You (Identity) ─────────────────────────────────────────────

@@ -791,6 +791,37 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             return ""
 
+    def get_site_default_host(self, data) -> str:
+        """Called from QML to pre-fill the MQ Host field from a site config file.
+
+        Consulted beneath ``ORI_RMQ_HOST`` (checked first, in QML) and above
+        the hardcoded ``"localhost"`` fallback (session-config-file). A
+        missing or malformed config file returns ``""``, which QML's
+        ``||`` chain treats the same as "no site default" — never an error.
+        """
+        try:
+            from otio_sync_core.site_config import load_site_config
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            site = load_site_config(plugin_dir) or {}
+            return site.get("host", "")
+        except Exception:
+            return ""
+
+    def get_account_identity(self, data) -> str:
+        """Called from QML to show the resolved account identity, read-only.
+
+        Distinct from :meth:`get_default_identity`'s display-name override:
+        this is the underlying account (``resolve_identity()["user"]``,
+        already reflecting ``ORI_SYNC_USER`` if set), shown so a user can
+        confirm which account they are about to connect as
+        (``ori-session-management``).
+        """
+        try:
+            from otio_sync_core.identity import resolve_identity
+            return resolve_identity().get("user", "")
+        except Exception:
+            return ""
+
     # ── discovery ──────────────────────────────────────────────────────────────
 
     def _discovery_timeout_task(self) -> None:
@@ -806,6 +837,31 @@ class ORISyncPlugin(PluginBase):
         if self.manager and self.manager.status == STATE_DISCOVERING:
             _log("No master found — queuing self-election")
             self._cmd_queue.put(("self_elect", {}))
+
+    def _report_session_not_found(self, reason: str) -> None:
+        """A Join attempt found no session to join — report and disconnect.
+
+        Called from the poll thread, before this connect attempt would
+        otherwise self-elect (session-join-validation): either discovery
+        timed out with nobody answering (``reason="self_elect"``), or a peer
+        answered discovery but never answered the follow-up state request
+        (``reason="state_request_timeout"``). Deliberately checked *before*
+        electing, not after via ``on_synced`` — that also fires for
+        legitimate mid-session master-failover recovery, and the callers here
+        run timeline-building work synchronously right after election that a
+        same-thread disconnect would tear down out from under.
+
+        :param reason: Which trigger called this, for the log line only.
+        """
+        name = self.session_id_attr.value() or ""
+        _log(f"{reason}: join found no usable session for {name!r} — reporting not found")
+        self._pending_create_check = False
+        self.disconnect()
+        self.popup_message_box(
+            "Session Not Found",
+            f"Could not join session '{name}' — no peer completed the connection. "
+            "Check the name and try again.",
+        )
 
     # ── poll loop ──────────────────────────────────────────────────────────────
 
@@ -864,6 +920,13 @@ class ORISyncPlugin(PluginBase):
                     for action, data in _events:
                         with _timed(f"handle:{action}"):
                             self._handle_manager_event(action, data)
+                        # A Join that found no session (session-join-validation)
+                        # disconnects from inside a "state_request_timeout"
+                        # handler, clearing self.manager — stop rather than
+                        # hand a later action in this same batch to handlers
+                        # that assume it's still there.
+                        if not self.manager:
+                            break
 
                 # 4. Pen-up annotation flush
                 with _timed("annotation.flush"):
@@ -979,6 +1042,9 @@ class ORISyncPlugin(PluginBase):
                 # session out of STATE_DISCOVERING, and electing then would make
                 # a second master.
                 if self.manager and self.manager.status == STATE_DISCOVERING:
+                    if not self._pending_create_check:
+                        self._report_session_not_found("self_elect")
+                        return
                     _log("No master found — self-electing")
                     # Register the current xStudio session as the initial
                     # timeline.  Done here rather than at connect time because
@@ -1198,6 +1264,9 @@ class ORISyncPlugin(PluginBase):
                     _log_exc(f"Could not rename timeline {tl_guid[:8]}")
 
         elif action == "state_request_timeout":
+            if not self._pending_create_check:
+                self._report_session_not_found("state_request_timeout")
+                return
             _log("State request timed out. Electing self as master.")
             for tl in self.builder.build_otio_timelines():
                 self.manager.register_timeline(tl)

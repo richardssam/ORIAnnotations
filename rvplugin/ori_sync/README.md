@@ -52,4 +52,19 @@ open /Applications/OpenRV.app
 
 ## How it works
 
-On startup the plugin broadcasts a `WHO_IS_MASTER` discovery message. If no response arrives within 2 seconds the instance promotes itself to **master** and initialises a fresh OTIO timeline. Subsequent instances receive `I_AM_MASTER`, request a full state snapshot, and then sync incremental deltas (property changes, clip insertions, annotations) as they occur.
+On connect the plugin broadcasts a `WHO_IS_MASTER` discovery message and waits up to 2 seconds for a response. On the **Create Session** path, no response means this instance promotes itself to **master** and initialises a fresh OTIO timeline. On the **Join Session** path, no response means the named session doesn't exist — the connect fails with a "Session Not Found" warning instead of silently starting an empty one under that name. Subsequent instances that do find a master receive `I_AM_MASTER`, request a full state snapshot, and then sync incremental deltas (property changes, clip insertions, annotations) as they occur.
+
+The Create/Join dialogs also show the resolved **account** identity (read-only — the underlying OS/account login, distinct from the editable display-name field below it) so you can confirm which account you're about to connect as.
+
+### Site config file
+
+A JSON file named `ori_site_config.json`, dropped into this plugin's folder (alongside `plugin.py`/`utils.py`), pre-defines the MQ Host default shown in the connect dialogs:
+
+```json
+{
+  "host": "mq.example.com",
+  "port": 5672
+}
+```
+
+Precedence: a value typed into the dialog > the `ORI_RMQ_HOST` environment variable > this file > the hardcoded `127.0.0.1` fallback. A missing or malformed file is silently ignored.

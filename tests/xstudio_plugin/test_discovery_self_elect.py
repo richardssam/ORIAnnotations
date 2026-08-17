@@ -19,6 +19,7 @@ Lives under the repo-root ``tests/`` tree, not inside ``xstudio_plugin/`` —
 xStudio's plugin loader enumerates every subdirectory there as a plugin
 candidate and logs a load failure for non-plugin packages.
 """
+import functools
 import importlib.abc
 import importlib.machinery
 import os
@@ -115,19 +116,37 @@ class FakeBuilder:
         return list(self.timelines)
 
 
-def _fake_plugin(manager, builder=None):
+def _fake_plugin(manager, builder=None, pending_create_check=True):
     """A duck-typed stand-in for ORISyncPlugin.
 
-    The two methods under test only reach ``manager``, ``builder``,
-    ``_cmd_queue``, and ``DISCOVERY_TIMEOUT``, so the real (xStudio-dependent)
-    constructor is deliberately not run.
+    ``pending_create_check`` defaults to ``True`` (a Create attempt) so
+    existing self_elect/state_request_timeout tests, which expect an
+    unconditional election, are unaffected — set it ``False`` to exercise
+    the Join-found-no-session path (session-join-validation).
+
+    ``_report_session_not_found`` is bound to the *real* implementation
+    (via ``functools.partial``) rather than stubbed, so these tests exercise
+    the actual disconnect/report logic, not a guess at what it does; only
+    what it in turn calls (``disconnect``, ``popup_message_box``,
+    ``session_id_attr``) is faked.
     """
-    return types.SimpleNamespace(
+    calls = types.SimpleNamespace(disconnected=0, popups=[])
+    plugin = types.SimpleNamespace(
         manager=manager,
         builder=builder or FakeBuilder(),
         _cmd_queue=queue.Queue(),
         DISCOVERY_TIMEOUT=0.0,
+        _pending_create_check=pending_create_check,
+        _STRUCTURAL_ACTIONS=ORISyncPlugin._STRUCTURAL_ACTIONS,
+        session_id_attr=types.SimpleNamespace(value=lambda: "test-session"),
+        disconnect=lambda: setattr(calls, "disconnected", calls.disconnected + 1),
+        popup_message_box=lambda title, message: calls.popups.append((title, message)),
+        _calls=calls,
     )
+    plugin._report_session_not_found = functools.partial(
+        ORISyncPlugin._report_session_not_found, plugin
+    )
+    return plugin
 
 
 # ---------------------------------------------------------------------------
@@ -206,3 +225,64 @@ def test_self_elect_is_a_noop_after_disconnect():
     ORISyncPlugin._execute_command(plugin, "self_elect", {})
 
     assert plugin.builder.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# session-join-validation: a Join that found no session reports and
+# disconnects instead of electing — checked before electing, not via
+# on_synced afterward, which also fires for legitimate mid-session
+# master-failover recovery (regression test for the live crash this caused
+# when it briefly lived in on_synced: disconnecting mid-flight of
+# _init_as_master's synchronous build left RV's sync_manager None while
+# _deferred_master_init was still using it).
+# ---------------------------------------------------------------------------
+
+
+def test_self_elect_reports_not_found_for_a_join_with_no_master():
+    mgr = RecordingManager(STATE_DISCOVERING)
+    plugin = _fake_plugin(mgr, pending_create_check=False)
+
+    ORISyncPlugin._execute_command(plugin, "self_elect", {})
+
+    assert mgr.elected == []
+    assert mgr.registered == []
+    assert plugin.builder.calls == 0
+    assert plugin._calls.disconnected == 1
+    assert len(plugin._calls.popups) == 1
+    title, message = plugin._calls.popups[0]
+    assert "not found" in (title + message).lower()
+
+
+def test_self_elect_still_elects_for_a_create_with_no_master():
+    mgr = RecordingManager(STATE_DISCOVERING)
+    builder = FakeBuilder(["tl-a"])
+    plugin = _fake_plugin(mgr, builder, pending_create_check=True)
+
+    ORISyncPlugin._execute_command(plugin, "self_elect", {})
+
+    assert mgr.elected == [True]
+    assert plugin._calls.disconnected == 0
+    assert plugin._calls.popups == []
+
+
+def test_state_request_timeout_reports_not_found_for_a_join():
+    mgr = RecordingManager(STATE_JOINING)
+    plugin = _fake_plugin(mgr, pending_create_check=False)
+
+    ORISyncPlugin._handle_manager_event(plugin, "state_request_timeout", None)
+
+    assert mgr.elected == []
+    assert mgr.registered == []
+    assert plugin._calls.disconnected == 1
+    assert len(plugin._calls.popups) == 1
+
+
+def test_state_request_timeout_still_elects_for_a_create():
+    mgr = RecordingManager(STATE_JOINING)
+    builder = FakeBuilder(["tl-a"])
+    plugin = _fake_plugin(mgr, builder, pending_create_check=True)
+
+    ORISyncPlugin._handle_manager_event(plugin, "state_request_timeout", None)
+
+    assert mgr.elected == [True]
+    assert plugin._calls.disconnected == 0

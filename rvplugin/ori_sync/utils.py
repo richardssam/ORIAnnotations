@@ -152,15 +152,31 @@ def session_dialog(title, show_default_role=False):
             _log("PySide not available — cannot show session dialog")
             return None, None, None, None
 
-    default_host = os.environ.get("ORI_RMQ_HOST", "127.0.0.1")
+    env_host = os.environ.get("ORI_RMQ_HOST")
+    if env_host:
+        default_host = env_host
+    else:
+        # site-config-file: a config file dropped into this plugin's folder
+        # pre-defines the host beneath the env var and above the hardcoded
+        # fallback. Best-effort — a missing/malformed file just falls
+        # through to "127.0.0.1", the behaviour before this existed.
+        try:
+            from otio_sync_core.site_config import load_site_config
+            site = load_site_config(os.path.dirname(os.path.abspath(__file__))) or {}
+            default_host = site.get("host") or "127.0.0.1"
+        except Exception:
+            default_host = "127.0.0.1"
 
     try:
         from otio_sync_core.identity import resolve_identity
         from otio_sync_core.session_state import display_name
+        _resolved = resolve_identity()
         # Build a synthetic peer dict that display_name expects (it needs an "identity" sub-dict)
-        default_you = display_name({"identity": resolve_identity()})
+        default_you = display_name({"identity": _resolved})
+        account_identity = _resolved.get("user", "")
     except Exception:
         default_you = ""
+        account_identity = ""
 
     dlg = QDialog()
     dlg.setWindowTitle(title)
@@ -168,9 +184,17 @@ def session_dialog(title, show_default_role=False):
     layout = QFormLayout(dlg)
     host_edit = QLineEdit(default_host)
     name_edit = QLineEdit()
+    # Read-only: the resolved account identity, distinct from the editable
+    # display-name override below. An account-level override, where one
+    # exists, is set the way it is today (ORI_SYNC_USER), not through this
+    # dialog (ori-session-management, session-connection-ux).
+    account_edit = QLineEdit(account_identity)
+    account_edit.setReadOnly(True)
+    account_edit.setEnabled(False)
     you_edit = QLineEdit(default_you)
     layout.addRow(QLabel("MQ Host:"), host_edit)
     layout.addRow(QLabel("Session Name:"), name_edit)
+    layout.addRow(QLabel("Account:"), account_edit)
     layout.addRow(QLabel("You:"), you_edit)
     role_combo = None
     if show_default_role:

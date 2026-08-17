@@ -399,14 +399,14 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     QtCore.QTimer.singleShot(0, _confirm_after_settling)
                 else:
                     _confirm_after_settling()
-            if self._pending_create_check:
-                self._pending_create_check = False
-                if not self.sync_manager.is_master:
-                    name = self._current_session_name or ""
-                    _show_warning(
-                        f"Session '{name}' already exists. "
-                        "You have joined as a peer rather than creating a new session."
-                    )
+            _pending = self._pending_create_check
+            self._pending_create_check = False
+            if _pending and not self.sync_manager.is_master:
+                name = self._current_session_name or ""
+                _show_warning(
+                    f"Session '{name}' already exists. "
+                    "You have joined as a peer rather than creating a new session."
+                )
 
         self.sync_manager.start_session()
         self._discovery_start_time = time.time()
@@ -444,6 +444,26 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         matching ``broadcast_master_response()`` is at the end of
         :meth:`_deferred_master_init`.
         """
+        if not self._pending_create_check:
+            # This was a Join attempt and no session was actually joined —
+            # either discovery timed out with nobody answering, or a peer
+            # answered discovery but never answered the follow-up state
+            # request (session-join-validation). Report and disconnect
+            # rather than silently becoming master of an empty session
+            # under this name. Checked here, before electing — not via
+            # on_synced afterward, which also fires for legitimate
+            # mid-session master-failover recovery, and whose caller
+            # (this function) runs deferred timeline-building work right
+            # after election that a same-thread disconnect would tear
+            # down out from under.
+            name = self._current_session_name or ""
+            _log(f"_init_as_master: join found no session for {name!r} — reporting not found")
+            self.disconnect_from_session()
+            _show_warning(
+                f"Could not join session '{name}' — no peer completed the connection. "
+                "Check the name and try again."
+            )
+            return
         self.sync_manager.elect_self_as_master(broadcast=False)
         self._deferred_master_init()
 
@@ -509,6 +529,12 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
             self.sync_manager.broadcast_master_discovery()
             if time.time() - self._discovery_start_time > 2.0:
                 self._init_as_master()
+                # A Join that found no session (session-join-validation)
+                # disconnects from inside _init_as_master, clearing
+                # sync_manager — re-check rather than assume it's still the
+                # session we started this tick with.
+                if not self.sync_manager:
+                    return
 
         for action, data in self.sync_manager.tick():
             self._rv_updating = True
@@ -542,6 +568,13 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
                     self._handle_action(action, data)
             finally:
                 self._rv_updating = False
+            # A Join that found no session (session-join-validation)
+            # disconnects from inside a "state_request_timeout" action,
+            # clearing sync_manager — stop rather than hand a later action
+            # in this same batch, or the post-loop polling below, to code
+            # that assumes it's still there.
+            if not self.sync_manager:
+                return
 
         if not self._rv_updating:
             try:
