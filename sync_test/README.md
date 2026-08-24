@@ -73,6 +73,15 @@ You can run the full suite or a specific test using the `run_tests.sh` wrapper s
 # Run a specific test
 ./run_tests.sh run --test xstudio_vs_openrv_demo
 
+# Run a list of tests (space-separated) — reports a suite summary like a full run
+./run_tests.sh run --test xstudio_vs_openrv_demo xstudio_selects_script_xstudio
+
+# Show each test's last recorded result from run_history.jsonl without running anything
+./run_tests.sh status
+
+# Same, restricted to specific tests
+./run_tests.sh status --test xstudio_vs_openrv_demo
+
 # Run with custom config
 ./run_tests.sh run --config my_tests.yaml
 

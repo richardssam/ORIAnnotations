@@ -2631,16 +2631,25 @@ class TestRunner:
         last_desc = "pass" if last.get("result") == "pass" else f"fail({last.get('fail_kind')})"
         return f"prev: {last_desc}, last {len(recent)}: {trend}"
 
-    def run_all(self, script_driven=False):
+    def run_all(self, script_driven=False, test_names=None):
+        """Run configured tests and report overall suite pass/fail.
+
+        With *test_names* omitted, runs every test in ``self.config.tests``
+        in config order (the full-suite case). With *test_names* given, runs
+        just those, in the order given — each still goes through
+        ``run_test``, which already reports a clean failure for a name that
+        isn't in the config, so there's no need to pre-filter or validate
+        the list here.
+        """
         # Snapshot history *before* this run's own entries are appended, so
         # "previous results" in the summary reflects prior invocations only.
         previous_history = self.load_history()
 
         suite_start_time = time.time()
         results = {}
-        total = len(self.config.tests)
-        for i, t in enumerate(self.config.tests, start=1):
-            test_name = t['name']
+        names = test_names if test_names is not None else [t['name'] for t in self.config.tests]
+        total = len(names)
+        for i, test_name in enumerate(names, start=1):
             results[test_name] = self.run_test(
                 test_name, script_driven=script_driven,
                 test_index=i, test_total=total,
@@ -2682,6 +2691,58 @@ class TestRunner:
         print("="*70 + "\n")
 
         return all_passed
+
+    def print_status(self, test_names=None):
+        """Print each test's most recent recorded result, without running
+        anything — sourced entirely from ``run_history.jsonl``.
+
+        With *test_names* omitted, covers every test in the loaded config,
+        in config order; otherwise just the given names, in the order given
+        (they don't need to be in the config — history is keyed by name, so
+        a test that's since been renamed or removed can still be looked up).
+        """
+        history = self.load_history()
+        names = test_names if test_names is not None else [t['name'] for t in self.config.tests]
+
+        print("\n" + "="*70)
+        print("  SYNC TEST STATUS  (from run_history.jsonl)")
+        print("="*70)
+        for test_name in names:
+            entries = history.get(test_name, [])
+            status, blocked_by = self._test_status(test_name)
+
+            if not entries:
+                print(f"  ⬜ NO RUNS       |  {test_name}  (never run)")
+                continue
+
+            last = entries[-1]
+            passed = last.get("result") == "pass"
+            duration = last.get("duration")
+            duration_str = f"[{duration:.1f}s]" if isinstance(duration, (int, float)) else ""
+            last_run = last.get("timestamp", "?")
+            recent = entries[-5:]
+            trend = "".join("✅" if e.get("result") == "pass" else "❌" for e in recent)
+            trend_str = f"(last {len(recent)}: {trend})"
+
+            if passed and status == 'known_broken':
+                print(
+                    f"  ⚠️  XPASS         |  {test_name}  {duration_str}  last run: {last_run}  "
+                    f"(status: known_broken but passed — check whether blocked_by "
+                    f"'{blocked_by}' can be closed out)  {trend_str}"
+                )
+            elif passed:
+                print(f"  ✅ PASSED        |  {test_name}  {duration_str}  last run: {last_run}  {trend_str}")
+            elif status == 'known_broken':
+                print(
+                    f"  ⚪ KNOWN_BROKEN  |  {test_name}  {duration_str}  last run: {last_run}  "
+                    f"({last.get('fail_kind')}; blocked_by: {blocked_by})  {trend_str}"
+                )
+            else:
+                print(
+                    f"  ❌ FAILED        |  {test_name}  {duration_str}  last run: {last_run}  "
+                    f"({last.get('fail_kind')})  {trend_str}"
+                )
+        print("="*70 + "\n")
 
 
 def derive_checkpoints(jsonl_path, min_spacing=2.0, frame_tolerance=5,
