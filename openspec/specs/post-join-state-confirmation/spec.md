@@ -50,26 +50,28 @@ whole failure being detected is an intention that did not take effect.
 
 ### Requirement: Confirmation reports and does not repair
 
-A confirmation SHALL NOT alter this peer's state, request state, or broadcast
-anything.
+Confirmation itself — the act of comparing what this peer is displaying against the snapshot it joined with — SHALL NOT alter this peer's state, request state, or broadcast anything. It only records an outcome.
 
-Detection is separated from response deliberately. A repair driven by a detector
-that has not yet earned confidence is worse than the condition it repairs: this
-project has twice concluded that acting on an uncertain signal costs more than
-the signal is worth — a read that timed out must not be treated as a deletion,
-and a position that could not be read must not be treated as frame 0. A
-confirmation that only reports cannot make a session worse than not having it.
+A `MISMATCHED` outcome MAY subsequently be acted on by `session-divergence-repair`, which issues a bounded, rate-limited recovery request specifically in response to that recorded outcome. This is a separate capability reading a recorded fact, not the confirmation step itself reaching further than it should — the distinction matters because it keeps the same caution this requirement was written to enforce: repair is conditioned on a *confirmed* mismatch, never on `NOT_CONFIRMED` (see `session-divergence-repair`'s "An unconfirmable join does not trigger repair").
 
-#### Scenario: A mismatch changes nothing
+Detection stays separated from response for the reason this requirement was written for: a repair driven by a detector that has not yet earned confidence is worse than the condition it repairs. What changes here is that a `MISMATCHED` result — not `NOT_CONFIRMED`, and not the confirmation step acting on its own account — has now earned that confidence.
 
-- **WHEN** the confirmation finds a mismatch
-- **THEN** this peer's displayed state SHALL be unchanged by the confirmation
-- **AND** no state request or broadcast SHALL be made as a result
+#### Scenario: The confirmation step itself changes nothing
 
-#### Scenario: A confirmation is not a broadcast
+- **WHEN** the confirmation step runs and compares displayed state against the join snapshot
+- **THEN** the comparison itself SHALL NOT alter this peer's state, request state, or broadcast anything
+- **AND** it SHALL only record the outcome
+
+#### Scenario: A mismatch may be repaired by a separate capability
+
+- **WHEN** the confirmation step records a `MISMATCHED` outcome
+- **THEN** `session-divergence-repair` MAY issue a recovery request in response
+- **AND** that request SHALL be attributable to the repair capability reading the recorded outcome, not to the confirmation step itself
+
+#### Scenario: A confirmation is still not a broadcast
 
 - **WHEN** a confirmation runs
-- **THEN** no peer other than this one SHALL be affected by it
+- **THEN** no peer other than this one SHALL be affected by the confirmation step itself
 
 ### Requirement: Confirmation runs when the join has settled
 
