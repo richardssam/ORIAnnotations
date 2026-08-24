@@ -3,6 +3,7 @@
 """PlaybackSyncController — owns playback/selection state and methods."""
 
 import os
+import threading
 import time
 import opentimelineio as otio
 from xstudio.api.session.playhead import Playhead
@@ -29,6 +30,19 @@ from .utils import _log, _log_exc, bounded, bounded_timeout
 # for a healthy actor (which replies in a few ms) but far below the 100 s default
 # so a stale/destroyed actor fails fast and the poll thread keeps running.
 _PLAYHEAD_TIMEOUT_MS = 2000
+
+# Bounded timeout (ms) for refresh_playhead_attributes specifically.  It walks
+# every one of a playhead's ~46 attributes with one round-trip apiece (xStudio's
+# Python API has no batch-fetch), so on a freshly-spawned playhead actor that is
+# still busy initializing, one slow attribute can consume the *entire*
+# _PLAYHEAD_TIMEOUT_MS budget of whichever @bounded poll-thread method called
+# it before failing — e.g. resolve_and_broadcast_selection, which then can't
+# finish resolving the selection (and broadcasting the resulting view state)
+# until that 2 s elapses. Carrying over Loop Mode onto a new playhead is
+# best-effort (see _get_playback_mode's docstring: a missed carry-over self-
+# heals on the next genuine mode change), so it should fail fast rather than
+# hold up selection resolution for the full playhead budget.
+_LOOP_MODE_CARRYOVER_TIMEOUT_MS = 300
 
 # Fan-out label for the container-selection handler (see the plugin's
 # join_event_group).  There is only ever one of it.
@@ -114,6 +128,25 @@ class PlaybackSyncController:
         self._pending_seek_deadline: float = 0.0
         self._last_known_playback_mode: str | None = None
         self._loop_mode_apply_suppress_until: float = 0.0
+        # Remote key of the last playhead _carry_over_playback_mode actually ran
+        # its (expensive, per-attribute) refresh for. Two independent event
+        # paths — the viewport's own playhead-changed callback and the
+        # selection poll — both notice the same newly-spawned playhead and both
+        # call _carry_over_playback_mode within milliseconds of each other; this
+        # guard makes the second call a no-op instead of a redundant concurrent
+        # attribute fetch against the same actor (see _carry_over_playback_mode).
+        self._last_carried_over_playhead_key: str | None = None
+        self._last_carried_over_at: float = 0.0
+        # Serializes the two callers above so the second one blocks on a cheap
+        # Python lock instead of racing the first on the shared xStudio
+        # connection: a bounded_timeout set by one thread mutates the
+        # connection's default_timeout_ms for *all* threads, so a client-side
+        # timeout on one caller's request cannot protect it from the other
+        # caller's in-flight request occupying the connection first. Taking the
+        # lock before checking the (key, time) guard, rather than only around
+        # the actual request, is what prevents that: the second thread waits
+        # here, cheaply, and by the time it gets in the guard already covers it.
+        self._carry_over_lock = threading.Lock()
         # Event-group key the selection handler is currently attached to.
         self._current_selection_group_key: str | None = None
         self._current_selection_container_uuid: str | None = None
@@ -282,6 +315,8 @@ class PlaybackSyncController:
         self._pending_seek_deadline = 0.0
         self._last_known_playback_mode = None
         self._loop_mode_apply_suppress_until = 0.0
+        self._last_carried_over_playhead_key = None
+        self._last_carried_over_at = 0.0
         self._last_pinned_source_mode = None
         self._last_sel_names = None
         self._last_src_names = None
@@ -1726,18 +1761,30 @@ class PlaybackSyncController:
         try:
             from xstudio.core import attribute_uuids_atom
             from xstudio.api.module import ModuleAttribute
-            attr_uuids = ph.connection.request_receive(
-                ph.remote,
-                attribute_uuids_atom())[0]
-            ph.attrs_by_name_ = {}
-            ph.attrs_by_uuid_ = {}
-            for attr_uuid in attr_uuids:
-                attr_wrapper = ModuleAttribute(
-                    ph.connection,
+            # Tighter bound than the caller's own @bounded(_PLAYHEAD_TIMEOUT_MS):
+            # see _LOOP_MODE_CARRYOVER_TIMEOUT_MS.  46 individual round-trips
+            # against a playhead actor that may still be initializing can
+            # otherwise burn the caller's entire timeout budget on one slow
+            # attribute before failing.
+            with bounded_timeout(ph.connection, _LOOP_MODE_CARRYOVER_TIMEOUT_MS):
+                attr_uuids = ph.connection.request_receive(
                     ph.remote,
-                    uuid=attr_uuid)
-                ph.attrs_by_name_[attr_wrapper.name] = attr_wrapper
-                ph.attrs_by_uuid_[attr_uuid] = attr_wrapper
+                    attribute_uuids_atom())[0]
+                ph.attrs_by_name_ = {}
+                ph.attrs_by_uuid_ = {}
+                for attr_uuid in attr_uuids:
+                    attr_wrapper = ModuleAttribute(
+                        ph.connection,
+                        ph.remote,
+                        uuid=attr_uuid)
+                    ph.attrs_by_name_[attr_wrapper.name] = attr_wrapper
+                    ph.attrs_by_uuid_[attr_uuid] = attr_wrapper
+        except TimeoutError:
+            _log(
+                "refresh_playhead_attributes: timed out after"
+                f" {_LOOP_MODE_CARRYOVER_TIMEOUT_MS}ms (playhead busy/stale) —"
+                " Loop Mode carry-over skipped for this acquisition"
+            )
         except Exception:
             _log_exc("refresh_playhead_attributes failed")
 
@@ -1750,20 +1797,60 @@ class PlaybackSyncController:
         reverting a user's loop/ping-pong choice on every clip switch. Carry
         the last mode we actually observed forward so switching clips (or
         reacquiring a stale playhead) doesn't reset it.
+
+        A new playhead is announced to us on two independent paths at once: the
+        viewport's own "active playhead changed" event (``_adopt_playhead``) and
+        the selection poll noticing ``playhead_selection`` changed
+        (``resolve_and_broadcast_selection``). Both call this method for the
+        *same* freshly-spawned playhead within milliseconds of each other, on
+        different threads. Without the guard below, both proceed to call
+        :meth:`refresh_playhead_attributes`, which fetches every one of the
+        playhead's ~46 attributes one request at a time — so two threads doing
+        it concurrently against a single actor mailbox doesn't run in parallel,
+        it doubles the queued work the actor has to drain serially. Measured:
+        ~2.0s per caller (both stalling on the same freshly-spawned, not yet
+        idle, actor) versus <0.1s for a single caller. That 2s stall on the
+        single-threaded poll loop was long enough for a legitimate `set_frame`
+        landing in between to be discarded by the frame-0 reset this method's
+        caller (:meth:`broadcast_view_state`) applies once it finally resumes —
+        see the `_new_source_clip` branch there.
+
+        Guarded by (playhead key, time) rather than key alone: ``on_playhead_
+        attribute_changed`` also calls this method for the *same* ``active_
+        playhead`` object when its "Current Media Uuid" attribute changes
+        in-place (xStudio does not always spawn a new Playhead per clip), and
+        that later call is a genuine re-carry a bare identity guard would
+        wrongly swallow. ``_PLAYHEAD_SETTLE_S`` — the same window already used
+        elsewhere in this file for "let a just-acquired playhead settle" — is
+        long enough to absorb the two callers' ~20ms gap and short enough that
+        no real clip switch (driven at human or scripted-test pace, both
+        already ≥0.3s apart everywhere else this fires) is ever that close to
+        the previous one.
         """
         if not ph or not self._last_known_playback_mode:
             return
-        self.refresh_playhead_attributes(ph)
-        target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
-        if target is None:
-            return
-        try:
-            if _get_attr_str(ph, "Loop Mode") != target:
-                self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
-                ph.set_attribute("Loop Mode", target)
-                _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
-        except Exception:
-            _log_exc("_carry_over_playback_mode: failed")
+        with self._carry_over_lock:
+            key = self._remote_key(ph)
+            _now = time.monotonic()
+            if (
+                key is not None
+                and key == self._last_carried_over_playhead_key
+                and _now < self._last_carried_over_at + _PLAYHEAD_SETTLE_S
+            ):
+                return
+            self._last_carried_over_playhead_key = key
+            self._last_carried_over_at = _now
+            self.refresh_playhead_attributes(ph)
+            target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
+            if target is None:
+                return
+            try:
+                if _get_attr_str(ph, "Loop Mode") != target:
+                    self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                    ph.set_attribute("Loop Mode", target)
+                    _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
+            except Exception:
+                _log_exc("_carry_over_playback_mode: failed")
 
     def _on_loop_mode_changed(self) -> None:
         """Local "Loop Mode" attribute change on the active playhead.
