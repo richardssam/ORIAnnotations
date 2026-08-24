@@ -1072,11 +1072,75 @@ class PlaybackSyncController:
         showed 21 "active playhead updated" lines all carrying the identical
         address, each one re-adopting (and re-subscribing to) the same playhead.
         Comparing the string form makes the change detection real.
+
+        Accepts either a wrapper (``Playhead``, which carries ``.remote``) or a
+        bare actor handle as returned by :meth:`_viewport_playhead_actor`.  Both
+        must normalise to the *same* string for the same actor: the cheap
+        identity path and the wrapper path compare their results against each
+        other (a handle observed this tick against a key recorded from a
+        wrapper), and if the two forms disagreed every tick would look like a
+        change and re-adopt — reintroducing exactly the subscription-killing
+        churn described above.  A wrapper's ``.remote`` *is* the handle, so
+        stringifying whichever we were given yields the same key.
         """
         if obj is None:
             return None
-        remote = getattr(obj, "remote", None)
+        remote = getattr(obj, "remote", obj)
         return str(remote) if remote is not None else None
+
+    def _viewport_playhead_reusing_adopted(self):
+        """The viewport's playhead, reusing the adopted wrapper when it is current.
+
+        Resolves the handle (cheap) and, if it is the *same actor* the plugin
+        has already adopted, returns that existing wrapper instead of building
+        a second one for the same playhead.  Only when the handle disagrees is
+        a new wrapper constructed.
+
+        This is verification, not caching: the reuse is conditional on a live
+        handle read matching, so it cannot hand back a wrapper for a playhead
+        that has been swapped out — which is the failure mode the callers here
+        avoid ``active_playhead`` for.  A stale adopted reference simply fails
+        the key comparison and a fresh wrapper is built.
+
+        Callers on the recurring selection path use this rather than
+        :meth:`_viewport_playhead`, which rebuilds unconditionally: rebuilding
+        costs ~46 round-trips, and on that path the answer is almost always the
+        playhead already adopted.  Leaving that rebuild in was what kept the
+        selection resolution ~2 s slow after the cheaper identity paths landed.
+
+        :returns: a ``Playhead``, or None if none is reachable.
+        """
+        handle = self._viewport_playhead_actor()
+        if handle is None:
+            return None
+        adopted = self.plugin.active_playhead
+        if adopted is not None and self._remote_key(handle) == self._remote_key(adopted):
+            return adopted
+        return self._as_playhead(handle)
+
+    def _as_playhead(self, obj):
+        """Return *obj* as a ``Playhead``, wrapping a bare actor handle if needed.
+
+        Lets the cheap-identity paths pass whichever they hold.  A caller that
+        already has a wrapper must not be made to build a second one — that
+        would reintroduce the very round-trip cost the handle paths exist to
+        avoid — so an object that already answers ``get_attribute`` is returned
+        unchanged.
+
+        :returns: a ``Playhead``, or None if wrapping is impossible.
+        """
+        if obj is None:
+            return None
+        if hasattr(obj, "get_attribute"):
+            return obj
+        conn = self.plugin.connection
+        if not conn:
+            return None
+        try:
+            return Playhead(conn, obj)
+        except Exception:
+            _log_exc("_as_playhead: could not wrap playhead actor handle")
+            return None
 
     def _adopt_playhead(self, ph) -> bool:
         """Adopt *ph* as the active playhead, wiring its attribute events.
@@ -1150,7 +1214,50 @@ class PlaybackSyncController:
         name the Form-2 events report (``_viewport_name``), which is the one whose
         playhead the user is actually driving.
 
+        Prefer :meth:`_viewport_playhead_actor` when only the playhead's
+        *identity* is needed.  Wrapping the actor is what costs: ``Playhead``
+        derives from ``ModuleBase``, whose ``__init__`` enumerates the
+        playhead's attributes and fetches each one with its own synchronous
+        round-trip (~46 of them).  This method is for callers that go on to
+        read or write attributes; a caller that only compares "is this the
+        same playhead as last time?" should not pay for it.
+
         :returns: a ``Playhead``, or None if no viewport/playhead is reachable.
+        """
+        conn = self.plugin.connection
+        ph_actor = self._viewport_playhead_actor()
+        if not ph_actor or not conn:
+            return None
+        try:
+            return Playhead(conn, ph_actor)
+        except Exception:
+            return None
+
+    def _viewport_playhead_actor(self):
+        """Resolve the visible viewport's playhead *actor handle*, unwrapped.
+
+        The cheap half of :meth:`_viewport_playhead`: same viewport resolution
+        (see that method's docstring for why the viewport is resolved this way
+        and why ``current_playhead()`` is wrong), but it stops at the raw actor
+        handle instead of constructing a ``Playhead``.
+
+        This exists because wrapping is not free.  ``ModuleBase.__init__``
+        fetches every attribute of the actor individually — ~46 synchronous
+        round-trips per wrapper — and two of this controller's callers wanted
+        nothing from the wrapper but its identity, then discarded it.  The
+        periodic scan did that once a second, and the selection path did it on
+        every selection change before a dedup guard could decline the work.
+        Under contention against a freshly-spawned playhead actor those
+        round-trips serialise and stall the poll thread for ~2 s, which is long
+        enough for a queued view broadcast to overwrite a seek the user has
+        already made.
+
+        Handles are cheap to obtain but are fresh objects on every access, so
+        they must be compared via :meth:`_remote_key`, never with ``==`` — the
+        same normalisation the wrapper path uses, so the two agree about what
+        counts as "changed".
+
+        :returns: the playhead actor handle, or None if none is reachable.
         """
         conn = self.plugin.connection
         if not conn or not hasattr(conn, "request_receive"):
@@ -1178,8 +1285,7 @@ class PlaybackSyncController:
                 vp = vps[0] if vps else None
             if not vp:
                 return None
-            ph_actor = conn.request_receive(vp, viewport_playhead_atom())[0]
-            return Playhead(conn, ph_actor) if ph_actor else None
+            return conn.request_receive(vp, viewport_playhead_atom())[0] or None
         except Exception:
             return None
 
@@ -1194,20 +1300,41 @@ class PlaybackSyncController:
         delivered promptly by the Form-2 event path; this is the safety net for
         the changes xStudio does not announce, where one extra second costs
         nothing.
+
+        Runs on every poll tick, so it resolves the playhead's *handle* and
+        compares identity before wrapping.  It used to construct a full
+        ``Playhead`` — ~46 actor round-trips — purely to read its key, and then
+        discard it on both early-return paths, which is the overwhelmingly
+        common outcome for a scan whose whole job is to notice the rare case
+        where nothing announced a change.  The wrapper is now built only on the
+        path that actually adopts one.
         """
         try:
-            ph = self._viewport_playhead()
+            ph_actor = self._viewport_playhead_actor()
         except Exception:
             return
-        if not ph:
+        if not ph_actor:
             return
 
-        key = self._remote_key(ph)
+        key = self._remote_key(ph_actor)
         if key != self._last_scanned_playhead_key:
             # First sighting — wait for the next scan to confirm it.
             self._last_scanned_playhead_key = key
             return
 
+        # Confirmed on two consecutive scans. If it is already the adopted
+        # playhead, _adopt_playhead would no-op — check that against the key we
+        # already hold rather than paying for a wrapper to be told so.
+        if key == self._remote_key(self.plugin.active_playhead):
+            return
+
+        conn = self.plugin.connection
+        if not conn:
+            return
+        try:
+            ph = Playhead(conn, ph_actor)
+        except Exception:
+            return
         if self._adopt_playhead(ph):
             _log(f"[position_atom] active playhead updated: {ph.remote}")
 
@@ -1493,7 +1620,14 @@ class PlaybackSyncController:
                         self._last_src_names = src_names
                         self._last_selection_change_at = time.monotonic()
                         if selected_sources:
-                            self._carry_over_playback_mode(self._viewport_playhead())
+                            # Handle, not wrapper: _carry_over_playback_mode's
+                            # dedup guard usually declines this call (the
+                            # viewport event path has just handled the same
+                            # playhead), and wrapping costs ~46 round-trips
+                            # that the guard would then throw away.
+                            self._carry_over_playback_mode(
+                                self._viewport_playhead_actor()
+                            )
                     if selected_sources:
                         clip_name = selected_sources[0].name
                         clip_uuid_str = str(selected_sources[0].uuid)
@@ -1539,7 +1673,7 @@ class PlaybackSyncController:
                     # global_active_playhead_, whose PSM may belong to a
                     # different playhead entirely.
                     with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
-                        _psm_ph = self._viewport_playhead()
+                        _psm_ph = self._viewport_playhead_reusing_adopted()
                     psm_attr = _psm_ph.get_attribute("Pinned Source Mode") if _psm_ph else None
                     if psm_attr is not None:
                         with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
@@ -1826,8 +1960,20 @@ class PlaybackSyncController:
         no real clip switch (driven at human or scripted-test pace, both
         already ≥0.3s apart everywhere else this fires) is ever that close to
         the previous one.
+
+        Accepts a bare actor handle as well as a ``Playhead``.  The guard has
+        to be reachable *before* anything expensive happens, and constructing
+        the wrapper is itself the expensive thing (~46 round-trips, the same
+        cost as :meth:`refresh_playhead_attributes`).  When this took a wrapper
+        only, the selection call site read
+        ``_carry_over_playback_mode(self._viewport_playhead())`` — and Python
+        evaluates the argument first, so the guard could decline a call whose
+        entire cost had already been paid.  That is the residual stall left
+        behind after the guard was introduced: the duplicate refresh was gone
+        but the duplicate *construction* was not.  Passing a handle lets the
+        guard run first and the wrapper be built only if it will be used.
         """
-        if not ph or not self._last_known_playback_mode:
+        if ph is None or not self._last_known_playback_mode:
             return
         with self._carry_over_lock:
             key = self._remote_key(ph)
@@ -1837,6 +1983,11 @@ class PlaybackSyncController:
                 and key == self._last_carried_over_playhead_key
                 and _now < self._last_carried_over_at + _PLAYHEAD_SETTLE_S
             ):
+                return
+            # Past the guard: this call is going to do the work, so it is now
+            # worth paying for a wrapper if we were handed a bare handle.
+            ph = self._as_playhead(ph)
+            if ph is None:
                 return
             self._last_carried_over_playhead_key = key
             self._last_carried_over_at = _now
@@ -2429,6 +2580,23 @@ class PlaybackSyncController:
             # established that this is a local action — all four gate on
             # :meth:`_view_assertion_is_echo` — so an isolation reaching here is
             # local by construction, and an echo never arrives.
+            #
+            # KNOWN GAP (not fixed here — see the OpenSpec change
+            # fix-xstudio-selects-flakiness): this resets unconditionally, so a
+            # seek that lands *after* the selection but *before* this resolution
+            # runs is destroyed.  ``_playhead_moving`` above covers only the
+            # first ``_SCRUB_SETTLE_S`` (0.5 s) of that window; measured
+            # 2026-08-24, a ~2.1 s resolution stall let a driven seek to frame 28
+            # land ~1.2 s earlier and this branch rewound both peers to 0.
+            #
+            # An ordering gate (compare the selection timestamp against
+            # ``_last_position_change_at``) was implemented and reverted: it
+            # never fired, because ``on_playhead_attribute_changed`` reads
+            # ``self.plugin.active_playhead`` while the seek lands on the
+            # *viewport* playhead, so between a clip switch and adoption this
+            # plugin does not observe the seek at all and has no timestamp to
+            # compare.  Fixing that needs the adoption path addressed first —
+            # do not re-attempt the timestamp comparison alone.
             _log(
                 "[SEL] broadcast_view_state: new source-clip isolation"
                 f" {(clip_guid or '-')[:8]} — forcing frame=0"
