@@ -228,6 +228,53 @@ def test_a_deferred_seek_lands_on_the_settled_playhead():
     assert ctrl._pending_seek_frame is None
 
 
+# ── a failed switch must not poison the dedup guard (session-divergence,
+#    live 2026-08-18: a peer landed on the wrong clip because an early,
+#    doomed-to-fail apply — playlists not built yet — got recorded as
+#    "applied" anyway, so the later, well-timed retry from
+#    apply_join_playback_state was skipped as a no-op) ───────────────────────
+
+
+def test_a_failed_view_switch_does_not_poison_the_dedup_guard():
+    ctrl = _controller(_SESSION_VIEW)
+    ctrl.plugin.active_playhead = FakePlayhead()
+    ctrl.apply_selection = lambda data: False  # e.g. "no playlist found for clip"
+
+    ctrl.apply_playback_state(_SESSION_VIEW)
+
+    assert ctrl._last_applied_view_mode is None, (
+        "a switch that didn't actually land must not be recorded as applied"
+    )
+    assert ctrl._last_applied_clip_guid is None
+
+
+def test_a_later_retry_re_attempts_the_switch_a_failed_apply_skipped():
+    """End-to-end shape of the live bug: the first apply_playback_state call
+    (on receipt, before playlists exist) fails to switch; the second call
+    (apply_join_playback_state's well-timed retry, same view_mode/clip_guid,
+    playlists now built) must actually attempt the switch again rather than
+    being skipped as "nothing changed since last applied"."""
+    ctrl = _controller(_SESSION_VIEW)
+    ctrl.plugin.active_playhead = FakePlayhead()
+    calls: list = []
+
+    def flaky_apply_selection(data):
+        calls.append(data)
+        return len(calls) > 1  # first call fails, second succeeds
+
+    ctrl.apply_selection = flaky_apply_selection
+
+    ctrl.apply_playback_state(_SESSION_VIEW)  # attempt 0: fails
+    ctrl.apply_playback_state(_SESSION_VIEW)  # attempt 1: same view/clip, now succeeds
+
+    assert len(calls) == 2, (
+        "the second call must re-attempt the switch, not skip it as a no-op"
+        " because the first (failed) call already recorded it as applied"
+    )
+    assert ctrl._last_applied_view_mode == "source"
+    assert ctrl._last_applied_clip_guid == "clip-host-is-on"
+
+
 def test_join_adopt_is_a_no_op_with_no_session_view():
     """A joiner into a session whose master never had a view has nothing to adopt."""
     ctrl = _controller(None)
@@ -247,5 +294,7 @@ if __name__ == "__main__":
     test_join_adopt_retries_while_there_is_no_playhead()
     test_join_adopt_applies_the_session_view_once_a_playhead_exists()
     test_join_adopt_gives_up_rather_than_retrying_forever()
+    test_a_failed_view_switch_does_not_poison_the_dedup_guard()
+    test_a_later_retry_re_attempts_the_switch_a_failed_apply_skipped()
     test_join_adopt_is_a_no_op_with_no_session_view()
     print("PASS")

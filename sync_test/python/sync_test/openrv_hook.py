@@ -16,6 +16,7 @@ def get_openrv_state():
         "clip": None,
         "frame": None,
         "playing": False,
+        "playback_mode": None,
         "view_mode": None,
         "annotations": [],
         "is_master": None,
@@ -108,6 +109,12 @@ def get_openrv_state():
         except Exception:
             state["frame"] = rv.commands.frame()
         state["playing"] = rv.commands.isPlaying()
+        try:
+            state["playback_mode"] = {0: "loop", 1: "play-once", 2: "ping-pong"}.get(
+                rv.commands.playMode(), "loop"
+            )
+        except Exception:
+            state["playback_mode"] = "loop"
         
         # Report the first non-empty sequence's human-readable name regardless
         # of what RV's view node is.  After addSource or a SELECTION event RV
@@ -337,13 +344,20 @@ def execute_openrv_command(payload):
         raise ValueError(f"Could not find sequence or clip matching name: {name}")
 
     elif action == "set_frame":
-        # `frame` is the protocol's 0-indexed local frame value (see
-        # get_openrv_state's `frame() - frameStart() + 1` comment on the
-        # inverse conversion); apply it against frameStart() so timecode
-        # media (non-zero frameStart) shuttles to the same point as
-        # non-timecode media.
-        frame = int(payload.get("frame"))
-        rv.commands.setFrame(rv.commands.frameStart() + frame)
+        target_frame = int(payload.get("frame"))
+        start = rv.commands.frameStart()
+        end = rv.commands.frameEnd()
+
+        if payload.get("relative") or payload.get("offset"):
+            frame = start + target_frame
+        elif payload.get("timecode") or payload.get("absolute"):
+            frame = target_frame
+        elif start <= target_frame <= end:
+            frame = target_frame
+        else:
+            frame = start + target_frame
+
+        rv.commands.setFrame(frame)
         return {"action": action, "status": "success"}
 
     elif action == "save_session":

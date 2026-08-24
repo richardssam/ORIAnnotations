@@ -175,9 +175,13 @@ class TimelineBuildController:
                         plugin.structure.subscribe_timeline_item_events(guid, playlist)
                         try:
                             current_media = playlist.media
+                            current_order = [
+                                plugin.media.sync_guid_for_xs_uuid(str(m.uuid), guid)
+                                for m in current_media
+                            ]
                             plugin.structure._xs_flat_playlists[guid] = (
                                 playlist,
-                                [plugin.media.sync_guid_for_xs_uuid(str(m.uuid), guid) or str(m.uuid) for m in current_media],
+                                [g for g in current_order if g is not None],
                             )
                         except Exception:
                             pass
@@ -216,9 +220,13 @@ class TimelineBuildController:
                     plugin.media.bootstrap_mapping(playlist, otio_tl, None)
                     try:
                         current_media = playlist.media
+                        current_order = [
+                            plugin.media.sync_guid_for_xs_uuid(str(m.uuid), guid)
+                            for m in current_media
+                        ]
                         plugin.structure._xs_flat_playlists[guid] = (
                             playlist,
-                            [plugin.media.sync_guid_for_xs_uuid(str(m.uuid), guid) or str(m.uuid) for m in current_media],
+                            [g for g in current_order if g is not None],
                         )
                     except Exception:
                         _log_exc("Could not init _xs_flat_playlists entry from load")
@@ -539,9 +547,14 @@ class TimelineBuildController:
 
         clips = list(track)
         tl.tracks.append(track)
+        stored_guids = [
+            c.metadata.get("sync", {}).get("guid")
+            for c in clips
+            if isinstance(c, otio.schema.Clip) and c.metadata.get("sync", {}).get("guid")
+        ]
         plugin.structure._xs_flat_playlists[tl_guid] = (
             playlist,
-            [plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid) for m in media_list],
+            stored_guids,
         )
         _log(f"Built synthetic OTIO timeline for flat playlist {name!r}: {len(clips)} clip(s)")
         return tl

@@ -68,3 +68,10 @@ sync_test/logs
 testchart/rv_output.old
 testchart/rv_output
 testchart/xstudio_output.old
+testdist/
+builddocs/
+.jekyll-metadata
+_config_local.yml
+imgui.ini
+*.rvpkg
+sync_test/run_history.jsonl

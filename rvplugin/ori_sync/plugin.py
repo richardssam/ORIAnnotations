@@ -444,7 +444,7 @@ class OpenRVSyncPlugin(rv.rvtypes.MinorMode):
         matching ``broadcast_master_response()`` is at the end of
         :meth:`_deferred_master_init`.
         """
-        if not self._pending_create_check:
+        if not self._pending_create_check and not os.environ.get("ORI_SESSION"):
             # This was a Join attempt and no session was actually joined —
             # either discovery timed out with nobody answering, or a peer
             # answered discovery but never answered the follow-up state

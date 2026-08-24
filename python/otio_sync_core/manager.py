@@ -2907,6 +2907,7 @@ class SyncManager:
         if role_status == authority.SUPPRESSED:
             status = role_status
         self._send_message(PlaybackSettingsSet.from_payload(inner))
+        self.playback_state = inner
         return status
 
     def clip_guid_at_frame(

@@ -41,6 +41,7 @@ def get_xstudio_state(port=14441):
         "frame": None,
         "playing": False,
         "view_mode": None,
+        "playback_mode": None,
         "annotations": [],
         "is_master": None,
         # Visibility authority, reported separately from is_master so a test can
@@ -260,6 +261,18 @@ def get_xstudio_state(port=14441):
                     state["view_mode"] = "sequence" if _psm else "source"
                 except Exception:
                     pass
+                
+                try:
+                    _lm = str(ph.get_attribute("Loop Mode").value()).strip()
+                    if _lm == "Loop":
+                        state["playback_mode"] = "loop"
+                    elif _lm == "Ping Pong":
+                        state["playback_mode"] = "ping-pong"
+                    else:
+                        state["playback_mode"] = "play-once"
+                except Exception:
+                    pass
+                
                 ms = ph.on_screen_media
                 if ms:
                     ms_src = ms.media_source()
@@ -400,16 +413,29 @@ def execute_xstudio_command(payload, port):
                 for m in pl.media:
                     if m.name == name or os.path.basename(m.name) == name:
                         conn.api.session.set_on_screen_source(m)
+                        pl.playhead_selection.set_selection([m.uuid])
+                        
+                        # Simulate the UI double-click which drops Pinned Source Mode
+                        # (Loop mode defaults to "Loop" natively so we don't need to force it)
+                        try:
+                            from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
+                            gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
+                            ph_actor = conn.request_receive(gphev, viewport_playhead_atom())[0]
+                            if ph_actor:
+                                from xstudio.api.session.playhead import Playhead
+                                ph = Playhead(conn, ph_actor)
+                                psm_attr = ph.get_attribute("Pinned Source Mode")
+                                if psm_attr and psm_attr.value() is True:
+                                    psm_attr.set_value(False)
+                        except Exception as e:
+                            logging.error(f"Failed to emulate PSM UI actions: {e}")
+
                         return {"action": action, "status": "success"}
 
             raise ValueError(f"Could not find sequence or media matching name: {name}")
 
         elif action == "set_frame":
-            # `frame` is the protocol's 0-indexed local frame value; per
-            # get_xstudio_state's `state["frame"] = ph.position` (compared
-            # directly against protocol_value + 1 elsewhere), ph.position
-            # is 1-indexed, so add 1 to match.
-            frame = int(payload.get("frame"))
+            target_frame = int(payload.get("frame"))
             from xstudio.core import get_global_playhead_events_atom, viewport_playhead_atom
             from xstudio.api.session.playhead import Playhead
             gphev = conn.request_receive(conn.remote(), get_global_playhead_events_atom())[0]
@@ -417,7 +443,39 @@ def execute_xstudio_command(payload, port):
             if not ph_actor:
                 raise RuntimeError("set_frame: no active playhead")
             ph = Playhead(conn, ph_actor)
-            ph.position = frame + 1
+
+            # Determine duration and timecode start of the active source/playhead
+            duration = None
+            try:
+                duration = int(ph.get_attribute("Duration Frames").value())
+            except Exception:
+                pass
+
+            tc_start = None
+            try:
+                tc_attr = ph.get_attribute("Timecode As Frame")
+                if tc_attr:
+                    tc_start = int(tc_attr.value()) - ph.position
+            except Exception:
+                pass
+
+            # Explicit flags take highest priority
+            if payload.get("relative") or payload.get("offset"):
+                pos = target_frame
+            elif payload.get("timecode") or payload.get("absolute"):
+                pos = target_frame - (tc_start or 0)
+            elif tc_start is not None and duration is not None:
+                # If target_frame falls within [tc_start, tc_start + duration), convert to 0-based offset
+                if tc_start > 0 and tc_start <= target_frame < (tc_start + duration):
+                    pos = target_frame - tc_start
+                else:
+                    pos = target_frame
+            elif tc_start is not None and tc_start > 0 and target_frame >= tc_start:
+                pos = target_frame - tc_start
+            else:
+                pos = target_frame
+
+            ph.position = max(0, pos)
             return {"action": action, "status": "success"}
 
         elif action == "save_session":

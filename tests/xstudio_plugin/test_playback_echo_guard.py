@@ -61,6 +61,27 @@ class FakeQueue:
 class FakeConnection:
     default_timeout_ms = 2000
 
+    def __init__(self) -> None:
+        self.api = types.SimpleNamespace(
+            session=types.SimpleNamespace(
+                viewed_container=None,
+                set_on_screen_source=lambda target: None,
+            )
+        )
+
+
+class FakePlaylist:
+    """A flat xStudio Playlist: no genuine Timeline, so no frame-position
+    concept of its own — see test_apply_sequence_view_resets_a_flat_playlists_selection.
+    """
+
+    def __init__(self, name: str = "Added Media") -> None:
+        self.name = name
+        self.select_all_calls: list = []
+        self.playhead_selection = types.SimpleNamespace(
+            select_all=lambda: self.select_all_calls.append(True)
+        )
+
 
 class FakePlayhead:
     """Stands in for the active xStudio playhead where a test needs one."""
@@ -476,6 +497,118 @@ def test_a_trustworthy_position_is_still_broadcast():
 
     _, state = ctrl.plugin._cmd_queue.items[0]
     assert state["current_time"]["value"] == 82.0
+
+
+# ── a local view change must invalidate the remote-apply dedup guard ────────
+#
+# Live 2026-08-18: a viewer joined, correctly landed on the host's clip (its
+# own local pick came later), then picked a different clip locally. Because a
+# local selection only ever updated _cur_view_mode/_cur_clip_guid — never the
+# _last_applied_* fields apply_playback_state uses to decide whether a switch
+# is needed — the host's subsequent scrub messages kept re-asserting the SAME
+# clip_guid the viewer was on *before* its local pick, which apply_playback_state
+# read as "already applied" and never re-attempted apply_selection. The viewer
+# stayed on its local pick indefinitely while frame position kept updating.
+
+
+def test_a_local_view_change_updates_the_remote_apply_dedup_guard():
+    ctrl = _controller()
+    ctrl.plugin.manager.status = STATE_SYNCED
+    ctrl.plugin.manager.active_timeline_guid = "tl-clip-b"
+    # Simulate having correctly landed on the host's clip via an earlier
+    # remote apply (e.g. the join).
+    ctrl._last_applied_view_mode = "source"
+    ctrl._last_applied_clip_guid = "clip-original"
+    ctrl._last_applied_tl_guid = "tl-original"
+
+    ctrl.broadcast_view_state("clip-b", "source")
+
+    assert ctrl._last_applied_clip_guid == "clip-b", (
+        "a genuine local selection must be reflected in the remote-apply"
+        " dedup guard, not just _cur_clip_guid"
+    )
+    assert ctrl._last_applied_tl_guid == "tl-clip-b"
+
+
+def test_the_host_reasserting_the_original_clip_switches_back_after_a_local_pick():
+    """End-to-end: after a local pick, a remote message for the peer's
+    original (unchanged) clip must still trigger apply_selection."""
+    ctrl = _controller()
+    ctrl.plugin.active_playhead = FakePlayhead()
+    ctrl.plugin.manager.status = STATE_SYNCED
+    ctrl.plugin.manager.active_timeline_guid = "tl-clip-b"
+    ctrl._last_applied_view_mode = "source"
+    ctrl._last_applied_clip_guid = "clip-original"
+    ctrl._last_applied_tl_guid = "tl-original"
+
+    ctrl.broadcast_view_state("clip-b", "source")  # the local pick
+    # Past the ~1s local-action guard window (live 2026-08-18: the host kept
+    # scrubbing for many seconds after the pick, well outside it) — this test
+    # targets the persistent dedup-guard bug, not the short-lived race guard.
+    ctrl._local_view_action_until = 0.0
+
+    calls: list = []
+    ctrl.apply_selection = lambda data: (calls.append(data), True)[1]
+
+    ctrl.apply_playback_state({
+        "view_mode": "source",
+        "clip_guid": "clip-original",  # the host never changed clips
+        "timeline_guid": "tl-original",
+        "playing": False,
+        "current_time": {"OTIO_SCHEMA": "RationalTime.1", "value": 10.0, "rate": 24.0},
+    })
+
+    assert calls, (
+        "the host reasserting its original clip must switch the peer back,"
+        " even though that clip_guid matches what this peer had applied"
+        " before its own local pick"
+    )
+    assert ctrl._last_applied_clip_guid == "clip-original"
+
+
+# ── _apply_sequence_view must actually change what's on screen for a flat
+#    playlist, not just its container pointer ────────────────────────────────
+#
+# Live 2026-08-18: after the local-pick fix above correctly made the peer
+# re-attempt a switch back to sequence view, _apply_sequence_view reported
+# success (target found, viewed_container/set_on_screen_source both called)
+# but zero show_atom fired — the flat playlist ("Added Media", no genuine
+# xStudio Timeline exists for it) has no frame-position concept of its own,
+# so re-pointing the container to it left the previously-isolated clip's
+# selection untouched and still on screen.
+
+
+def test_apply_sequence_view_resets_a_flat_playlists_selection():
+    ctrl = _controller()
+    ctrl.plugin.active_playhead = FakePlayhead()
+    playlist = FakePlaylist()
+    ctrl.plugin._sync_playlists["tl-seq"] = (playlist, None)  # flat: no xs Timeline
+
+    result = ctrl._apply_sequence_view("tl-seq")
+
+    assert result is True
+    assert playlist.select_all_calls, (
+        "the flat-playlist fallback must reset the playlist's own selection"
+        " (the same way apply_selection's clear branch already does), or the"
+        " previously-isolated clip stays on screen despite the container"
+        " switch reporting success"
+    )
+
+
+def test_apply_sequence_view_does_not_reset_selection_for_a_real_timeline():
+    """A genuine Timeline's own frame position governs what's shown — the
+    reset above is specific to the flat-playlist fallback, not sequence
+    switches in general."""
+    ctrl = _controller()
+    ctrl.plugin.active_playhead = FakePlayhead()
+    playlist = FakePlaylist()
+    real_timeline = types.SimpleNamespace(name="RealSequence")
+    ctrl.plugin._sync_playlists["tl-seq"] = (playlist, real_timeline)
+
+    result = ctrl._apply_sequence_view("tl-seq")
+
+    assert result is True
+    assert playlist.select_all_calls == []
 
 
 # ── view switch echo guard ──────────────────────────────────────────────────

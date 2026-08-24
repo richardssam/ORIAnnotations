@@ -854,9 +854,11 @@ class StructureSyncController:
             try:
                 current_media = xs_playlist.media
                 current_order = [
-                    self.plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid)
+                    self.plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid)
                     for m in current_media
                 ]
+                if any(g is None for g in current_order):
+                    continue
             except Exception:
                 continue
 
@@ -1122,11 +1124,8 @@ class StructureSyncController:
 
             # Broadcast additions.
             for new_idx, media in enumerate(current_media):
-                guid = (
-                    self.plugin.media.sync_guid_for_xs_uuid(str(media.uuid), tl_guid)
-                    or str(media.uuid)
-                )
-                if guid in stored_names:
+                guid = self.plugin.media.sync_guid_for_xs_uuid(str(media.uuid), tl_guid)
+                if guid and guid in stored_names:
                     continue
                 try:
                     ms = media.media_source()
@@ -1174,9 +1173,10 @@ class StructureSyncController:
 
             # Re-evaluate current_order using updated mapping to ensure sync GUIDs are cached
             current_order = [
-                self.plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid) or str(m.uuid)
+                self.plugin.media.sync_guid_for_xs_uuid(str(m.uuid), tl_guid)
                 for m in current_media
             ]
+            current_order = [g for g in current_order if g is not None]
             self._xs_flat_playlists[tl_guid] = (xs_playlist, current_order)
 
     # ── new playlists and renames ──────────────────────────────────────

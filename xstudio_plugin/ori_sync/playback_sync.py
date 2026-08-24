@@ -18,11 +18,11 @@ from xstudio.core import (
     position_atom, play_forward_atom, play_atom,
     get_global_playhead_events_atom, viewport_atom, active_viewport_atom,
 )
-from otio_sync_core.manager import STATE_SYNCED
+from otio_sync_core.manager import STATE_SYNCED, RECOVERY_COOLDOWN
 from otio_sync_core.authority import (
     CHANNEL_POSITION, POSITION_FIELDS, CHANNEL_VISIBILITY, position_frame,
 )
-from otio_sync_core.join_confirmation import NOT_CONFIRMED
+from otio_sync_core.join_confirmation import MISMATCHED, NOT_CONFIRMED
 from .utils import _log, _log_exc, bounded, bounded_timeout
 
 # Bounded timeout (ms) for quick poll-thread playhead/viewport reads.  Generous
@@ -78,6 +78,21 @@ _SCRUB_SETTLE_S = 0.5
 # instant kill-switch: flip it to False to disable all item_selection_atom sends
 # outright if crashes recur during live testing.
 _ENABLE_TIMELINE_ITEM_HIGHLIGHT = True
+
+
+def _get_attr_str(ph, attr_name: str) -> str:
+    """Safely read an attribute's string value across ModuleAttribute and mock objects."""
+    if not ph:
+        return ""
+    try:
+        attr = ph.get_attribute(attr_name)
+        if attr is None:
+            return ""
+        if hasattr(attr, "value"):
+            return str(attr.value()).strip()
+        return str(attr).strip()
+    except Exception:
+        return ""
 
 
 class PlaybackSyncController:
@@ -171,6 +186,16 @@ class PlaybackSyncController:
         self._last_scrub_broadcast_at: float = 0.0
         self._pending_scrub_state: "dict | None" = None
         self._pending_scrub_due: float = 0.0
+
+        # session-divergence-repair: consecutive _tl_mismatch detections in
+        # apply_playback_state (reset on a clean match) and the cooldown
+        # timestamp gating _trigger_view_recovery. Kept separate from
+        # manager.structure_diverged / _last_recovery_attempt (design
+        # decision 2) — a session can have correct structure and a wrong
+        # view, or vice versa, and the two recovery paths must not block or
+        # starve each other.
+        self._tl_mismatch_streak: int = 0
+        self._last_view_recovery_attempt: "float | None" = None
 
         # ── echo guards ───────────────────────────────────────────────
         # Polling-based scrub detection: last frame seen by the poll loop and
@@ -421,7 +446,10 @@ class PlaybackSyncController:
 
                 if not clip_guid or not _media_name_hint:
                     # Legacy fallback scan — snapshot to avoid RuntimeError from concurrent mutation
-                    for _pl, _ in list(self.plugin._sync_playlists.values()):
+                    _all_pl = [pl for pl, _ in list(self.plugin._sync_playlists.values())]
+                    if hasattr(self.plugin, "structure") and hasattr(self.plugin.structure, "_xs_flat_playlists"):
+                        _all_pl.extend([pl for pl, _ in list(self.plugin.structure._xs_flat_playlists.values())])
+                    for _pl in _all_pl:
                         try:
                             for _m in _pl.media:
                                 if str(_m.uuid) == media_uuid_str:
@@ -433,6 +461,7 @@ class PlaybackSyncController:
                         if _media_name_hint:
                             break
 
+                _is_new_media = (_media_name_hint is not None and _media_name_hint != self._last_show_atom_media)
                 _, _prov_note = self._provenance()
                 _log(
                     f"[SEL] show_atom media-change: name={_media_name_hint!r}"
@@ -475,6 +504,13 @@ class PlaybackSyncController:
                 if _seq_tl_guid is None:
                     # Fallback — snapshot to avoid RuntimeError from concurrent mutation
                     for _tg, (_seq_pl, _xs_tl, _kn) in list(self.plugin.structure._xs_sequence_playlists.items()):
+                        if self.plugin.manager:
+                            _mgr_tl = self.plugin.manager.timelines.get(_tg)
+                            if _mgr_tl:
+                                if _mgr_tl.metadata.get("xs_flat_playlist"):
+                                    continue
+                                if _mgr_tl.metadata.get("clip_timeline_for"):
+                                    continue
                         try:
                             for _m in _seq_pl.media:
                                 if str(_m.uuid) == media_uuid_str:
@@ -601,14 +637,13 @@ class PlaybackSyncController:
                     _log("[SEL] → suppressed (playing through sequence)")
                     return
                 if (
-                    clip_guid
-                    and self.plugin.manager
+                    self.plugin.manager
                     and self.plugin.manager.status == STATE_SYNCED
                 ):
                     self._last_viewed_clip_guid = clip_guid
                     if view_mode == "sequence" and _seq_tl_guid:
                         self.plugin.manager.active_timeline_guid = _seq_tl_guid
-                    elif view_mode == "source":
+                    elif view_mode == "source" and clip_guid:
                         clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
                         if clip_tl_guid:
                             self.plugin.manager.active_timeline_guid = clip_tl_guid
@@ -637,11 +672,22 @@ class PlaybackSyncController:
                             f" mode={view_mode} suppressed (remote-induced){_prov_note}"
                         )
                     else:
-                        self.broadcast_view_state(clip_guid, view_mode)
-                        _log(
-                            f"[SEL] → broadcast view-state clip {clip_guid[:8]} mode={view_mode}"
-                            f"{_prov_note}"
-                        )
+                        _force_new = False
+                        if view_mode == "source":
+                            if _is_new_media:
+                                _force_new = True
+                            elif self._cur_view_mode != "source":
+                                _force_new = True
+                        if view_mode == "source" and not clip_guid:
+                            _log(
+                                f"[SEL] → broadcast view-state suppressed: mode=source but no clip_guid{_prov_note}"
+                            )
+                        else:
+                            self.broadcast_view_state(clip_guid, view_mode, force_new_source_clip=_force_new)
+                            _log(
+                                f"[SEL] → broadcast view-state clip {(clip_guid or '-')[:8]} mode={view_mode}"
+                                f"{_prov_note}"
+                            )
                 return
 
             if self.plugin.annotation.reload_in_progress():
@@ -923,6 +969,7 @@ class PlaybackSyncController:
         ("OTIO_SESSION_1.0", "INSERT_CHILD"): _ANNOTATION_VIEW_ECHO_S,
         ("OTIO_SESSION_1.0", "REMOVE_CHILD"): _ANNOTATION_VIEW_ECHO_S,
         ("OTIO_SESSION_1.0", "MOVE_CHILD"): _ANNOTATION_VIEW_ECHO_S,
+        ("OTIO_SESSION_1.0", "SET_PROPERTY"): _ANNOTATION_VIEW_ECHO_S,
         ("LiveSession.1", "STATE_SNAPSHOT"): _SNAPSHOT_VIEW_ECHO_S,
     }
 
@@ -1071,30 +1118,35 @@ class PlaybackSyncController:
         :returns: a ``Playhead``, or None if no viewport/playhead is reachable.
         """
         conn = self.plugin.connection
-        gphev = conn.request_receive(
-            conn.remote(), get_global_playhead_events_atom())[0]
-        vp = None
-        if self._viewport_name:
-            try:
-                vp = conn.request_receive(
-                    gphev, viewport_atom(), self._viewport_name)[0]
-            except Exception:
-                vp = None
-        # Only before any Form-2 event has named a viewport for us: the visible
-        # one, else the first that exists (offscreen/test sessions have no
-        # "active" viewport).
-        if not vp:
-            try:
-                vp = conn.request_receive(gphev, active_viewport_atom())[0]
-            except Exception:
-                pass
-        if not vp:
-            vps = conn.request_receive(gphev, viewport_atom())[0]
-            vp = vps[0] if vps else None
-        if not vp:
+        if not conn or not hasattr(conn, "request_receive"):
             return None
-        ph_actor = conn.request_receive(vp, viewport_playhead_atom())[0]
-        return Playhead(conn, ph_actor) if ph_actor else None
+        try:
+            gphev = conn.request_receive(
+                conn.remote(), get_global_playhead_events_atom())[0]
+            vp = None
+            if self._viewport_name:
+                try:
+                    vp = conn.request_receive(
+                        gphev, viewport_atom(), self._viewport_name)[0]
+                except Exception:
+                    vp = None
+            # Only before any Form-2 event has named a viewport for us: the visible
+            # one, else the first that exists (offscreen/test sessions have no
+            # "active" viewport).
+            if not vp:
+                try:
+                    vp = conn.request_receive(gphev, active_viewport_atom())[0]
+                except Exception:
+                    pass
+            if not vp:
+                vps = conn.request_receive(gphev, viewport_atom())[0]
+                vp = vps[0] if vps else None
+            if not vp:
+                return None
+            ph_actor = conn.request_receive(vp, viewport_playhead_atom())[0]
+            return Playhead(conn, ph_actor) if ph_actor else None
+        except Exception:
+            return None
 
     @bounded(_PLAYHEAD_TIMEOUT_MS)
     def check_and_update_active_playhead(self) -> None:
@@ -1171,8 +1223,14 @@ class PlaybackSyncController:
             _log("on_playhead_attribute_changed: could not read attribute name")
             return
 
+        _log(f"[ATTR-DIAG] playhead attribute changed: {attr_name}")
+
         if attr_name == "Loop Mode":
             self._on_loop_mode_changed()
+            return
+
+        if attr_name == "Current Media Uuid":
+            self._carry_over_playback_mode(self.plugin.active_playhead)
             return
 
         if attr_name not in ("Logical Frame", "playing"):
@@ -1237,6 +1295,9 @@ class PlaybackSyncController:
         # Construct the unified view-state payload (position + current view).
         # The view_mode/clip_guid describe what we are currently viewing so a
         # peer receiving this position update also keeps the correct mode/clip.
+        _vm = self._cur_view_mode
+        if _vm == "source" and not self._cur_clip_guid:
+            _vm = "sequence"
         state = {
             "playing": playing,
             "current_time": {
@@ -1245,7 +1306,7 @@ class PlaybackSyncController:
                 "rate": fps,
             },
             "playback_mode": self._get_playback_mode(),
-            "view_mode": self._cur_view_mode,
+            "view_mode": _vm,
             "clip_guid": self._cur_clip_guid,
         }
 
@@ -1398,6 +1459,8 @@ class PlaybackSyncController:
                         _log(f"[SEL] Playlist.playhead_selection changed: {src_names}")
                         self._last_src_names = src_names
                         self._last_selection_change_at = time.monotonic()
+                        if selected_sources:
+                            self._carry_over_playback_mode(self._viewport_playhead())
                     if selected_sources:
                         clip_name = selected_sources[0].name
                         clip_uuid_str = str(selected_sources[0].uuid)
@@ -1606,11 +1669,8 @@ class PlaybackSyncController:
         ph = self.plugin.active_playhead
         if not ph:
             return "play-once"
-        try:
-            mode = str(ph.get_attribute("Loop Mode")).strip()
-            return _LOOP_MODE_TO_WIRE.get(mode, "play-once")
-        except Exception:
-            return "play-once"
+        mode = _get_attr_str(ph, "Loop Mode")
+        return _LOOP_MODE_TO_WIRE.get(mode, "play-once")
 
     def _get_playback_mode(self) -> str:
         """Return the wire playback_mode ("play-once"/"loop"/"ping-pong") to broadcast.
@@ -1626,27 +1686,23 @@ class PlaybackSyncController:
         such window: it changes only on genuine signals (a local "Loop Mode"
         event, or a value applied from a peer).
 
-        Reading through that gap was survivable while the value stayed local. It
-        is not survivable on the wire, because applying a peer's mode writes the
-        cache, so one bad read becomes permanent for the whole session:
+        native "Loop Mode" resets to the engine's "Play Once" default instead of
+        inheriting the session's mode. The plugin carries the mode forward onto
+        each new playhead, but that write is an **asynchronous actor message**,
+        so between acquiring a playhead and the write landing the raw attribute
+        reads "Play Once" regardless of what the user chose.
 
-            host   12:41:51.594  broadcast (mid-scrub, sequence mode) → play-once
-            client 12:41:51.682  RECV playback: set Loop Mode=Play Once
-            host   12:41:53.450  RECV playback: set Loop Mode=Play Once   ← echoed back
-            host   12:43:02.774  [SEL] carried over Loop Mode=Play Once   ← now permanent
+        Falling through to the playhead through that gap is harmless locally (the
+        write lands a moment later) and catastrophic on the wire (a peer that
+        applies our broadcast writes its cache, so a single bad read becomes
+        permanent session state).
 
-        Neither user touched a loop control. The transient misread round-tripped,
-        both caches latched it, and from then on carry-over pushed Play Once onto
-        every new playhead — the session had silently changed its own mode.
-
-        The same oscillation was found and fixed once before for clip isolation
-        (see ``apply_playback_state``, which refuses a peer's "play-once" while
-        pinned to a source). That fix was scoped to single-clip review; sequence
-        mode had no equivalent, which is where this recurred.
+        Only falls through to the playhead on startup, before any genuine mode
+        has been observed (from a user event or applied from a peer).
         """
-        # In single-clip review mode we force Loop (see broadcast_view_state):
-        # short shots must loop to be reviewable, so the clip's mode is this
-        # peer's to assert regardless of what any playhead or cache says.
+        # Short clips viewed in isolation are always forced to loop — short shots
+        # must loop to be reviewable, and in single-clip mode the loop setting is
+        # this peer's to assert regardless of what any playhead or cache says.
         if self._last_pinned_source_mode is False:
             return "loop"
         if self._last_known_playback_mode:
@@ -1654,6 +1710,35 @@ class PlaybackSyncController:
         # Nothing genuine observed yet (startup, before the first Loop Mode
         # event or applied peer value) — the playhead is all there is.
         return self._read_playhead_loop_mode()
+
+    def refresh_playhead_attributes(self, ph) -> None:
+        """Query C++ playhead for current attribute UUIDs and refresh the python caches.
+
+        Needed because xStudio replaces/recreates its playhead attributes internally
+        when a new media item is loaded, leaving the python playhead wrapper's
+        attrs caches stale and unable to route events or set values correctly.
+        """
+        if not ph:
+            return
+        if not hasattr(ph, "connection") or not hasattr(ph.connection, "request_receive"):
+            return
+        try:
+            from xstudio.core import attribute_uuids_atom
+            from xstudio.api.module import ModuleAttribute
+            attr_uuids = ph.connection.request_receive(
+                ph.remote,
+                attribute_uuids_atom())[0]
+            ph.attrs_by_name_ = {}
+            ph.attrs_by_uuid_ = {}
+            for attr_uuid in attr_uuids:
+                attr_wrapper = ModuleAttribute(
+                    ph.connection,
+                    ph.remote,
+                    uuid=attr_uuid)
+                ph.attrs_by_name_[attr_wrapper.name] = attr_wrapper
+                ph.attrs_by_uuid_[attr_uuid] = attr_wrapper
+        except Exception:
+            _log_exc("refresh_playhead_attributes failed")
 
     def _carry_over_playback_mode(self, ph) -> None:
         """Apply the last-known playback mode onto a newly-acquired playhead.
@@ -1667,11 +1752,12 @@ class PlaybackSyncController:
         """
         if not ph or not self._last_known_playback_mode:
             return
+        self.refresh_playhead_attributes(ph)
         target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
         if target is None:
             return
         try:
-            if str(ph.get_attribute("Loop Mode")).strip() != target:
+            if _get_attr_str(ph, "Loop Mode") != target:
                 self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
                 ph.set_attribute("Loop Mode", target)
                 _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
@@ -1686,26 +1772,42 @@ class PlaybackSyncController:
         see ``_get_playback_mode``'s docstring). Update the carry-over cache
         and broadcast immediately, mirroring OpenRV's play-mode-changed hook.
         """
-        if time.monotonic() < self._loop_mode_apply_suppress_until:
-            return
         ph = self.plugin.active_playhead
         if not ph:
             return
+        
+        mode = _get_attr_str(ph, "Loop Mode")
+        try:
+            if self._last_pinned_source_mode is False and mode != "Loop":
+                _log("[SEL] playhead Loop Mode reset detected in source mode — writing Loop back")
+                self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                ph.set_attribute("Loop Mode", "Loop")
+                return
+        except Exception:
+            pass
+
+        if time.monotonic() < self._loop_mode_apply_suppress_until:
+            return
+
         # The raw read, not _get_playback_mode() — that now answers *from* the
         # cache, so asking it here would compare the cache against itself and
-        # the user's own mode change could never enter it.  Reaching this line
-        # means a real attribute change fired outside the apply-suppression
-        # window, which is precisely when the playhead's value is the user's.
-        wire_mode = self._read_playhead_loop_mode()
-        self._last_known_playback_mode = wire_mode
-        if not (self.plugin.manager and self.plugin.manager.status == STATE_SYNCED):
+        # read every user change as "unchanged".
+        wire_mode = _LOOP_MODE_TO_WIRE.get(mode)
+        if wire_mode is None:
             return
+        if wire_mode == self._last_known_playback_mode:
+            return
+
+        self._last_known_playback_mode = wire_mode
         try:
             playing = ph.playing
             frame = ph.position
             fps = ph.frame_rate.fps() or 25.0
         except Exception:
             return
+        _vm = self._cur_view_mode
+        if _vm == "source" and not self._cur_clip_guid:
+            _vm = "sequence"
         state = {
             "playing": playing,
             "current_time": {
@@ -1714,7 +1816,7 @@ class PlaybackSyncController:
                 "rate": fps,
             },
             "playback_mode": wire_mode,
-            "view_mode": self._cur_view_mode,
+            "view_mode": _vm,
             "clip_guid": self._cur_clip_guid,
         }
         _log(f"Event: queuing playback_mode broadcast mode={wire_mode} (source_attr=Loop Mode)")
@@ -1739,6 +1841,54 @@ class PlaybackSyncController:
     #: switch has not finished with would manufacture a false mismatch on the
     #: exact frame this capability exists to get right (design D3).
     _JOIN_CONFIRM_MAX_ATTEMPTS = 20
+
+    #: How many *consecutive* ``_tl_mismatch`` detections in
+    #: :meth:`apply_playback_state` are required before
+    #: :meth:`_trigger_view_recovery` fires (session-divergence-repair,
+    #: design decision 3). A single mismatch can be a view-switch-in-flight
+    #: artifact (see the comment where ``_tl_mismatch`` is computed) that
+    #: self-clears within a message or two; a real divergence does not.
+    #: Start conservative — tuned from live logs the same way
+    #: ``DEFAULT_FRAME_TOLERANCE`` was (design's Open Questions).
+    _TL_MISMATCH_THRESHOLD = 3
+
+    def _trigger_view_recovery(self, signal: str) -> bool:
+        """Cooldown-gated request to re-adopt the session's actual view.
+
+        Shared trigger for both view-divergence signals
+        (session-divergence-repair): a confirmed join-time mismatch
+        (:meth:`confirm_join_state`) and a sustained live ``_tl_mismatch``
+        streak (:meth:`apply_playback_state`). Reuses the recovery path
+        structure-divergence-recovery already built —
+        ``manager.request_state(reason="recovery")`` — rather than a second
+        repair mechanism, so it composes with delta buffering/replay
+        unmodified.
+
+        Paced by its own :attr:`_last_view_recovery_attempt` /
+        ``RECOVERY_COOLDOWN``, independent of structural recovery's own
+        cooldown state (design decision 2): a session can have correct
+        structure and a wrong view, or vice versa, and a recent structural
+        recovery attempt must not silently suppress a needed view recovery,
+        or vice versa.
+
+        :param signal: Which detector fired — ``"join-mismatch"`` or
+            ``"sustained-live-mismatch"`` — logged so a live session can be
+            diagnosed the same way ``[JOIN-CONFIRM]`` logging supports.
+        :returns: ``True`` if a recovery request was sent, ``False`` if it
+            was suppressed by the cooldown or there is no manager.
+        """
+        manager = self.plugin.manager
+        if not manager:
+            return False
+        now = time.monotonic()
+        if (self._last_view_recovery_attempt is not None
+                and now - self._last_view_recovery_attempt < RECOVERY_COOLDOWN):
+            _log(f"[VIEW-RECOVERY] suppressed by cooldown ({signal})")
+            return False
+        self._last_view_recovery_attempt = now
+        _log(f"[VIEW-RECOVERY] requesting state from master ({signal})")
+        manager.request_state(reason="recovery")
+        return True
 
     def _sequence_timeline_for_clip(self, clip_guid: "str | None") -> "str | None":
         """The sequence timeline that actually contains *clip_guid*, or ``None``.
@@ -1860,7 +2010,15 @@ class PlaybackSyncController:
         except Exception:
             _log_exc("confirm_join_state: could not read live display state")
 
-        manager.confirm_join(actual)
+        outcome = manager.confirm_join(actual)
+        # session-divergence-repair: a confirmed mismatch (never
+        # NOT_CONFIRMED — that stays inert, unchanged) re-adopts the
+        # session's actual view through the same recovery path
+        # structure-divergence-recovery uses. Gated on the MISMATCHED string
+        # constant specifically, not "anything other than CONFIRMED", so a
+        # future refactor cannot let NOT_CONFIRMED reach this by accident.
+        if outcome == MISMATCHED:
+            self._trigger_view_recovery("join-mismatch")
 
     def apply_join_playback_state(self, attempt: int = 0, generation: "int | None" = None) -> None:
         """Adopt the session's view after this peer's own session build.
@@ -1955,6 +2113,9 @@ class PlaybackSyncController:
                 frame = ph.position
                 fps = ph.frame_rate.fps() or 25.0
                 playing = ph.playing
+            _vm = self._cur_view_mode
+            if _vm == "source" and not self._cur_clip_guid:
+                _vm = "sequence"
             return {
                 "playing": playing,
                 "current_time": {
@@ -1963,7 +2124,7 @@ class PlaybackSyncController:
                     "rate": fps,
                 },
                 "playback_mode": self._get_playback_mode(),
-                "view_mode": self._cur_view_mode,
+                "view_mode": _vm,
                 "clip_guid": self._cur_clip_guid,
             }
         except Exception:
@@ -1974,6 +2135,7 @@ class PlaybackSyncController:
         clip_guid: "str | None",
         view_mode: str,
         playing_override: "bool | None" = None,
+        force_new_source_clip: bool = False,
     ) -> None:
         """Broadcast the unified view-state (selection + playback) message.
 
@@ -2027,8 +2189,7 @@ class PlaybackSyncController:
         )
         _new_source_clip = (
             view_mode == "source"
-            and clip_guid
-            and clip_guid != self._cur_clip_guid
+            and (force_new_source_clip or (clip_guid and clip_guid != self._cur_clip_guid))
             and not _playhead_moving
         )
         if view_mode == "source" and clip_guid != self._cur_clip_guid and _playhead_moving:
@@ -2039,6 +2200,23 @@ class PlaybackSyncController:
             )
         self._cur_view_mode = view_mode
         self._cur_clip_guid = clip_guid or None
+        # A local view change moves the actual on-screen state out from under
+        # apply_playback_state's remote-apply dedup guard (_last_applied_*),
+        # which otherwise only ever changes on a successful remote apply.
+        # Without updating it here too, a later remote message reasserting
+        # the view/clip this peer had *before* the local change reads as
+        # "already applied" and apply_selection is skipped, even though the
+        # screen has since moved on to something else entirely — this
+        # method is always a genuine local action (see docstring), so it is
+        # safe to treat unconditionally as new ground truth. Observed live
+        # 2026-08-18: a viewer's own clip pick was never reflected here, so
+        # the host's later scrub of its original (unchanged) clip never
+        # switched the viewer back — every subsequent message's clip_guid
+        # still matched the stale pre-pick record.
+        self._last_applied_view_mode = view_mode
+        self._last_applied_clip_guid = clip_guid or None
+        if self.plugin.manager:
+            self._last_applied_tl_guid = self.plugin.manager.active_timeline_guid
         # This is a LOCAL user action — guard against in-flight remote messages
         # (sent before the remote knew about this local change) overriding it.
         # Only set the guard when not inside a remote-apply echo suppression window
@@ -2168,7 +2346,7 @@ class PlaybackSyncController:
             # blocks the poll thread for ~100 s (the default request_receive
             # timeout) — which is what froze xStudio after the first clip.
             try:
-                ph = self.plugin.active_playhead
+                ph = self._viewport_playhead() or self.plugin.active_playhead
                 if ph is not None:
                     with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
                         ph.position = 0
@@ -2336,6 +2514,24 @@ class PlaybackSyncController:
         try:
             self.plugin.connection.api.session.viewed_container = target
             self.plugin.connection.api.session.set_on_screen_source(target)
+            if tl is None:
+                # Flat-playlist fallback (no genuine xStudio Timeline exists
+                # for this "sequence"): a real Timeline's frame position alone
+                # determines what's shown, but a flat Playlist has no such
+                # concept — set_on_screen_source(pl) just re-points the
+                # container and leaves whatever clip the playlist's own
+                # playhead_selection last isolated still showing. Reset it,
+                # the same way apply_selection's "clear" branch already does,
+                # or this call fires zero show_atom and is a visual no-op.
+                # Live 2026-08-18: a viewer isolated a clip, the host kept
+                # scrubbing its own (unchanged) clip, and this method
+                # reported success switching back to "sequence" while the
+                # screen kept showing the viewer's stale isolated clip.
+                try:
+                    pl.playhead_selection.select_all()
+                    self._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                except Exception:
+                    _log_exc("apply view-state: sequence flat-playlist reset failed")
             if self.plugin.active_playhead:
                 try:
                     self._applying_pinned_mode = True
@@ -2475,6 +2671,17 @@ class PlaybackSyncController:
             #   * sequence mode and the *sequence* (timeline) changes — opening a
             #     different sequence.  A clip-only change inside one sequence
             #     (scrubbing across cuts) does NOT switch.
+            #
+            # switch_failed stays False when no switch was attempted at all
+            # (nothing changed, or the local-action guard neutralised
+            # view_mode above) — only an *attempted* switch that didn't
+            # actually land sets it. That distinction is what the dedup guard
+            # below depends on: recording _last_applied_* unconditionally let
+            # an early, doomed-to-fail attempt (playlists not built yet
+            # during a join — apply_selection's "no playlist found for clip")
+            # permanently poison it, silently skipping the later, well-timed
+            # retry (apply_join_playback_state) that would have succeeded.
+            switch_failed = False
             if view_mode == "sequence":
                 # Switch to the sequence by its shared timeline guid (robust to
                 # per-peer clip-guid differences).  Only on a real transition:
@@ -2485,9 +2692,12 @@ class PlaybackSyncController:
                         # Fall back to the clip-based path if the sequence guid
                         # isn't registered locally for some reason.
                         try:
-                            self.apply_selection({"clip_guid": clip_guid or "", "view_mode": "sequence"})
+                            switch_failed = not self.apply_selection(
+                                {"clip_guid": clip_guid or "", "view_mode": "sequence"}
+                            )
                         except Exception:
                             _log_exc("apply_playback_state: sequence view switch failed")
+                            switch_failed = True
                     self._pending_seek_frame = None
                 # A sequence-mode clip_guid change is deliberately NOT actioned:
                 # in sequence view clip_guid tracks the clip under the peer's
@@ -2499,13 +2709,22 @@ class PlaybackSyncController:
             elif view_mode == "source":
                 if mode_changed or clip_changed:
                     try:
-                        self.apply_selection({"clip_guid": clip_guid or "", "view_mode": "source"})
+                        switch_failed = not self.apply_selection(
+                            {"clip_guid": clip_guid or "", "view_mode": "source"}
+                        )
                     except Exception:
                         _log_exc("apply_playback_state: source view switch failed")
+                        switch_failed = True
                     self._pending_seek_frame = None
-            self._last_applied_view_mode = view_mode
-            self._last_applied_clip_guid = clip_guid
-            self._last_applied_tl_guid = view_tl_guid
+            if not switch_failed:
+                self._last_applied_view_mode = view_mode
+                self._last_applied_clip_guid = clip_guid
+                self._last_applied_tl_guid = view_tl_guid
+            else:
+                _log(
+                    "apply_playback_state: view switch failed — leaving dedup"
+                    " state unchanged so a later retry re-attempts it"
+                )
 
         incoming_tl_guid = state.get("timeline_guid")
         _tl_mismatch = False
@@ -2530,6 +2749,17 @@ class PlaybackSyncController:
                         f" target={self.plugin.manager.active_timeline_guid[:8]},"
                         f" incoming={incoming_tl_guid[:8]})"
                     )
+            else:
+                # A clean match against the active timeline (session-
+                # divergence-repair, design decision 3): resets the
+                # sustained-mismatch streak, since a transitional mismatch
+                # self-clears within a message or two and only a streak that
+                # doesn't is a real divergence.
+                self._tl_mismatch_streak = 0
+        if _tl_mismatch:
+            self._tl_mismatch_streak += 1
+            if self._tl_mismatch_streak >= self._TL_MISMATCH_THRESHOLD:
+                self._trigger_view_recovery("sustained-live-mismatch")
         # If timelines mismatch, still apply a play command — a view switch may
         # have just landed and the local guid is still catching up.  Drop only the
         # seek (frame) when mismatched; do not silently drop playing=True.
@@ -2832,15 +3062,23 @@ class PlaybackSyncController:
                 f" range for xStudio timeline"
             )
 
-    def apply_selection(self, data: dict) -> None:
+    def apply_selection(self, data: dict) -> bool:
         """Apply a remotely broadcast clip selection.
 
         Switches the viewed container to the sequence's parent playlist and sets
         the playlist playhead selection to the targeted clip (mimicking RV source view).
         If selection is cleared, switches back to the sequence timeline and selects all.
+
+        :returns: ``True`` if a switch was actually dispatched, ``False`` on any
+            failure (no playhead, no manager, clip not found, no playlist found,
+            or an exception while switching). The caller (``apply_playback_state``)
+            uses this to decide whether it may treat the target view as applied —
+            recording it unconditionally let an early, doomed-to-fail attempt
+            (playlists not built yet during a join) poison the dedup guard and
+            silently skip a later, would-succeed retry.
         """
         if not self.plugin.active_playhead:
-            return
+            return False
         clip_guid = data.get("clip_guid", "")
         view_mode = data.get("view_mode", "source")
 
@@ -2859,6 +3097,7 @@ class PlaybackSyncController:
                 f"{'sequence' if view_mode == 'sequence' else 'source/playlist'} view"
                 f" (mode={view_mode})"
             )
+            cleared = False
             if self.plugin.manager:
                 seq_tl_guid = self.plugin.manager.sequence_timeline_guid
                 if seq_tl_guid:
@@ -2915,20 +3154,21 @@ class PlaybackSyncController:
                             # playlist.  Suppress those for 0.5 s — in practice all
                             # echo show_atoms arrive within 150 ms.
                             self._selection_broadcast_suppress_until = time.monotonic() + 0.5
+                            cleared = True
                         except Exception:
                             _log_exc("RECV selection clear: failed to switch container")
 
                         # active_playhead is refreshed by the Form-2 viewport_playhead_atom
                         # event that fires after set_on_screen_source completes.
-            return
+            return cleared
 
         # Skip if we already broadcast this same clip — this is an echo from RV
         if not self.plugin.manager:
-            return
+            return False
         clip = self.plugin.manager._object_map.get(clip_guid)
         if clip is None or not isinstance(clip, otio.schema.Clip):
             _log(f"RECV selection: guid={clip_guid} not found in object_map")
-            return
+            return False
         _log(f"RECV selection: clip '{clip.name}' guid={clip_guid[:8]} mode={view_mode}")
 
         # Switch active_timeline_guid to the clip's own single-clip timeline.
@@ -3152,7 +3392,14 @@ class PlaybackSyncController:
                             f" → {getattr(media, 'name', '?')!r} ({str(media.uuid)[:8]})"
                         )
                     else:
+                        # The playlist container exists but this specific
+                        # clip's media hasn't resolved yet (still loading) —
+                        # no exception, but the target clip was never
+                        # actually selected, so this must not be reported as
+                        # a successful switch (same failure class the dedup
+                        # guard above needs to see through).
                         _log(f"RECV selection: media not found for clip {clip_guid[:8]}")
+                        return False
 
                 # Ensure the active playhead's Pinned Source Mode matches the view_mode.
                 self.check_and_update_active_playhead()
@@ -3169,13 +3416,16 @@ class PlaybackSyncController:
                         self._applying_pinned_mode = False
             except Exception:
                 _log_exc("RECV selection: container switch or selection failed")
+                return False
 
             # active_playhead is refreshed by Form-2 viewport_playhead_atom events
             # that fire as the source switch completes (~200 ms).  apply_pending_seek
             # then applies the deferred seek once the deadline passes.
             _log("RECV selection: source switch dispatched")
+            return True
         else:
             _log("RECV selection: no playlist found for clip")
+            return False
 
     # ── clip frame resolution ──────────────────────────────────────────
 

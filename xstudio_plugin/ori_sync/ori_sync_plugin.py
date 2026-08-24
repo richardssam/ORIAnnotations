@@ -1042,7 +1042,7 @@ class ORISyncPlugin(PluginBase):
                 # session out of STATE_DISCOVERING, and electing then would make
                 # a second master.
                 if self.manager and self.manager.status == STATE_DISCOVERING:
-                    if not self._pending_create_check:
+                    if not self._pending_create_check and not os.environ.get("ORI_SESSION"):
                         self._report_session_not_found("self_elect")
                         return
                     _log("No master found — self-electing")
@@ -1264,7 +1264,7 @@ class ORISyncPlugin(PluginBase):
                     _log_exc(f"Could not rename timeline {tl_guid[:8]}")
 
         elif action == "state_request_timeout":
-            if not self._pending_create_check:
+            if not self._pending_create_check and not os.environ.get("ORI_SESSION"):
                 self._report_session_not_found("state_request_timeout")
                 return
             _log("State request timed out. Electing self as master.")

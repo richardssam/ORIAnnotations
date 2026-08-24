@@ -972,3 +972,139 @@ tests:
     apps:
       - "xstudio"
       - "openrv"
+
+  - name: "flat_playlist_convergence_xs_rv"
+    description: >
+      A 6-step convergence flow: host isolates a clip and frame, viewer joins
+      and catches up, viewer picks a different clip locally (must not affect host),
+      host reasserts and viewer follows back. Also used to diagnose the
+      flat-playlist view_mode classification anomaly.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "viewer"
+    users:
+      - "driver_xs"
+      - "viewer_rv"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/graphic_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/laser_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "xstudio"
+        role: "driver"
+      - action: "expect_role"
+        app: "openrv"
+        role: "viewer"
+      - action: "concurrent_commands"
+        by_app:
+          xstudio: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+      - action: "concurrent_commands"
+        by_app:
+          xstudio: {action: "set_frame", frame: 89950}
+      - action: "expect_no_propagation"
+        app: "openrv"
+        command: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+        settle: 4.0
+      - action: "expect_no_propagation"
+        app: "openrv"
+        command: {action: "set_frame", frame: 91785}
+        settle: 4.0
+      - action: "concurrent_commands"
+        by_app:
+          xstudio: {action: "set_frame", frame: 89900}
+    apps:
+      - "xstudio"
+      - "openrv"
+
+  - name: "flat_playlist_convergence_xs_xs"
+    description: >
+      Same as flat_playlist_convergence_xs_rv but between two xStudio instances.
+    script_driven: true
+    checkpoint_validation_delay: 4
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+      - "viewer"
+    users:
+      - "driver_xs"
+      - "viewer_xs"
+    names:
+      - "xstudio_0"
+      - "xstudio_1"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/graphic_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/laser_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "expect_role"
+        app: "xstudio_0"
+        role: "driver"
+      - action: "expect_role"
+        app: "xstudio_1"
+        role: "viewer"
+      - action: "concurrent_commands"
+        by_app:
+          xstudio_0: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+      - action: "concurrent_commands"
+        by_app:
+          xstudio_0: {action: "set_frame", frame: 89950}
+      - action: "expect_no_propagation"
+        app: "xstudio_1"
+        command: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
+        settle: 4.0
+      - action: "expect_no_propagation"
+        app: "xstudio_1"
+        command: {action: "set_frame", frame: 91785}
+        settle: 4.0
+      - action: "concurrent_commands"
+        by_app:
+          xstudio_0: {action: "set_frame", frame: 89900}
+    apps:
+      - "xstudio"
+      - "xstudio"
+
+  - name: "flat_playlist_view_classification_xs_solo"
+    description: >
+      Single-app diagnostic vehicle. Picks graphic_ACES_sRGB at frame 89950 and
+      verifies that xStudio correctly self-reports view_mode: "source" and Loop Mode,
+      AND that its wire broadcast carries exactly those values.
+    script_driven: true
+    checkpoint_validation_delay: 2
+    frame_tolerance: 5
+    default_role: "driver"
+    roles:
+      - "driver"
+    users:
+      - "driver_xs"
+    commands:
+      - action: "add_media"
+        url: "test_media/source/encoded/car_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/graphic_ACES_sRGB.mov"
+      - action: "add_media"
+        url: "test_media/source/encoded/laser_ACES_sRGB.mov"
+      - action: "wait_for_media"
+      - action: "concurrent_commands"
+        by_app:
+          xstudio: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
+      - action: "concurrent_commands"
+        by_app:
+          xstudio: {action: "set_frame", frame: 89950}
+      - action: "expect_broadcast_and_state"
+        app: "xstudio"
+        view_mode: "source"
+        playback_mode: "loop"
+    apps:
+      - "xstudio"
