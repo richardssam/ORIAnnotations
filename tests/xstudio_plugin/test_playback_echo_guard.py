@@ -595,6 +595,32 @@ def test_apply_sequence_view_resets_a_flat_playlists_selection():
     )
 
 
+def test_an_echo_suppressed_selection_still_updates_current_view_bookkeeping():
+    """Live 2026-08-24: a driver's clip pick propagated to and was applied by
+    this peer, which correctly recognised its own later re-poll of that same
+    selection as an echo and suppressed the outbound re-broadcast — but the
+    _view_assertion_is_echo() call sites only skip broadcast_view_state, the
+    one place that normally updates _cur_clip_guid. Left pointing at the
+    peer's *previous* clip, every later position-only broadcast (a scrub)
+    kept reporting that stale clip_guid alongside the new frame, so a peer
+    receiving it switched to the wrong media."""
+    ctrl = _controller()
+    ctrl.plugin.active_playhead = FakePlayhead(position=10.0)
+    ctrl._cur_view_mode = "source"
+    ctrl._cur_clip_guid = "clip-original"
+
+    # Mirrors what each echo-suppressed branch in resolve_and_broadcast_selection
+    # must do instead of only logging: record the view without broadcasting it.
+    ctrl._record_current_view("clip-b", "source")
+
+    assert ctrl._cur_clip_guid == "clip-b"
+    state = ctrl.current_playback_state()
+    assert state["clip_guid"] == "clip-b", (
+        "a subsequent position-only broadcast must report the clip actually"
+        " on screen, not the stale pre-echo clip_guid"
+    )
+
+
 def test_apply_sequence_view_does_not_reset_selection_for_a_real_timeline():
     """A genuine Timeline's own frame position governs what's shown — the
     reset above is specific to the flat-playlist fallback, not sequence

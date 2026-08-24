@@ -1223,8 +1223,6 @@ class PlaybackSyncController:
             _log("on_playhead_attribute_changed: could not read attribute name")
             return
 
-        _log(f"[ATTR-DIAG] playhead attribute changed: {attr_name}")
-
         if attr_name == "Loop Mode":
             self._on_loop_mode_changed()
             return
@@ -1534,6 +1532,7 @@ class PlaybackSyncController:
                                     self.plugin.manager.active_timeline_guid = seq_tl_guid
                                 _echo, _why = self._view_assertion_is_echo(None, "sequence")
                                 if _echo:
+                                    self._record_current_view(None, "sequence")
                                     _log(f"[SEL] → broadcast view-state suppressed ({_why})")
                                 else:
                                     self.broadcast_view_state(None, "sequence")
@@ -1594,6 +1593,7 @@ class PlaybackSyncController:
                                         _may_claim = self.plugin.manager.owns_visibility()
                                         _echo, _why = self._view_assertion_is_echo(_cg, "source")
                                         if _echo:
+                                            self._record_current_view(_cg, "source")
                                             _log(f"[SEL] PSM True→False: broadcast view-state {_cg[:8]} suppressed ({_why})")
                                         else:
                                             self.broadcast_view_state(
@@ -1647,6 +1647,7 @@ class PlaybackSyncController:
                         self.plugin.manager.active_timeline_guid = _rctg
                     _echo, _why = self._view_assertion_is_echo(_rcg, "source")
                     if _echo:
+                        self._record_current_view(_rcg, "source")
                         _log(f"[SEL] → reliable selection broadcast suppressed ({_why})")
                     else:
                         self.broadcast_view_state(_rcg, "source")
@@ -2129,6 +2130,26 @@ class PlaybackSyncController:
             }
         except Exception:
             return None
+
+    def _record_current_view(self, clip_guid: "str | None", view_mode: str) -> None:
+        """Update ``_cur_view_mode``/``_cur_clip_guid`` without broadcasting.
+
+        For the case where a view change is recognised as an echo of a
+        peer's own message (:meth:`_view_assertion_is_echo` returned
+        ``True``): suppressing the outbound broadcast is correct — it
+        avoids echoing the peer's own change back at them — but this
+        peer's local view genuinely did change, and :meth:`broadcast_view_state`
+        is the only place that normally updates these two fields. Skipping
+        both together leaves them pointing at whatever clip/mode this peer
+        had *before* the echoed change, so the next position-only broadcast
+        (a scrub) reports the stale clip_guid alongside the new frame.
+        Observed live 2026-08-24: a driver's clip pick echoed back to the
+        host correctly (no re-broadcast), but the host's own later scrubs
+        kept announcing its *original* clip — the one before that pick —
+        because ``_cur_clip_guid`` was never moved off it.
+        """
+        self._cur_view_mode = view_mode
+        self._cur_clip_guid = clip_guid or None
 
     def broadcast_view_state(
         self,
@@ -3389,7 +3410,7 @@ class PlaybackSyncController:
                         playlist.playhead_selection.set_selection([media.uuid])
                         _log(
                             f"RECV selection: set_selection"
-                            f" → {getattr(media, 'name', '?')!r} ({str(media.uuid)[:8]})"
+                            f" → {clip_name!r} ({str(media.uuid)[:8]})"
                         )
                     else:
                         # The playlist container exists but this specific
