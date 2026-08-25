@@ -257,4 +257,8 @@
       → Does **not** make the PR build pass on its own — still `checkpoint_timeout`.
       → **Develop regression run done: 10/10**, better than the 15/16 baseline it had
       to beat, with zero `Dequeue timeout` and zero `POLL-SLOW`. Safe on both topologies.
-- [ ] 7.2 Once this lands and the PR is adoptable, revisit the deferred isolation/seek correctness fix in `fix-xstudio-selects-flakiness`, which needs prompt playhead adoption.
+- [~] 7.2 Once this lands and the PR is adoptable, revisit the deferred isolation/seek correctness fix in `fix-xstudio-selects-flakiness`, which needs prompt playhead adoption.
+      → **Still blocked, and now known to be blocked further out than assumed.** It needs
+      prompt playhead adoption, which needs the PR to be adoptable, which needs the
+      upstream `Connection` work in 7.1 — not merely this change. Carried out of here
+      rather than left open: nothing in this repo unblocks it.
