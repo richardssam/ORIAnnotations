@@ -145,7 +145,42 @@
       sync_test OpenRV (inspector on port 19000), an xStudio, and two orphaned `rvio`
       thumbnail jobs pinning 300-600% CPU. `pkill -f rv_thumbnails`,
       `pkill -f start_openrv_inspector`, then wait for load < 5.
-- [ ] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
+- [!] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
+      → **Does not pass. 0/10, then 1/10 after two further fixes.** This change is now
+      complete against its own spec and that is still not sufficient. Recorded as a
+      finding, not a failure to be retried.
+      → What the PR-build run *did* buy: it found two real violations the audit missed
+      (`on_annotation_event` → `poll_and_broadcast_display`, `on_structure_event` →
+      `_join_playlist_group_from_actor`), both fixed in `a0ce3b7`. `Dequeue timeout`
+      occurrences fell ~4/run → ~1/run. Battery power was fine for this: the discriminator
+      was a mechanism signal, and throttling only makes contention worse, so it is a
+      conservative test.
+      → **Proof our side is clean**: a probe (`debug/xstudio_offthread_io_probe.py`)
+      wrapping `request_receive` logged **zero** off-poll-thread calls from any
+      ORIAnnotations module.
+      → **Three hypotheses tested and refuted**, recorded so nobody retries them:
+        1. *xStudio's bundled `filesystem_browser_python` is stealing the connection.*
+           It genuinely does issue `request_receive` from its `_search_worker` thread on
+           the **same `Connection` object** (proven: patching our instance intercepted its
+           calls). But moving the plugin out of the scan path changed nothing — 0/10,
+           Dq 32 vs 36. Those 7 hits are a startup burst, real but immaterial.
+        2. *`Connection.response()` discards a response another consumer already filed.*
+           It genuinely does — `_dequeue_messages` files every response it sees into
+           `self.responses`, but `response()` lets `TimeoutError` propagate without
+           consulting `_response(req_id)`. Patching it to re-check changed nothing:
+           0/10, Dq 38. So responses are not being stolen-and-filed.
+        3. *The PR build is simply slower per round-trip.* It is not: isolated,
+           bare `request_receive` 0.0001s and `Playhead` ctor 0.0052s, matching develop's
+           0.0002s / 0.0041s.
+      → **What the evidence actually says.** The stalls are not timeouts — instrumenting
+        the pump caught only one timeout per run, on a 100ms budget, having dispatched
+        zero broadcasts. They are many individually-successful reads that are slow only
+        under live concurrent listener load. Raw performance is fine and our callbacks are
+        cheap enqueues, so the remaining cost is N listener threads contending on the one
+        shared `dequeue_message_with_timeout` queue — inside the PR, not the plugin.
+      → **Next step is upstream, not here** (see 7.1, now the blocker rather than a
+        nice-to-have). The plugin cannot fix this by moving work between threads; it has
+        already moved all of it.
 - [~] 6.3 Run `debug/xstudio_request_receive_repro.py --concurrency-probe` on each build to confirm which listener topology was actually exercised, so a pass is not misattributed.
       → **develop confirmed**: 5 subscriptions, 77 invocations, **1 thread, peak overlap 1
       — SERIALISED**. So the 6.1 result above was measured against the shared-listener
@@ -175,5 +210,18 @@
 
 ## 7. Follow-ups (not in this change)
 
-- [ ] 7.1 Note the option of fixing `Connection` thread-safety upstream (per-connection lock around `request_receive`, or demultiplexing responses by request id) — this change works around the API as it is.
+- [!] 7.1 Note the option of fixing `Connection` thread-safety upstream (per-connection lock around `request_receive`, or demultiplexing responses by request id) — this change works around the API as it is.
+      → **Promoted from optional follow-up to the actual blocker for
+      `pr/python-per-subscription-listeners`** (see 6.2). Two specific defects were
+      confirmed in the Python `Connection` while investigating, both worth reporting
+      upstream even though neither alone explains the failure:
+        * `response()` drops a response that `_dequeue_messages` already filed into
+          `self.responses`, because it lets `TimeoutError` propagate without consulting
+          `_response(req_id)`. A three-line fix, and correct regardless.
+        * `request_receive` doubles as the event pump: any message it dequeues that is
+          not the one it is waiting for is dispatched via `handle_broadcast` **inline on
+          the calling thread**. So a read's latency depends on unrelated event volume.
+      → One `Connection` instance is shared across all Python plugins in the process, so
+        "only one thread performs actor I/O" is not a property any single plugin can
+        establish. That is the structural argument for fixing it upstream.
 - [ ] 7.2 Once this lands and the PR is adoptable, revisit the deferred isolation/seek correctness fix in `fix-xstudio-selects-flakiness`, which needs prompt playhead adoption.
