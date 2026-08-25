@@ -125,22 +125,39 @@
 ## 6. Verification
 
 - [x] 6.1 Re-run `xstudio_selects_script_xstudio` 10x on **develop**; confirm no `POLL-SLOW cmd:resolve_selection` and no `Dequeue timeout`.
-      → **The primary signal is clean: 0 `POLL-SLOW`, 0 `Dequeue timeout` across all 10.**
-      → The pass rate is *not* interpretable from this session and should not be quoted.
-      10 runs gave 7/10 (2× `structural_consensus`, 1× `view_mirror_failed`) against a
-      9/10 baseline — but the machine was in heavy swap (16.9 GB of 18.4 GB used, load
-      ~12). A control of the *unmodified* code under the same conditions scored **2/5**,
-      well below its own 9/10 baseline, so the load dominated both. Recorded per
-      `feedback_suite_results_need_memory_check`, which exists because this has produced
-      two false diagnoses before.
-      → Redo on a rebooted machine before drawing any conclusion. Note also that both
-      failure modes seen were the same missing `graphic` clip on the OpenRV side —
-      `structure_sync` territory, untouched by this change, and the already-known residual
-      from `fix-xstudio-selects-flakiness` task 6.2.
+      → **Primary signal clean: 0 `POLL-SLOW`, 0 `Dequeue timeout` across all 10.**
+      → Pass rate, rebooted machine (0 swap, load ~5), 2026-08-25 13:53-14:00: **6/10**
+      (3x `structural_consensus`, 1x `checkpoint_timeout`).
+      → That is below the 9/10 recorded baseline, so it was A/B'd rather than explained
+      away. **Control at `HEAD~1` on the same machine minutes later: 4/10.** The change is
+      no worse and probably better; the 9/10 baseline is simply not reproducible today on
+      *either* version, so something in the environment has drifted since it was taken.
+      Do not quote 9/10 as the develop reference again without re-measuring it.
+      → The first attempt at this ran during post-reboot churn and had to be discarded:
+      macOS session-restore had relaunched a sync_test OpenRV (inspector on port 19000),
+      an xStudio, and two orphaned `rvio` thumbnail jobs pinning 300-600% CPU. Kill any
+      `rv_thumbnails` / `start_openrv_inspector` strays and wait for load < 5 before
+      trusting a run.
 - [ ] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
 - [ ] 6.3 Run `debug/xstudio_request_receive_repro.py --concurrency-probe` on each build to confirm which listener topology was actually exercised, so a pass is not misattributed.
-- [ ] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
-- [ ] 6.5 Check `converged_late` in `run_history.jsonl` — a latency regression from deferring shows up there before it shows up as a failure (design Risks).
+- [~] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
+      → develop: `openrv_hosts_selection` PASS, `contended_visibility_selection` PASS,
+      `contended_visibility_selection_rv` PASS, `xstudio_selects` FAIL
+      (`structural_consensus` — the same recurring mode, present in the control too).
+      → `contended_visibility_selection` passing is worth noting: it was failing 5/5
+      before `3e21954`.
+      → PR build outstanding.
+- [x] 6.5 Check `converged_late` in `run_history.jsonl` — a latency regression from deferring shows up there before it shows up as a failure (design Risks).
+      → `converged_late` turned out to be useless as the signal: it is `True` on every
+      run of this test, passing or failing, before and after. `time_to_converge` is the
+      field that actually discriminates.
+      → Convergence on *passing* runs, change vs control, same machine:
+        median **0.219s vs 0.181s**, i.e. **+38ms** — inside the one-poll-hop (0.1s)
+        budget Decision 3 accepted, and far short of the `default_timeout_ms` stall it
+        buys out.
+        (Raw change figures include a 1.498s first-run cold start; excluded from the
+        median above, and called out rather than quietly dropped. Control's own first run
+        failed, so there is no cold-start figure to compare it against.)
 
 ## 7. Follow-ups (not in this change)
 
