@@ -299,8 +299,11 @@ class AnnotationSyncController:
         event_name = payload.get("event") if isinstance(payload, dict) else None
 
         if event_name in self._VISIBILITY_EVENTS:
-            _log(f"Draw interaction: {event_name} — broadcasting visibility")
-            self.plugin.display.poll_and_broadcast_display()
+            _log(f"Draw interaction: {event_name} — queuing visibility broadcast")
+            # Deferred: poll_and_broadcast_display reads the viewport's colour
+            # pipeline (exposure, channel) and serialises the viewport — all
+            # request_receive — and this runs on an xStudio callback thread.
+            self.plugin._cmd_queue.put(("broadcast_display", None))
             return
 
         # PaintPoint arrives at pointer rate (~130 events for three strokes), so

@@ -245,7 +245,21 @@ def test_remove_event_handler_never_touches_manager_and_enqueues_only():
     ]
 
 
-def test_add_playlist_event_joins_new_group_and_enqueues_only():
+def test_add_playlist_event_defers_the_group_join_and_enqueues_only():
+    """The join must be *queued*, not performed here.
+
+    This test previously asserted the handler joined the group itself, under
+    the name "..._joins_new_group_and_enqueues_only" — two clauses that cannot
+    both be true, since `join_event_group` reaches `subscribe_to_event_group`
+    and that is a `request_receive`. The contradiction is why an audit for
+    "handlers that perform actor I/O" cleared `on_structure_event`: the join
+    was hidden one call deep behind a helper whose docstring truthfully says
+    *wrapping* the actor is free, and says nothing about the join.
+
+    It cost a 0/10 on the per-subscription-listeners build, where callback
+    threads run concurrently and this join collided with the poll thread's own
+    reads (poll-thread-owns-actor-io).
+    """
     plugin = FakePlugin()
     plugin.manager = ManagerTouchGuard()
     structure = StructureSyncController(plugin)
@@ -253,8 +267,14 @@ def test_add_playlist_event_joins_new_group_and_enqueues_only():
     ua = types.SimpleNamespace(uuid=Uuid(), actor=object())
     structure.on_structure_event(_event(add_playlist_atom(), ua))
 
-    assert plugin._cmd_queue.items == [("structure_dirty", {})]
-    assert plugin.joins and plugin.joins[0][1] == "playlist-structure"
+    kinds = [c for c, _ in plugin._cmd_queue.items]
+    assert kinds == ["join_playlist_group", "structure_dirty"], (
+        "the join must be queued ahead of the dirty mark, not performed inline"
+    )
+    assert plugin.joins == [], "no group may be joined from a callback thread"
+
+    payload = plugin._cmd_queue.items[0][1]
+    assert payload["actor"] is ua.actor, "the raw actor handle is carried, not a wrapper"
 
 
 def test_unrecognised_message_is_ignored_cheaply():

@@ -381,7 +381,17 @@ class StructureSyncController:
             native_uuid = str(getattr(ua, "uuid", ua) or "")
             actor = getattr(ua, "actor", None)
             if isinstance(payload, add_playlist_atom) and actor is not None:
-                self._join_playlist_group_from_actor(actor, getattr(ua, "uuid", None))
+                # Deferred: joining a group is a request_receive
+                # (join_event_group -> subscribe_to_event_group), and this
+                # handler runs on an xStudio callback thread.  Under a build
+                # that gives each subscription its own listener those threads
+                # run concurrently, so a join here collides with whatever the
+                # poll thread has in flight.  Wrapping the actor is free; the
+                # join is not.
+                self.plugin._cmd_queue.put((
+                    "join_playlist_group",
+                    {"actor": actor, "uuid": getattr(ua, "uuid", None)},
+                ))
             self.mark_container_dirty(native_uuid)
             _log(
                 f"[3E] {type(payload).__name__} uuid={native_uuid[:8] if native_uuid else '?'}"

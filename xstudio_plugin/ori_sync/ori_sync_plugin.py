@@ -1107,6 +1107,14 @@ class ORISyncPlugin(PluginBase):
                 self.playback._carry_over_playback_mode(self.playback.plugin.active_playhead)
             elif cmd == "playhead_sample":
                 self.playback.sample_and_broadcast_playhead(payload or "")
+            elif cmd == "join_playlist_group":
+                # Deferred from on_structure_event (callback thread).
+                self.structure._join_playlist_group_from_actor(
+                    payload.get("actor"), payload.get("uuid")
+                )
+            elif cmd == "broadcast_display":
+                # Deferred from on_annotation_event (callback thread).
+                self.display.poll_and_broadcast_display()
             elif cmd == "show_atom_media":
                 self.playback.handle_show_atom_media(
                     payload.get("media_uuid", ""), payload.get("shape", "")
