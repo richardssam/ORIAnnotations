@@ -52,6 +52,22 @@ dispatch timing enough to turn an intermittent collision into a reliable one
 
 The fix is plugin-side: get every ``request_receive`` onto one thread.
 
+Phase 6 (2026-08-25, develop): 5 subscriptions on one group, 45 callback
+invocations, **1 distinct thread, peak overlap 1 — SERIALISED**.
+
+That is the answer to "if the defect is pre-existing, why is the PR worse?".
+On develop every subscription on a connection shares ONE listener actor, so
+Python callbacks cannot overlap each other. Concurrency is therefore only
+2-way: the poll thread versus that single callback thread. Per-subscription
+listeners remove that accidental serialisation, so callbacks can also overlap
+EACH OTHER — N-way concurrency against a connection that tolerates none.
+
+So the PR does not introduce the defect, but it does legitimately make it far
+more likely to fire. Both statements are true; "exonerated" is too strong.
+
+NOT YET MEASURED: phase 6 on the PR build (expect >1 threads and peak overlap
+>1). Needs a rebuild. Do not assert it until measured.
+
 Usage
 -----
 Against an already-running xStudio (find the port in its log, "API enabled on
@@ -146,6 +162,10 @@ def main():
                     help="run phase 4: N threads constructing concurrently")
     ap.add_argument("--in-callback", action="store_true",
                     help="run phase 5: request_receive from inside an event callback")
+    ap.add_argument("--concurrency-probe", action="store_true",
+                    help="run phase 6: do callbacks on one connection overlap?")
+    ap.add_argument("--subscriptions", type=int, default=5,
+                    help="phase 6: how many callbacks to attach to one group")
     args = ap.parse_args()
 
     try:
@@ -339,6 +359,71 @@ def main():
             except Exception as exc:
                 print(f"    could not set up: {exc!r}")
 
+        # ── Phase 6: are callbacks serialised or concurrent? ─────────────
+        # The decisive question for "why is the PR worse if the defect is
+        # pre-existing?". On develop every subscription on a connection shares
+        # ONE listener actor, so callbacks necessarily enter Python one at a
+        # time. Per-subscription listeners can run them at once. If so, the PR
+        # does not add a defect — it removes an accidental serialisation that
+        # was masking the connection's lack of thread-safety.
+        #
+        # Measures actual overlap, not thread names alone: a callback that
+        # sleeps briefly lets genuine concurrency show up as overlapping
+        # intervals.
+        if args.concurrency_probe:
+            import threading
+            from xstudio.core import get_event_group_atom
+            lock = threading.Lock()
+            spans, threads_seen = [], set()
+
+            def _make_cb(_i):
+                def _cb(*_a, **_kw):
+                    t0 = time.monotonic()
+                    threads_seen.add(threading.current_thread().name)
+                    time.sleep(0.05)  # widen the window so overlap is visible
+                    with lock:
+                        spans.append((t0, time.monotonic()))
+                return _cb
+
+            print(f"\nPhase 6 — {args.subscriptions} subscriptions on one group,"
+                  " callback overlap:")
+            try:
+                sess = conn.api.session
+                # No trailing True: that form is Module-specific
+                # (ModuleBase.setup_message_handler). The generic idiom is
+                # subscribe_to_event_group's plain get_event_group_atom().
+                grp = conn.request_receive(sess.remote, get_event_group_atom())[0]
+                if not grp:
+                    raise RuntimeError("session actor has no event group")
+                for i in range(args.subscriptions):
+                    conn.link.add_message_callback(grp, _make_cb(i))
+                for i in range(args.iterations):
+                    try:
+                        sess.create_playlist(f"probe_{i}")
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+                time.sleep(2.0)  # let the tail drain
+
+                # Max number of callback intervals overlapping at any instant.
+                peak = 0
+                for s, _e in spans:
+                    peak = max(peak, sum(1 for s2, e2 in spans if s2 <= s < e2))
+                print(f"    callback invocations : {len(spans)}")
+                print(f"    distinct threads     : {len(threads_seen)}"
+                      f" {sorted(threads_seen)}")
+                print(f"    peak overlap         : {peak}")
+                if peak > 1:
+                    print("    *** CONCURRENT: callbacks run at the same time."
+                          " Any request_receive inside one can collide.")
+                elif spans:
+                    print("    *** SERIALISED: callbacks never overlap."
+                          " A shared listener is absorbing the concurrency.")
+                else:
+                    print("    no callbacks fired — inconclusive, not a pass")
+            except Exception as exc:
+                print(f"    could not set up: {exc!r}")
+
         print("\nInterpretation:")
         print("  Phase 1 timeouts        -> request/response itself is affected"
               " (upstream bug, unrelated to subscriptions).")
@@ -349,6 +434,9 @@ def main():
         print("  Phase 3 flat            -> accumulation ruled out.")
         print("  Phase 4 timeouts        -> concurrent callers on one connection"
               " contend (matches poll thread + xStudio callback threads).")
+        print("  Phase 6 peak overlap >1 -> callbacks are concurrent; a shared"
+              " listener is no longer serialising them, so the connection's"
+              " lack of thread-safety is now reachable from event handlers.")
         print("  Phase 5 timeouts        -> a synchronous request issued from"
               " inside an event callback cannot complete; the plugin does"
               " exactly this and its own threading invariant forbids it.")
