@@ -79,6 +79,18 @@ class DisplaySyncController:
 
         # Cached Viewport object; created lazily, cleared on disconnect.
         self._viewport: "Viewport | None" = None
+        # Cached ColourPipeline for _viewport.  Viewport.colour_pipeline is a
+        # property with NO memoisation (unlike Viewport.playhead right above it
+        # in the bindings): every access does a request_receive AND constructs a
+        # ModuleBase, which subscribes to that pipeline's event group.  This
+        # poll runs at 2 Hz, so re-reading it leaked a subscription every 0.5 s.
+        # Harmless on a build with one shared listener per connection — they all
+        # collapse onto one membership — but under per-subscription listeners
+        # each leaked subscription is its own actor and thread, growing without
+        # bound and contending on the connection's single message queue.
+        # Measured: 69 subscriptions against 25 distinct groups, 39 of the 44
+        # duplicates from this one property.
+        self._colour_pipeline = None
         # Timeline to set as on-screen source once the viewport is ready.
         # Set by builder.do_load_timelines; consumed and cleared by get_viewport.
         self._pending_on_screen_source = None
@@ -113,7 +125,7 @@ class DisplaySyncController:
 
     def reset(self) -> None:
         """Clear display state on disconnect."""
-        self._viewport = None
+        self._drop_viewport()
         self._pending_on_screen_source = None
         self._last_display_state = {}
         self._xs_base_scale = None
@@ -186,6 +198,25 @@ class DisplaySyncController:
         self._apply_pending_on_screen_source()
         return self._viewport
 
+    def get_colour_pipeline(self):
+        """Return the cached ColourPipeline for the active viewport, or None.
+
+        Invalidated wherever ``_viewport`` is, since it belongs to that
+        viewport — see :meth:`_drop_viewport`.
+        """
+        if self._colour_pipeline is not None:
+            return self._colour_pipeline
+        vp = self.get_viewport()
+        if vp is None:
+            return None
+        self._colour_pipeline = vp.colour_pipeline
+        return self._colour_pipeline
+
+    def _drop_viewport(self) -> None:
+        """Forget the cached viewport and anything derived from it."""
+        self._viewport = None
+        self._colour_pipeline = None
+
     # ── read ──────────────────────────────────────────────────────────────────
 
     def _read_annotations_visible(self) -> bool:
@@ -229,7 +260,9 @@ class DisplaySyncController:
         # affects the playhead during source-view switches).
         try:
             with bounded_timeout(self.plugin.connection, _DISPLAY_TIMEOUT_MS):
-                cp = vp.colour_pipeline
+                cp = self.get_colour_pipeline()
+                if cp is None:
+                    return state
                 state["exposure"] = float(cp.exposure.value())
                 xs_ch = cp.channel.value()
                 state["channel"] = self._XS_TO_PROTO_CHANNEL.get(str(xs_ch), "RGBA")
@@ -261,7 +294,7 @@ class DisplaySyncController:
                     state["pan"] = [-translate_x / k, translate_y / k]
         except Exception as e:
             _log(f"read_xs_display_state: read failed ({e}) — dropping stale viewport")
-            self._viewport = None
+            self._drop_viewport()
             return {
                 "pan": [0.0, 0.0], "zoom": 1.0, "exposure": 0.0, "channel": "RGBA",
                 "annotations_visible": state["annotations_visible"],
@@ -303,13 +336,17 @@ class DisplaySyncController:
                 _log(f"RECV display: annotations_visible set failed: {e}")
 
         try:
-            vp.colour_pipeline.exposure.set_value(float(exposure))
+            _cp = self.get_colour_pipeline()
+            if _cp is not None:
+                _cp.exposure.set_value(float(exposure))
         except Exception as e:
             _log(f"RECV display: exposure set failed: {e}")
 
         try:
             xs_ch = self._PROTO_TO_XS_CHANNEL.get(channel, "RGB")
-            vp.colour_pipeline.channel.set_value(xs_ch)
+            _cp = self.get_colour_pipeline()
+            if _cp is not None:
+                _cp.channel.set_value(xs_ch)
         except Exception as e:
             _log(f"RECV display: channel set failed: {e}")
 

@@ -158,3 +158,56 @@ def install_playhead_census(plugin, playhead_cls, log, interval=8.0):
         log(f"[CENSUS] t={now - state['t0']:5.1f}s  Playhead ctors={state['ctors']:4d}"
             f"  live threads={len(names):3d}  listener(Dummy) threads={len(dummies):3d}")
     return census
+
+
+def install_subscription_census(conn, log):
+    """Count subscriptions vs DISTINCT groups subscribed to.
+
+    Decides whether "one listener per group" would be cheaper than the PR's
+    "one listener per subscription". The PR spawns a listener actor per call to
+    add_message_callback; a per-group scheme would spawn one per distinct group
+    actor and fan out in Python. The saving is exactly the duplicate rate
+    measured here, so if every subscription targets a distinct group the two
+    schemes cost the same and this idea is worthless.
+    """
+    import collections, threading
+    per_group = collections.Counter()
+    lock = threading.Lock()
+    real = conn.link
+    orig = real.add_message_callback
+
+    class _LinkProxy:
+        # conn.link is a pybind object whose attributes cannot be set, so the
+        # interception has to happen one level up: every caller reaches it as
+        # `self.connection.link`, and that IS a plain Python attribute.
+        def __init__(self, inner):
+            object.__setattr__(self, "_inner", inner)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_inner"), name)
+
+        def add_message_callback(self, *a, **k):
+            return add_message_callback(*a, **k)
+
+    def add_message_callback(*a, **k):
+        try:
+            grp = a[0] if a else None
+            with lock:
+                per_group[str(grp)] += 1
+                total = sum(per_group.values())
+                distinct = len(per_group)
+                dupes = total - distinct
+            log(f"[SUBS] subscriptions={total} distinct_groups={distinct} "
+                f"duplicates={dupes}  (per-subscription listeners={total}, "
+                f"per-group listeners={distinct})")
+            if per_group[str(grp)] > 1:
+                import traceback
+                frames = [f for f in traceback.format_stack()[:-1]
+                          if "ORIAnnotations" in f or "site-packages/xstudio" in f]
+                log("[SUBS] DUPLICATE subscription to a group already joined:\n"
+                    + "".join(frames[-4:]))
+        except Exception:
+            pass
+        return orig(*a, **k)
+
+    conn.link = _LinkProxy(real)

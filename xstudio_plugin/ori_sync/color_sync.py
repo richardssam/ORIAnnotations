@@ -131,7 +131,12 @@ class ColorSyncController:
         if vp is None:
             return
         try:
-            vp.colour_pipeline.display.set_value(name)
+            # Cached wrapper: see DisplaySyncController.get_colour_pipeline —
+            # the binding's colour_pipeline property subscribes on every access.
+            _cp = self.plugin.display.get_colour_pipeline()
+            if _cp is None:
+                return
+            _cp.display.set_value(name)
             self._last_output = name
             _log(f"RECV color output_space display={name!r}")
         except Exception as e:
@@ -197,6 +202,9 @@ class ColorSyncController:
             return None
         try:
             with bounded_timeout(self.plugin.connection, _COLOR_TIMEOUT_MS):
-                return str(vp.colour_pipeline.display.value()) or None
+                _cp = self.plugin.display.get_colour_pipeline()
+                if _cp is None:
+                    return None
+                return str(_cp.display.value()) or None
         except Exception:
             return None
