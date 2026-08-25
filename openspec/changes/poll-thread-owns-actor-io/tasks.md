@@ -224,4 +224,36 @@
       → One `Connection` instance is shared across all Python plugins in the process, so
         "only one thread performs actor I/O" is not a property any single plugin can
         establish. That is the structural argument for fixing it upstream.
+      → **A cheaper upstream alternative was identified: one listener per GROUP,
+      not per subscription.** All three defects the PR fixes (crosstalk,
+      sender-dependent routing, unsubscribe collateral damage) trace to one root
+      cause — `BroadcastActor::subscribers_` is keyed by subscriber *address*, so
+      every Python subscription reaching a group collapses onto one membership.
+      Those are properties of *group* identity, not *subscription* identity, so a
+      per-group listener fixes all three: it joins exactly one group (no address
+      matching), and leaving group A cannot revoke membership in group B.
+      Measured cost here: **25 listeners instead of 69** — bounded by distinct
+      groups rather than growing with subscription churn. This is also the exact
+      pattern the plugin already emulates in Python (`join_event_group` +
+      `_dispatch_event_group`), so it is proven in practice.
+      → Two things to test rather than assume if this is built: whether 25
+      concurrent listeners still stall the poll thread, and whether the PR's
+      "unsubscribe race" fix survives listener sharing.
+
+- [x] 7.3 Stop the plugin leaking duplicate subscriptions (found while answering
+      "is any event noisier than the others?").
+      → `Viewport.colour_pipeline` is a binding property with **no memoisation**,
+      unlike `Viewport.playhead` directly above it. Every access constructs a
+      `ModuleBase`, which subscribes. The display poll (2 Hz) and colour poll
+      (0.5 Hz) re-read it, leaking a subscription roughly every half second —
+      invisible on a shared-listener build, unbounded actor+thread growth under
+      per-subscription listeners.
+      → Fixed in `9b8e8b6` by caching the wrapper alongside the viewport and
+      invalidating both together (`_drop_viewport`). Measured on the PR build:
+      **69 subs / 44 duplicates and climbing → 34 subs / 9 duplicates, flat**
+      (confirmed flat across a full 63s run). A win on develop too: one fewer
+      round-trip and wrapper construction per poll.
+      → Does **not** make the PR build pass on its own — still `checkpoint_timeout`.
+      → **Needs a develop-build regression run** against the 15/16 baseline; the
+      PR build was live when it was written.
 - [ ] 7.2 Once this lands and the PR is adoptable, revisit the deferred isolation/seek correctness fix in `fix-xstudio-selects-flakiness`, which needs prompt playhead adoption.
