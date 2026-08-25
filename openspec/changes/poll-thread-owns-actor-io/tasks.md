@@ -129,10 +129,19 @@
       → Pass rate, rebooted machine (0 swap, load ~5), 2026-08-25 13:53-14:00: **6/10**
       (3x `structural_consensus`, 1x `checkpoint_timeout`).
       → That is below the 9/10 recorded baseline, so it was A/B'd rather than explained
-      away. **Control at `HEAD~1` on the same machine minutes later: 4/10.** The change is
-      no worse and probably better; the 9/10 baseline is simply not reproducible today on
-      *either* version, so something in the environment has drifted since it was taken.
-      Do not quote 9/10 as the develop reference again without re-measuring it.
+      away. **Control at `HEAD~1` on the same machine minutes later: 4/10.**
+      → **Both batches ran on battery power**, which was only established afterwards. That
+      is the likely reason neither version reached its own 9/10 baseline: macOS throttles
+      CPU and reduces available cores on low power, and this test is timing-sensitive
+      enough that three of its four failure modes here (`checkpoint_timeout`,
+      `structural_consensus`) are latency-driven. Treat both absolute numbers as invalid.
+      → The A/B *comparison* survives, because both batches were throttled identically:
+      the change is no worse than the code it replaces, and on these figures better.
+      That is the whole value of having run the control — a single 6/10 would have looked
+      like a regression it is not.
+      → Redo 6.1 and the 6.4 siblings on mains power before quoting any absolute rate.
+      Record power state alongside swap/load in future runs; it belongs next to
+      `feedback_suite_results_need_memory_check` as a thing that mimics timing races.
       → The first attempt at this ran during post-reboot churn and had to be discarded:
       macOS session-restore had relaunched a sync_test OpenRV (inspector on port 19000),
       an xStudio, and two orphaned `rvio` thumbnail jobs pinning 300-600% CPU. Kill any
@@ -146,6 +155,9 @@
       (`structural_consensus` — the same recurring mode, present in the control too).
       → `contended_visibility_selection` passing is worth noting: it was failing 5/5
       before `3e21954`.
+      → Also run on battery — see 6.1. The three passes stand (a pass under throttling is
+      still a pass); the single `xstudio_selects` failure needs re-running on mains before
+      it counts as anything.
       → PR build outstanding.
 - [x] 6.5 Check `converged_late` in `run_history.jsonl` — a latency regression from deferring shows up there before it shows up as a failure (design Risks).
       → `converged_late` turned out to be useless as the signal: it is `True` on every
