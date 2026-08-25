@@ -146,7 +146,15 @@
       thumbnail jobs pinning 300-600% CPU. `pkill -f rv_thumbnails`,
       `pkill -f start_openrv_inspector`, then wait for load < 5.
 - [ ] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
-- [ ] 6.3 Run `debug/xstudio_request_receive_repro.py --concurrency-probe` on each build to confirm which listener topology was actually exercised, so a pass is not misattributed.
+- [~] 6.3 Run `debug/xstudio_request_receive_repro.py --concurrency-probe` on each build to confirm which listener topology was actually exercised, so a pass is not misattributed.
+      → **develop confirmed**: 5 subscriptions, 77 invocations, **1 thread, peak overlap 1
+      — SERIALISED**. So the 6.1 result above was measured against the shared-listener
+      topology, as intended. Serial performance also clean (bare `request_receive`
+      0.0002s, `Playhead` ctor 0.0041s), matching the proposal's figures.
+      → This is a better build discriminator than the binary mtime: it observes the
+      topology directly rather than inferring it from the filesystem, and the source tree
+      has been misleading three times across two sessions. Run it *before* each batch.
+      → PR build outstanding — expect peak overlap 5.
 - [~] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
       → develop: `openrv_hosts_selection` PASS, `contended_visibility_selection` PASS,
       `contended_visibility_selection_rv` PASS, `xstudio_selects` FAIL
