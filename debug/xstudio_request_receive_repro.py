@@ -65,8 +65,17 @@ EACH OTHER — N-way concurrency against a connection that tolerates none.
 So the PR does not introduce the defect, but it does legitimately make it far
 more likely to fire. Both statements are true; "exonerated" is too strong.
 
-NOT YET MEASURED: phase 6 on the PR build (expect >1 threads and peak overlap
->1). Needs a rebuild. Do not assert it until measured.
+Phase 6 A/B (2026-08-25) — 5 subscriptions on one group
+--------------------------------------------------------
+    build     invocations   threads   peak overlap
+    develop   45            1         1   SERIALISED
+    PR        80            5         5   CONCURRENT
+
+Confirmed. One shared listener serialises Python callbacks; per-subscription
+listeners let all five run at once. So concurrency against the connection goes
+from 2-way on develop (poll thread vs the single callback thread) to N-way
+under the PR. The defect is pre-existing but the PR makes it far more likely to
+fire — 9/10 -> 0/10 on the suite.
 
 Usage
 -----
@@ -83,9 +92,18 @@ Or let it launch its own instance and clean up afterwards::
 `<xstudio-python>` is xStudio's bundled interpreter, e.g.
 ``/Users/sam/git/xstudio/build/vcpkg_installed/arm-osx/tools/python3/python3``.
 
-Run it once per build and compare. A build is identified by the `parent_atom`
-signature: develop emits "unexpected message ... parent_atom()" warnings, the PR
-emits none.
+Run it once per build and compare.
+
+**Identifying the build — do not trust the source tree.** A PR-built binary
+under a develop checkout (and the reverse) has happened repeatedly; `git branch`
+and the source file both lie about what is actually running. Compare
+`build/xSTUDIO.app/Contents/MacOS/xstudio.bin`'s mtime against when each build
+was made.
+
+The `parent_atom` warning signature (present on develop, absent under the PR) is
+only valid for runs with the **ori_sync plugin loaded** — it is the plugin's
+subscription pattern that provokes those warnings. This script loads no plugin,
+so it always reports zero and the signature must NOT be used here.
 
 Exit status is 0 whatever the timings — this measures, it does not assert.
 """
