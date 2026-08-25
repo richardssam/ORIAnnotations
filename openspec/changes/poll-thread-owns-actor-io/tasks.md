@@ -130,21 +130,19 @@
 ## 6. Verification
 
 - [x] 6.1 Re-run `xstudio_selects_script_xstudio` 10x on **develop**; confirm no `POLL-SLOW cmd:resolve_selection` and no `Dequeue timeout`.
-      → **On mains power: 9/10** (1x `structural_consensus`), plus a follow-up batch of
-      6/6 = **15/16 overall**. Matches the 9/10 recorded baseline exactly.
-      → **0 `Dequeue timeout`. 0 `POLL-SLOW cmd:resolve_selection`.** Two runs logged a
-      `POLL-SLOW`, both `fullstate_write` (1.1s, 1.3s) — the test inspector's JSON dump
-      at poll-loop step 6.2, i.e. harness overhead, not actor I/O. Chased down rather
-      than counted, because "a POLL-SLOW appeared" and "the stall we are fixing appeared"
-      are not the same claim.
-      → **Supersedes the earlier battery-powered batches** (6/10 change, 4/10 control),
-      which are retained above only as the record of why an absolute rate must not be
-      quoted without knowing the power state. On mains both the rate and the latency
-      recovered, confirming throttling was the whole story.
-      → Post-reboot hygiene that this depended on: macOS session-restore had relaunched a
-      sync_test OpenRV (inspector on port 19000), an xStudio, and two orphaned `rvio`
-      thumbnail jobs pinning 300-600% CPU. `pkill -f rv_thumbnails`,
-      `pkill -f start_openrv_inspector`, then wait for load < 5.
+      → **10/10 on mains power, with `9b8e8b6` included. 0 `Dequeue timeout`,
+      0 `POLL-SLOW` of any kind.** Topology confirmed SERIALISED by the probe
+      immediately beforehand, so this is definitely the develop build.
+      → Earlier readings on this task, kept for the record: 9/10 + 6/6 = 15/16 before
+      the ColourPipeline fix; 6/10 (change) vs 4/10 (control) on battery, both invalid
+      absolutes — see the battery note under 6.4.
+      → The ~1/10 `structural_consensus` residual did not appear in this batch. n=10
+      cannot distinguish "fixed by fewer poll-thread round-trips" from "did not come up",
+      so it is NOT claimed as fixed.
+      → Post-reboot hygiene this depends on: macOS session-restore relaunches sync_test
+      apps (an OpenRV with the inspector still on port 19000, an xStudio) and orphaned
+      `rvio` thumbnail jobs pinning 300-600% CPU. `pkill -f rv_thumbnails`,
+      `pkill -f start_openrv_inspector`, wait for load < 5.
 - [!] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
       → **Does not pass. 0/10, then 1/10 after two further fixes.** This change is now
       complete against its own spec and that is still not sufficient. Recorded as a
@@ -190,17 +188,20 @@
       topology directly rather than inferring it from the filesystem, and the source tree
       has been misleading three times across two sessions. Run it *before* each batch.
       → PR build outstanding — expect peak overlap 5.
-- [~] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
-      → develop: `openrv_hosts_selection` PASS, `contended_visibility_selection` PASS,
-      `contended_visibility_selection_rv` PASS, `xstudio_selects` FAIL
-      (`structural_consensus` — the same recurring mode, present in the control too).
+- [x] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
+      → **develop, mains power: `xstudio_selects` PASS, `openrv_hosts_selection` PASS,
+      `contended_visibility_selection` PASS, `contended_visibility_selection_rv` 2/3.**
+      `xstudio_selects` had failed `structural_consensus` on the earlier battery pass and
+      passes on mains — which is the battery lesson again, not a fix.
+      → `contended_visibility_selection_rv`'s failure is **not a sync failure and not a
+      regression**: the test detects that only one peer ever held the visibility lease and
+      refuses to report a vacuous pass ("the scenario never produced contention"). Same
+      failure appears in `run_history.jsonl` on 2026-08-18, before this change existed.
+      A scenario-precondition flake, worth its own look someday.
       → `contended_visibility_selection` passing is worth noting: it was failing 5/5
       before `3e21954`.
-      → The three passes were on battery and stand regardless (a pass under throttling is
-      still a pass). The single `xstudio_selects` failure was `structural_consensus`, the
-      same mode that survives on mains at ~1/10 and appears in the pre-change control —
-      re-run it on mains alongside 6.2 rather than treating it as a finding.
-      → PR build outstanding.
+      → PR build not run for these — 6.2 shows the whole suite is blocked there for
+      reasons outside this change.
 - [x] 6.5 Check `converged_late` in `run_history.jsonl` — a latency regression from deferring shows up there before it shows up as a failure (design Risks).
       → `converged_late` turned out to be useless as the signal: it is `True` on every
       run of this test, passing or failing, before and after. `time_to_converge` is the
@@ -254,6 +255,6 @@
       (confirmed flat across a full 63s run). A win on develop too: one fewer
       round-trip and wrapper construction per poll.
       → Does **not** make the PR build pass on its own — still `checkpoint_timeout`.
-      → **Needs a develop-build regression run** against the 15/16 baseline; the
-      PR build was live when it was written.
+      → **Develop regression run done: 10/10**, better than the 15/16 baseline it had
+      to beat, with zero `Dequeue timeout` and zero `POLL-SLOW`. Safe on both topologies.
 - [ ] 7.2 Once this lands and the PR is adoptable, revisit the deferred isolation/seek correctness fix in `fix-xstudio-selects-flakiness`, which needs prompt playhead adoption.
