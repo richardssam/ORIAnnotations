@@ -1,13 +1,20 @@
 ## Why
 
-> **STATUS 2026-08-25: premise disproved — do not implement as written.**
-> This change was created on the hypothesis that the plugin receives events via
-> a routing bug and must subscribe explicitly. A trace diff has since shown the
-> problem is a **synchronous `request_receive` timeout under
-> `xstudio/pr/python-per-subscription-listeners`**, which explicit subscriptions
-> would not fix. Retained as the record of that investigation. The live work is
-> the minimal repro described below; if it confirms an upstream regression this
-> change should be closed in favour of an xStudio bug report.
+> **STATUS 2026-08-25: SUPERSEDED — premise disproved, do not implement.**
+> Created on the hypothesis that the plugin receives events via a routing bug
+> and must subscribe explicitly. That is wrong, as is the follow-up hypothesis
+> that the PR regressed `request_receive`. An A/B with
+> `debug/xstudio_request_receive_repro.py` shows the xStudio Python
+> `Connection` is **not thread-safe for concurrent `request_receive` on either
+> build** — develop stalls too (max 200 s vs the PR's 100 s). The PR is
+> exonerated; it only changes dispatch timing enough to make an intermittent
+> collision reliable.
+>
+> The real work is plugin-side: serialise every `request_receive` onto the poll
+> thread, honouring the threading invariant the plugin already documents and
+> currently violates via `_adopt_playhead` -> `_carry_over_playback_mode` ->
+> `refresh_playhead_attributes`. That belongs in a new, correctly-named change.
+> Retained only as the record of how this was narrowed down.
 
 The xStudio sync plugin stops syncing when
 `xstudio/pr/python-per-subscription-listeners` is applied. Measured 2026-08-25

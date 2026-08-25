@@ -32,13 +32,25 @@ the entire timeout.
 This rules out the two earlier hypotheses: request/response is not broken
 (phase 1), and listener actors do not accumulate harmfully (phase 3, flat).
 
-**Still to do: run this on `develop` too.** If phase 4 also stalls there, the
-`Connection` is simply not thread-safe for concurrent `request_receive` and
-always has been — the PR would only be changing the timing that makes it fatal,
-and the fix belongs in the plugin (which issues requests from its poll thread
-*and* from xStudio callback threads). If phase 4 is clean on develop, the PR
-has introduced the contention and the fix belongs upstream. Do not conclude
-either way from the PR-side numbers alone.
+A/B RESULT (2026-08-25) — phase 4, 4 threads x 10 constructions
+---------------------------------------------------------------
+    build     mean      p50        max      timeouts   wall
+    PR        15.81s    0.0147s    100.05s   2         200.2s
+    develop    5.28s    0.0142s    200.01s   2         200.2s
+
+**Both builds stall. The contention is PRE-EXISTING, not introduced by the PR.**
+develop is if anything worse on max (200s = two stacked 100s timeouts). Serial
+use is clean on both; only concurrency breaks.
+
+Conclusion: the xStudio Python ``Connection`` is not thread-safe for concurrent
+``request_receive``, and never was. The sync plugin issues requests from its
+poll thread *and* from xStudio callback threads, which its own threading
+invariant already forbids ("event handlers SHALL only mutate cheap local state
+or enqueue onto ``_cmd_queue``"). The PR does not cause this; it changes
+dispatch timing enough to turn an intermittent collision into a reliable one
+(suite 9/10 -> 0/10).
+
+The fix is plugin-side: get every ``request_receive`` onto one thread.
 
 Usage
 -----
