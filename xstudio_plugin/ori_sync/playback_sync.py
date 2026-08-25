@@ -3,7 +3,6 @@
 """PlaybackSyncController — owns playback/selection state and methods."""
 
 import os
-import threading
 import time
 import opentimelineio as otio
 from xstudio.api.session.playhead import Playhead
@@ -133,20 +132,18 @@ class PlaybackSyncController:
         # paths — the viewport's own playhead-changed callback and the
         # selection poll — both notice the same newly-spawned playhead and both
         # call _carry_over_playback_mode within milliseconds of each other; this
-        # guard makes the second call a no-op instead of a redundant concurrent
+        # guard makes the second call a no-op instead of a redundant repeat
         # attribute fetch against the same actor (see _carry_over_playback_mode).
+        #
+        # This used to be a lock as well, because those two callers were on
+        # different threads and racing each other for the shared connection.
+        # They are both on the poll thread now (the viewport path is deferred
+        # through handle_viewport_playhead), so there is nothing left to
+        # serialise — and a lock was never the right answer anyway: it made the
+        # collision orderly while still parking a callback thread for up to the
+        # connection's full timeout.
         self._last_carried_over_playhead_key: str | None = None
         self._last_carried_over_at: float = 0.0
-        # Serializes the two callers above so the second one blocks on a cheap
-        # Python lock instead of racing the first on the shared xStudio
-        # connection: a bounded_timeout set by one thread mutates the
-        # connection's default_timeout_ms for *all* threads, so a client-side
-        # timeout on one caller's request cannot protect it from the other
-        # caller's in-flight request occupying the connection first. Taking the
-        # lock before checking the (key, time) guard, rather than only around
-        # the actual request, is what prevents that: the second thread waits
-        # here, cheaply, and by the time it gets in the guard already covers it.
-        self._carry_over_lock = threading.Lock()
         # Event-group key the selection handler is currently attached to.
         self._current_selection_group_key: str | None = None
         self._current_selection_container_uuid: str | None = None
@@ -162,10 +159,19 @@ class PlaybackSyncController:
         self._last_pinned_source_mode: bool | None = None
         self._last_sel_names = None
         self._last_src_names = None
-        self._last_playhead_check: float = 0.0
         # Poll-thread cadence for the periodic active-playhead re-check (see the
         # 6.15 step in ori_sync_plugin._poll_loop).
         self._last_playhead_scan: float = 0.0
+        # True while a "check_active_playhead" command is queued but not yet
+        # run, so a burst of selection events queues one re-check, not one each.
+        self._playhead_check_pending: bool = False
+        # Same idea for the per-frame playhead sample: see
+        # _enqueue_playhead_attr_work.
+        self._playhead_sample_pending: bool = False
+        # Playhead attribute uuid → name, seeded from the wrapper's own
+        # attrs_by_name_ at adoption.  Lets on_playhead_attribute_changed
+        # identify an attribute with no actor read at all; see _seed_attr_names.
+        self._attr_name_by_uuid: dict[str, str] = {}
         # Name of the viewport whose playhead we track, learned from Form-2
         # events.  _viewport_playhead resolves this same viewport every time; see
         # there for why "whichever viewport answers first" is not good enough.
@@ -320,7 +326,6 @@ class PlaybackSyncController:
         self._last_pinned_source_mode = None
         self._last_sel_names = None
         self._last_src_names = None
-        self._last_playhead_check = 0.0
         self._cached_viewed_tl_guid = None
         self._cached_viewed_tl_at = 0.0
         self._cur_view_mode = "sequence"
@@ -338,6 +343,9 @@ class PlaybackSyncController:
         self._last_source_atom_at = 0.0
         self._last_selection_change_at = 0.0
         self._last_playhead_scan = 0.0
+        self._playhead_check_pending = False
+        self._playhead_sample_pending = False
+        self._attr_name_by_uuid.clear()
         self._viewport_name = None
         self._last_scanned_playhead_key = None
         self._last_polled_frame = None
@@ -429,7 +437,6 @@ class PlaybackSyncController:
 
     # ── global playhead event ──────────────────────────────────────────
 
-    @bounded(_PLAYHEAD_TIMEOUT_MS)
     def on_global_playhead_event(self, event) -> None:
         """Track the on-screen playhead and detect locally-drawn annotations.
 
@@ -438,6 +445,20 @@ class PlaybackSyncController:
         - ``(event_atom, viewport_playhead_atom, viewport_name, playhead_actor)`` — Form 2
         - ``(event_atom, show_atom, UuidActor, UuidActor, str, int)`` — bookmark shown
           (fires when the user draws a stroke and when bookmarks are displayed)
+
+        Runs on an xStudio callback thread, so it only classifies the event and
+        enqueues — see the "Only the poll thread performs xStudio actor I/O"
+        requirement.  Everything it reads off the event (``UuidActor.uuid``, the
+        viewport name, the playhead actor handle) is carried by the message
+        itself; the two branches that need to *ask* xStudio anything hand off to
+        :meth:`handle_show_atom_media` and :meth:`handle_viewport_playhead`.
+
+        It used to be ``@bounded(_PLAYHEAD_TIMEOUT_MS)``.  That decorator is gone
+        from here rather than kept as a safety net: it sets the connection's
+        ``default_timeout_ms``, which is process-wide and not thread-local, so
+        arming it on a callback thread also reshaped the timeout of whatever the
+        poll thread had in flight.  The bound belongs on the poll-thread methods,
+        where it now is.
         """
         if not (len(event) >= 2 and isinstance(event[0], event_atom)):
             return
@@ -448,281 +469,17 @@ class PlaybackSyncController:
             _shape = f"len={len(event)} types=[{', '.join(type(e).__name__ for e in event)}]"
             is_bookmark_shown = len(event) == 6 and isinstance(event[5], int)
             if not is_bookmark_shown and len(event) >= 5 and hasattr(event[2], 'uuid'):
-                # On-screen media changed
-                self.check_and_update_active_playhead()
-                media_ua = event[2]
-                media_uuid_str = str(media_ua.uuid)
-                is_playlist = self._viewport_container_is_playlist
-                is_timeline = self._viewport_container_is_timeline
-                _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
-                _media_name_hint = None
-                # Resolve via the timeline actually on screen right now, not
-                # manager.active_timeline_guid — that field is only updated by
-                # this same handler (further below) and a few apply paths, so it
-                # still holds the *previous* selection's value while this event
-                # is being processed.  Same xStudio media UUID can be registered
-                # under multiple owning timelines (e.g. once as a standalone
-                # bin/individual-clip entry, again as a sequence clip after the
-                # clip is folded into a sequence); sync_guid_for_xs_uuid's
-                # unscoped fallback scan would otherwise return whichever one
-                # was registered first — the stale bin guid — instead of the
-                # sequence's own clip guid that peers actually share.
-                clip_guid = self.plugin.media.sync_guid_for_xs_uuid(
-                    media_uuid_str,
-                    self.cached_viewed_timeline_guid(ttl=0.1),
-                )
-                if clip_guid:
-                    media_obj = (
-                        self.plugin.media._sync_guid_to_xs_media.get(clip_guid)
-                        or self.plugin.media._flat_clip_to_media.get(clip_guid)
-                    )
-                    if media_obj:
-                        _media_name_hint = media_obj.name
-
-                if not clip_guid or not _media_name_hint:
-                    # Legacy fallback scan — snapshot to avoid RuntimeError from concurrent mutation
-                    _all_pl = [pl for pl, _ in list(self.plugin._sync_playlists.values())]
-                    if hasattr(self.plugin, "structure") and hasattr(self.plugin.structure, "_xs_flat_playlists"):
-                        _all_pl.extend([pl for pl, _ in list(self.plugin.structure._xs_flat_playlists.values())])
-                    for _pl in _all_pl:
-                        try:
-                            for _m in _pl.media:
-                                if str(_m.uuid) == media_uuid_str:
-                                    _media_name_hint = _m.name
-                                    clip_guid = self.plugin.media.clip_guid_for_media_name(_media_name_hint)
-                                    break
-                        except Exception:
-                            pass
-                        if _media_name_hint:
-                            break
-
-                _is_new_media = (_media_name_hint is not None and _media_name_hint != self._last_show_atom_media)
-                _, _prov_note = self._provenance()
-                _log(
-                    f"[SEL] show_atom media-change: name={_media_name_hint!r}"
-                    f" uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}"
-                    f"{_prov_note}"
-                )
-                # Determine view_mode by checking whether this media UUID belongs
-                # to a tracked sequence (Timeline) playlist.
-                _seq_tl_guid: str | None = None
-                if clip_guid and self.plugin.manager:
-                    for _tg, _tl in list(self.plugin.manager.timelines.items()):
-                        if _tl.metadata.get("xs_flat_playlist"):
-                            continue
-                        # Skip dynamic single-clip timelines (created lazily by
-                        # get_or_create_clip_timeline for clip-level annotation
-                        # bookkeeping).  They hold exactly one clip — a copy of
-                        # whatever sequence/bin clip was last selected — and are
-                        # not real sequences.  Without this check, once any clip
-                        # had been individually selected this session, its
-                        # leftover clip-timeline entry made every later
-                        # selection of that same clip look like "media inside a
-                        # sequence" (_is_seq_media=True), wrongly triggering the
-                        # "playing through sequence" suppression and silently
-                        # dropping the selection broadcast even with no sequence
-                        # ever created.
-                        if _tl.metadata.get("clip_timeline_for"):
-                            continue
-                        for _track in _tl.tracks:
-                            if _track.kind == otio.schema.TrackKind.Video:
-                                if any(
-                                    getattr(_c, "metadata", {}).get("sync", {}).get("guid") == clip_guid
-                                    for _c in _track
-                                    if isinstance(_c, otio.schema.Clip)
-                                ):
-                                    _seq_tl_guid = _tg
-                                    break
-                        if _seq_tl_guid:
-                            break
-
-                if _seq_tl_guid is None:
-                    # Fallback — snapshot to avoid RuntimeError from concurrent mutation
-                    for _tg, (_seq_pl, _xs_tl, _kn) in list(self.plugin.structure._xs_sequence_playlists.items()):
-                        if self.plugin.manager:
-                            _mgr_tl = self.plugin.manager.timelines.get(_tg)
-                            if _mgr_tl:
-                                if _mgr_tl.metadata.get("xs_flat_playlist"):
-                                    continue
-                                if _mgr_tl.metadata.get("clip_timeline_for"):
-                                    continue
-                        try:
-                            for _m in _seq_pl.media:
-                                if str(_m.uuid) == media_uuid_str:
-                                    _seq_tl_guid = _tg
-                                    break
-                        except Exception:
-                            pass
-                        if _seq_tl_guid:
-                            break
-
-                _is_seq_media = _seq_tl_guid is not None
-
-                # Normalize to the SEQUENCE clip's guid before broadcasting.  The
-                # same media is a separate OTIO object in the bin vs the sequence,
-                # with different sync guids; only the sequence clip's guid is shared
-                # across peers.  Selecting via the bin would otherwise broadcast the
-                # bin guid, which the peer (which only has the sequence) can't match
-                # — they end up "looking at something different".  Map bin↔sequence
-                # by media basename so both sides exchange the shared identity.
-                if _seq_tl_guid and _media_name_hint and self.plugin.manager:
-                    _seq_tl = self.plugin.manager.timelines.get(_seq_tl_guid)
-                    if _seq_tl is not None:
-                        _base = os.path.splitext(os.path.basename(_media_name_hint))[0].lower()
-                        _found = None
-                        for _track in _seq_tl.tracks:
-                            if _track.kind != otio.schema.TrackKind.Video:
-                                continue
-                            for _c in _track:
-                                if not isinstance(_c, otio.schema.Clip):
-                                    continue
-                                _cn = os.path.splitext(os.path.basename(_c.name or ""))[0].lower()
-                                if _cn == _base:
-                                    _found = _c.metadata.get("sync", {}).get("guid")
-                                    break
-                                # Fallback: match by ExternalReference basename for
-                                # xStudio-origin sequence clips whose name is empty.
-                                _mr = getattr(_c, "media_reference", None)
-                                if isinstance(_mr, otio.schema.ExternalReference):
-                                    _ref_base = os.path.splitext(
-                                        os.path.basename(_mr.target_url or "")
-                                    )[0].lower()
-                                    if _ref_base and _ref_base == _base:
-                                        _found = _c.metadata.get("sync", {}).get("guid")
-                                        break
-                            if _found:
-                                break
-                        if _found and _found != clip_guid:
-                            _log(f"[SEL] normalize bin→sequence clip guid {str(clip_guid)[:8]}→{_found[:8]}")
-                            clip_guid = _found
-
-                # Determine view_mode from what is actually being viewed, in
-                # priority order:
-                #   1. PSM=False  → an isolated single clip → "source".
-                #   2. viewing a Timeline container → "sequence".
-                #   3. viewing a Playlist container (the bin) → "source", even if
-                #      the media also appears in a sequence — selecting it in the
-                #      bin is a source/bin selection, not a sequence selection.
-                #      (Keying off "_is_seq_media" here mislabelled bin clicks as
-                #      mode=sequence and desynced the peers.)
-                #   4. fallback when container type is unknown.
-                # Normally use the cached Pinned Source Mode, but it is only
-                # refreshed when the selection poll runs, which lags xStudio by a
-                # poll or more.  When a deliberate selection fired within the
-                # last few seconds the user may have just entered single-clip
-                # ("select a clip in the timeline") mode whose PSM flip we have
-                # not polled yet — read PSM fresh so the FIRST selected clip is
-                # not mislabelled as mode=sequence against a stale PSM=True.
-                # Still gated on a recent selection so scrub/playback show_atoms
-                # keep using the cheap cached value.
-                #
-                # "Deliberate selection" is deliberately NOT just source_atom.
-                # A double-click can reach us through the selection poll with no
-                # source_atom at all, and then the stale PSM=True makes the
-                # scan-through guard below swallow it — four consecutive
-                # attempts to select one clip were dropped that way on
-                # 2026-08-09 08:58-08:59, while the ones that did fire a
-                # source_atom went through.  The poll's own change detection is
-                # the missing signal, so it counts too.
-                _psm = self._last_pinned_source_mode
-                _selected_recently = max(
-                    self._last_source_atom_at, self._last_selection_change_at
-                )
-                if time.monotonic() - _selected_recently < 3.0:
-                    _fresh_psm = self._read_pinned_source_mode_fresh()
-                    if _fresh_psm is not None:
-                        _psm = _fresh_psm
-                _in_single_clip = (_psm is False)
-                if _in_single_clip:
-                    view_mode = "source"
-                elif is_timeline:
-                    view_mode = "sequence"
-                elif is_playlist:
-                    view_mode = "source"
-                else:
-                    view_mode = "sequence" if _is_seq_media else "source"
-                # Track unconditionally — PSM True→False handler reads this to
-                # broadcast mode=source even when the show_atom was not suppressed.
-                if _media_name_hint:
-                    self._last_show_atom_media = _media_name_hint
-                    self._last_show_atom_seq_tl_guid = _seq_tl_guid
-                    self._last_show_atom_at = time.monotonic()
-                # Echo guard: suppress the show_atom burst fired after we call
-                # select_all() / set_on_screen_source in apply_selection.
-                if time.monotonic() < self._selection_broadcast_suppress_until:
-                    _log("[SEL] → suppressed (echo guard)")
+                # On-screen media changed.  The uuid is a field of the UuidActor
+                # in the message, not a read — everything else this needs is
+                # resolved on the poll thread.
+                try:
+                    media_uuid_str = str(event[2].uuid)
+                except Exception:
                     return
-                # Extended clip-specific guard: a POLL-SLOW can delay the show_atom
-                # by 2+ s, past the short time window above.  If this show_atom is
-                # for the exact clip we most recently applied remotely, suppress it
-                # (it's the delayed echo, not a new local action).  A local switch
-                # to a *different* clip is not suppressed (different guid).
-                if (
-                    clip_guid
-                    and clip_guid == self._applied_clip_echo_guid
-                    and time.monotonic() < self._applied_clip_echo_until
-                ):
-                    _log("[SEL] → suppressed (delayed clip echo)")
-                    return
-                if self._is_scan_through(
-                    is_seq_media=_is_seq_media,
-                    is_playlist=is_playlist,
-                    in_single_clip=_in_single_clip,
-                ):
-                    _log("[SEL] → suppressed (playing through sequence)")
-                    return
-                if (
-                    self.plugin.manager
-                    and self.plugin.manager.status == STATE_SYNCED
-                ):
-                    self._last_viewed_clip_guid = clip_guid
-                    if view_mode == "sequence" and _seq_tl_guid:
-                        self.plugin.manager.active_timeline_guid = _seq_tl_guid
-                    elif view_mode == "source" and clip_guid:
-                        clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
-                        if clip_tl_guid:
-                            self.plugin.manager.active_timeline_guid = clip_tl_guid
-                    # Local bookkeeping above runs either way — this peer really
-                    # is viewing that clip now, whoever caused it.  Only the
-                    # *broadcast* is conditional.
-                    _, _prov_note = self._provenance()
-                    if self._induced_by_remote_apply():
-                        # An annotation must never change what the session is
-                        # looking at.  Applying a peer's stroke makes xStudio
-                        # *show* the annotated clip, which was being read as a
-                        # fresh local isolation — so this peer broadcast
-                        # ``mode=source`` with ``forcing frame=0``, the drawing
-                        # peer's playhead was reset mid-stroke, and the rest of
-                        # its live stroke arrived stamped frame 0 (2026-08-13
-                        # 11:21:08, reviewer annotating while the driver drove).
-                        #
-                        # The existing echo guards cannot catch it: they key on
-                        # a view message this peer applied, and this show_atom
-                        # came from an annotation.  Provenance is the only thing
-                        # that knows, and it already did — it was being logged
-                        # and then ignored.  Matches what the Pinned Source Mode
-                        # branches below already do with the same signal.
-                        _log(
-                            f"[SEL] → broadcast view-state clip {clip_guid[:8]}"
-                            f" mode={view_mode} suppressed (remote-induced){_prov_note}"
-                        )
-                    else:
-                        _force_new = False
-                        if view_mode == "source":
-                            if _is_new_media:
-                                _force_new = True
-                            elif self._cur_view_mode != "source":
-                                _force_new = True
-                        if view_mode == "source" and not clip_guid:
-                            _log(
-                                f"[SEL] → broadcast view-state suppressed: mode=source but no clip_guid{_prov_note}"
-                            )
-                        else:
-                            self.broadcast_view_state(clip_guid, view_mode, force_new_source_clip=_force_new)
-                            _log(
-                                f"[SEL] → broadcast view-state clip {(clip_guid or '-')[:8]} mode={view_mode}"
-                                f"{_prov_note}"
-                            )
+                self.plugin._cmd_queue.put((
+                    "show_atom_media",
+                    {"media_uuid": media_uuid_str, "shape": _shape},
+                ))
                 return
 
             if self.plugin.annotation.reload_in_progress():
@@ -740,13 +497,320 @@ class PlaybackSyncController:
         if len(event) <= 3:
             _log(f"viewport_playhead_atom Form-1 (ignored): len={len(event)}")
             return
-        ph_remote = event[3]
+        try:
+            _viewport = str(event[2])
+        except Exception:
+            _viewport = None
+        # The playhead actor handle is a value carried by the message; wrapping
+        # it in a Playhead is what costs ~46 round-trips, and that now happens on
+        # the poll thread.
+        self.plugin._cmd_queue.put((
+            "viewport_playhead",
+            {"viewport": _viewport, "ph_remote": event[3]},
+        ))
+
+    @bounded(_PLAYHEAD_TIMEOUT_MS)
+    def handle_show_atom_media(self, media_uuid_str: str, _shape: str) -> None:
+        """Poll thread: react to the on-screen media having changed.
+
+        The body of the old ``on_global_playhead_event`` show_atom media-change
+        branch, unchanged apart from running here.  It resolves the clip guid,
+        decides ``view_mode`` and broadcasts the view state — every step of which
+        reads xStudio (the playhead re-check, media names, Pinned Source Mode,
+        the viewed container).
+
+        The echo and scan-through guards below are time-windowed (3 s, and the
+        suppression windows).  Deferring shifts them by one poll interval at
+        most, which is well inside their tolerance — and the queue is FIFO, so a
+        selection event that arrived first still stamps ``_last_source_atom_at``
+        before this reads it.
+        """
+        self.check_and_update_active_playhead()
+        is_playlist = self._viewport_container_is_playlist
+        is_timeline = self._viewport_container_is_timeline
+        _container_label = "playlist" if is_playlist else ("timeline" if is_timeline else "unknown")
+        _media_name_hint = None
+        # Resolve via the timeline actually on screen right now, not
+        # manager.active_timeline_guid — that field is only updated by
+        # this same handler (further below) and a few apply paths, so it
+        # still holds the *previous* selection's value while this event
+        # is being processed.  Same xStudio media UUID can be registered
+        # under multiple owning timelines (e.g. once as a standalone
+        # bin/individual-clip entry, again as a sequence clip after the
+        # clip is folded into a sequence); sync_guid_for_xs_uuid's
+        # unscoped fallback scan would otherwise return whichever one
+        # was registered first — the stale bin guid — instead of the
+        # sequence's own clip guid that peers actually share.
+        clip_guid = self.plugin.media.sync_guid_for_xs_uuid(
+            media_uuid_str,
+            self.cached_viewed_timeline_guid(ttl=0.1),
+        )
+        if clip_guid:
+            media_obj = (
+                self.plugin.media._sync_guid_to_xs_media.get(clip_guid)
+                or self.plugin.media._flat_clip_to_media.get(clip_guid)
+            )
+            if media_obj:
+                _media_name_hint = media_obj.name
+
+        if not clip_guid or not _media_name_hint:
+            # Legacy fallback scan — snapshot to avoid RuntimeError from concurrent mutation
+            _all_pl = [pl for pl, _ in list(self.plugin._sync_playlists.values())]
+            if hasattr(self.plugin, "structure") and hasattr(self.plugin.structure, "_xs_flat_playlists"):
+                _all_pl.extend([pl for pl, _ in list(self.plugin.structure._xs_flat_playlists.values())])
+            for _pl in _all_pl:
+                try:
+                    for _m in _pl.media:
+                        if str(_m.uuid) == media_uuid_str:
+                            _media_name_hint = _m.name
+                            clip_guid = self.plugin.media.clip_guid_for_media_name(_media_name_hint)
+                            break
+                except Exception:
+                    pass
+                if _media_name_hint:
+                    break
+
+        _is_new_media = (_media_name_hint is not None and _media_name_hint != self._last_show_atom_media)
+        _, _prov_note = self._provenance()
+        _log(
+            f"[SEL] show_atom media-change: name={_media_name_hint!r}"
+            f" uuid={media_uuid_str[:8]} container={_container_label} raw={_shape}"
+            f"{_prov_note}"
+        )
+        # Determine view_mode by checking whether this media UUID belongs
+        # to a tracked sequence (Timeline) playlist.
+        _seq_tl_guid: str | None = None
+        if clip_guid and self.plugin.manager:
+            for _tg, _tl in list(self.plugin.manager.timelines.items()):
+                if _tl.metadata.get("xs_flat_playlist"):
+                    continue
+                # Skip dynamic single-clip timelines (created lazily by
+                # get_or_create_clip_timeline for clip-level annotation
+                # bookkeeping).  They hold exactly one clip — a copy of
+                # whatever sequence/bin clip was last selected — and are
+                # not real sequences.  Without this check, once any clip
+                # had been individually selected this session, its
+                # leftover clip-timeline entry made every later
+                # selection of that same clip look like "media inside a
+                # sequence" (_is_seq_media=True), wrongly triggering the
+                # "playing through sequence" suppression and silently
+                # dropping the selection broadcast even with no sequence
+                # ever created.
+                if _tl.metadata.get("clip_timeline_for"):
+                    continue
+                for _track in _tl.tracks:
+                    if _track.kind == otio.schema.TrackKind.Video:
+                        if any(
+                            getattr(_c, "metadata", {}).get("sync", {}).get("guid") == clip_guid
+                            for _c in _track
+                            if isinstance(_c, otio.schema.Clip)
+                        ):
+                            _seq_tl_guid = _tg
+                            break
+                if _seq_tl_guid:
+                    break
+
+        if _seq_tl_guid is None:
+            # Fallback — snapshot to avoid RuntimeError from concurrent mutation
+            for _tg, (_seq_pl, _xs_tl, _kn) in list(self.plugin.structure._xs_sequence_playlists.items()):
+                if self.plugin.manager:
+                    _mgr_tl = self.plugin.manager.timelines.get(_tg)
+                    if _mgr_tl:
+                        if _mgr_tl.metadata.get("xs_flat_playlist"):
+                            continue
+                        if _mgr_tl.metadata.get("clip_timeline_for"):
+                            continue
+                try:
+                    for _m in _seq_pl.media:
+                        if str(_m.uuid) == media_uuid_str:
+                            _seq_tl_guid = _tg
+                            break
+                except Exception:
+                    pass
+                if _seq_tl_guid:
+                    break
+
+        _is_seq_media = _seq_tl_guid is not None
+
+        # Normalize to the SEQUENCE clip's guid before broadcasting.  The
+        # same media is a separate OTIO object in the bin vs the sequence,
+        # with different sync guids; only the sequence clip's guid is shared
+        # across peers.  Selecting via the bin would otherwise broadcast the
+        # bin guid, which the peer (which only has the sequence) can't match
+        # — they end up "looking at something different".  Map bin↔sequence
+        # by media basename so both sides exchange the shared identity.
+        if _seq_tl_guid and _media_name_hint and self.plugin.manager:
+            _seq_tl = self.plugin.manager.timelines.get(_seq_tl_guid)
+            if _seq_tl is not None:
+                _base = os.path.splitext(os.path.basename(_media_name_hint))[0].lower()
+                _found = None
+                for _track in _seq_tl.tracks:
+                    if _track.kind != otio.schema.TrackKind.Video:
+                        continue
+                    for _c in _track:
+                        if not isinstance(_c, otio.schema.Clip):
+                            continue
+                        _cn = os.path.splitext(os.path.basename(_c.name or ""))[0].lower()
+                        if _cn == _base:
+                            _found = _c.metadata.get("sync", {}).get("guid")
+                            break
+                        # Fallback: match by ExternalReference basename for
+                        # xStudio-origin sequence clips whose name is empty.
+                        _mr = getattr(_c, "media_reference", None)
+                        if isinstance(_mr, otio.schema.ExternalReference):
+                            _ref_base = os.path.splitext(
+                                os.path.basename(_mr.target_url or "")
+                            )[0].lower()
+                            if _ref_base and _ref_base == _base:
+                                _found = _c.metadata.get("sync", {}).get("guid")
+                                break
+                    if _found:
+                        break
+                if _found and _found != clip_guid:
+                    _log(f"[SEL] normalize bin→sequence clip guid {str(clip_guid)[:8]}→{_found[:8]}")
+                    clip_guid = _found
+
+        # Determine view_mode from what is actually being viewed, in
+        # priority order:
+        #   1. PSM=False  → an isolated single clip → "source".
+        #   2. viewing a Timeline container → "sequence".
+        #   3. viewing a Playlist container (the bin) → "source", even if
+        #      the media also appears in a sequence — selecting it in the
+        #      bin is a source/bin selection, not a sequence selection.
+        #      (Keying off "_is_seq_media" here mislabelled bin clicks as
+        #      mode=sequence and desynced the peers.)
+        #   4. fallback when container type is unknown.
+        # Normally use the cached Pinned Source Mode, but it is only
+        # refreshed when the selection poll runs, which lags xStudio by a
+        # poll or more.  When a deliberate selection fired within the
+        # last few seconds the user may have just entered single-clip
+        # ("select a clip in the timeline") mode whose PSM flip we have
+        # not polled yet — read PSM fresh so the FIRST selected clip is
+        # not mislabelled as mode=sequence against a stale PSM=True.
+        # Still gated on a recent selection so scrub/playback show_atoms
+        # keep using the cheap cached value.
+        #
+        # "Deliberate selection" is deliberately NOT just source_atom.
+        # A double-click can reach us through the selection poll with no
+        # source_atom at all, and then the stale PSM=True makes the
+        # scan-through guard below swallow it — four consecutive
+        # attempts to select one clip were dropped that way on
+        # 2026-08-09 08:58-08:59, while the ones that did fire a
+        # source_atom went through.  The poll's own change detection is
+        # the missing signal, so it counts too.
+        _psm = self._last_pinned_source_mode
+        _selected_recently = max(
+            self._last_source_atom_at, self._last_selection_change_at
+        )
+        if time.monotonic() - _selected_recently < 3.0:
+            _fresh_psm = self._read_pinned_source_mode_fresh()
+            if _fresh_psm is not None:
+                _psm = _fresh_psm
+        _in_single_clip = (_psm is False)
+        if _in_single_clip:
+            view_mode = "source"
+        elif is_timeline:
+            view_mode = "sequence"
+        elif is_playlist:
+            view_mode = "source"
+        else:
+            view_mode = "sequence" if _is_seq_media else "source"
+        # Track unconditionally — PSM True→False handler reads this to
+        # broadcast mode=source even when the show_atom was not suppressed.
+        if _media_name_hint:
+            self._last_show_atom_media = _media_name_hint
+            self._last_show_atom_seq_tl_guid = _seq_tl_guid
+            self._last_show_atom_at = time.monotonic()
+        # Echo guard: suppress the show_atom burst fired after we call
+        # select_all() / set_on_screen_source in apply_selection.
+        if time.monotonic() < self._selection_broadcast_suppress_until:
+            _log("[SEL] → suppressed (echo guard)")
+            return
+        # Extended clip-specific guard: a POLL-SLOW can delay the show_atom
+        # by 2+ s, past the short time window above.  If this show_atom is
+        # for the exact clip we most recently applied remotely, suppress it
+        # (it's the delayed echo, not a new local action).  A local switch
+        # to a *different* clip is not suppressed (different guid).
+        if (
+            clip_guid
+            and clip_guid == self._applied_clip_echo_guid
+            and time.monotonic() < self._applied_clip_echo_until
+        ):
+            _log("[SEL] → suppressed (delayed clip echo)")
+            return
+        if self._is_scan_through(
+            is_seq_media=_is_seq_media,
+            is_playlist=is_playlist,
+            in_single_clip=_in_single_clip,
+        ):
+            _log("[SEL] → suppressed (playing through sequence)")
+            return
+        if (
+            self.plugin.manager
+            and self.plugin.manager.status == STATE_SYNCED
+        ):
+            self._last_viewed_clip_guid = clip_guid
+            if view_mode == "sequence" and _seq_tl_guid:
+                self.plugin.manager.active_timeline_guid = _seq_tl_guid
+            elif view_mode == "source" and clip_guid:
+                clip_tl_guid = self.plugin.manager.get_or_create_clip_timeline(clip_guid)
+                if clip_tl_guid:
+                    self.plugin.manager.active_timeline_guid = clip_tl_guid
+            # Local bookkeeping above runs either way — this peer really
+            # is viewing that clip now, whoever caused it.  Only the
+            # *broadcast* is conditional.
+            _, _prov_note = self._provenance()
+            if self._induced_by_remote_apply():
+                # An annotation must never change what the session is
+                # looking at.  Applying a peer's stroke makes xStudio
+                # *show* the annotated clip, which was being read as a
+                # fresh local isolation — so this peer broadcast
+                # ``mode=source`` with ``forcing frame=0``, the drawing
+                # peer's playhead was reset mid-stroke, and the rest of
+                # its live stroke arrived stamped frame 0 (2026-08-13
+                # 11:21:08, reviewer annotating while the driver drove).
+                #
+                # The existing echo guards cannot catch it: they key on
+                # a view message this peer applied, and this show_atom
+                # came from an annotation.  Provenance is the only thing
+                # that knows, and it already did — it was being logged
+                # and then ignored.  Matches what the Pinned Source Mode
+                # branches below already do with the same signal.
+                _log(
+                    f"[SEL] → broadcast view-state clip {clip_guid[:8]}"
+                    f" mode={view_mode} suppressed (remote-induced){_prov_note}"
+                )
+            else:
+                _force_new = False
+                if view_mode == "source":
+                    if _is_new_media:
+                        _force_new = True
+                    elif self._cur_view_mode != "source":
+                        _force_new = True
+                if view_mode == "source" and not clip_guid:
+                    _log(
+                        f"[SEL] → broadcast view-state suppressed: mode=source but no clip_guid{_prov_note}"
+                    )
+                else:
+                    self.broadcast_view_state(clip_guid, view_mode, force_new_source_clip=_force_new)
+                    _log(
+                        f"[SEL] → broadcast view-state clip {(clip_guid or '-')[:8]} mode={view_mode}"
+                        f"{_prov_note}"
+                    )
+    @bounded(_PLAYHEAD_TIMEOUT_MS)
+    def handle_viewport_playhead(self, viewport, ph_remote) -> None:
+        """Poll thread: adopt the playhead a viewport just bound to.
+
+        Deferred from ``on_global_playhead_event``'s Form-2 branch.  All three
+        steps here read xStudio — wrapping the actor handle in a ``Playhead``
+        alone is roughly 46 round-trips, since ``ModuleBase.__init__`` fetches
+        every attribute one at a time — which is why the handler passes the bare
+        handle rather than doing any of it.
+        """
         # Remember which viewport this is: _viewport_playhead resolves that same
         # viewport on every later poll, rather than whichever one answers first.
-        try:
-            self._viewport_name = str(event[2]) or self._viewport_name
-        except Exception:
-            pass
+        if viewport:
+            self._viewport_name = viewport
         # Compare BEFORE constructing: building a Playhead subscribes it to the
         # playhead's attribute events group, so constructing one per event just to
         # discard it churns subscriptions on a group we are already listening to.
@@ -760,10 +824,10 @@ class PlaybackSyncController:
                     # the address cannot answer it.
                     _log(
                         f"[SEL] viewport_playhead_atom Form-2: active playhead updated"
-                        f" viewport={event[2]!r} playhead={ph_remote}"
+                        f" viewport={viewport!r} playhead={ph_remote}"
                     )
             except Exception:
-                _log_exc("on_global_playhead_event: failed to update playhead")
+                _log_exc("handle_viewport_playhead: failed to update playhead")
 
         # Subscribe to viewed container's selection actor events, and its event
         # group (for add_media detection).  Both re-subscribe when the viewed
@@ -820,7 +884,14 @@ class PlaybackSyncController:
             _log_exc("[SEL] Failed to subscribe to container selection events")
 
     def on_selection_event(self, event) -> None:
-        """Fires when selection actor changes selection."""
+        """Fires when selection actor changes selection.
+
+        Runs on an xStudio callback thread, so it performs no actor I/O — see
+        the "Only the poll thread performs xStudio actor I/O" requirement.  Both
+        the playhead re-check and the selection resolution are enqueued, in that
+        order; the queue is FIFO, so the poll thread still refreshes the playhead
+        before it resolves the selection against it.
+        """
         if not (
             len(event) > 1
             and isinstance(event[0], event_atom)
@@ -838,19 +909,41 @@ class PlaybackSyncController:
         # single-clip decision) so the first selected clip isn't mislabelled
         # against a stale cached Pinned Source Mode.
         self._last_source_atom_at = now
-        # Throttle the blocking current_playhead() query: on_global_playhead_event
-        # already maintains active_playhead, so re-querying it on every selection
-        # event is redundant.  During a selection storm those per-event blocking
-        # reads stack into multi-second stalls (each bounded read costs up to its
-        # timeout).  At most once per second is plenty to catch a real change.
-        if now - self._last_playhead_check >= 1.0:
-            self._last_playhead_check = now
-            self.check_and_update_active_playhead()
+        # The playhead re-check is a blocking current_playhead() query, so it
+        # goes to the poll thread.  It used to run here throttled to 1 Hz — but
+        # that throttle only rationed the collision, it did not remove it, and at
+        # the same 1 Hz cadence the poll loop was already making the identical
+        # call (the 6.15 step in ori_sync_plugin._poll_loop).  Enqueuing gets the
+        # promptness the handler wanted without a second thread touching the
+        # connection.
+        self.enqueue_playhead_check()
         self.enqueue_selection_update()
 
     def enqueue_selection_update(self) -> None:
         """Enqueue selection resolution to the poll thread command queue."""
         self.plugin._cmd_queue.put(("resolve_selection", None))
+
+    def enqueue_playhead_check(self) -> None:
+        """Enqueue an active-playhead re-check to the poll thread.
+
+        Deliberately a *separate* command from ``resolve_selection`` rather than
+        folded into it: the periodic scan and the connect path already call
+        :meth:`check_and_update_active_playhead` directly, and a caller that
+        wants only the re-check should not have to trigger a selection
+        broadcast to get one.
+
+        Coalesced while one is already queued.  A selection storm fires this per
+        event, and the check is an idempotent refresh — a hundred queued copies
+        would do the same work a hundred times and only delay the resolutions
+        behind them.  This is not the 1 Hz throttle in another costume: nothing
+        is rationed or dropped, and the check the poll thread runs reflects
+        every event that arrived before it.  The flag is cleared *before* the
+        check runs, so an event landing mid-check queues a fresh one.
+        """
+        if self._playhead_check_pending:
+            return
+        self._playhead_check_pending = True
+        self.plugin._cmd_queue.put(("check_active_playhead", None))
 
     def suppress_selection_broadcast(self, seconds: float) -> None:
         """Withhold selection/view broadcasts for *seconds*, for a change we caused.
@@ -1167,6 +1260,7 @@ class PlaybackSyncController:
             ph.attribute_changed = self.plugin.playhead_attribute_changed
         except Exception:
             _log_exc("_adopt_playhead: could not wire attribute_changed")
+        self._seed_attr_names(ph)
         self._carry_over_playback_mode(ph)
         self.plugin.active_playhead = ph
         return True
@@ -1354,47 +1448,115 @@ class PlaybackSyncController:
         except Exception:
             _log_exc("_reacquire_active_playhead: failed")
 
+    def _seed_attr_names(self, ph) -> None:
+        """Record *ph*'s attribute uuid → name map, so callbacks need no I/O.
+
+        ``ModuleBase.__init__`` already built ``attrs_by_name_`` — the names were
+        paid for when the wrapper was constructed and are sitting in memory.
+        Copying the inverse here is what lets
+        :meth:`on_playhead_attribute_changed` identify an attribute without the
+        round-trip ``attr.name`` costs.
+        """
+        try:
+            for name, attr in (getattr(ph, "attrs_by_name_", None) or {}).items():
+                self._attr_name_by_uuid[str(attr.uuid)] = name
+        except Exception:
+            # A wrapper without the map just falls back to the poll-thread
+            # resolve path below; nothing here is worth a traceback.
+            pass
+
     def on_playhead_attribute_changed(self, attr, role) -> None:
         """Fires when playhead position, play state, or loop mode changes.
 
-        Runs on xStudio's **message-dispatch thread**, not the poll thread, which
-        constrains it in two ways the poll-thread methods are not.
+        Runs on xStudio's **message-dispatch thread**, so it performs no actor
+        I/O at all and does no work itself — it identifies the attribute from
+        local state and enqueues (see the "Only the poll thread performs xStudio
+        actor I/O" requirement).
 
-        ``attr.name`` is not a local field: each read is a synchronous
-        ``request_receive`` round-trip to the attribute's actor, bounded by the
-        connection's 100 s default.  It is therefore read *once* here and passed
-        down.  Reading it per use cost three round-trips per event — and this
-        event fires once per rendered frame while scrubbing.
+        Identifying the attribute without I/O is the whole trick here.
+        ``attr.name`` is a synchronous ``request_receive`` per read, and this
+        event fires once per rendered frame while scrubbing — but ``attr.uuid``
+        *is* a local field (``ModuleAttribute.__init__``), and the dispatcher
+        found this very wrapper by uuid in ``attrs_by_uuid_``.  So the uuid is
+        free, and :meth:`_seed_attr_names` has already mapped it to a name.
 
-        The read is also bounded and guarded, because a stale playhead actor
-        raises out of this frame into xStudio's ``message_handler`` and takes the
-        dispatcher's handler with it.  Observed 2026-08-13 12:25:10: a peer's
-        playhead went stale mid-scrub, this callback raised ``TimeoutError``, and
-        the peer spent the next three minutes heartbeating normally while unable
-        to read its own playhead — still holding the session's host seat, since
-        liveness is measured by the poll thread's heartbeat and says nothing
-        about whether the actor layer beneath it still answers.
+        The old code read the name here, bounded and guarded, because a stale
+        playhead actor raises out of this frame into xStudio's
+        ``message_handler`` and takes the dispatcher's handler with it.  Observed
+        2026-08-13 12:25:10: a peer's playhead went stale mid-scrub, this
+        callback raised ``TimeoutError``, and the peer spent the next three
+        minutes heartbeating normally while unable to read its own playhead —
+        still holding the session's host seat, since liveness is measured by the
+        poll thread's heartbeat and says nothing about whether the actor layer
+        beneath it still answers.  Not reading anything here retires that hazard
+        rather than bounding it; the poll side keeps the bounds for its own reads.
+        """
+        try:
+            attr_key = str(attr.uuid)
+        except Exception:
+            return
+
+        attr_name = self._attr_name_by_uuid.get(attr_key)
+        if attr_name is None:
+            # Unseeded attribute (added after adoption, or a playhead we never
+            # adopted).  The poll thread reads the name, caches it and dispatches
+            # this same event, so the first one is delayed rather than dropped.
+            self.plugin._cmd_queue.put(("playhead_attr_name", attr))
+            return
+
+        self._enqueue_playhead_attr_work(attr_name)
+
+    def _enqueue_playhead_attr_work(self, attr_name: str) -> None:
+        """Queue the poll-thread work for a change to *attr_name*.
+
+        Shared by the callback thread (cache hit) and the poll thread (after
+        resolving a name it had not seen), so both dispatch identically.
+        """
+        if attr_name == "Loop Mode":
+            self.plugin._cmd_queue.put(("playhead_loop_mode", None))
+        elif attr_name == "Current Media Uuid":
+            self.plugin._cmd_queue.put(("playhead_media_changed", None))
+        elif attr_name in ("Logical Frame", "playing"):
+            # Coalesced: xStudio fires these ~60 Hz while scrubbing, and the
+            # poll thread samples the playhead *live*, so one queued marker
+            # already covers every event that arrived before it runs.  Queuing
+            # each one instead would put sixty playhead reads a second on the
+            # poll thread to compute the same answer.  Nothing is dropped — the
+            # sample reflects the latest state, and the flag is cleared before
+            # the sample so an event landing mid-sample queues a fresh one.
+            if self._playhead_sample_pending:
+                return
+            self._playhead_sample_pending = True
+            self.plugin._cmd_queue.put(("playhead_sample", attr_name))
+
+    def resolve_playhead_attr_name(self, attr) -> None:
+        """Poll thread: learn *attr*'s name, cache it, then dispatch the event.
+
+        The fallback for an attribute :meth:`_seed_attr_names` did not cover.
+        Bounded, and quiet on failure: a stale playhead during teardown or a
+        viewport swap is routine, and a traceback per frame would bury the log
+        it is meant to help read.  ``_reacquire_active_playhead`` recovers it.
         """
         try:
             with bounded_timeout(self.plugin.connection, _PLAYHEAD_TIMEOUT_MS):
                 attr_name = attr.name
+            self._attr_name_by_uuid[str(attr.uuid)] = attr_name
         except Exception:
-            # Not _log_exc: a stale playhead during teardown or a viewport swap
-            # is routine, and a per-frame traceback would bury the log it is
-            # meant to help read.  _reacquire_active_playhead recovers it.
-            _log("on_playhead_attribute_changed: could not read attribute name")
+            _log("resolve_playhead_attr_name: could not read attribute name")
             return
+        self._enqueue_playhead_attr_work(attr_name)
 
-        if attr_name == "Loop Mode":
-            self._on_loop_mode_changed()
-            return
+    def sample_and_broadcast_playhead(self, source_attr: str) -> None:
+        """Poll thread: read the live playhead and broadcast if it changed.
 
-        if attr_name == "Current Media Uuid":
-            self._carry_over_playback_mode(self.plugin.active_playhead)
-            return
-
-        if attr_name not in ("Logical Frame", "playing"):
-            return
+        The body of the old ``on_playhead_attribute_changed`` from the point it
+        first touched an actor.  Reading current state rather than state carried
+        on the event is what makes the coalescing in
+        :meth:`_enqueue_playhead_attr_work` safe.
+        """
+        # Cleared first: an event arriving while these reads are in flight must
+        # queue another sample rather than be swallowed by this one.
+        self._playhead_sample_pending = False
 
         if not self.plugin.active_playhead:
             return
@@ -1489,7 +1651,7 @@ class PlaybackSyncController:
         # Enqueue the broadcast command to be processed asynchronously
         _log(
             f"Event: queuing playback state broadcast frame={frame} playing={playing} "
-            f"(source_attr={attr_name})"
+            f"(source_attr={source_attr})"
         )
         self.plugin._cmd_queue.put(("broadcast_playback_state", state))
 
@@ -1913,6 +2075,11 @@ class PlaybackSyncController:
                         uuid=attr_uuid)
                     ph.attrs_by_name_[attr_wrapper.name] = attr_wrapper
                     ph.attrs_by_uuid_[attr_uuid] = attr_wrapper
+            # The uuids just changed, so the callback thread's name map is stale
+            # for this playhead.  Re-seed from the map we have right here rather
+            # than let on_playhead_attribute_changed miss and take the slow path
+            # on the next ~60 events of a scrub.
+            self._seed_attr_names(ph)
         except TimeoutError:
             _log(
                 "refresh_playhead_attributes: timed out after"
@@ -1936,8 +2103,10 @@ class PlaybackSyncController:
         viewport's own "active playhead changed" event (``_adopt_playhead``) and
         the selection poll noticing ``playhead_selection`` changed
         (``resolve_and_broadcast_selection``). Both call this method for the
-        *same* freshly-spawned playhead within milliseconds of each other, on
-        different threads. Without the guard below, both proceed to call
+        *same* freshly-spawned playhead within milliseconds of each other —
+        these days both on the poll thread, since the viewport path is deferred
+        through ``handle_viewport_playhead``. Without the guard below, both
+        proceed to call
         :meth:`refresh_playhead_attributes`, which fetches every one of the
         playhead's ~46 attributes one request at a time — so two threads doing
         it concurrently against a single actor mailbox doesn't run in parallel,
@@ -1975,33 +2144,32 @@ class PlaybackSyncController:
         """
         if ph is None or not self._last_known_playback_mode:
             return
-        with self._carry_over_lock:
-            key = self._remote_key(ph)
-            _now = time.monotonic()
-            if (
-                key is not None
-                and key == self._last_carried_over_playhead_key
-                and _now < self._last_carried_over_at + _PLAYHEAD_SETTLE_S
-            ):
-                return
-            # Past the guard: this call is going to do the work, so it is now
-            # worth paying for a wrapper if we were handed a bare handle.
-            ph = self._as_playhead(ph)
-            if ph is None:
-                return
-            self._last_carried_over_playhead_key = key
-            self._last_carried_over_at = _now
-            self.refresh_playhead_attributes(ph)
-            target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
-            if target is None:
-                return
-            try:
-                if _get_attr_str(ph, "Loop Mode") != target:
-                    self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
-                    ph.set_attribute("Loop Mode", target)
-                    _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
-            except Exception:
-                _log_exc("_carry_over_playback_mode: failed")
+        key = self._remote_key(ph)
+        _now = time.monotonic()
+        if (
+            key is not None
+            and key == self._last_carried_over_playhead_key
+            and _now < self._last_carried_over_at + _PLAYHEAD_SETTLE_S
+        ):
+            return
+        # Past the guard: this call is going to do the work, so it is now
+        # worth paying for a wrapper if we were handed a bare handle.
+        ph = self._as_playhead(ph)
+        if ph is None:
+            return
+        self._last_carried_over_playhead_key = key
+        self._last_carried_over_at = _now
+        self.refresh_playhead_attributes(ph)
+        target = _WIRE_TO_LOOP_MODE.get(self._last_known_playback_mode)
+        if target is None:
+            return
+        try:
+            if _get_attr_str(ph, "Loop Mode") != target:
+                self._loop_mode_apply_suppress_until = time.monotonic() + 0.4
+                ph.set_attribute("Loop Mode", target)
+                _log(f"[SEL] carried over Loop Mode={target} onto newly-acquired playhead")
+        except Exception:
+            _log_exc("_carry_over_playback_mode: failed")
 
     def _on_loop_mode_changed(self) -> None:
         """Local "Loop Mode" attribute change on the active playhead.

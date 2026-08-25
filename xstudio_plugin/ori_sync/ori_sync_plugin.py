@@ -1088,6 +1088,33 @@ class ORISyncPlugin(PluginBase):
                         )
             elif cmd == "resolve_selection":
                 self.playback.resolve_and_broadcast_selection()
+            elif cmd == "check_active_playhead":
+                # Deferred from a callback thread (selection events).  Cleared
+                # before the check, not after, so an event arriving while it
+                # runs queues a fresh one rather than being swallowed.  Stamping
+                # _last_playhead_scan keeps the 6.15 periodic scan from
+                # immediately repeating the read we just did.
+                self.playback._playhead_check_pending = False
+                self.playback.check_and_update_active_playhead()
+                self.playback._last_playhead_scan = time.monotonic()
+            elif cmd == "playhead_attr_name":
+                # Deferred from on_playhead_attribute_changed: an attribute whose
+                # name the callback thread could not resolve locally.
+                self.playback.resolve_playhead_attr_name(payload)
+            elif cmd == "playhead_loop_mode":
+                self.playback._on_loop_mode_changed()
+            elif cmd == "playhead_media_changed":
+                self.playback._carry_over_playback_mode(self.playback.plugin.active_playhead)
+            elif cmd == "playhead_sample":
+                self.playback.sample_and_broadcast_playhead(payload or "")
+            elif cmd == "show_atom_media":
+                self.playback.handle_show_atom_media(
+                    payload.get("media_uuid", ""), payload.get("shape", "")
+                )
+            elif cmd == "viewport_playhead":
+                self.playback.handle_viewport_playhead(
+                    payload.get("viewport"), payload.get("ph_remote")
+                )
             elif cmd == "sync_container":
                 self.structure.execute_sync_container(payload.get("tl_guid"))
             elif cmd == "sync_sequences":
@@ -1133,15 +1160,27 @@ class ORISyncPlugin(PluginBase):
         except Exception:
             _log_exc(f"Command {cmd!r} failed")
 
+    #: Upper bound on commands executed in one drain.  Only a backstop: a
+    #: command that unconditionally re-queued itself would otherwise hold the
+    #: poll thread in the drain forever, starving the manager tick.
+    _MAX_DRAIN = 256
+
     def _drain_cmd_queue(self) -> None:
-        """Execute all enqueued commands on the poll thread."""
-        qsize = self._cmd_queue.qsize()
-        for _ in range(qsize):
+        """Execute enqueued commands on the poll thread until the queue is empty.
+
+        Drains to empty rather than to a snapshot of ``qsize`` because a command
+        can legitimately enqueue another — ``playhead_sample`` reads the playhead
+        and queues the ``broadcast_playback_state`` it decided to send — and
+        leaving that for the next iteration costs it a whole poll interval on
+        the scrub path, which is the one path where latency shows.
+        """
+        for _ in range(self._MAX_DRAIN):
             try:
                 cmd, payload = self._cmd_queue.get_nowait()
             except queue.Empty:
-                break
+                return
             self._execute_command(cmd, payload)
+        _log(f"_drain_cmd_queue: hit {self._MAX_DRAIN}-command cap, deferring the rest")
 
     # ── manager event dispatch ─────────────────────────────────────────────────
 
