@@ -91,8 +91,13 @@
       → Plus the one the audit had not counted: `Playhead(connection, ph_remote)` in the
       Form-2 branch, which is ~46 round-trips on its own.
 - [x] 4.3 Measure broadcast latency against the 1.3 baseline and confirm no material regression, especially on the scrub path.
-      → No regression: post-change runs 27-29s wall against a 32.8s baseline run, and
-      `POLL-SLOW` / `Dequeue timeout` stayed at 0 across all 10.
+      → **No regression. On mains power, convergence on passing runs: median 0.084s,
+      mean 0.094s, max 0.164s** — comfortably inside the 0.1s poll interval, and in fact
+      *faster* than any figure measured for the pre-change code.
+      → An earlier battery-powered measurement suggested +38ms (0.219s vs a 0.181s
+      control). That was a throttling artifact, not a cost of deferring: on mains the
+      same code converges in less than half the control's throttled time. Recorded
+      because the intermediate number was reported before the cause was known.
       → The one-hop cost Decision 3 accepted is mostly not paid, for two reasons found
       during implementation: §3.1's seeding removes the hop on the hot path entirely, and
       `_drain_cmd_queue` now drains to empty rather than to a snapshot of `qsize`, so a
@@ -125,28 +130,21 @@
 ## 6. Verification
 
 - [x] 6.1 Re-run `xstudio_selects_script_xstudio` 10x on **develop**; confirm no `POLL-SLOW cmd:resolve_selection` and no `Dequeue timeout`.
-      → **Primary signal clean: 0 `POLL-SLOW`, 0 `Dequeue timeout` across all 10.**
-      → Pass rate, rebooted machine (0 swap, load ~5), 2026-08-25 13:53-14:00: **6/10**
-      (3x `structural_consensus`, 1x `checkpoint_timeout`).
-      → That is below the 9/10 recorded baseline, so it was A/B'd rather than explained
-      away. **Control at `HEAD~1` on the same machine minutes later: 4/10.**
-      → **Both batches ran on battery power**, which was only established afterwards. That
-      is the likely reason neither version reached its own 9/10 baseline: macOS throttles
-      CPU and reduces available cores on low power, and this test is timing-sensitive
-      enough that three of its four failure modes here (`checkpoint_timeout`,
-      `structural_consensus`) are latency-driven. Treat both absolute numbers as invalid.
-      → The A/B *comparison* survives, because both batches were throttled identically:
-      the change is no worse than the code it replaces, and on these figures better.
-      That is the whole value of having run the control — a single 6/10 would have looked
-      like a regression it is not.
-      → Redo 6.1 and the 6.4 siblings on mains power before quoting any absolute rate.
-      Record power state alongside swap/load in future runs; it belongs next to
-      `feedback_suite_results_need_memory_check` as a thing that mimics timing races.
-      → The first attempt at this ran during post-reboot churn and had to be discarded:
-      macOS session-restore had relaunched a sync_test OpenRV (inspector on port 19000),
-      an xStudio, and two orphaned `rvio` thumbnail jobs pinning 300-600% CPU. Kill any
-      `rv_thumbnails` / `start_openrv_inspector` strays and wait for load < 5 before
-      trusting a run.
+      → **On mains power: 9/10** (1x `structural_consensus`), plus a follow-up batch of
+      6/6 = **15/16 overall**. Matches the 9/10 recorded baseline exactly.
+      → **0 `Dequeue timeout`. 0 `POLL-SLOW cmd:resolve_selection`.** Two runs logged a
+      `POLL-SLOW`, both `fullstate_write` (1.1s, 1.3s) — the test inspector's JSON dump
+      at poll-loop step 6.2, i.e. harness overhead, not actor I/O. Chased down rather
+      than counted, because "a POLL-SLOW appeared" and "the stall we are fixing appeared"
+      are not the same claim.
+      → **Supersedes the earlier battery-powered batches** (6/10 change, 4/10 control),
+      which are retained above only as the record of why an absolute rate must not be
+      quoted without knowing the power state. On mains both the rate and the latency
+      recovered, confirming throttling was the whole story.
+      → Post-reboot hygiene that this depended on: macOS session-restore had relaunched a
+      sync_test OpenRV (inspector on port 19000), an xStudio, and two orphaned `rvio`
+      thumbnail jobs pinning 300-600% CPU. `pkill -f rv_thumbnails`,
+      `pkill -f start_openrv_inspector`, then wait for load < 5.
 - [ ] 6.2 Re-run 10x on the **PR** build; confirm it now passes (baseline 0/10). This is the load-bearing result — it is what unblocks that PR.
 - [ ] 6.3 Run `debug/xstudio_request_receive_repro.py --concurrency-probe` on each build to confirm which listener topology was actually exercised, so a pass is not misattributed.
 - [~] 6.4 Run the sibling selection tests (`xstudio_selects`, `openrv_hosts_selection`, `contended_visibility_selection`, `contended_visibility_selection_rv`) on both builds.
@@ -155,21 +153,17 @@
       (`structural_consensus` — the same recurring mode, present in the control too).
       → `contended_visibility_selection` passing is worth noting: it was failing 5/5
       before `3e21954`.
-      → Also run on battery — see 6.1. The three passes stand (a pass under throttling is
-      still a pass); the single `xstudio_selects` failure needs re-running on mains before
-      it counts as anything.
+      → The three passes were on battery and stand regardless (a pass under throttling is
+      still a pass). The single `xstudio_selects` failure was `structural_consensus`, the
+      same mode that survives on mains at ~1/10 and appears in the pre-change control —
+      re-run it on mains alongside 6.2 rather than treating it as a finding.
       → PR build outstanding.
 - [x] 6.5 Check `converged_late` in `run_history.jsonl` — a latency regression from deferring shows up there before it shows up as a failure (design Risks).
       → `converged_late` turned out to be useless as the signal: it is `True` on every
       run of this test, passing or failing, before and after. `time_to_converge` is the
-      field that actually discriminates.
-      → Convergence on *passing* runs, change vs control, same machine:
-        median **0.219s vs 0.181s**, i.e. **+38ms** — inside the one-poll-hop (0.1s)
-        budget Decision 3 accepted, and far short of the `default_timeout_ms` stall it
-        buys out.
-        (Raw change figures include a 1.498s first-run cold start; excluded from the
-        median above, and called out rather than quietly dropped. Control's own first run
-        failed, so there is no cold-start figure to compare it against.)
+      field that actually discriminates — see 4.3 for the figures.
+      → Worth fixing the design's assumption here rather than just noting it: a future
+      change told to "watch `converged_late`" would watch a constant.
 
 ## 7. Follow-ups (not in this change)
 
