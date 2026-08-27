@@ -408,8 +408,35 @@ class ORISyncPlugin(PluginBase):
         # Grab the current playhead and wire its attribute events ourselves.
         #
         # We deliberately do NOT call PluginBase.subscribe_to_playhead_events().
-        # On develop that call is actively harmful here, for two compounding
-        # reasons:
+        #
+        # ── THE ORIGINAL REASON IS NO LONGER TRUE (re-tested 2026-08-27) ──
+        # The two reasons below describe a hazard that does not reproduce on
+        # today's develop.  Measured directly: the base method was called here
+        # alongside our own machinery and the suite was run 5x against 5x with it
+        # removed — identical results (2/5 each, both degraded by host swap), and
+        # identical position-broadcast counts (5 per run).  The catastrophic
+        # symptom the note describes — zero position broadcasts, every message
+        # frame=0.0 — did not occur at all.
+        #
+        # Three separate subscription pairings were also probed directly against a
+        # develop build and none reproduced the collateral leave (xStudio
+        # scratch/playhead_events_api_repro.py).  The likely reason is upstream
+        # 70aaaa3f "Fix python actor event group callback routing" (2026-07-29),
+        # which registers each callback under BOTH the event group and its parent,
+        # so removing one route can no longer empty the other route's entry and no
+        # leave_broadcast is sent.  This workaround was added 2026-08-02 against a
+        # build that evidently predated it.
+        #
+        # ── BUT WE STILL DO NOT CALL IT, FOR A DIFFERENT AND CURRENT REASON ──
+        # __connect_to_playhead constructs a Playhead on the xStudio callback
+        # thread on every viewport_playhead_atom event.  That is ~46 synchronous
+        # request_receive round-trips off the poll thread, which violates the
+        # "Only the poll thread performs xStudio actor I/O" requirement
+        # (openspec/specs/xstudio-plugin-module-structure).  _adopt_playhead plus
+        # handle_viewport_playhead do the same job on the poll thread.
+        #
+        # The historical reasons are kept below because they explain the shape of
+        # the code, not because they still hold:
         #
         #   1. It calls subscribe_to_global_playhead_events() a SECOND time (see
         #      plugin_base.subscribe_to_playhead_events) on top of our own call in
@@ -437,7 +464,11 @@ class ORISyncPlugin(PluginBase):
         # (assign attribute_changed), at every site that acquires a playhead, and
         # never issues the killing leave.
         #
-        # ── IF pr/python-per-subscription-listeners LANDS, REDO THIS ──
+        # ── ON A PER-SUBSCRIPTION OR PER-GROUP LISTENER BUILD ──
+        # (Kept as analysis. We are not moving off develop's shared listener —
+        # see the memory note on listener topology: the canary test is 10/10
+        # there vs 4/10 per-group, because request_receive doubles as the event
+        # pump so per-read cost scales with the number of pumping threads.)
         # That branch gives every subscription its own listener actor, which
         # changes the ground this workaround stands on in three ways.  Re-verify
         # each rather than assuming the workaround stays correct or stays needed:
