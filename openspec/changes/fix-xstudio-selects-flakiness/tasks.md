@@ -53,4 +53,26 @@ re-attempted the same way. See 5.5 for the evidence.
 ## 6. Follow-ups (not implemented here)
 
 - [ ] 6.1 File or note the auto-play race (`playback still active … a seek must park the playhead`) with the `set_frame`-does-not-pause and `playing_override`-without-local-play hypotheses from design.md.
-- [ ] 6.2 File or note the `structural_consensus` mismatch after `add_media`, capturing the projection diff detail that was not recorded in the observed failure.
+- [x] 6.2 File or note the `structural_consensus` mismatch after `add_media`, capturing the projection diff detail that was not recorded in the observed failure.
+      → **Captured and root-caused 2026-08-27.** 10x on a quiet host (AC, load ~4-5, 26 GB free) = **9 pass / 1 fail**, matching the recorded baseline; the one failure is this. The projection diff, recorded for the first time:
+      ```
+      xstudio vs openrv: timeline 2291c69f track 'videotrack':
+        missing clip ec8dbbfd ('/users/.../test_media/source/encoded/car_aces_srgb.mov')
+      ```
+      A **single missing clip**, not a timeline pair — so this is *not* the timeline-guid-adoption bug. xStudio's `Default Sequence` holds 9 clips with `car_ACES_sRGB.mov` present **twice**: `ec8dbbfd` (random v4, full-path name, xStudio-minted) and `e66187fe` (deterministic v5, basename, `target_url` a plain path — RV-minted). Every other media appears once. OpenRV holds only its own `e66187fe`, so the diff reports xStudio's as missing.
+
+      Mechanism, from the captured logs:
+      - `22:23:46.128 _create_rv_sequence_for_timeline: no media in 'Default Sequence'` / `22:23:46.414 Flat-playlist rebuild: 0 source(s) loaded` — RV joins on a snapshot whose sequence is still **empty**; the host's clips arrive afterwards as `INSERT_CHILD`.
+      - RV meanwhile registers its own already-loaded `car` source under a derived guid and broadcasts it: `22:23:47.387 apply_remote_clip_insert: clip=e66187fe name='car_ACES_sRGB.mov'` on the xStudio side, which appends it as a 9th clip.
+      - `22:23:47.431 MIRROR FAILED: host's clip ec8dbbfd is in neither the object map nor the bin cache` — RV's object map is keyed by *its own* guid for that media, so the host's isolate cannot resolve. (Note `ec8dbbfd` *does* match in the clip table by normalised URL at `46.933`; the two lookups disagree, which is the observable symptom.)
+
+      Root cause is [sequence_sync.py:1019](../../../rvplugin/ori_sync/sequence_sync.py#L1019) in `_make_clip`:
+      ```python
+      _guid = (self.plugin.playback._clip_guid_for_media_path(_mp)
+               or self.plugin.sync_manager._derive_guid(f"rv_clip:{_mp}"))
+      ```
+      `_clip_guid_for_media_path` scans only `sync_manager._object_map`, which does not yet hold the host's clips at build time, so the deterministic fallback fires. Its comment — *"the derivation makes both peers agree"* — is **the same false premise the timeline-level fix already superseded**: xStudio mints random v4 guids and does not participate in RV's derivation scheme, so a derived guid can never converge with it. Cf. `_session_timeline_guid_for_name` ([sequence_sync.py:139](../../../rvplugin/ori_sync/sequence_sync.py#L139)), which fixed exactly this at timeline level by *adopting* the peer's guid.
+
+      Intermittency is whether the host's clip reaches RV's object map before RV builds its own clip — hence ~1/10.
+
+      **Not fixed here** (out of scope for this change). The clip-level analogue of the timeline fix is the candidate: before minting a derived guid, adopt any session clip whose normalised media path matches. Needs its own change — `_make_clip` is bundled RV code, so it also needs an rvpkg rebuild+reinstall to test.
