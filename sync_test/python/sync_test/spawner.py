@@ -1,7 +1,51 @@
 import subprocess
 import os
+import shutil
 import time
 import logging
+
+#: How many runs of per-test logs to keep, counting the current one. The
+#: newest run is always ``logs/<test>/``; older runs are ``logs/<test>_1``
+#: (previous) through ``logs/<test>_<RETAINED_LOG_RUNS-1>`` (oldest).
+RETAINED_LOG_RUNS = 5
+
+
+def rotate_log_dirs(logs_dir, keep=RETAINED_LOG_RUNS):
+    """Rotate a test's previous log directory aside so it survives the next run.
+
+    Every run used to overwrite ``logs/<test>/`` in place, so a failure followed
+    by a pass destroyed the only evidence of the failure — which is why two
+    root-caused flakes (the clip-guid duplication and the unresolved-patch
+    recovery gap) could only be diagnosed by catching them on the run that
+    happened to be last. Keeping a short history makes an intermittent failure
+    diagnosable after the fact instead of only in the moment.
+
+    ``logs/<test>/`` stays the newest run so every existing path reference is
+    unaffected; archives are suffixed ``_1`` (previous) upward, oldest evicted.
+
+    Best-effort: a rotation failure must never take down the test run, so
+    problems are logged and swallowed.
+
+    :param logs_dir: The per-test log directory, e.g. ``.../logs/add_media``.
+    :param keep: Total runs to retain, including the current one. Values below
+        2 disable rotation (nothing is retained beyond the current run).
+    """
+    try:
+        if keep < 2 or not os.path.isdir(logs_dir) or not os.listdir(logs_dir):
+            # Nothing to preserve: no prior run, or the caller disabled history.
+            return
+        # Evict the oldest, then shift each archive down one slot, youngest
+        # last — walking upward would overwrite a slot before it was moved.
+        oldest = f"{logs_dir}_{keep - 1}"
+        if os.path.isdir(oldest):
+            shutil.rmtree(oldest, ignore_errors=True)
+        for i in range(keep - 2, 0, -1):
+            src = f"{logs_dir}_{i}"
+            if os.path.isdir(src):
+                os.rename(src, f"{logs_dir}_{i + 1}")
+        os.rename(logs_dir, f"{logs_dir}_1")
+    except Exception as e:
+        logging.warning(f"Could not rotate logs for {logs_dir}: {e}")
 
 class AppSpawner:
     """
@@ -28,6 +72,8 @@ class AppSpawner:
         # Ensure log directory exists
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.logs_dir = os.path.join(base_dir, "logs", test_name)
+        # Preserve the previous run's logs before this run overwrites them.
+        rotate_log_dirs(self.logs_dir)
         os.makedirs(self.logs_dir, exist_ok=True)
         self.base_dir = base_dir
 
