@@ -148,6 +148,22 @@ REMOTE_APPLY_SETTLE_SECONDS = 5.0
 #: into the one rebuild it deserves rather than one request per child.
 DIVERGENCE_SETTLE = 0.5
 
+#: Seconds a structural patch must stay unapplied before this peer asks the
+#: master for a fresh snapshot (unresolved-patch-resync, design D3).
+#:
+#: This window is the whole reason an unresolved patch is a usable signal at
+#: all. At the instant a patch fails, "I have diverged" and "I have not caught
+#: up yet" look identical — the objection ``structure-divergence-recovery``
+#: raises against this signal, and it is right. Waiting is what separates them,
+#: because only one of the two clears on its own.
+#:
+#: Starts at :data:`DIVERGENCE_SETTLE`'s value rather than inventing a second
+#: number there is no evidence for, but is named separately so the two can part
+#: company later without a second edit. In the failure this was written from the
+#: peer held zero objects for ~45s, so anything in the low seconds separates it
+#: cleanly from a peer that is merely a beat behind.
+UNRESOLVED_SETTLE = DIVERGENCE_SETTLE
+
 #: Minimum seconds between successive recovery attempts (design D5).
 #:
 #: A lease refusal is a legitimate, recurring race between two peers who may
@@ -562,6 +578,13 @@ class SyncManager:
         #: :meth:`otio_sync_core.session_state.session_state_snapshot` needs
         #: both to tell "recovering" from "unrecoverable".
         self._recovery_unreachable: bool = False
+        #: Whether the most recent *unresolved-patch* resync had no master to
+        #: ask (unresolved-patch-resync).  Deliberately not
+        #: :attr:`_recovery_unreachable`: that one qualifies
+        #: :attr:`structure_diverged` for the panels, and a peer missing
+        #: structure is not diverged.  Sharing it would put this condition on a
+        #: user-visible signal that must keep meaning exactly one thing.
+        self._resync_unreachable: bool = False
 
         #: Receive-side dispatch table: ``(command_schema, event)`` -> handler.
         #: Each handler takes ``(msg, data, source)`` and returns an
@@ -631,6 +654,18 @@ class SyncManager:
     def unresolved_patch_count(self) -> int:
         """Total unresolved patches seen, including those aged out of the list."""
         return self.patcher.unresolved_patch_count
+
+    @property
+    def unresolved_targets(self) -> dict[str, float]:
+        """Absent patch targets awaiting resolution, GUID -> first-seen monotonic.
+
+        What :meth:`tick` measures the settle window against.  Non-empty only
+        transiently in a healthy session: a target that arrives is dropped, and
+        one that does not costs a snapshot request and is then cleared.
+
+        :rtype: dict
+        """
+        return dict(self.patcher.unresolved_targets)
 
     @property
     def unpublished_parents(self) -> list[str]:
@@ -4014,6 +4049,47 @@ class SyncManager:
                 )
                 self.request_state(reason="recovery")
 
+        # Unresolved-patch resync (unresolved-patch-resync). A second, wholly
+        # independent trigger for the same request, for the mirror-image
+        # condition: the branch above is "I changed structure I could not
+        # broadcast", this one is "I was given structure I could not apply".
+        # Only the first is divergence — a peer told about a change has
+        # attempted nothing — so structure_diverged is deliberately neither
+        # read nor written here, and the panels keep reporting one thing.
+        #
+        # What the two do share is _last_recovery_attempt, so they cannot
+        # combine to issue recovery requests faster than RECOVERY_COOLDOWN
+        # allows however many conditions hold at once.
+        if self.status == STATE_SYNCED and self.patcher.unresolved_targets:
+            self.patcher.drop_resolved_targets()
+            now = time.monotonic()
+            settled = [
+                guid for guid, seen in self.patcher.unresolved_targets.items()
+                if now - seen >= UNRESOLVED_SETTLE
+            ]
+            if settled and (self._last_recovery_attempt is None
+                            or now - self._last_recovery_attempt >= RECOVERY_COOLDOWN):
+                self._last_recovery_attempt = now
+                if self.is_master or not self.master_guid:
+                    # The same dead ends structural recovery has: a master has
+                    # no higher authority to ask, and a peer with no master has
+                    # nowhere to send the request. Both are recorded rather
+                    # than retried in silence.
+                    self._resync_unreachable = True
+                    _log(
+                        f"unresolved-patch resync: no master to ask — "
+                        f"{len(settled)} target(s) still unapplied"
+                    )
+                    app_events.append(("unresolved_resync_failed", None))
+                else:
+                    self._resync_unreachable = False
+                    _log(
+                        f"unresolved-patch resync: {len(settled)} target(s) "
+                        f"unapplied past {UNRESOLVED_SETTLE}s — requesting state "
+                        f"from master {self.master_guid[:8]}"
+                    )
+                    self.request_state(reason="recovery")
+
         return app_events
 
     def _heartbeat(self) -> None:
@@ -4254,6 +4330,15 @@ class SyncManager:
             # unreachable while the timestamp comparison below always failed;
             # it becomes reachable the moment the comparison works, so the two
             # belong together.
+            # The snapshot just rebuilt the object map, so whatever this peer
+            # was missing it is not missing now: the condition that raised the
+            # request is over (unresolved-patch-resync). Cleared *before* the
+            # replay below, never after — a buffered patch that replays and
+            # still fails must be free to re-arm the condition rather than be
+            # wiped by a clear that trails it.
+            self.patcher.clear_unresolved_targets()
+            self._resync_unreachable = False
+
             replay_results: list[tuple[str, Any]] = []
             self._replaying = True
             try:

@@ -46,6 +46,14 @@ class OTIOPatcher:
     #: diagnostic record, not a replay queue (see below).
     _UNRESOLVED_HISTORY = 10
 
+    #: Distinct unresolved *targets* retained for resync (unresolved-patch-resync).
+    #: Bounded for the same reason :attr:`_UNRESOLVED_HISTORY` is: a peer failing
+    #: continuously must not grow this without limit.  Eviction is oldest-first,
+    #: and in practice unreachable — the settle window is a fraction of a second
+    #: and :meth:`SyncManager.tick` runs far more often than ten distinct
+    #: timelines can go missing.
+    _UNRESOLVED_TARGETS = 10
+
     def __init__(self) -> None:
         self.object_map: dict[str, otio.core.SerializableObject] = {}
         self._is_syncing: bool = False
@@ -55,6 +63,11 @@ class OTIOPatcher:
         self.unresolved_patches: list[str] = []
         #: Total unresolved patches seen, which the bounded list above loses.
         self.unresolved_patch_count: int = 0
+        #: Unresolved target GUID -> monotonic time it was first seen unresolved
+        #: (unresolved-patch-resync).  Keyed by target, not by patch, so a media
+        #: add arriving as several children against one missing timeline is the
+        #: one gap it actually is.  :meth:`SyncManager.tick` reads this.
+        self.unresolved_targets: dict[str, float] = {}
 
     def _record_unresolved(self, kind: str, target_uuid: "str | None") -> None:
         """Record a patch that could not be applied because its target is unknown.
@@ -69,10 +82,21 @@ class OTIOPatcher:
         — is a bug at the sender, and a queue that silently succeeded later would
         be the same "looks fine, is not" behaviour this record exists to remove.
 
+        The target is also *retained*, and that is not a change of heart about
+        replay: what the retention feeds is a request for a fresh snapshot
+        (unresolved-patch-resync), which repairs the whole gap at once. Replaying
+        the parked patch is what would resurrect the "looks fine, is not"
+        behaviour above — the peer would gain one child and still be missing the
+        timeline and every other child.
+
         :param kind: Message kind, e.g. ``"INSERT_CHILD"``.
         :param target_uuid: GUID that could not be resolved.
         """
         self.unresolved_patch_count += 1
+        if target_uuid is not None:
+            self.unresolved_targets.setdefault(str(target_uuid), time.monotonic())
+            for stale in list(self.unresolved_targets)[:-self._UNRESOLVED_TARGETS]:
+                del self.unresolved_targets[stale]
         detail = (
             f"{kind}: target {str(target_uuid)[:8]} not in object_map "
             f"({len(self.object_map)} objects held)"
@@ -80,6 +104,29 @@ class OTIOPatcher:
         self.unresolved_patches.append(detail)
         del self.unresolved_patches[:-self._UNRESOLVED_HISTORY]
         _log(f"UNRESOLVED PATCH {detail}")
+
+    def drop_resolved_targets(self) -> None:
+        """Forget retained targets that have since arrived.
+
+        Asked of the object map directly rather than tracked by a "resolved"
+        callback, because the object map is the thing the *next* patch will be
+        tested against: consulting it cannot drift from what actually matters,
+        and a callback can.
+
+        This is what keeps a patch that lands normally moments later from
+        costing a snapshot request.
+        """
+        for guid in [g for g in self.unresolved_targets if g in self.object_map]:
+            del self.unresolved_targets[guid]
+
+    def clear_unresolved_targets(self) -> None:
+        """Forget every retained target, the object map having been rebuilt.
+
+        Called from :meth:`SyncManager.apply_snapshot` *before* its delta replay,
+        so a patch that replays and still fails re-arms the condition honestly
+        instead of being wiped by the clear that follows it.
+        """
+        self.unresolved_targets.clear()
 
     def on_property_changed(
         self, callback: Callable[[str, str, Any], None]
