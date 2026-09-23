@@ -1,0 +1,24 @@
+## 1. Container classification (design Decision 1)
+
+- [x] 1.1 Extract a helper in `playback_sync.py` that classifies a container as playlist / timeline / neither (Timeline → timeline, Playlist → playlist, Subset/ContactSheet → neither) and sets `_viewport_container_is_playlist` / `_viewport_container_is_timeline`. Switch `resolve_and_broadcast_selection` to use it. Verify with `./run_tests_xstudio.sh`: existing tests pass unchanged.
+- [x] 1.2 In `handle_viewport_playhead`, classify the container returned by `get_viewed_container_safe()` with the helper. Verify with a new test in `tests/xstudio_plugin/test_playback_echo_guard.py`: after a viewport-playhead event for a Timeline, a following `handle_show_atom_media` (flags previously playlist) broadcasts `view_mode: "sequence"`, not `"source"`.
+
+## 2. Announce the container switch from the selection poll (design Decision 2)
+
+- [x] 2.1 Add a dedicated last-viewed-container-uuid field (reset alongside the other `_viewport_container_*` fields) and a helper that returns the sync guid of a *published sequence* for a Timeline container uuid (an `_sync_playlists` entry with `xs_tl is not None`), or `None`. Verify with unit tests: a sequence uuid resolves, and a flat playlist's internal Timeline uuid and an unknown uuid both return `None`.
+- [x] 2.2 In `resolve_and_broadcast_selection`, when the container uuid changes to a published sequence Timeline while PSM is True and the view isn't already `sequence` on that guid, set `manager.active_timeline_guid`. Then broadcast via `_view_assertion_is_echo(None, "sequence")` → `_record_current_view` / `broadcast_view_state(None, "sequence")`, logging `[SEL] → broadcast view-state: sequence (container switched to <guid>)`. Verify with unit tests covering these spec scenarios: switch announced, suppressed-show_atom still announced, flat-playlist internal Timeline not announced, peer-driven (echo) switch not announced, already-announced switch not announced twice.
+
+  Implementation note: extracted as `_maybe_announce_sequence_container_switch(container_uuid, container_switched)`, called from `resolve_and_broadcast_selection`, so the scenarios could be unit-tested directly rather than driving the whole poll (which would need a full fake xStudio actor/container layer). Same behavior, same call site.
+
+## 3. Verification
+
+- [x] 3.1 Run `./run_tests_core.sh` and `./run_tests_xstudio.sh`. Verify that both pass. (755 passed + 4 subtests, and 159 passed, respectively.)
+- [x] 3.2 Live repro: an xStudio host and an xStudio client joined to one session. The host isolates a clip in the bin, then double-clicks Sequence 1. Verify with `python debug/merge_sync_logs.py rvplugin/ori_sync/xstudio_host.log rvplugin/ori_sync/xstudio_client.log --view state`: the host shows `view_mode=sequence` for the sequence's guid, the client shows `applied_view=sequence`, there are no `mismatched timeline_guid — ignoring` lines on the client afterwards, and the client follows the host's scrub.
+
+  Verified 2026-09-23 12:24:29: host's show_atom for the switch already read `container=timeline` (the task 1.2 fix — previously this would have read the stale `playlist`) and broadcast `mode=sequence` directly; the task 2.2 poll backstop never needed to fire on the host side. Client applied `sequence → 'Sequence 1'`, seeked to frame 75, then followed every subsequent host scrub (48, 51, 95, 164, 178, 206, 240...) with zero `mismatched timeline_guid — ignoring` lines. Client's own poll also logged `→ broadcast view-state: sequence (container switched to daf13087)` — the new 2.2 code firing harmlessly as a side effect of applying the remote switch (its role strips the fields before send, per existing viewer-role gating).
+- [x] 3.3 Repeat 3.2 with an OpenRV client. Verify that RV switches to the sequence (after `rvplugin/<pkg>/reinstall.csh`, though no RV change is expected).
+
+  Verified 2026-09-23 13:35:47 (host + RV client, `xsrv_client.log`): host's show_atom again read `container=timeline` immediately and broadcast `mode=sequence` directly (`xstudio_host.log:1886`). RV applied it (`apply view-state: sequence → Sequence (272f8c2c)` at 13:35:47.379), seeked to frame 1, then followed every subsequent host scrub continuously through 13:35:49.997 (`VIEW ALREADY-DISPLAYED` confirming it recognized it was already on that sequence rather than re-switching). No RV-side code change was needed, as expected.
+- [x] 3.4 Regression check: play a flat playlist in the bin on the host. Verify there's no `view_mode: "sequence"` broadcast in the host log.
+
+  Verified indirectly 2026-09-23 13:43: not via sustained bin playback, but every return from the sequence to the "Added Media" bin (13:43:22, 13:43:27 — `container=Playlist`) correctly broadcast `mode=source` for each clip; no `mode=sequence` broadcast occurred for a Playlist container in either log across the session. User accepted this as sufficient without the literal press-play scenario.

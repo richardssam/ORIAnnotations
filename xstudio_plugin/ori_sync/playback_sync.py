@@ -299,6 +299,12 @@ class PlaybackSyncController:
         self._viewport_container_is_playlist: bool = False
         self._viewport_container_is_timeline: bool = False
 
+        #: Container uuid last seen by :meth:`resolve_and_broadcast_selection`,
+        #: used to detect "the viewed container just changed" independently of
+        #: ``_last_logged_container_uuid`` (which also changes on a clip-name
+        #: change within the same container and so can't tell the two apart).
+        self._last_polled_container_uuid: str | None = None
+
         #: Container uuid of the last unpublished Timeline reported by
         #: :meth:`get_local_viewed_timeline_guid`, so a steady wrong view logs
         #: once rather than on every scrub broadcast.  Initialised here as well
@@ -315,6 +321,7 @@ class PlaybackSyncController:
         self._current_selection_group_key = None
         self._current_selection_container_uuid = None
         self._last_logged_container_uuid = None
+        self._last_polled_container_uuid = None
         self._last_logged_clip_name = None
         self._last_viewed_clip_guid = None
         self._pending_seek_frame = None
@@ -361,10 +368,124 @@ class PlaybackSyncController:
         self._selection_broadcast_suppress_until = 0.0
         self._viewport_container_is_playlist = False
         self._viewport_container_is_timeline = False
+        self._last_polled_container_uuid = None
         #: Container uuid of the last unpublished Timeline reported by
         #: :meth:`get_local_viewed_timeline_guid`, so a steady wrong view logs
         #: once rather than on every scrub broadcast.
         self._unpublished_view_logged = None
+
+    def _classify_and_cache_viewport_container(self, container) -> "tuple[bool, bool]":
+        """Classify *container* as playlist/timeline and cache the result.
+
+        Both :meth:`handle_viewport_playhead` (the first event of a container
+        switch) and :meth:`resolve_and_broadcast_selection` (the selection
+        poll) need this classification. Sharing it keeps the two writers from
+        disagreeing about what the viewport currently shows — the show_atom
+        for a bin→sequence switch used to read whichever one the poll last
+        wrote, which could still be the previous container's classification
+        when the switch's own show_atom arrived first.
+
+        :param container: A ``Playlist``/``Timeline``/``Subset``/``ContactSheet``
+            instance, or ``None``.
+        :returns: ``(is_timeline, is_playlist)``, also written to
+            ``_viewport_container_is_timeline`` / ``_viewport_container_is_playlist``.
+        """
+        is_timeline = isinstance(container, Timeline)
+        is_playlist = isinstance(container, Playlist)
+        self._viewport_container_is_playlist = is_playlist
+        self._viewport_container_is_timeline = is_timeline
+        return is_timeline, is_playlist
+
+    def _sequence_guid_for_container_uuid(self, container_uuid: "str | None") -> "str | None":
+        """Sync guid of the published SEQUENCE timeline for *container_uuid*.
+
+        Matches only a ``_sync_playlists`` entry with ``xs_tl is not None`` —
+        a sequence timeline actually built from a Timeline container. This
+        deliberately excludes two other things that also answer to a Timeline
+        container uuid in the viewport:
+
+        - a flat playlist's *own* internal Timeline (``xs_tl is None`` in the
+          same dict), which xStudio's viewport reports once that playlist
+          starts playing — see :meth:`get_local_viewed_timeline_guid` for the
+          full story of that container-identity trap;
+        - a Timeline the session has never published at all.
+
+        Both would otherwise make a plain "container became a Timeline" check
+        misfire.  Returns ``None`` for either.
+
+        :param container_uuid: The xStudio container uuid to resolve, or
+            ``None``.
+        """
+        if not container_uuid:
+            return None
+        for tl_guid, (_pl, xs_tl) in self.plugin._sync_playlists.items():
+            if xs_tl is not None and str(xs_tl.uuid) == container_uuid:
+                return tl_guid
+        return None
+
+    def _maybe_announce_sequence_container_switch(
+        self, container_uuid: "str | None", container_switched: bool
+    ) -> None:
+        """Announce a bin→sequence container switch as a sequence view.
+
+        Called from :meth:`resolve_and_broadcast_selection` (the selection
+        poll) on every tick, with whether the viewed container changed this
+        tick and the fresh Pinned Source Mode that block just established.
+
+        Opening a published sequence from the bin (e.g. a double-click)
+        changes the viewed container from a Playlist to that sequence's
+        Timeline without touching Pinned Source Mode — it stays True the
+        whole time, so the PSM-transition handling in
+        :meth:`resolve_and_broadcast_selection` never fires for it. The
+        switch's own show_atom is not a reliable substitute: it can be
+        suppressed as scan-through (the playhead moves as the sequence
+        loads), and before :meth:`handle_viewport_playhead` started
+        refreshing the container-type flags itself, it could also read a
+        stale classification left by the *previous* poll (2026-09-23). This
+        is the one signal that sees the container change directly, so it is
+        the backstop.
+
+        Matching "the container became a Timeline" is not enough on its own:
+        a flat playlist's own internal Timeline also satisfies that once the
+        playlist starts playing (see ``get_local_viewed_timeline_guid``), so
+        :meth:`_sequence_guid_for_container_uuid` only matches a Timeline the
+        session actually published as a sequence. Requiring PSM True keeps
+        this from firing while a clip is isolated inside a sequence's own
+        Timeline container.
+
+        :param container_uuid: The viewport's current container uuid.
+        :param container_switched: Whether it differs from the previous poll.
+        """
+        if not (
+            container_switched
+            and self._last_pinned_source_mode is True
+            and self.plugin.manager
+            and self.plugin.manager.status == STATE_SYNCED
+        ):
+            return
+        seq_guid = self._sequence_guid_for_container_uuid(container_uuid)
+        if not seq_guid:
+            return
+        already_announced = (
+            self._cur_view_mode == "sequence"
+            and self.plugin.manager.active_timeline_guid == seq_guid
+        )
+        if already_announced:
+            return
+        self.plugin.manager.active_timeline_guid = seq_guid
+        echo, why = self._view_assertion_is_echo(None, "sequence")
+        if echo:
+            self._record_current_view(None, "sequence")
+            _log(
+                f"[SEL] → broadcast view-state suppressed ({why})"
+                f" (container switched to sequence {seq_guid[:8]})"
+            )
+        else:
+            self.broadcast_view_state(None, "sequence")
+            _log(
+                "[SEL] → broadcast view-state: sequence"
+                f" (container switched to {seq_guid[:8]})"
+            )
 
     def _is_scan_through(
         self, *, is_seq_media: bool, is_playlist: bool, in_single_clip: bool
@@ -833,9 +954,18 @@ class PlaybackSyncController:
         # group (for add_media detection).  Both re-subscribe when the viewed
         # container changes — important for a peer that joined an empty session
         # and only later views/creates a container.
+        #
+        # This is also the first event of a container switch — before any
+        # show_atom for it — so it is where the container-type flags get
+        # refreshed too. Without this, a show_atom for a fresh bin→sequence
+        # switch could still read the *previous* container's classification
+        # (only resolve_and_broadcast_selection, the selection poll, wrote
+        # them), and misreport the switch as a source-clip isolation instead
+        # of a sequence view (2026-09-23).
         try:
             container = self.get_viewed_container_safe()
             if container:
+                self._classify_and_cache_viewport_container(container)
                 self.subscribe_container_selection(container)
                 self.plugin.structure.subscribe_viewed_container_events(container)
         except Exception:
@@ -1746,10 +1876,13 @@ class PlaybackSyncController:
             else:
                 container = Playlist(self.plugin.connection, result.actor, result.uuid)
 
-            is_timeline = isinstance(container, Timeline)
-            is_playlist = isinstance(container, Playlist)
-            self._viewport_container_is_playlist = is_playlist
-            self._viewport_container_is_timeline = is_timeline
+            is_timeline, is_playlist = self._classify_and_cache_viewport_container(container)
+            # Whether the viewed container itself changed this poll, tracked
+            # separately from _last_logged_container_uuid (which also moves
+            # on a clip-name change within the same container and so can't
+            # distinguish "new container" from "same container, new clip").
+            _container_switched = container_uuid != self._last_polled_container_uuid
+            self._last_polled_container_uuid = container_uuid
 
             clip_name = None
             clip_uuid_str = None
@@ -1945,6 +2078,8 @@ class PlaybackSyncController:
                         self._last_pinned_source_mode = psm
                 except Exception:
                     _log_exc("[SEL] Pinned Source Mode poll failed")
+
+            self._maybe_announce_sequence_container_switch(container_uuid, _container_switched)
 
             # Reliable single-clip broadcast — driven by the (reliably-fired)
             # selection event, NOT the show_atom media-change.  When we are in

@@ -665,6 +665,213 @@ def test_genuine_local_selection_returns_false():
     assert note == ""
 
 
+# ── announce-sequence-view-on-container-switch: container-type flags ────────
+#
+# 2026-09-23 bug: a bin→sequence double-click's show_atom read
+# _viewport_container_is_playlist/_timeline, which only the selection poll
+# wrote — and the poll runs *after* the switch's own show_atom, so the
+# show_atom saw the stale bin classification and broadcast a source-clip
+# isolation instead of a sequence view.
+
+
+def test_classify_and_cache_viewport_container_reads_the_container_type():
+    ctrl = _controller()
+    ctrl._viewport_container_is_playlist = True
+    ctrl._viewport_container_is_timeline = False
+
+    timeline = playback_sync.Timeline(ctrl.plugin.connection, object(), object())
+    is_timeline, is_playlist = ctrl._classify_and_cache_viewport_container(timeline)
+
+    assert (is_timeline, is_playlist) == (True, False)
+    assert ctrl._viewport_container_is_timeline is True
+    assert ctrl._viewport_container_is_playlist is False
+
+
+def test_classify_and_cache_viewport_container_handles_neither():
+    """A Subset/ContactSheet (or None) is neither a playlist nor a timeline —
+    distinct from the ``is_timeline``/``is_playlist`` both-False default so a
+    stale prior classification can't leak through either flag.
+    """
+    ctrl = _controller()
+    ctrl._viewport_container_is_playlist = True
+    ctrl._viewport_container_is_timeline = True
+
+    is_timeline, is_playlist = ctrl._classify_and_cache_viewport_container(None)
+
+    assert (is_timeline, is_playlist) == (False, False)
+    assert ctrl._viewport_container_is_timeline is False
+    assert ctrl._viewport_container_is_playlist is False
+
+
+def test_sequence_guid_for_container_uuid_resolves_a_published_sequence():
+    ctrl = _controller()
+    playlist = FakePlaylist()
+    xs_tl = types.SimpleNamespace(uuid="xs-tl-uuid-1")
+    ctrl.plugin._sync_playlists["seq-guid-1"] = (playlist, xs_tl)
+
+    assert ctrl._sequence_guid_for_container_uuid("xs-tl-uuid-1") == "seq-guid-1"
+
+
+def test_sequence_guid_for_container_uuid_excludes_a_flat_playlists_own_timeline():
+    """A flat playlist's internal Timeline is recorded with ``xs_tl is None``
+    — it must not be returned as a sequence, however its container uuid
+    looks.  See ``get_local_viewed_timeline_guid`` for the full story."""
+    ctrl = _controller()
+    playlist = FakePlaylist()
+    ctrl.plugin._sync_playlists["flat-guid-1"] = (playlist, None)
+
+    assert ctrl._sequence_guid_for_container_uuid("flat-guid-1") is None
+
+
+def test_sequence_guid_for_container_uuid_rejects_an_unpublished_timeline():
+    ctrl = _controller()
+    playlist = FakePlaylist()
+    xs_tl = types.SimpleNamespace(uuid="xs-tl-uuid-1")
+    ctrl.plugin._sync_playlists["seq-guid-1"] = (playlist, xs_tl)
+
+    assert ctrl._sequence_guid_for_container_uuid("some-other-uuid") is None
+    assert ctrl._sequence_guid_for_container_uuid(None) is None
+
+
+def _seq_setup(ctrl, seq_guid="seq-tl-1", container_uuid="xs-seq-uuid-1"):
+    """Register *seq_guid* as a published sequence timeline for *container_uuid*
+    and put the controller in the pre-switch state (viewing the bin, PSM True).
+    """
+    playlist = FakePlaylist()
+    xs_tl = types.SimpleNamespace(uuid=container_uuid)
+    ctrl.plugin._sync_playlists[seq_guid] = (playlist, xs_tl)
+    ctrl.plugin.active_playhead = FakePlayhead()
+    ctrl.plugin.manager.status = STATE_SYNCED
+    ctrl._last_pinned_source_mode = True
+    ctrl._cur_view_mode = "source"  # was isolating a clip in the bin
+    return container_uuid
+
+
+def test_container_switch_to_a_published_sequence_is_announced():
+    """The core fix: bin→sequence, PSM never changes, container did."""
+    ctrl = _controller()
+    container_uuid = _seq_setup(ctrl)
+
+    ctrl._maybe_announce_sequence_container_switch(container_uuid, True)
+
+    assert ctrl.plugin.manager.active_timeline_guid == "seq-tl-1"
+    assert ctrl._cur_view_mode == "sequence"
+    _, state = ctrl.plugin._cmd_queue.items[0]
+    assert state["view_mode"] == "sequence"
+    assert state["clip_guid"] is None
+
+
+def test_container_switch_is_announced_even_if_the_show_atom_was_suppressed():
+    """No show_atom needs to have fired at all — the poll alone is enough."""
+    ctrl = _controller()
+    container_uuid = _seq_setup(ctrl)
+    # A show_atom for this switch never reached broadcast_view_state (e.g.
+    # suppressed as scan-through) — nothing here depends on show_atom state.
+
+    ctrl._maybe_announce_sequence_container_switch(container_uuid, True)
+
+    assert ctrl.plugin._cmd_queue.items, "the poll must announce it on its own"
+
+
+def test_flat_playlists_own_timeline_is_not_announced_as_a_sequence():
+    """Playing a flat playlist reports that playlist's internal Timeline as
+    the viewport container (xs_tl is None in _sync_playlists) — not a
+    sequence, must not be announced as one."""
+    ctrl = _controller()
+    playlist = FakePlaylist()
+    ctrl.plugin._sync_playlists["flat-guid-1"] = (playlist, None)
+    ctrl.plugin.active_playhead = FakePlayhead()
+    ctrl.plugin.manager.status = STATE_SYNCED
+    ctrl._last_pinned_source_mode = True
+
+    ctrl._maybe_announce_sequence_container_switch("flat-internal-tl-uuid", True)
+
+    assert ctrl.plugin._cmd_queue.items == []
+    assert ctrl.plugin.manager.active_timeline_guid is None
+
+
+def test_a_peer_driven_switch_to_a_sequence_is_not_re_announced():
+    """Applying a peer's own view_mode=sequence message moves this peer's
+    container the same way a local double-click would; it must not be
+    echoed back as a fresh local assertion."""
+    ctrl = _controller()
+    container_uuid = _seq_setup(ctrl)
+    ctrl.plugin.manager.remote_apply_context = lambda: {"in_apply": True}
+
+    ctrl._maybe_announce_sequence_container_switch(container_uuid, True)
+
+    assert ctrl.plugin._cmd_queue.items == [], (
+        "a switch caused by applying a peer's message must not be broadcast"
+    )
+    # Bookkeeping still runs — this peer really is on that sequence now.
+    assert ctrl._cur_view_mode == "sequence"
+    assert ctrl.plugin.manager.active_timeline_guid == "seq-tl-1"
+
+
+def test_an_already_announced_sequence_switch_is_not_announced_twice():
+    ctrl = _controller()
+    container_uuid = _seq_setup(ctrl)
+    ctrl._cur_view_mode = "sequence"
+    ctrl.plugin.manager.active_timeline_guid = "seq-tl-1"  # already announced
+
+    ctrl._maybe_announce_sequence_container_switch(container_uuid, True)
+
+    assert ctrl.plugin._cmd_queue.items == []
+
+
+def test_no_container_switch_this_poll_does_not_announce():
+    """container_switched=False (the uuid didn't change) must be a no-op,
+    however the other conditions look."""
+    ctrl = _controller()
+    container_uuid = _seq_setup(ctrl)
+
+    ctrl._maybe_announce_sequence_container_switch(container_uuid, False)
+
+    assert ctrl.plugin._cmd_queue.items == []
+
+
+class _FakeTimelineContainer(playback_sync.Timeline):
+    """A real ``Timeline`` for ``isinstance`` purposes, without the actor
+    round-trips its methods make against a live session — this test has no
+    actor to answer them.  Only ``__bool__`` is overridden: ``Timeline``
+    defines no ``__bool__`` of its own, so Python's default truthiness check
+    (``if container:``) falls back to ``__len__``, which does make an actor
+    call. Defining ``__bool__`` here short-circuits that fallback.
+    """
+
+    def __bool__(self):
+        return True
+
+
+def test_viewport_playhead_event_refreshes_stale_container_flags_first():
+    """The viewport-playhead event is the first sign of a container switch —
+    before any show_atom for it. It must leave the flags a following
+    show_atom reads matching the *new* container, not whatever the selection
+    poll last saw.
+    """
+    ctrl = _controller()
+    # Stale from viewing the bin, exactly as in the 2026-09-23 log: the poll
+    # last ran while the bin was on screen and hasn't run again yet.
+    ctrl._viewport_container_is_playlist = True
+    ctrl._viewport_container_is_timeline = False
+    timeline = _FakeTimelineContainer(ctrl.plugin.connection, object(), object())
+    ctrl.plugin.connection.api.session.viewed_container = timeline
+    # subscribe_container_selection makes a real (bounded) xStudio call this
+    # test has no actor for; it is unrelated to the flags under test and the
+    # caller already tolerates it failing, so stub it out rather than fake a
+    # whole selection actor.
+    ctrl.subscribe_container_selection = lambda container: None
+    # Match active_playhead's remote key so handle_viewport_playhead's own
+    # playhead-adoption branch (irrelevant here) is a no-op instead of
+    # failing to construct a Playhead against an actor this test doesn't have.
+    ctrl.plugin.active_playhead = types.SimpleNamespace(remote="ph-current")
+
+    ctrl.handle_viewport_playhead(viewport="viewport0", ph_remote="ph-current")
+
+    assert ctrl._viewport_container_is_timeline is True
+    assert ctrl._viewport_container_is_playlist is False
+
+
 if __name__ == "__main__":
     import pytest
 
