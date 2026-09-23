@@ -105,3 +105,12 @@ xStudio logged every frame it *broadcast* and nothing about applying one, so a
 peer that followed every frame and one that silently dropped them all produced
 identical logs. Before concluding a peer did nothing, confirm the thing it
 would have done is actually logged.
+
+## HTTP media fallback scenario
+
+`sync_test/run_http_media_fallback_test.py` runs an additional scenario
+(`http_media_fallback` in `sync_tests_xstudio.yaml`) exercising the OTIO
+`media_linker` plugin that falls back to HTTP-served media when a peer's
+local copy is unavailable — including the one non-obvious trap it took a
+live spike to find (plain `http.server` fails RV's demuxer outright). See
+[docs/http_media_fallback.md](http_media_fallback.md).

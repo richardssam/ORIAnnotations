@@ -240,6 +240,8 @@ def _media_path(url: str) -> str:
     """
     if not url:
         return url
+    if url.startswith(('http://', 'https://')):
+        return url
     if not url.startswith('file://'):
         return os.path.abspath(os.path.normpath(url))
     try:

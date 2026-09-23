@@ -1551,6 +1551,15 @@ class TestRunner:
                     "ORI_SESSION_PEER_ROLES": memory,
                     "ORI_SESSION": "test_session",
                 }
+            # ``media_roots`` is a third parallel list to ``apps``: each peer's
+            # local directory for the http_fallback OTIO media_linker's
+            # existence check (see openspec/changes/http-media-fallback).
+            # A peer whose entry's directory lacks a clip's media falls back
+            # to ``media_http_base_url`` for that clip. Absent means the
+            # linker stays unconfigured/inert for every peer, unchanged from
+            # today's behaviour.
+            media_roots = test_data.get("media_roots", [])
+            media_http_base_url = test_data.get("media_http_base_url")
             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
             for i, (app_name, port) in enumerate(zip(apps, free_ports)):
                 fixture = fixtures[i] if i < len(fixtures) else None
@@ -1559,6 +1568,13 @@ class TestRunner:
                 env_extra = dict(role_env)
                 if role_env and i < len(users) and users[i]:
                     env_extra["ORI_SYNC_USER"] = users[i]
+                if media_roots and i < len(media_roots) and media_roots[i] and media_http_base_url:
+                    media_root = media_roots[i]
+                    if not os.path.isabs(media_root):
+                        media_root = os.path.join(repo_root, media_root)
+                    env_extra["ORI_MEDIA_LOCAL_ROOT"] = media_root
+                    env_extra["ORI_MEDIA_HTTP_BASE_URL"] = media_http_base_url
+                    env_extra["OTIO_DEFAULT_MEDIA_LINKER"] = "http_fallback"
                 # Launch by app type; address by peer name. The spawner already
                 # keys its logs on the port, so two peers of one type stay
                 # separable without anything further here.
@@ -1797,6 +1813,35 @@ class TestRunner:
                             logging.error(
                                 f"Peers never agreed on a single {channel} owner — "
                                 "the lease stayed split instead of converging."
+                            )
+                            failed = True
+                            break
+                        continue
+
+                    # Asserts which media source a peer actually resolved a
+                    # clip to — the observable proof that the http_fallback
+                    # OTIO media_linker fired (or didn't) for that peer. See
+                    # openspec/changes/http-media-fallback.
+                    if action == "expect_media_path_prefix":
+                        target = cmd.get("app")
+                        expected_prefix = cmd.get("prefix")
+                        settle = cmd.get("settle", 10.0)
+                        port = next((p for n, p in app_ports if n == target), None)
+                        observed = None
+                        deadline = time.monotonic() + settle
+                        while time.monotonic() < deadline:
+                            observed = (self.fetch_state(port) or {}).get("media_path") if port else None
+                            if observed and observed.startswith(expected_prefix):
+                                break
+                            time.sleep(0.25)
+                        logging.info(f"  -> {target} media_path: {observed} (expected prefix {expected_prefix!r})")
+                        if not observed or not observed.startswith(expected_prefix):
+                            logging.error(
+                                f"expect_media_path_prefix: {target} reports "
+                                f"media_path {observed!r}, expected it to start "
+                                f"with {expected_prefix!r}. The media_linker "
+                                "fallback either did not fire or resolved to "
+                                "something unexpected."
                             )
                             failed = True
                             break

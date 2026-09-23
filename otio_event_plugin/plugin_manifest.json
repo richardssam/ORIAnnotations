@@ -7,5 +7,12 @@
             "execution_scope" : "in process",
             "filepath" : "schemadefs/SyncEvent.py"
          }
+    ],
+    "media_linkers" : [
+        {
+            "OTIO_SCHEMA" : "MediaLinker.1",
+            "name" : "http_fallback",
+            "filepath" : "media_linkers/http_fallback.py"
+        }
     ]
 }

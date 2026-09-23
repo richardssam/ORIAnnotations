@@ -213,14 +213,23 @@ def get_openrv_state():
             if media_info and len(media_info) > 0:
                 path = media_info[0]
                 state["media_path"] = path
-                if path.startswith("file:/"):
-                    if path.startswith("file://localhost"):
-                        path = path[16:]
-                    elif path.startswith("file://"):
-                        path = path[7:]
-                    elif path.startswith("file:/"):
-                        path = path[5:]
-                state["media_exists"] = os.path.exists(path)
+                if path.startswith(("http://", "https://")):
+                    # Not a filesystem path — os.path.exists would always
+                    # report False for a resolved HTTP fallback (see
+                    # openspec/changes/http-media-fallback). RV having
+                    # created a source for it at all is the available
+                    # existence signal; media_count already covers "no
+                    # source was created".
+                    state["media_exists"] = True
+                else:
+                    if path.startswith("file:/"):
+                        if path.startswith("file://localhost"):
+                            path = path[16:]
+                        elif path.startswith("file://"):
+                            path = path[7:]
+                        elif path.startswith("file:/"):
+                            path = path[5:]
+                    state["media_exists"] = os.path.exists(path)
         else:
             # If no sources, we don't treat media as "missing" (just empty)
             state["media_exists"] = True
