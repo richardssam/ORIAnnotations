@@ -52,7 +52,8 @@ re-attempted the same way. See 5.5 for the evidence.
 
 ## 6. Follow-ups (not implemented here)
 
-- [ ] 6.1 File or note the auto-play race (`playback still active … a seek must park the playhead`) with the `set_frame`-does-not-pause and `playing_override`-without-local-play hypotheses from design.md.
+- [x] 6.1 File or note the auto-play race (`playback still active … a seek must park the playhead`) with the `set_frame`-does-not-pause and `playing_override`-without-local-play hypotheses from design.md.
+      → Filed 2026-09-23 as a memory note (`project-xstudio-autoplay-race`): both hypotheses recorded, not yet distinguished; still needs its own reproduction.
 - [x] 6.2 File or note the `structural_consensus` mismatch after `add_media`, capturing the projection diff detail that was not recorded in the observed failure.
       → **Captured and root-caused 2026-08-27.** 10x on a quiet host (AC, load ~4-5, 26 GB free) = **9 pass / 1 fail**, matching the recorded baseline; the one failure is this. The projection diff, recorded for the first time:
       ```
