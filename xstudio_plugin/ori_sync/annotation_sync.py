@@ -712,10 +712,30 @@ class AnnotationSyncController:
                     _log(f"broadcast_local_bookmark: no clip at frame {frame} — will retry")
                     return None
 
-        annotation_track_guid = self.plugin.manager.annotation_track_guid_for_clip(clip_guid)
+        manager = self.plugin.manager
+        annotation_track_guid = manager.annotation_track_guid_for_clip(clip_guid)
+        if annotation_track_guid is None:
+            # No track yet (e.g. a flat playlist) — build the clip timeline so
+            # there is one, as RV's send path does.
+            if manager.get_or_create_clip_timeline(clip_guid):
+                annotation_track_guid = manager.annotation_track_guid_for_clip(clip_guid)
         if annotation_track_guid is None:
             _log("broadcast_local_bookmark: no Annotations track")
             return False
+        # If the track lives in a clip timeline, peers must be told about that
+        # timeline before the INSERT_CHILD below, or they have nothing to bind
+        # it to and drop the stroke.  The clip timeline is usually built by the
+        # selection path, which never announces it.  broadcast_clip_timeline
+        # sends at most once per timeline, so calling it every stroke is cheap.
+        for tl_guid, tl in manager.timelines.items():
+            if tl.metadata.get("clip_timeline_for") != clip_guid:
+                continue
+            if any(
+                t.metadata.get("sync", {}).get("guid") == annotation_track_guid
+                for t in tl.tracks
+            ):
+                manager.broadcast_clip_timeline(tl_guid)
+                break
 
         _, aspect_half = self.plugin.media.media_for_sync_guid(clip_guid)
         all_strokes = canvas.get("pen_strokes", [])
