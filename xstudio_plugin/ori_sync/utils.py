@@ -123,6 +123,24 @@ def media_frame_count(media, media_reference=None):
     return None
 
 
+def media_start_frame(media_reference) -> int:
+    """Return the media's embedded-timecode start frame, or ``0`` if it has none.
+
+    A clip's ``available_range`` must start at the media's timecode (e.g. 91699)
+    rather than 0. Peers convert an annotation's clip-local frame into their own
+    per-source frame by adding this start; a range that says 0 for media whose
+    timecode is not 0 makes RV add its own timecode base on top of the wrong one
+    and file the stroke on a frame that does not exist.
+
+    :param media_reference: xStudio ``MediaReference``.
+    :returns: Timecode start in frames; ``0`` when unknown or not probed yet.
+    """
+    try:
+        return max(0, int(media_reference.timecode().total_frames()))
+    except Exception:
+        return 0
+
+
 def _uri_to_posix_path(uri: str) -> str:
     """Convert a URI or xStudio internal URI string to a POSIX filesystem path.
 

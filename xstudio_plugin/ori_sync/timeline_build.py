@@ -9,7 +9,7 @@ import time
 import opentimelineio as otio
 from xstudio.api.session.playlist.timeline import Timeline
 
-from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout, media_frame_count
+from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout, media_frame_count, media_start_frame
 
 
 def _write_sync_item_props(xs_tl, tl, connection) -> None:
@@ -507,7 +507,7 @@ class TimelineBuildController:
                 ).hexdigest()
                 if frame_count is not None:
                     sr = otio.opentime.TimeRange(
-                        otio.opentime.RationalTime(0, fps),
+                        otio.opentime.RationalTime(media_start_frame(mr), fps),
                         otio.opentime.RationalTime(frame_count, fps),
                     )
                     clip = otio.schema.Clip(

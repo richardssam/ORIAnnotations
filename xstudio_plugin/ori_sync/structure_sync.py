@@ -29,6 +29,7 @@ from .utils import (
     _uri_to_posix_path,
     bounded_timeout,
     media_frame_count,
+    media_start_frame,
     structure_events_enabled,
 )
 
@@ -1154,7 +1155,7 @@ class StructureSyncController:
                     frame_count = media_frame_count(media, ms.media_reference)
                     if frame_count:
                         sr = otio.opentime.TimeRange(
-                            otio.opentime.RationalTime(0, fps),
+                            otio.opentime.RationalTime(media_start_frame(ms.media_reference), fps),
                             otio.opentime.RationalTime(frame_count, fps),
                         )
                         clip = otio.schema.Clip(
@@ -1700,7 +1701,7 @@ class StructureSyncController:
                     frame_count = media_frame_count(media, ms.media_reference)
                     if frame_count:
                         sr = otio.opentime.TimeRange(
-                            otio.opentime.RationalTime(0, fps),
+                            otio.opentime.RationalTime(media_start_frame(ms.media_reference), fps),
                             otio.opentime.RationalTime(frame_count, fps),
                         )
                         clip = otio.schema.Clip(
