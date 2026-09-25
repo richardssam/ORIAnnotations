@@ -147,7 +147,7 @@ class SyncPlayer:
         speed: float = 1.0,
         loop: bool = False,
         replace_source_guid: bool = True,
-        wait_for_peer: bool = False,
+        wait_for_peer: bool = True,
         post_snapshot_delay: float = 3.0,
     ) -> None:
         """Synchronously play back the loaded events, blocking until finished.
@@ -158,10 +158,12 @@ class SyncPlayer:
             the player's own guid.
         :param wait_for_peer: If True, hold playback until a peer has requested
             and received a ``STATE_SNAPSHOT``, then wait *post_snapshot_delay*
-            seconds before sending the first recorded event.
+            seconds before sending the first recorded event.  On by default so
+            nothing is sent into an empty session.
         :param post_snapshot_delay: Seconds to wait after the snapshot is
             delivered before playback begins.  Gives the joining peer time to
-            apply the snapshot before events start arriving.  Default 1.0 s.
+            load the state before events start arriving.  Always waited in
+            full; peer chatter does not cut it short.  Default 3.0 s.
         """
         if not self.events:
             raise ValueError("No recording loaded. Call load_recording() first.")
@@ -170,26 +172,33 @@ class SyncPlayer:
         self._peer_snapshot_sent_at = None
 
         if wait_for_peer:
-            print("[*] Waiting for a peer to join and request state…")
+            print(f"[*] {time.strftime('%H:%M:%S')} Waiting for a peer to join and request state…")
             while self._peer_snapshot_sent_at is None:
                 self._process_network_requests()
                 time.sleep(0.01)
             print(
-                f"[*] State snapshot sent. Waiting up to {post_snapshot_delay:.1f}s "
+                f"[*] {time.strftime('%H:%M:%S')} State snapshot sent. Waiting up to {post_snapshot_delay:.1f}s "
                 "for peer to become ready…"
             )
-            self._peer_active_received = False
             start_wait = time.time()
+            print(f"[*] {time.strftime('%H:%M:%S')} Post-snapshot wait started.")
             while (time.time() - start_wait) < post_snapshot_delay:
                 self._process_network_requests()
-                if self._peer_active_received:
-                    print("[*] Peer activity detected! Starting playback early.")
-                    break
                 time.sleep(0.01)
+            print(
+                f"[*] {time.strftime('%H:%M:%S')} Post-snapshot wait finished "
+                f"({time.time() - start_wait:.1f}s)."
+            )
 
         try:
             while True:
                 start_time = time.time()
+                print(
+                    f"[*] {time.strftime('%H:%M:%S')} Starting playback of "
+                    f"{len(self.events)} events (first at "
+                    f"t={self.events[0]['time_offset']:.2f}s, last at "
+                    f"t={self.events[-1]['time_offset']:.2f}s)."
+                )
                 for event in self.events:
                     offset = event["time_offset"]
                     target_time = start_time + (offset / speed)
@@ -203,6 +212,7 @@ class SyncPlayer:
 
                     self._send_event(event, replace_source_guid)
 
+                print(f"[*] {time.strftime('%H:%M:%S')} Sent all {len(self.events)} events.")
                 if not loop:
                     break
         finally:
@@ -615,12 +625,13 @@ def main() -> None:
         help="Keep original source GUIDs instead of replacing them",
     )
     p.add_argument(
-        "--wait-for-peer",
-        action="store_true",
+        "--no-wait-for-peer",
+        dest="wait_for_peer",
+        action="store_false",
         help=(
-            "Hold playback until a peer has joined and received the state "
-            "snapshot, then wait --post-snapshot-delay seconds before "
-            "sending the first event."
+            "Start playback immediately. By default playback is held until a "
+            "peer has joined and received the state snapshot, then "
+            "--post-snapshot-delay seconds elapse before the first event."
         ),
     )
     p.add_argument(
@@ -630,7 +641,7 @@ def main() -> None:
         metavar="SECONDS",
         help=(
             "Seconds to wait after sending the state snapshot before "
-            "playback begins (only used with --wait-for-peer, default: 3.0)."
+            "playback begins (unless --no-wait-for-peer, default: 3.0)."
         ),
     )
     args = p.parse_args()

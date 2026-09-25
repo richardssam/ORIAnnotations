@@ -57,8 +57,8 @@ Options:
 - `--speed`: Playback speed multiplier, e.g. `2.0` plays twice as fast (default: `1.0`).
 - `--loop`: Loops playback indefinitely.
 - `--keep-guids`: Keeps original source GUIDs instead of replacing them with the player's own unique GUID.
-- `--wait-for-peer`: Hold playback until a peer has joined and received the `STATE_SNAPSHOT`, then wait `--post-snapshot-delay` seconds before sending the first recorded event. The player will also start early if it detects peer activity before the delay expires.
-- `--post-snapshot-delay SECONDS`: Seconds to wait after delivering the state snapshot before playback begins (default: `3.0`). Only used with `--wait-for-peer`.
+- `--no-wait-for-peer`: Start playback immediately. By default the player holds playback until a peer has joined and received the `STATE_SNAPSHOT`, then waits the full `--post-snapshot-delay` seconds before sending the first recorded event.
+- `--post-snapshot-delay SECONDS`: Seconds to wait after delivering the state snapshot before playback begins (default: `3.0`). Ignored with `--no-wait-for-peer`.
 
 ### Converting a Recording to an OTIO Timeline
 
