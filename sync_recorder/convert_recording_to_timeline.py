@@ -148,7 +148,17 @@ def get_commands_signature(cmds: list[Any] | None) -> tuple[Any, ...] | None:
             position = cmd.get("position")
         position_tuple = tuple(position) if position else None
 
-        sig.append((schema, uuid_val, text, rgba_tuple, position_tuple))
+        # A live stroke keeps its uuid while it grows, so the point count is
+        # what tells a 1-point partial from the finished stroke.
+        points = getattr(cmd, "points", None)
+        if points is None and isinstance(cmd, dict):
+            points = cmd.get("points")
+        xs = getattr(points, "x", None)
+        if xs is None and isinstance(points, dict):
+            xs = points.get("x")
+        n_points = len(xs) if xs is not None else None
+
+        sig.append((schema, uuid_val, text, rgba_tuple, position_tuple, n_points))
     return tuple(sig)
 
 
@@ -234,6 +244,9 @@ def convert_recording(
     segments: list[VisualSegment] = []
     partial_annotations: dict[str, dict[int, dict[str, Any]]] = {}
     annotation_histories: dict[tuple[str, int], list] = {}
+    # Committed strokes from annotation INSERT_CHILDs whose parent track is
+    # unknown, keyed like partial_annotations: clip_guid -> media frame -> uuid.
+    unbound_committed: dict[str, dict[int, dict[str, Any]]] = {}
     last_recorded_signatures: dict[tuple[str, int], Any] = {}
 
     last_flush_t = 0.0
@@ -423,6 +436,12 @@ def convert_recording(
                             for uuid_val, stroke_cmds in clip_strokes.items():
                                 frame_dict[uuid_val] = stroke_cmds
 
+        for cg, frames in unbound_committed.items():
+            for frame, strokes in frames.items():
+                frame_dict = committed_by_cg_frame.setdefault(cg, {}).setdefault(frame, {})
+                for uuid_val, stroke_cmds in strokes.items():
+                    frame_dict.setdefault(uuid_val, stroke_cmds)
+
         all_keys = set()
         for cg, frames in committed_by_cg_frame.items():
             for frame in frames:
@@ -525,17 +544,27 @@ def convert_recording(
         elif cmd == "OTIO_SESSION_1.0":
             if evt == "INSERT_CHILD":
                 child_data = payload_data.get("child_data", {})
-                if child_data and child_data.get("OTIO_SCHEMA") == "Clip.2":
+                parent_known = payload_data.get("parent_uuid") in patcher.object_map
+                if child_data and child_data.get("OTIO_SCHEMA") == "Clip.2" and not parent_known:
+                    # A committed annotation whose Annotations track was never
+                    # announced (the sender skipped its ADD_TIMELINE). The patch
+                    # cannot bind, so keep the strokes directly rather than
+                    # dropping them; update_annotation_histories merges these
+                    # with the strokes found in the timelines.
                     meta = child_data.get("metadata", {})
                     cg = meta.get("clip_guid")
                     sr = child_data.get("source_range")
-                    if cg and sr:
+                    commands = meta.get("annotation_commands") or []
+                    if cg and sr and commands:
                         drw_frame = sr.get("start_time", {}).get("value")
                         if drw_frame is not None:
                             media_frame = resolve_annotation_media_frame(cg, drw_frame)
-                            # committed strokes are picked up via
-                            # update_annotation_histories; nothing to store here.
-                            _ = media_frame
+                            if media_frame is not None:
+                                strokes: dict[str, list] = {}
+                                for c in commands:
+                                    if isinstance(c, dict) and c.get("uuid"):
+                                        strokes.setdefault(c["uuid"], []).append(c)
+                                unbound_committed.setdefault(cg, {}).setdefault(media_frame, {}).update(strokes)
 
             from otio_sync_core.protocol_messages import message_for
             msg_cls = message_for(cmd, evt)
