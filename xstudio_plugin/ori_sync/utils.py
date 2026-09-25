@@ -91,6 +91,38 @@ def _log_exc(msg: str) -> None:
 # ── path helpers ───────────────────────────────────────────────────────────────
 
 
+def media_frame_count(media, media_reference=None):
+    """Return *media*'s frame count, or ``None`` when xStudio does not know it.
+
+    Reads ``MediaReference.frame_count()``, which is authoritative once xStudio
+    has probed the file. ``Media.display_info`` is only a fallback: it holds the
+    values shown in the MediaList panel, not a stable keyed schema, so guessing
+    keys there returned nothing and left clips without any range.
+
+    :param media: xStudio ``Media`` object.
+    :param media_reference: Already-fetched media reference, to save a round trip.
+    :returns: Positive frame count, or ``None`` if unknown (e.g. not yet probed).
+    """
+    try:
+        mr = media_reference
+        if mr is None:
+            mr = media.media_source().media_reference
+        n = int(mr.frame_count())
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    try:
+        info = media.display_info
+        if isinstance(info, dict):
+            for key in ("frames", "Frames", "frame_count", "num_frames", "duration_frames"):
+                if info.get(key):
+                    return int(info[key])
+    except Exception:
+        pass
+    return None
+
+
 def _uri_to_posix_path(uri: str) -> str:
     """Convert a URI or xStudio internal URI string to a POSIX filesystem path.
 

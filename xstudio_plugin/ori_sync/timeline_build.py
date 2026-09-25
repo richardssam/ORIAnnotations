@@ -9,7 +9,7 @@ import time
 import opentimelineio as otio
 from xstudio.api.session.playlist.timeline import Timeline
 
-from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout
+from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout, media_frame_count
 
 
 def _write_sync_item_props(xs_tl, tl, connection) -> None:
@@ -501,15 +501,7 @@ class TimelineBuildController:
                         fps = rate_obj.fps()
                     except Exception:
                         pass
-                frame_count: int | None = None
-                try:
-                    info = media.display_info
-                    for key in ("frames", "Frames", "frame_count", "num_frames", "duration_frames"):
-                        if key in info and info[key]:
-                            frame_count = int(info[key])
-                            break
-                except Exception:
-                    pass
+                frame_count = media_frame_count(media, mr)
                 clip_guid = hashlib.sha1(
                     f"{track_guid}:{media_idx}:{media.name}".encode("utf-8")
                 ).hexdigest()

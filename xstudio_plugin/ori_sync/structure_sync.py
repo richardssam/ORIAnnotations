@@ -23,7 +23,14 @@ except ImportError:
     _add_media_atom = None
 from otio_sync_core.manager import STATE_SYNCED
 from otio_sync_core.authority import CHANNEL_STRUCTURE
-from .utils import _log, _log_exc, _uri_to_posix_path, bounded_timeout, structure_events_enabled
+from .utils import (
+    _log,
+    _log_exc,
+    _uri_to_posix_path,
+    bounded_timeout,
+    media_frame_count,
+    structure_events_enabled,
+)
 
 _MEDIA_NAME_TIMEOUT_MS = 2000
 
@@ -1144,16 +1151,7 @@ class StructureSyncController:
                     rate_obj = ms.rate
                     if rate_obj:
                         fps = rate_obj.fps() or fps
-                    frame_count = None
-                    try:
-                        info = media.display_info
-                        for key in ("frames", "Frames", "frame_count", "num_frames"):
-                            v = info.get(key)
-                            if v:
-                                frame_count = int(v)
-                                break
-                    except Exception:
-                        pass
+                    frame_count = media_frame_count(media, ms.media_reference)
                     if frame_count:
                         sr = otio.opentime.TimeRange(
                             otio.opentime.RationalTime(0, fps),
@@ -1699,16 +1697,7 @@ class StructureSyncController:
                     rate_obj = ms.rate
                     if rate_obj:
                         fps = rate_obj.fps() or fps
-                    frame_count = None
-                    try:
-                        info = media.display_info
-                        for key in ("frames", "Frames", "frame_count", "num_frames"):
-                            v = info.get(key)
-                            if v:
-                                frame_count = int(v)
-                                break
-                    except Exception:
-                        pass
+                    frame_count = media_frame_count(media, ms.media_reference)
                     if frame_count:
                         sr = otio.opentime.TimeRange(
                             otio.opentime.RationalTime(0, fps),
