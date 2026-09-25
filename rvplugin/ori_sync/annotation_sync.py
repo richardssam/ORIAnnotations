@@ -750,7 +750,17 @@ class AnnotationSyncController:
             there is no ``MetaEvalInfo`` to read a native frame from.
         """
         seq_frame = frame
-        if self.plugin.sync_manager:
+        try:
+            source_view = self.plugin.playback._displayed_view()[0] == "source"
+        except Exception:
+            source_view = False
+        if source_view:
+            # RV is showing a single source, whose frame domain is the source's
+            # own native frames — and *frame* is already one of those.  Adding
+            # the sequence clip's range_in_parent.start below would push it past
+            # the end of the media (91761 -> 91963 for a clip 202 frames in).
+            _log(f"  _find_paint_node: source view — seq_frame = frame = {frame}")
+        elif self.plugin.sync_manager:
             if clip_guid:
                 # Derive the sequence-position frame for metaEvaluateClosestByType.
                 # The caller's `frame` is the STORAGE frame (source timecode, e.g. 110),
