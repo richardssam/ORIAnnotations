@@ -212,14 +212,16 @@ class AppSpawner:
             # comparisons. Pin both apps to the same known config.
             repo_root = os.path.abspath(os.path.join(self.base_dir, ".."))
             env["OCIO"] = os.path.join(repo_root, "test_media", "config.ocio")
-            # Without this, OTIO_DEFAULT_MEDIA_LINKER (or any named linker)
-            # fails to resolve at all — unlike a schemadef mismatch, which
-            # degrades to a generic object, a MediaLinker name that can't be
-            # found raises NotSupportedError on every read_from_string call
-            # in the process. The xStudio branch already sets this; RV had
-            # silently never had it, unnoticed because nothing previously
-            # required a linker name to resolve on the RV side.
-            env["OTIO_PLUGIN_MANIFEST_PATH"] = os.path.join(repo_root, "otio_event_plugin", "plugin_manifest.json")
+            # A named media linker (OTIO_DEFAULT_MEDIA_LINKER) only resolves
+            # if its manifest is on OTIO_PLUGIN_MANIFEST_PATH, so tests that
+            # configure one get the repo manifest. Every other RV launch must
+            # NOT: RV's installed ori_annotations plugin already appends its
+            # own otio_event_plugin manifest, and a second manifest defining
+            # the SyncEvent schemadef loads it twice — deserialised events
+            # then fail isinstance(ev, SyncEvent.PaintStart) and every
+            # received annotation is silently dropped.
+            if (env_extra or {}).get("OTIO_DEFAULT_MEDIA_LINKER"):
+                env["OTIO_PLUGIN_MANIFEST_PATH"] = os.path.join(repo_root, "otio_event_plugin", "plugin_manifest.json")
             env.update(env_extra or {})
 
             p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
