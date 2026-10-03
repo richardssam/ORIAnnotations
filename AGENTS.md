@@ -10,7 +10,7 @@ A toolkit for sharing review annotations between applications in real time. The 
 
 The core protocol is built on top of **OpenTimelineIO (OTIO)**: the shared state is an OTIO `Timeline`, mutations are broadcast as structured JSON messages over **RabbitMQ**, and every peer maintains a local replica of that timeline.
 
-For a detailed breakdown of the protocol and architecture, see [docs/architecture.md](file:///Users/sam/git/ORIAnnotations/docs/architecture.md).
+For a detailed breakdown of the protocol and architecture, see [docs/architecture.md](docs/architecture.md).
 
 ---
 
@@ -29,7 +29,7 @@ For a detailed breakdown of the protocol and architecture, see [docs/architectur
 | `sync_viewer/static/index.html` | Single-file browser UI for the debug viewer. |
 | `xstudio_plugin/` | xStudio equivalent of the RV plugin (separate integration). |
 | `otio_event_plugin/` | OTIO schemadef plugin that defines `SyncEvent` — used to embed annotation commands in OTIO metadata. |
-| `openspec/` | Protocol specification documents. |
+| `openspec/` | OpenSpec root: the `otio_sync_protocol_v1.md` protocol spec, plus `specs/` and `changes/` (the change-proposal workflow the `.claude/skills/openspec-*` skills operate on). |
 
 ---
 
@@ -63,43 +63,9 @@ Runtime: `opentimelineio`, `pika` (RabbitMQ client, vendored into `.rvpkg`), `fa
 
 ---
 
-# AI Agents
+## Tests
 
-This project utilizes AI agents to assist with the development workflow. Below are the defined roles and their responsibilities.
-
-## 🤖 Antigravity (The Main Assistant)
-**Role**: Lead Developer / Pair Programmer
-**Responsibilities**:
-- Analyzing codebase and understanding requirements.
-- Planning and implementing features and bug fixes.
-- Writing code, tests, and documentation.
-- Conducting code reviews and refactoring.
-- Managing project structure and configuration.
-
-## 🧠 OpenSpec Agents (Spec-Driven Development)
-Where applicable, agents may be specialized for OpenSpec workflows:
-
-### Architect
-- **Focus**: High-level design and system architecture.
-- **Tasks**: Drafting specifications, defining interfaces, validating requirements.
-
-### Implementer
-- **Focus**: Writing code based on specifications.
-- **Tasks**: Translating specs into implementation, adhering to coding standards.
-
-### Verifier / QA
-- **Focus**: Validation and testing.
-- **Tasks**: Creating test plans, writing unit/integration tests, verifying implementation against specs.
-- **Tools**: Unit tests (pytest), UI Tests (QtQuick.Test).
-
-## 🧪 Testing Infrastructure
-- **Unit Tests**: `test/` (C++), `src/plugin/.../test_*.py` (Python)
+- **Unit Tests**: `tests/otio_sync/` via `./run_tests_core.sh`, and `tests/xstudio_plugin/` via `./run_tests_xstudio.sh` (needs xStudio's bundled interpreter)
 - **UI / Integration Tests**: `sync_test/` (Python framework driving OpenRV and xStudio)
-- **RPA Helpers**: `rpa_test/`
 
-## 📝 Documentation Agent
-- **Focus**: Knowledge management.
-- **Tasks**: Maintaining documentation, creating tutorials, updating KIs (Knowledge Items).
-
-## usage
-To interact with a specific agent persona, you can address them by role or context in your prompt, e.g., "As an Architect, how should we structure this module?".
+See [docs/testing.md](docs/testing.md) for the `rv` stub collision and the known flaky test.
