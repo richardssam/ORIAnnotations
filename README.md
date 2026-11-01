@@ -36,6 +36,7 @@ See **[docs/rabbitmq_setup.md](file:///Users/sam/git/ORIAnnotations/docs/rabbitm
 
    * [examples/testexport/annotationreview.otio](https://github.com/richardssam/ORIAnnotations/tree/main/examples) is an example OTIO annotation file.
    * [examples/testsession.rv](https://github.com/richardssam/ORIAnnotations/blob/main/examples/testsession.rv) is the rv-session file that was used to generate this file, and the media is in that folder.
+   * [Vector annotations vs. baked images](docs/annotation_vector_vs_image_comparison.md) compares the vector strokes in these exports against the exported PNG frames, both for geometric fidelity and storage size.
 
 ## Sync Plugins
 
