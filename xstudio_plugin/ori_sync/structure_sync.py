@@ -116,9 +116,6 @@ class StructureSyncController:
         self._test_container_group_key: str | None = None
         # Event-group joins are owned by the plugin (join_event_group) so all
         # subscription paths share one join-once/never-leave rule; see there.
-        # Requester GUIDs that sent STATE_REQUEST when we had no timelines yet.
-        # On each poll tick we retry send_state_snapshot until it succeeds.
-        self._pending_snapshot_requesters: list[str] = []
         self._last_structure_scan: float = 0.0
         #: Signature of the last structure census logged, so the once-a-second
         #: scan reports only when what it can see actually changes.
@@ -167,7 +164,6 @@ class StructureSyncController:
             self._timeline_item_dirty.clear()
         self._test_container_uuid = None
         self._test_container_group_key = None
-        self._pending_snapshot_requesters.clear()
         self._last_structure_scan = 0.0
         self._last_scan_census = ""
         self._structural_mutation_suppress_until = 0.0
@@ -2784,19 +2780,3 @@ class StructureSyncController:
             self.plugin.annotation.clear_reload_state()
             _log_exc(f"move_child: failed to reload timeline {tl_guid[:8]}")
             return
-
-    # ── deferred snapshots ─────────────────────────────────────────────
-
-    def process_deferred_snapshots(self) -> None:
-        """Send deferred state snapshots to requesters that arrived before timelines were ready."""
-        if not self._pending_snapshot_requesters:
-            return
-        if not self.plugin.manager or not self.plugin.manager._timelines:
-            return
-        for _req_guid in list(self._pending_snapshot_requesters):
-            _log(f"Deferred snapshot: sending to {_req_guid[:8]}")
-            self.plugin.manager.send_state_snapshot(
-                _req_guid,
-                playback_state=self.plugin.playback.current_playback_state(),
-            )
-        self._pending_snapshot_requesters.clear()

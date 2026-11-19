@@ -286,3 +286,54 @@ def test_state_request_timeout_still_elects_for_a_create():
 
     assert mgr.elected == [True]
     assert plugin._calls.disconnected == 0
+
+
+# ---------------------------------------------------------------------------
+# session-join-validation: the master answers a STATE_REQUEST even with
+# nothing loaded. Holding the answer until timelines appeared never ended in
+# an empty session — the joiner timed out and a Join reported the session as
+# not found.
+# ---------------------------------------------------------------------------
+
+
+class SnapshotManager:
+    """Master-side stand-in recording every snapshot sent."""
+
+    def __init__(self):
+        self.root_timeline = None
+        self._timelines = {}
+        self.display_state = None
+        self.snapshots = []
+
+    def register_timeline(self, tl):
+        self._timelines[tl] = tl
+        self.root_timeline = self.root_timeline or tl
+
+    def send_state_snapshot(self, target_guid, playback_state=None):
+        self.snapshots.append((target_guid, sorted(self._timelines)))
+
+
+def _master_plugin(builder):
+    plugin = _fake_plugin(SnapshotManager(), builder)
+    plugin.display = types.SimpleNamespace(
+        read_xs_display_state=lambda: {"exposure": 0.0},
+        _last_display_state={},
+    )
+    plugin.playback = types.SimpleNamespace(current_playback_state=lambda: None)
+    return plugin
+
+
+def test_an_empty_master_answers_a_state_request_at_once():
+    plugin = _master_plugin(FakeBuilder([]))
+
+    ORISyncPlugin._handle_manager_event(plugin, "state_request_received", "guid-joiner")
+
+    assert plugin.manager.snapshots == [("guid-joiner", [])]
+
+
+def test_a_master_with_media_answers_with_its_timelines():
+    plugin = _master_plugin(FakeBuilder(["tl-a", "tl-b"]))
+
+    ORISyncPlugin._handle_manager_event(plugin, "state_request_received", "guid-joiner")
+
+    assert plugin.manager.snapshots == [("guid-joiner", ["tl-a", "tl-b"])]

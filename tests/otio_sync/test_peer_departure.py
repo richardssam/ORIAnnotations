@@ -332,9 +332,9 @@ def test_a_missing_roster_does_not_blank_the_table():
 def test_a_joiner_with_no_snapshot_still_learns_peers_from_heartbeats():
     """The case that makes retiring the answer cascade safe.
 
-    `send_state_snapshot` returns early when the master holds no timelines, so a
-    joiner into an empty session gets no roster at all. It must still converge —
-    bounded by the heartbeat interval rather than never.
+    The roster rides on the snapshot, and a joiner can still end up without one
+    — the snapshot is a single broadcast, and a lost one is not resent. It must
+    still converge — bounded by the heartbeat interval rather than never.
     """
     xs = _manager("guid-xs", "xstudio")
     xs.start_session()

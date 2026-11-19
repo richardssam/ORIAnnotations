@@ -2488,11 +2488,17 @@ class SyncManager:
         whole session (not unicast), but only the peer whose GUID matches *target_guid*
         will act on it.
 
+        A master with no timelines still answers, with an empty snapshot: the
+        session exists, and a joiner waiting on its ``STATE_REQUEST`` would
+        otherwise time out and report it as not found (session-join-validation).
+        Timelines the master registers later reach the joiner as ``ADD_TIMELINE``
+        like any other mid-session change.
+
         :param target_guid: GUID of the requesting peer.
         :param playback_state: Optional current playback state dict to include so the
             joiner can immediately seek to the right position.
         """
-        if not self.is_master or not self._timelines:
+        if not self.is_master:
             return
         self._send_message(StateSnapshot(
             target_guid=target_guid,
