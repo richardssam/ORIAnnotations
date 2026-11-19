@@ -18,6 +18,13 @@ When a user attempts to join a session by name, the plugin SHALL check whether a
 - **WHEN** a user attempts to join a session name that currently exists
 - **THEN** the join SHALL proceed as it does today
 
+#### Scenario: Joining an existing session with nothing loaded
+
+- **WHEN** a user attempts to join a session that exists but whose master has no timelines yet
+- **THEN** the master SHALL still answer the joiner's state request, with an empty snapshot
+- **AND** the join SHALL complete rather than report the session as not found
+- **AND** timelines the master loads afterwards SHALL reach the joiner as they would for any peer already in the session
+
 ### Requirement: The existence check is side-effect free
 
 Checking whether a session exists SHALL NOT itself bring that session into existence or otherwise alter server-side state.

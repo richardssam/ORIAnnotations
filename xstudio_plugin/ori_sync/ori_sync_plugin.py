@@ -1034,16 +1034,6 @@ class ORISyncPlugin(PluginBase):
                         self.structure._reconcile_dirty_marks()
                     self.structure._last_structure_scan = now
 
-                # 7. Deferred snapshot responses
-                if self.structure._pending_snapshot_requesters and self.manager and self.manager._timelines:
-                    for _req_guid in list(self.structure._pending_snapshot_requesters):
-                        _log(f"Deferred snapshot: sending to {_req_guid[:8]}")
-                        self.manager.send_state_snapshot(
-                            _req_guid,
-                            playback_state=self.playback.current_playback_state(),
-                        )
-                    self.structure._pending_snapshot_requesters.clear()
-
             except Exception:
                 _log_exc("Poll loop error")
 
@@ -1250,17 +1240,17 @@ class ORISyncPlugin(PluginBase):
             current_display = self.display.read_xs_display_state()
             self.manager.display_state = current_display
             self.display._last_display_state = dict(current_display)
-            if self.manager._timelines:
-                self.manager.send_state_snapshot(
-                    requester_guid,
-                    playback_state=self.playback.current_playback_state(),
-                )
-            else:
-                # No timelines yet (session still loading) — defer until the
-                # poll loop has built and registered them.
-                _log(f"No timelines yet — deferring snapshot for {requester_guid[:8]}")
-                if requester_guid not in self.structure._pending_snapshot_requesters:
-                    self.structure._pending_snapshot_requesters.append(requester_guid)
+            # Answer even with no timelines. Holding the answer until some
+            # appeared never ended in an empty session: the joiner's
+            # STATE_REQUEST timed out and a Join reported the session as not
+            # found. Playlists created later are picked up by the structure
+            # poll and reach the joiner as ADD_TIMELINE.
+            if not self.manager._timelines:
+                _log(f"No timelines yet — sending an empty snapshot to {requester_guid[:8]}")
+            self.manager.send_state_snapshot(
+                requester_guid,
+                playback_state=self.playback.current_playback_state(),
+            )
 
         elif action == "partial_annotation":
             self.annotation.apply_partial_annotation_xs(data)
