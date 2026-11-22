@@ -1,3 +1,11 @@
+---
+layout: default
+title: Debug Tools & Sync Port Configurations
+has_children: true
+parent: ORI Sync Tools
+nav_order: 5
+---
+
 # Debug Tools & Sync Port Configurations
 
 This directory contains utility scripts and documentation to assist with debugging selection synchronization and media updates between running xStudio and OpenRV instances.
