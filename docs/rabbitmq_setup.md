@@ -24,7 +24,7 @@ Key constraints for this setup:
 
 A step-by-step build plan for the OCI VM is detailed in:
 
-* **[OCI RabbitMQ Runbook](oci-rabbitmq-runbook.md)**
+* **[OCI RabbitMQ Runbook](https://github.com/richardssam/ORIAnnotations/blob/main/docs/oci-rabbitmq-runbook.md)**
 
 ---
 

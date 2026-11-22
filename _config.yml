@@ -10,15 +10,26 @@ include:
 exclude:
   - docs/source
   - docs/doctrees
+  - docs/OTIO Sync Protocol Draft.md
+  - docs/architecture.md
+  - docs/clip_selection_sync_status.md
+  - docs/docs.md
+  - docs/http_media_fallback.md
+  - docs/introduction.md
+  - docs/oci-rabbitmq-runbook.md
+  - docs/openrv_constraints.md
+  - docs/plugin_tasks.md
+  - docs/rv_vs_xstudio_api.md
+  - docs/selection_sync_xstudio_host.md
+  - docs/shape_annotation_comparison.md
+  - docs/sync_state_projection.md
+  - docs/sync_viewer_constraints.md
+  - docs/testing.md
+  - docs/visibility_authority_guards.md
+  - docs/xstudio_constraints.md
+  - docs/xstudio_questions.md
   - Makefile
   - AGENTS.md
-  - docs/architecture.md
-  - docs/introduction.md
-  - docs/OTIO Sync Protocol Draft.md
-  - docs/plugin_tasks.md
-  - docs/openrv_constraints.md
-  - docs/sync_viewer_constraints.md
-  - docs/xstudio_constraints.md
   - docs/conf.py
   - examples
   - test_media/source
