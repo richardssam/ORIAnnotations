@@ -148,7 +148,7 @@ To inspect the exact shapes for your xStudio version, raise the raw-event log ca
 if self._core_events_received <= 3:   # raise this while investigating
 ```
 
-Do **not** subscribe to the AnnotationsUI or AnnotationsCore *plugin events* groups to get at this. `PluginBase` spawns those without an owner and nothing is ever broadcast on them, so the subscription silently delivers nothing — the bug that kept this whole path dead until `fix-xs-annotation-draw-subscription`. See [docs/xstudio_constraints.md](../../docs/xstudio_constraints.md) for the full account.
+Do **not** subscribe to the AnnotationsUI or AnnotationsCore *plugin events* groups to get at this. `PluginBase` spawns those without an owner and nothing is ever broadcast on them, so the subscription silently delivers nothing — the bug that kept this whole path dead until `fix-xs-annotation-draw-subscription`. See [docs/xstudio_constraints.md](https://github.com/richardssam/ORIAnnotations/blob/main/docs/xstudio_constraints.md) for the full account.
 
 ---
 

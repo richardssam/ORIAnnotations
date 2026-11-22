@@ -15,7 +15,7 @@ During synchronization sessions, the application instances are configured to lis
 
 ### xStudio Inspector
 
-The script [xstudio_inspect.py](file:///Users/sam/git/ORIAnnotations/debug/xstudio_inspect.py) queries the running xStudio Master and Client processes, printing information about the viewport states, viewed containers, playhead positions, and track/clip hierarchies.
+The script [xstudio_inspect.py](https://github.com/richardssam/ORIAnnotations/blob/main/debug/xstudio_inspect.py) queries the running xStudio Master and Client processes, printing information about the viewport states, viewed containers, playhead positions, and track/clip hierarchies.
 
 #### How to Run
 
@@ -105,17 +105,17 @@ python3 diag.py
 
 ### Using the xStudio Inspector Debug Tool
 
-For quick and comprehensive connection status, viewport container type, active playhead frame, and playlist/track/clip hierarchy verification, use the dedicated [xstudio_inspect.py](file:///Users/sam/git/ORIAnnotations/debug/xstudio_inspect.py) script:
+For quick and comprehensive connection status, viewport container type, active playhead frame, and playlist/track/clip hierarchy verification, use the dedicated [xstudio_inspect.py](https://github.com/richardssam/ORIAnnotations/blob/main/debug/xstudio_inspect.py) script:
 
 ```bash
 /Users/sam/git/xstudio/build/vcpkg_installed/arm-osx/tools/python3/python3 -u debug/xstudio_inspect.py
 ```
 
-See [debug/README.md](file:///Users/sam/git/ORIAnnotations/debug/README.md) for more details on port numbers and log file locations.
+See [debug/README.md](README.md) for more details on port numbers and log file locations.
 
 ## Merging peer logs
 
-[merge_sync_logs.py](file:///Users/sam/git/ORIAnnotations/debug/merge_sync_logs.py)
+[merge_sync_logs.py](https://github.com/richardssam/ORIAnnotations/blob/main/debug/merge_sync_logs.py)
 interleaves two or more peer logs into one time-ordered view. Every sync
 question is a question about two peers at the same instant, and answering it
 from separate files means grepping each for the terms you already suspect —

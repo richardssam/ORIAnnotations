@@ -11,7 +11,7 @@ We provide a suite of tools to help with synchronization between different revie
 
 See:
 * **OpenRV Sync Plugin (`rvplugin/ori_sync`)**: Enables OpenRV to join sync sessions, broadcasting and receiving playhead, display, and annotation changes. See the [rvplugin README](rvplugin/ori_sync/README.md) for details.
-* **xStudio Sync Plugin (`xstudio_plugin/ori_sync`)**: Enables xStudio to join sync sessions. See the [xStudio plugin README](xstudio_plugin/README.md) for installation and usage.
+* **xStudio Sync Plugin (`xstudio_plugin/ori_sync`)**: Enables xStudio to join sync sessions. See the [xStudio plugin README](xstudio_plugin/ori_sync/README.md) for installation and usage.
 
 Full docs for the Annotation API are [here](docs/otio_sync_docs.html).
 

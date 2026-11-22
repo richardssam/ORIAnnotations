@@ -46,7 +46,7 @@ stroke width (px) = size*H
 
 ## Method 1: do the vectors match the image?
 
-[`debug/compare_annotation_vectors.py`](../debug/compare_annotation_vectors.py)
+[`debug/compare_annotation_vectors.py`](https://github.com/richardssam/ORIAnnotations/blob/main/debug/compare_annotation_vectors.py)
 does the following for each annotated frame:
 
 1. Extract the clean frame from the `.mov` (`rez-env ffmpeg -- ffmpeg …`).
@@ -95,7 +95,7 @@ differently.
    `1 / RV_WIDTH_SCALE` (1 / 0.6 = 1.67). The protocol convention is
    `size = rv_width / 0.6`, but read-back from RV was missing that division
    until the pen-width fix
-   ([`rv_annotation_codec.py`](../python/otio_sync_core/rv_annotation_codec.py),
+   ([`rv_annotation_codec.py`](https://github.com/richardssam/ORIAnnotations/blob/main/python/otio_sync_core/rv_annotation_codec.py),
    search for "Invert the forward `_pen_spec`"). These Aug 2025 files therefore
    hold raw RV widths. The scale isn't perfectly constant: the widest stroke
    (size 0.022) wants 1.85×, while the thin ones (size 0.01) want 1.4–1.6×. The

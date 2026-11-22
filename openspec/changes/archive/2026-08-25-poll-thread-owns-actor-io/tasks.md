@@ -240,6 +240,53 @@
       → Two things to test rather than assume if this is built: whether 25
       concurrent listeners still stall the poll thread, and whether the PR's
       "unsubscribe race" fix survives listener sharing.
+      → **Built and measured, 2026-08-25** (xstudio
+      `openspec/changes/python-per-group-event-listeners`, branch
+      `pr/python-per-group-event-listeners`). Both questions answered, and the answer
+      to the first is the more interesting one.
+        * *Does the unsubscribe race fix survive sharing?* **Yes.** S3 of
+          `scratch/event_routing_crosstalk_repro.py` passes 3/3 attempts, alongside S1
+          and S2, exactly as on the PR build. Sharing is safe because the leave is
+          refcounted: a group's listener leaves and quits only when its LAST callback
+          is removed. A new repro was written for precisely the case sharing newly
+          risks (`scratch/event_shared_group_repro.py`): two callbacks on one group,
+          remove one, assert the other still receives, then remove the second and
+          assert the listener leaves. It passes on per-group and **fails on the PR
+          build** (which reports 2 listener addresses for 2 callbacks, not 1), so it
+          discriminates rather than merely agreeing.
+        * *Do the listeners still stall the poll thread?* **The concurrency mechanism
+          is gone; the stalls are not.** `--concurrency-probe`, 5 subscriptions on one
+          group: per-group reports **1 thread, peak overlap 1** — develop's profile
+          (78 invocations / 1 / 1), not the PR's (389 / 5 / 5). So N-way callback
+          concurrency against a connection that tolerates none is no longer reachable
+          from event handlers.
+      → **Suite result: 4/10** on `xstudio_selects_script_xstudio` (develop 10/10, PR
+      1/10). Better, not fixed.
+      → **The residual is this item, 7.1, and the logs say so cleanly.** Every failing
+      run carries `[POLL-SLOW]` markers and every passing run has none:
+
+            FAIL  cmd:show_atom_media took 2.0s   drain_cmd_queue took 2.2s
+            FAIL  cmd:show_atom_media took 4.0s   drain_cmd_queue took 2.1s
+            PASS  (no POLL-SLOW markers at all)
+
+        Those are **exactly 1x and 2x `_PLAYHEAD_TIMEOUT_MS = 2000`** — bounded reads
+        burning their whole allowance, not slow-but-successful reads. That is a change
+        from what 6.2 measured on the PR build ("the stalls are not timeouts... many
+        individually-successful reads that are slow only under live concurrent listener
+        load"): remove the listener concurrency and what is left is the timeout itself
+        expiring, which is the `request_receive`-as-event-pump and `response()`-discard
+        defects named above.
+      → Knock-on in the plugin is a race, not a stall. The runner sends
+        `set_selection` then `set_frame` 1.0s apart, so a 2s poll stall lands selection
+        resolution *after* the frame command and new-source isolation discards it
+        (`[SEL] ... forcing frame=0 (discarding position 61)`). That discard is normal
+        and appears in passing runs too; only its ordering against the stall decides
+        the run. Nothing to fix plugin-side — it is the 2s stall that moves.
+      → **Conclusion for this item: still the blocker, and now the only one.** The
+      per-group change removes the listener-topology contribution entirely and is
+      judged on its own evidence (independence guarantees preserved, listener
+      population bounded by distinct groups). 7.1 is what stands between 4/10 and
+      10/10.
 
 - [x] 7.3 Stop the plugin leaking duplicate subscriptions (found while answering
       "is any event noisier than the others?").
