@@ -4,10 +4,14 @@ plugins:
 - jekyll-remote-theme
 - jekyll-seo-tag
 
-include: [docs]
+include:
+  - docs
+  # Sphinx output: underscore dirs are skipped by Jekyll unless listed
+  - docs/html/_static
+  - docs/html/_modules
+  - docs/html/_sources
 
 exclude:
-  - docs/html
   - docs/source
   - docs/doctrees
   - Makefile

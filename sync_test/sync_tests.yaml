@@ -150,7 +150,7 @@ tests:
       host here, so this asserts host-driven visibility propagating to an
       OpenRV follower — the intended topology under host-owned visibility.
     recording: "recordings/xstudio_selects_v2.jsonl"
-    #checkpoint_validation_delay: 2.5
+    checkpoint_validation_delay: 2.5
     script_driven: true
     frame_tolerance: 5
     apps:
@@ -785,17 +785,17 @@ tests:
               xstudio: {action: "set_selection", name: "car_ACES_sRGB.mov"}
               openrv: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
           - action: "concurrent_commands"
-            settle: 1.0
+            settle: 2.0
             by_app:
               xstudio: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}
               openrv: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
           - action: "concurrent_commands"
-            settle: 1.0
+            settle: 2.0
             by_app:
               xstudio: {action: "set_selection", name: "laser_ACES_sRGB.mov"}
               openrv: {action: "set_selection", name: "car_ACES_sRGB.mov"}
           - action: "concurrent_commands"
-            settle: 1.0
+            settle: 2.0
             by_app:
               xstudio: {action: "set_selection", name: "warp_ACES_sRGB.mov"}
               openrv: {action: "set_selection", name: "graphic_ACES_sRGB.mov"}

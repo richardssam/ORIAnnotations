@@ -26,7 +26,7 @@ make html
 
 Real-time synchronization between review sessions relies on RabbitMQ as the central messaging broker. 
 
-See **[docs/rabbitmq_setup.md](file:///Users/sam/git/ORIAnnotations/docs/rabbitmq_setup.md)** for detailed instructions on:
+See **[docs/rabbitmq_setup.md](docs/rabbitmq_setup.md)** for detailed instructions on:
 * Setting up a secure, public-facing broker on OCI (Always Free Tier).
 * Configuring a secure local instance (macOS/Homebrew) running over AMQPS.
 * Application-level connection URL formatting.
@@ -43,7 +43,7 @@ See **[docs/rabbitmq_setup.md](file:///Users/sam/git/ORIAnnotations/docs/rabbitm
 The toolkit includes plugins that enable real-time synchronization between different review applications using RabbitMQ and OTIO.
 
 * **OpenRV Sync Plugin (`rvplugin/ori_sync`)**: Enables OpenRV to join sync sessions, broadcasting and receiving playhead, display, and annotation changes. See the [rvplugin README](rvplugin/ori_sync/README.md) for details.
-* **xStudio Sync Plugin (`xstudio_plugin/ori_sync`)**: Enables xStudio to join sync sessions. See the [xStudio plugin README](xstudio_plugin/README.md) for installation and usage.
+* **xStudio Sync Plugin (`xstudio_plugin/ori_sync`)**: Enables xStudio to join sync sessions. See the [xStudio plugin README](xstudio_plugin/ori_sync/README.md) for installation and usage.
 * **Legacy OpenRV Exporter/Importer (`rvplugin/ori_annotations`)**: Contains a plugin for OpenRV to export and import annotations as custom OTIO files. Build `oriannotations.zip` via `makepackage.csh` and load it via the OpenRV package manager.
 
 ## Sync Tools
