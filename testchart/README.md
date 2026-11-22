@@ -23,12 +23,12 @@ Below is a list of the vector test chart image assets used in the test suite:
 
 | Chart Type | Standard Resolution |
 | :--- | :--- |
-| **Calligraphy** | ![Calligraphy]({% link testchart/vector_calligraphy.png %}) |
-| **Colors** | ![Colors]({% link testchart/vector_colors.png %}) |
-| **Fonts** | ![Fonts]({% link testchart/vector_fonts.png %}) |
-| **Primitives** | ![Primitives]({% link testchart/vector_primitives.png %}) |
-| **Shapes** | ![Shapes]({% link testchart/vector_shapes.png %}) |
-| **Thickness** | ![Thickness]({% link testchart/vector_thickness.png %}) |
+| **Calligraphy** | ![Calligraphy]({{ site.baseurl }}{% link testchart/vector_calligraphy.png %}) |
+| **Colors** | ![Colors]({{ site.baseurl }}{% link testchart/vector_colors.png %}) |
+| **Fonts** | ![Fonts]({{ site.baseurl }}{% link testchart/vector_fonts.png %}) |
+| **Primitives** | ![Primitives]({{ site.baseurl }}{% link testchart/vector_primitives.png %}) |
+| **Shapes** | ![Shapes]({{ site.baseurl }}{% link testchart/vector_shapes.png %}) |
+| **Thickness** | ![Thickness]({{ site.baseurl }}{% link testchart/vector_thickness.png %}) |
 
 ## How to Run
 
